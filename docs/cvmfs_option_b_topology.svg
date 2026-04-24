@@ -1,0 +1,141 @@
+<svg viewBox="0 0 900 440" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif" font-size="12">
+  <title>Option B — Two-Channel Stratum 1 Pre-Warming Topology</title>
+  <desc>Network topology showing the publisher node running cvmfs-prepub with the Distributor component, which uses an HTTPS control channel for announce and a plain-HTTP data channel for object PUTs to the Stratum 1 Receiver Agent, which writes objects to the local CAS before the catalog flip</desc>
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#888"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4A90D9"/>
+    </marker>
+    <marker id="arr-orange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#E67E22"/>
+    </marker>
+    <marker id="arr-teal" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#1ABC9C"/>
+    </marker>
+    <marker id="arr-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#5BAD6F"/>
+    </marker>
+    <marker id="arr-grey" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#95A5A6"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="440" fill="#ffffff" rx="8"/>
+
+  <!-- Title -->
+  <text x="450" y="26" text-anchor="middle" font-size="15" font-weight="700" fill="#111">Option B — Stratum 1 Pre-Warming Topology</text>
+
+  <!-- ═══════════════════ PUBLISHER NODE ═══════════════════ -->
+  <rect x="20" y="44" width="280" height="340" rx="10" fill="#EEF4FB" stroke="#4A90D9" stroke-width="2"/>
+  <text x="160" y="64" text-anchor="middle" font-size="12" font-weight="700" fill="#4A90D9">Publisher Node</text>
+  <text x="160" y="78" text-anchor="middle" font-size="10" fill="#888">cvmfs-prepub --mode publisher</text>
+
+  <!-- cvmfs-prepub internals -->
+  <!-- REST API -->
+  <rect x="40" y="88" width="240" height="32" rx="5" fill="#fff" stroke="#4A90D9" stroke-width="1"/>
+  <text x="160" y="108" text-anchor="middle" font-size="10" font-weight="600" fill="#4A90D9">REST API + Job Queue</text>
+
+  <!-- Pipeline -->
+  <rect x="40" y="130" width="240" height="32" rx="5" fill="#fff" stroke="#4A90D9" stroke-width="1"/>
+  <text x="160" y="150" text-anchor="middle" font-size="10" font-weight="600" fill="#4A90D9">Processing Pipeline</text>
+  <text x="160" y="163" text-anchor="middle" font-size="9" fill="#888">unpack → compress → dedup → CAS upload</text>
+
+  <!-- CAS Backend arrow -->
+  <line x1="160" y1="165" x2="160" y2="188" stroke="#4A90D9" stroke-width="1.2" marker-end="url(#arr-blue)"/>
+
+  <!-- Distributor box — highlighted -->
+  <rect x="40" y="192" width="240" height="60" rx="5" fill="#D6EAF8" stroke="#4A90D9" stroke-width="1.5"/>
+  <text x="160" y="214" text-anchor="middle" font-size="11" font-weight="700" fill="#1A5276">Distributor</text>
+  <text x="160" y="230" text-anchor="middle" font-size="9" fill="#555">announces + pushes objects</text>
+  <text x="160" y="243" text-anchor="middle" font-size="9" fill="#555">before catalog commit</text>
+
+  <!-- Gateway client -->
+  <line x1="160" y1="252" x2="160" y2="272" stroke="#888" stroke-width="1.2" marker-end="url(#arr)"/>
+  <rect x="40" y="276" width="240" height="32" rx="5" fill="#fff" stroke="#888" stroke-width="1"/>
+  <text x="160" y="296" text-anchor="middle" font-size="10" font-weight="600" fill="#555">cvmfs_gateway client</text>
+  <text x="160" y="309" text-anchor="middle" font-size="9" fill="#888">lease acquire + catalog commit</text>
+
+  <!-- CAS Backend (S3 / local) -->
+  <rect x="40" y="332" width="240" height="36" rx="5" fill="#FEF9E7" stroke="#E8954A" stroke-width="1"/>
+  <text x="160" y="354" text-anchor="middle" font-size="10" font-weight="600" fill="#E8954A">CAS Backend (S3 / local)</text>
+  <text x="160" y="367" text-anchor="middle" font-size="9" fill="#888">Stratum 0 object store</text>
+
+  <!-- ═══════════════════ STRATUM 1 NODE ═══════════════════ -->
+  <rect x="600" y="44" width="280" height="340" rx="10" fill="#E8F8F5" stroke="#1ABC9C" stroke-width="2"/>
+  <text x="740" y="64" text-anchor="middle" font-size="12" font-weight="700" fill="#16A085">Stratum 1 Node</text>
+  <text x="740" y="78" text-anchor="middle" font-size="10" fill="#888">cvmfs-prepub --mode receiver</text>
+
+  <!-- Control channel (HTTPS :9100) -->
+  <rect x="618" y="88" width="244" height="44" rx="5" fill="#FEF3E7" stroke="#E67E22" stroke-width="1.5"/>
+  <text x="740" y="108" text-anchor="middle" font-size="11" font-weight="700" fill="#E67E22">Control Channel</text>
+  <text x="740" y="122" text-anchor="middle" font-size="10" fill="#E67E22">HTTPS :9100 — announce endpoint</text>
+
+  <!-- arrow down inside S1 node -->
+  <line x1="740" y1="132" x2="740" y2="148" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+
+  <!-- Session store -->
+  <rect x="618" y="152" width="244" height="32" rx="5" fill="#fff" stroke="#888" stroke-width="1"/>
+  <text x="740" y="172" text-anchor="middle" font-size="10" font-weight="600" fill="#555">Session Store (in-memory)</text>
+  <text x="740" y="185" text-anchor="middle" font-size="9" fill="#888">token → payload_id (TTL = 1 h)</text>
+
+  <!-- arrow down inside S1 node -->
+  <line x1="740" y1="184" x2="740" y2="200" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+
+  <!-- Data channel (HTTP :9101) -->
+  <rect x="618" y="204" width="244" height="44" rx="5" fill="#E8F8F5" stroke="#1ABC9C" stroke-width="1.5"/>
+  <text x="740" y="224" text-anchor="middle" font-size="11" font-weight="700" fill="#1ABC9C">Data Channel</text>
+  <text x="740" y="238" text-anchor="middle" font-size="10" fill="#1ABC9C">HTTP :9101 — objects endpoint</text>
+
+  <!-- arrow down inside S1 node -->
+  <line x1="740" y1="248" x2="740" y2="270" stroke="#5BAD6F" stroke-width="1.5" marker-end="url(#arr-green)"/>
+
+  <!-- Handler description -->
+  <rect x="618" y="274" width="244" height="52" rx="5" fill="#fff" stroke="#888" stroke-width="1"/>
+  <text x="628" y="290" font-size="9" fill="#555">① verify Bearer token against session store</text>
+  <text x="628" y="304" font-size="9" fill="#555">② stream body: SHA-256 + tmp file (O_EXCL)</text>
+  <text x="628" y="318" font-size="9" fill="#555">③ verify X-Content-SHA256 header</text>
+
+  <!-- arrow down -->
+  <line x1="740" y1="326" x2="740" y2="346" stroke="#5BAD6F" stroke-width="1.5" marker-end="url(#arr-green)"/>
+
+  <!-- Local CAS -->
+  <rect x="618" y="350" width="244" height="20" rx="5" fill="#D5F5E3" stroke="#5BAD6F" stroke-width="1.5"/>
+  <text x="740" y="364" text-anchor="middle" font-size="10" font-weight="600" fill="#27AE60">atomic rename → local CAS</text>
+
+  <!-- CAS path label -->
+  <rect x="618" y="374" width="244" height="22" rx="4" fill="#fff" stroke="#ccc"/>
+  <text x="740" y="389" text-anchor="middle" font-size="9" fill="#555">{cas_root}/{hash[:2]}/{hash}C</text>
+
+  <!-- ═══════════════════ INTER-NODE ARROWS ═══════════════════ -->
+
+  <!-- Control channel arrow (HTTPS) — distributor to S1 control -->
+  <path d="M280,218 L420,218 L420,110 L600,110" fill="none" stroke="#E67E22" stroke-width="2" stroke-dasharray="0" marker-end="url(#arr-orange)"/>
+  <!-- label -->
+  <rect x="320" y="93" width="170" height="24" rx="4" fill="#FEF9E7" stroke="#E67E22" stroke-width="1"/>
+  <text x="405" y="106" text-anchor="middle" font-size="10" font-weight="600" fill="#E67E22">HTTPS :9100 — Announce</text>
+  <text x="405" y="116" text-anchor="middle" font-size="9" fill="#888">HMAC-SHA256 authenticated</text>
+
+  <!-- Data channel arrow (plain HTTP) — distributor to S1 data -->
+  <path d="M280,230 L450,230 L450,226 L600,226" fill="none" stroke="#1ABC9C" stroke-width="2" marker-end="url(#arr-teal)"/>
+  <!-- label -->
+  <rect x="320" y="238" width="170" height="24" rx="4" fill="#E8F8F5" stroke="#1ABC9C" stroke-width="1"/>
+  <text x="405" y="251" text-anchor="middle" font-size="10" font-weight="600" fill="#1ABC9C">HTTP :9101 — Object PUTs</text>
+  <text x="405" y="262" text-anchor="middle" font-size="9" fill="#888">Bearer token + SHA-256 verified</text>
+
+  <!-- Gateway arrow (after all S1s confirmed) -->
+  <path d="M160,308 L160,408 L520,408" fill="none" stroke="#888" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+  <text x="310" y="404" text-anchor="middle" font-size="9" fill="#888">quorum confirmed → catalog commit</text>
+
+  <!-- Legend -->
+  <rect x="315" y="316" width="262" height="64" rx="6" fill="#f9f9f9" stroke="#ccc" stroke-width="1"/>
+  <text x="446" y="333" text-anchor="middle" font-size="10" font-weight="600" fill="#555">Channel key</text>
+  <line x1="325" y1="347" x2="365" y2="347" stroke="#E67E22" stroke-width="2"/>
+  <text x="372" y="351" font-size="10" fill="#E67E22">HTTPS (TLS) — control</text>
+  <line x1="325" y1="366" x2="365" y2="366" stroke="#1ABC9C" stroke-width="2"/>
+  <text x="372" y="370" font-size="10" fill="#1ABC9C">HTTP — data (SHA-256 integrity)</text>
+
+</svg>

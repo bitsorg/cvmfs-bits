@@ -1,0 +1,149 @@
+<svg viewBox="0 0 780 680" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', 'Source Code Pro', monospace">
+  <!-- Background -->
+  <rect width="780" height="680" fill="#0d1117" rx="12"/>
+
+  <!-- Title -->
+  <text x="390" y="38" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="bold" font-family="ui-sans-serif, system-ui, sans-serif">CVMFS Provenance Chain — Irrefutable Attribution</text>
+
+  <!-- ═══════════════════════════════════════════════════════
+       LAYER 1 — CVMFS File → Content Hash
+  ══════════════════════════════════════════════════════════ -->
+  <!-- Card -->
+  <rect x="30" y="58" width="340" height="110" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <rect x="30" y="58" width="340" height="28" rx="8" fill="#1f6feb" opacity="0.85"/>
+  <rect x="30" y="74" width="340" height="12" rx="0" fill="#1f6feb" opacity="0.85"/>
+  <text x="200" y="77" text-anchor="middle" fill="#ffffff" font-size="11.5" font-weight="bold" font-family="ui-sans-serif, system-ui, sans-serif">Layer 1 — File → Content Hash</text>
+
+  <text x="46" y="106" fill="#79c0ff" font-size="10.5">CVMFS catalog  (.cvmfspublished)</text>
+  <text x="46" y="122" fill="#8b949e" font-size="10">  /atlas/24.0/libAtlasROOT.so</text>
+  <text x="46" y="135" fill="#56d364" font-size="10">    sha256: a3f9...b812  ← content address</text>
+  <text x="46" y="150" fill="#8b949e" font-size="10">  Manifest signed by Stratum 0 gateway key</text>
+
+  <!-- Icon lock -->
+  <text x="344" y="106" fill="#ffa657" font-size="14">🔑</text>
+
+  <!-- ═══════════════════════════════════════════════════════
+       LAYER 2 — Content Hash → Publish Job (Rekor)
+  ══════════════════════════════════════════════════════════ -->
+  <rect x="30" y="198" width="340" height="120" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <rect x="30" y="198" width="340" height="28" rx="8" fill="#388bfd" opacity="0.75"/>
+  <rect x="30" y="214" width="340" height="12" rx="0" fill="#388bfd" opacity="0.75"/>
+  <text x="200" y="217" text-anchor="middle" fill="#ffffff" font-size="11.5" font-weight="bold" font-family="ui-sans-serif, system-ui, sans-serif">Layer 2 — Hash → Publish Job  (Rekor)</text>
+
+  <text x="46" y="246" fill="#79c0ff" font-size="10.5">Rekor entry  (hashedrekord)</text>
+  <text x="46" y="261" fill="#8b949e" font-size="10">  hash:      sha256:a3f9...b812</text>
+  <text x="46" y="275" fill="#8b949e" font-size="10">  job_id:    550e8400-e29b-41d4-a716-…</text>
+  <text x="46" y="289" fill="#8b949e" font-size="10">  uuid:      24296fb24b3d…  log_index: 183047291</text>
+  <text x="46" y="303" fill="#56d364" font-size="10">  SET signed by Rekor's key — offline verifiable</text>
+  <text x="344" y="246" fill="#ffa657" font-size="14">📋</text>
+
+  <!-- ═══════════════════════════════════════════════════════
+       LAYER 3 — Publish Job → CI Pipeline (OIDC)
+  ══════════════════════════════════════════════════════════ -->
+  <rect x="30" y="348" width="340" height="130" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <rect x="30" y="348" width="340" height="28" rx="8" fill="#3fb950" opacity="0.70"/>
+  <rect x="30" y="364" width="340" height="12" rx="0" fill="#3fb950" opacity="0.70"/>
+  <text x="200" y="367" text-anchor="middle" fill="#ffffff" font-size="11.5" font-weight="bold" font-family="ui-sans-serif, system-ui, sans-serif">Layer 3 — Job → CI Pipeline  (OIDC)</text>
+
+  <text x="46" y="396" fill="#79c0ff" font-size="10.5">Job manifest  (spool/published/&lt;job_id&gt;/job.json)</text>
+  <text x="46" y="411" fill="#8b949e" font-size="10">  oidc_issuer:  https://token.actions.githubusercontent.com</text>
+  <text x="46" y="425" fill="#8b949e" font-size="10">  oidc_subject: repo:atlas-release/atlas-sw:ref:refs/heads/main</text>
+  <text x="46" y="439" fill="#8b949e" font-size="10">  git_sha:      c4e9f2a…</text>
+  <text x="46" y="453" fill="#56d364" font-size="10">  verified: true  ← OIDC token signature validated</text>
+  <text x="46" y="467" fill="#8b949e" font-size="10">  rekor_uuid: 24296fb24b3d…  rekor_log_index: 183047291</text>
+  <text x="344" y="396" fill="#ffa657" font-size="14">🪪</text>
+
+  <!-- ═══════════════════════════════════════════════════════
+       LAYER 4 — CI Pipeline → User / Git Commit
+  ══════════════════════════════════════════════════════════ -->
+  <rect x="30" y="508" width="340" height="115" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <rect x="30" y="508" width="340" height="28" rx="8" fill="#d29922" opacity="0.80"/>
+  <rect x="30" y="524" width="340" height="12" rx="0" fill="#d29922" opacity="0.80"/>
+  <text x="200" y="527" text-anchor="middle" fill="#ffffff" font-size="11.5" font-weight="bold" font-family="ui-sans-serif, system-ui, sans-serif">Layer 4 — CI → User / Git Commit  (VCS)</text>
+
+  <text x="46" y="556" fill="#79c0ff" font-size="10.5">git log --show-signature c4e9f2a</text>
+  <text x="46" y="571" fill="#8b949e" font-size="10">  Author:  atlas-releaser &lt;rel@cern.ch&gt;</text>
+  <text x="46" y="585" fill="#8b949e" font-size="10">  Date:    2026-04-24T09:12:33Z</text>
+  <text x="46" y="599" fill="#8b949e" font-size="10">  Message: "Release ATLAS 24.0.42 — LHC Run 3 data"</text>
+  <text x="46" y="613" fill="#56d364" font-size="10">  GPG signature verified by author's key</text>
+  <text x="344" y="556" fill="#ffa657" font-size="14">👤</text>
+
+  <!-- ═══════════════════════════════════════════════════════
+       CONNECTOR ARROWS (left column)
+  ══════════════════════════════════════════════════════════ -->
+  <!-- Arrow L1 → L2 -->
+  <line x1="200" y1="168" x2="200" y2="193" stroke="#30363d" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <!-- Arrow L2 → L3 -->
+  <line x1="200" y1="318" x2="200" y2="343" stroke="#30363d" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <!-- Arrow L3 → L4 -->
+  <line x1="200" y1="478" x2="200" y2="503" stroke="#30363d" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- Arrowhead marker -->
+  <defs>
+    <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="4" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrowhead2" markerWidth="8" markerHeight="8" refX="4" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#8b949e"/>
+    </marker>
+  </defs>
+
+  <!-- Arrow labels -->
+  <text x="211" y="186" fill="#58a6ff" font-size="9.5">reverse index by hash</text>
+  <text x="211" y="336" fill="#58a6ff" font-size="9.5">job_id links manifest ↔ Rekor UUID</text>
+  <text x="211" y="496" fill="#58a6ff" font-size="9.5">git_sha from verified OIDC claim</text>
+
+  <!-- ═══════════════════════════════════════════════════════
+       RIGHT COLUMN — Rekor verification flow
+  ══════════════════════════════════════════════════════════ -->
+  <rect x="410" y="58" width="340" height="565" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <rect x="410" y="58" width="340" height="28" rx="8" fill="#6e40c9" opacity="0.80"/>
+  <rect x="410" y="74" width="340" height="12" rx="0" fill="#6e40c9" opacity="0.80"/>
+  <text x="580" y="77" text-anchor="middle" fill="#ffffff" font-size="11.5" font-weight="bold" font-family="ui-sans-serif, system-ui, sans-serif">Offline Verification Workflow</text>
+
+  <!-- Steps -->
+  <!-- Step 1 -->
+  <rect x="426" y="100" width="308" height="64" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="442" y="118" fill="#ffa657" font-size="10.5" font-weight="bold">① Locate file hash in CVMFS catalog</text>
+  <text x="442" y="133" fill="#8b949e" font-size="9.5">  $ cvmfs_config probe software.cern.ch</text>
+  <text x="442" y="147" fill="#8b949e" font-size="9.5">  $ attr -g hash /cvmfs/…/libAtlasROOT.so</text>
+
+  <!-- Step 2 -->
+  <rect x="426" y="176" width="308" height="76" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="442" y="194" fill="#ffa657" font-size="10.5" font-weight="bold">② Query Rekor by hash (reverse index)</text>
+  <text x="442" y="209" fill="#8b949e" font-size="9.5">  $ rekor-cli search --sha &lt;hash&gt;</text>
+  <text x="442" y="223" fill="#8b949e" font-size="9.5">    → UUID: 24296fb24b3d…</text>
+  <text x="442" y="237" fill="#56d364" font-size="9.5">    → Merkle inclusion proof (append-only log)</text>
+
+  <!-- Step 3 -->
+  <rect x="426" y="264" width="308" height="76" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="442" y="282" fill="#ffa657" font-size="10.5" font-weight="bold">③ Retrieve Rekor entry — verify SET</text>
+  <text x="442" y="297" fill="#8b949e" font-size="9.5">  $ rekor-cli get --uuid 24296fb24b3d…</text>
+  <text x="442" y="311" fill="#8b949e" font-size="9.5">    body.data → job_id, catalog_hash, git_sha</text>
+  <text x="442" y="325" fill="#56d364" font-size="9.5">    SET verifiable offline with Rekor public key</text>
+
+  <!-- Step 4 -->
+  <rect x="426" y="352" width="308" height="76" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="442" y="370" fill="#ffa657" font-size="10.5" font-weight="bold">④ Confirm OIDC claims in job manifest</text>
+  <text x="442" y="385" fill="#8b949e" font-size="9.5">  oidc_issuer: token.actions.githubusercontent.com</text>
+  <text x="442" y="399" fill="#8b949e" font-size="9.5">  oidc_subject: repo:atlas-release/…</text>
+  <text x="442" y="413" fill="#56d364" font-size="9.5">  verified: true  (OIDC sig checked at submission)</text>
+
+  <!-- Step 5 -->
+  <rect x="426" y="440" width="308" height="76" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="442" y="458" fill="#ffa657" font-size="10.5" font-weight="bold">⑤ Trace to git commit / author</text>
+  <text x="442" y="473" fill="#8b949e" font-size="9.5">  $ git show c4e9f2a --show-signature</text>
+  <text x="442" y="487" fill="#8b949e" font-size="9.5">    Author, date, signed commit SHA</text>
+  <text x="442" y="501" fill="#56d364" font-size="9.5">  Full chain: file → hash → job → CI → user</text>
+
+  <!-- Non-repudiation banner -->
+  <rect x="426" y="528" width="308" height="80" rx="6" fill="#0d419d" opacity="0.55" stroke="#388bfd" stroke-width="1"/>
+  <text x="580" y="548" text-anchor="middle" fill="#79c0ff" font-size="10.5" font-weight="bold">Non-repudiation guarantee</text>
+  <text x="442" y="564" fill="#8b949e" font-size="9.5">• Rekor log is append-only (Merkle tree)</text>
+  <text x="442" y="578" fill="#8b949e" font-size="9.5">• Entries cannot be removed or altered</text>
+  <text x="442" y="592" fill="#8b949e" font-size="9.5">• SET + inclusion proof verifiable without</text>
+  <text x="442" y="606" fill="#8b949e" font-size="9.5">  Rekor server — permanent offline receipt</text>
+
+  <!-- Footer -->
+  <text x="390" y="660" text-anchor="middle" fill="#484f58" font-size="9">cvmfs-prepub · internal/provenance · Rekor: https://rekor.sigstore.dev</text>
+</svg>

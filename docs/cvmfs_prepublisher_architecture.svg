@@ -1,0 +1,203 @@
+<svg viewBox="0 0 900 720" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif" font-size="12">
+  <title>CVMFS Pre-Publisher Architecture</title>
+  <desc>Layered architecture showing tar ingestion, parallel processing pipeline, spool-based distribution, and integration with cvmfs_gateway, Stratum 0, and Stratum 1 replicas</desc>
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#888"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4A90D9"/>
+    </marker>
+    <marker id="arr-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#5BAD6F"/>
+    </marker>
+    <marker id="arr-orange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#E8954A"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="720" fill="#ffffff" rx="8"/>
+
+  <!-- LAYER LABELS (left margin) -->
+  <text x="14" y="122" fill="#999" font-size="10" font-weight="600" transform="rotate(-90,14,122)" text-anchor="middle">INGESTION</text>
+  <text x="14" y="280" fill="#999" font-size="10" font-weight="600" transform="rotate(-90,14,280)" text-anchor="middle">PROCESSING</text>
+  <text x="14" y="450" fill="#999" font-size="10" font-weight="600" transform="rotate(-90,14,450)" text-anchor="middle">COMMIT</text>
+  <text x="14" y="600" fill="#999" font-size="10" font-weight="600" transform="rotate(-90,14,600)" text-anchor="middle">DISTRIBUTION</text>
+
+  <!-- TITLE -->
+  <text x="450" y="28" text-anchor="middle" font-size="15" font-weight="700" fill="#111">CVMFS Pre-Publisher — Go Service Architecture</text>
+
+  <!-- LAYER 1: INGESTION -->
+  <rect x="32" y="42" width="836" height="118" rx="8" fill="#EEF4FB" stroke="#C0D4EC" stroke-width="1"/>
+
+  <rect x="52" y="60" width="110" height="44" rx="6" fill="#4A90D9" opacity=".85"/>
+  <text x="107" y="78" text-anchor="middle" font-size="11" fill="#fff" font-weight="600">Tar Upload</text>
+  <text x="107" y="93" text-anchor="middle" font-size="10" fill="#ddf">HTTP / S3 / NFS</text>
+
+  <rect x="192" y="55" width="120" height="54" rx="6" fill="#fff" stroke="#4A90D9" stroke-width="1.5"/>
+  <text x="252" y="74" text-anchor="middle" font-size="11" fill="#4A90D9" font-weight="600">REST / gRPC API</text>
+  <text x="252" y="89" text-anchor="middle" font-size="10" fill="#555">auth, deduplicate</text>
+  <text x="252" y="102" text-anchor="middle" font-size="10" fill="#555">submit / status</text>
+
+  <rect x="342" y="55" width="120" height="54" rx="6" fill="#fff" stroke="#4A90D9" stroke-width="1.5"/>
+  <text x="402" y="74" text-anchor="middle" font-size="11" fill="#4A90D9" font-weight="600">Job Queue</text>
+  <text x="402" y="89" text-anchor="middle" font-size="10" fill="#555">FSM + priority</text>
+  <text x="402" y="102" text-anchor="middle" font-size="10" fill="#555">channel-backed</text>
+
+  <rect x="492" y="55" width="130" height="54" rx="6" fill="#fff" stroke="#4A90D9" stroke-width="1.5"/>
+  <text x="557" y="74" text-anchor="middle" font-size="11" fill="#4A90D9" font-weight="600">Lease Manager</text>
+  <text x="557" y="89" text-anchor="middle" font-size="10" fill="#555">cvmfs_gateway API</text>
+  <text x="557" y="102" text-anchor="middle" font-size="10" fill="#555">path reservation</text>
+
+  <rect x="652" y="55" width="105" height="54" rx="6" fill="#FFF8EE" stroke="#E8954A" stroke-width="1.5"/>
+  <text x="704" y="74" text-anchor="middle" font-size="11" fill="#E8954A" font-weight="600">incoming/</text>
+  <text x="704" y="89" text-anchor="middle" font-size="10" fill="#555">atomic rename</text>
+  <text x="704" y="102" text-anchor="middle" font-size="10" fill="#555">job manifest</text>
+
+  <line x1="162" y1="82" x2="191" y2="82" stroke="#4A90D9" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+  <line x1="312" y1="82" x2="341" y2="82" stroke="#4A90D9" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+  <line x1="462" y1="82" x2="491" y2="82" stroke="#4A90D9" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+  <line x1="622" y1="82" x2="651" y2="82" stroke="#4A90D9" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+
+  <text x="760" y="68" font-size="10" fill="#E8954A" font-weight="700">SPOOL</text>
+  <text x="760" y="82" font-size="10" fill="#999">fsync +</text>
+  <text x="760" y="94" font-size="10" fill="#999">rename</text>
+
+  <!-- LAYER 2: PROCESSING PIPELINE -->
+  <rect x="32" y="175" width="836" height="190" rx="8" fill="#F0FBF2" stroke="#B2DEB9" stroke-width="1"/>
+  <text x="450" y="196" text-anchor="middle" font-size="11" fill="#5BAD6F" font-weight="700">PARALLEL PROCESSING PIPELINE (Worker Pool)</text>
+
+  <rect x="52" y="205" width="115" height="60" rx="6" fill="#fff" stroke="#5BAD6F" stroke-width="1.5"/>
+  <text x="109" y="225" text-anchor="middle" font-size="11" fill="#5BAD6F" font-weight="600">Unpacker</text>
+  <text x="109" y="240" text-anchor="middle" font-size="10" fill="#555">tar stream reader</text>
+  <text x="109" y="254" text-anchor="middle" font-size="10" fill="#555">path normaliser</text>
+
+  <rect x="195" y="205" width="130" height="60" rx="6" fill="#fff" stroke="#5BAD6F" stroke-width="1.5"/>
+  <text x="260" y="225" text-anchor="middle" font-size="11" fill="#5BAD6F" font-weight="600">Compress + Hash</text>
+  <text x="260" y="240" text-anchor="middle" font-size="10" fill="#555">zlib / zstd workers</text>
+  <text x="260" y="254" text-anchor="middle" font-size="10" fill="#555">SHA-256 / RIPEMD</text>
+
+  <rect x="353" y="205" width="120" height="60" rx="6" fill="#fff" stroke="#5BAD6F" stroke-width="1.5"/>
+  <text x="413" y="225" text-anchor="middle" font-size="11" fill="#5BAD6F" font-weight="600">Deduplicator</text>
+  <text x="413" y="240" text-anchor="middle" font-size="10" fill="#555">CAS existence check</text>
+  <text x="413" y="254" text-anchor="middle" font-size="10" fill="#555">bloom filter cache</text>
+
+  <rect x="501" y="205" width="120" height="60" rx="6" fill="#fff" stroke="#5BAD6F" stroke-width="1.5"/>
+  <text x="561" y="225" text-anchor="middle" font-size="11" fill="#5BAD6F" font-weight="600">CAS Uploader</text>
+  <text x="561" y="240" text-anchor="middle" font-size="10" fill="#555">S3 / local fs</text>
+  <text x="561" y="254" text-anchor="middle" font-size="10" fill="#555">multipart, retry</text>
+
+  <rect x="649" y="205" width="120" height="60" rx="6" fill="#fff" stroke="#5BAD6F" stroke-width="1.5"/>
+  <text x="709" y="225" text-anchor="middle" font-size="11" fill="#5BAD6F" font-weight="600">Catalog Builder</text>
+  <text x="709" y="240" text-anchor="middle" font-size="10" fill="#555">SQLite + WAL</text>
+  <text x="709" y="254" text-anchor="middle" font-size="10" fill="#555">Merkle diff</text>
+
+  <line x1="167" y1="235" x2="194" y2="235" stroke="#5BAD6F" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <line x1="325" y1="235" x2="352" y2="235" stroke="#5BAD6F" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <line x1="473" y1="235" x2="500" y2="235" stroke="#5BAD6F" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <line x1="621" y1="235" x2="648" y2="235" stroke="#5BAD6F" stroke-width="1.5" marker-end="url(#arr-green)"/>
+
+  <rect x="52" y="295" width="105" height="50" rx="6" fill="#FFF8EE" stroke="#E8954A" stroke-width="1.5"/>
+  <text x="104" y="315" text-anchor="middle" font-size="11" fill="#E8954A" font-weight="600">staged/</text>
+  <text x="104" y="330" text-anchor="middle" font-size="10" fill="#555">objects + catalog</text>
+
+  <rect x="175" y="295" width="105" height="50" rx="6" fill="#FFF8EE" stroke="#E8954A" stroke-width="1.5"/>
+  <text x="227" y="315" text-anchor="middle" font-size="11" fill="#E8954A" font-weight="600">uploading/</text>
+  <text x="227" y="330" text-anchor="middle" font-size="10" fill="#555">idempotent PUT</text>
+
+  <rect x="298" y="295" width="130" height="50" rx="6" fill="#F5F0FF" stroke="#9B7FD4" stroke-width="1.5"/>
+  <text x="363" y="315" text-anchor="middle" font-size="11" fill="#9B7FD4" font-weight="600">WAL Journal</text>
+  <text x="363" y="330" text-anchor="middle" font-size="10" fill="#555">op-log per job</text>
+
+  <rect x="450" y="295" width="115" height="50" rx="6" fill="#FFF0F0" stroke="#D45B5B" stroke-width="1.5"/>
+  <text x="507" y="315" text-anchor="middle" font-size="11" fill="#D45B5B" font-weight="600">Retry / Abort</text>
+  <text x="507" y="330" text-anchor="middle" font-size="10" fill="#555">lease release</text>
+
+  <line x1="109" y1="265" x2="109" y2="294" stroke="#E8954A" stroke-width="1.2" stroke-dasharray="3,3" marker-end="url(#arr-orange)"/>
+  <line x1="104" y1="345" x2="226" y2="345" stroke="#E8954A" stroke-width="1.2" marker-end="url(#arr-orange)"/>
+
+  <!-- LAYER 3: COMMIT -->
+  <rect x="32" y="380" width="836" height="90" rx="8" fill="#FDF6FF" stroke="#D4B8EC" stroke-width="1"/>
+  <text x="450" y="400" text-anchor="middle" font-size="11" fill="#9B7FD4" font-weight="700">ATOMIC COMMIT  ·  cvmfs_gateway lease API</text>
+
+  <rect x="60" y="408" width="130" height="48" rx="6" fill="#fff" stroke="#9B7FD4" stroke-width="1.5"/>
+  <text x="125" y="428" text-anchor="middle" font-size="11" fill="#9B7FD4" font-weight="600">Acquire Lease</text>
+  <text x="125" y="442" text-anchor="middle" font-size="10" fill="#555">POST /leases/{path}</text>
+
+  <rect x="215" y="408" width="140" height="48" rx="6" fill="#fff" stroke="#9B7FD4" stroke-width="1.5"/>
+  <text x="285" y="428" text-anchor="middle" font-size="11" fill="#9B7FD4" font-weight="600">Submit Payload</text>
+  <text x="285" y="442" text-anchor="middle" font-size="10" fill="#555">POST /payloads + catalog</text>
+
+  <rect x="380" y="408" width="140" height="48" rx="6" fill="#fff" stroke="#9B7FD4" stroke-width="1.5"/>
+  <text x="450" y="428" text-anchor="middle" font-size="11" fill="#9B7FD4" font-weight="600">Commit / Rollback</text>
+  <text x="450" y="442" text-anchor="middle" font-size="10" fill="#555">manifest sign + publish</text>
+
+  <rect x="545" y="408" width="130" height="48" rx="6" fill="#fff" stroke="#9B7FD4" stroke-width="1.5"/>
+  <text x="610" y="428" text-anchor="middle" font-size="11" fill="#9B7FD4" font-weight="600">Verify + Tag</text>
+  <text x="610" y="442" text-anchor="middle" font-size="10" fill="#555">root hash check</text>
+
+  <rect x="700" y="408" width="105" height="48" rx="6" fill="#FFF8EE" stroke="#E8954A" stroke-width="1.5"/>
+  <text x="752" y="428" text-anchor="middle" font-size="11" fill="#E8954A" font-weight="600">published/</text>
+  <text x="752" y="442" text-anchor="middle" font-size="10" fill="#555">audit + GC eligible</text>
+
+  <line x1="190" y1="432" x2="214" y2="432" stroke="#9B7FD4" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="355" y1="432" x2="379" y2="432" stroke="#9B7FD4" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="520" y1="432" x2="544" y2="432" stroke="#9B7FD4" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="675" y1="432" x2="699" y2="432" stroke="#9B7FD4" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- LAYER 4: DISTRIBUTION -->
+  <rect x="32" y="482" width="836" height="140" rx="8" fill="#FFFBF0" stroke="#E8C87A" stroke-width="1"/>
+  <text x="450" y="502" text-anchor="middle" font-size="11" fill="#C8922A" font-weight="700">ASYNC DISTRIBUTION  ·  pre-warm before catalog commit</text>
+
+  <rect x="60" y="512" width="130" height="96" rx="6" fill="#fff" stroke="#C8922A" stroke-width="1.5"/>
+  <text x="125" y="534" text-anchor="middle" font-size="11" fill="#C8922A" font-weight="600">Stratum 0</text>
+  <text x="125" y="549" text-anchor="middle" font-size="10" fill="#555">CAS backend</text>
+  <text x="125" y="563" text-anchor="middle" font-size="10" fill="#555">(S3 / local)</text>
+  <text x="125" y="578" text-anchor="middle" font-size="10" fill="#aaa">existing infra</text>
+
+  <rect x="220" y="512" width="140" height="96" rx="6" fill="#fff" stroke="#C8922A" stroke-width="1.5"/>
+  <text x="290" y="534" text-anchor="middle" font-size="11" fill="#C8922A" font-weight="600">Distributor</text>
+  <text x="290" y="549" text-anchor="middle" font-size="10" fill="#555">distributing/ spool</text>
+  <text x="290" y="563" text-anchor="middle" font-size="10" fill="#555">push vs pull</text>
+  <text x="290" y="578" text-anchor="middle" font-size="10" fill="#555">retry + backoff</text>
+
+  <rect x="400" y="512" width="120" height="96" rx="6" fill="#EFF8FF" stroke="#4A90D9" stroke-width="1.5"/>
+  <text x="460" y="534" text-anchor="middle" font-size="11" fill="#4A90D9" font-weight="600">Stratum 1 A</text>
+  <text x="460" y="549" text-anchor="middle" font-size="10" fill="#555">pre-seeded</text>
+  <text x="460" y="563" text-anchor="middle" font-size="10" fill="#555">objects arrive</text>
+  <text x="460" y="578" text-anchor="middle" font-size="10" fill="#555">before catalog</text>
+
+  <rect x="540" y="512" width="120" height="96" rx="6" fill="#EFF8FF" stroke="#4A90D9" stroke-width="1.5"/>
+  <text x="600" y="534" text-anchor="middle" font-size="11" fill="#4A90D9" font-weight="600">Stratum 1 B</text>
+  <text x="600" y="549" text-anchor="middle" font-size="10" fill="#555">pre-seeded</text>
+  <text x="600" y="563" text-anchor="middle" font-size="10" fill="#555">objects arrive</text>
+  <text x="600" y="578" text-anchor="middle" font-size="10" fill="#555">before catalog</text>
+
+  <rect x="680" y="512" width="120" height="96" rx="6" fill="#EFF8FF" stroke="#4A90D9" stroke-width="1.5"/>
+  <text x="740" y="534" text-anchor="middle" font-size="11" fill="#4A90D9" font-weight="600">Stratum 1 … N</text>
+  <text x="740" y="578" text-anchor="middle" font-size="10" fill="#aaa">fan-out</text>
+
+  <line x1="190" y1="560" x2="219" y2="560" stroke="#C8922A" stroke-width="1.5" marker-end="url(#arr-orange)"/>
+  <line x1="360" y1="542" x2="399" y2="542" stroke="#C8922A" stroke-width="1.5" marker-end="url(#arr-orange)"/>
+  <line x1="360" y1="570" x2="539" y2="570" stroke="#C8922A" stroke-width="1.5" marker-end="url(#arr-orange)"/>
+  <line x1="360" y1="580" x2="679" y2="580" stroke="#C8922A" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-orange)"/>
+
+  <line x1="450" y1="370" x2="450" y2="379" stroke="#aaa" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="450" y1="471" x2="450" y2="481" stroke="#aaa" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="450" y1="160" x2="450" y2="174" stroke="#aaa" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- Legend -->
+  <rect x="34" y="638" width="836" height="68" rx="6" fill="#f8f8f8" stroke="#ddd" stroke-width="1"/>
+  <text x="55" y="657" font-size="10" font-weight="700" fill="#333">KEY DESIGN PROPERTIES</text>
+  <rect x="55" y="664" width="10" height="10" fill="#E8954A" rx="2"/>
+  <text x="70" y="673" font-size="10" fill="#555">Spool dirs — atomic rename, crash-safe</text>
+  <rect x="220" y="664" width="10" height="10" fill="#9B7FD4" rx="2"/>
+  <text x="235" y="673" font-size="10" fill="#555">WAL journal — per-job op log, idempotent replay</text>
+  <rect x="450" y="664" width="10" height="10" fill="#5BAD6F" rx="2"/>
+  <text x="465" y="673" font-size="10" fill="#555">Worker pool — bounded concurrency, backpressure</text>
+  <rect x="660" y="664" width="10" height="10" fill="#4A90D9" rx="2"/>
+  <text x="675" y="673" font-size="10" fill="#555">Pre-warm — objects at S1 before catalog flip</text>
+  <text x="55" y="695" font-size="10" fill="#999">Lease token scopes sub-path · All state transitions are fsync+rename · Abort releases lease and GC-marks uploaded objects</text>
+</svg>

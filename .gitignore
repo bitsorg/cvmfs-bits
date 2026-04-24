@@ -1,0 +1,58 @@
+# Compiled binaries (produced by `make build`)
+prepub
+prepubctl
+
+# Go build cache and test output
+*.test
+*.out
+/vendor/
+
+# Test coverage
+coverage.html
+coverage.out
+
+# Go workspace files (if experimenting locally)
+go.work
+go.work.sum
+
+# Spool directories created by tests or local runs
+/spool/
+/incoming/
+/staging/
+/uploading/
+/distributing/
+/leased/
+/committing/
+/published/
+/failed/
+/aborted/
+
+# Temporary files written by the service
+*.tmp
+*.log
+dist.log
+upload.log
+journal.jsonl
+
+# Bloom filter snapshots (cluster state, not source)
+*.bloom
+*.bloom.tmp
+
+# SQLite databases (catalog builder)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local environment / secrets — never commit these
+.env
+*.pem
+*.key
+*.crt
