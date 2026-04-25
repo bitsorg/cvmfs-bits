@@ -151,9 +151,17 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	}
 
 	// ── Phase 2: pre-push objects to Stratum 1 (no lease held) ─────────────
-	if o.Distribute != nil && len(o.Distribute.Endpoints) > 0 {
+	//
+	// Distribution is triggered when either:
+	//   (a) HTTP announce path: Distribute != nil && len(Endpoints) > 0
+	//   (b) MQTT path: Distribute != nil && BrokerConfig is set
+	shouldDistribute := o.Distribute != nil &&
+		(len(o.Distribute.Endpoints) > 0 ||
+			(o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != ""))
+	if shouldDistribute {
 		logger.Info("pre-pushing to Stratum 1s before lease acquire",
-			"endpoints", len(o.Distribute.Endpoints))
+			"endpoints", len(o.Distribute.Endpoints),
+			"mqtt", o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != "")
 
 		if err := o.transition(ctx, j, job.StateDistributing); err != nil {
 			span.RecordError(err)
@@ -162,8 +170,15 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 
 		distLog := distribute.OpenDistLog(o.Spool.JobDir(j) + "/dist.log")
 		defer distLog.Close() // ensure file is flushed even on early return
+
+		// Copy the shared distribute config and inject per-job fields so that
+		// concurrent jobs running the same Orchestrator do not race on Repo/TotalBytes.
+		distCfg := *o.Distribute
+		distCfg.Repo = j.Repo
+		distCfg.TotalBytes = pipelineResult.NBytesComp
+
 		confirmed, total, distErr := distribute.Distribute(
-			ctx, j.ID, pipelineResult.ObjectHashes, o.CAS, *o.Distribute, distLog)
+			ctx, j.ID, pipelineResult.ObjectHashes, o.CAS, distCfg, distLog)
 		if distErr != nil {
 			logger.Warn("distribution failed or quorum not reached",
 				"error", distErr, "confirmed", confirmed, "total", total)

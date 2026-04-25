@@ -14,7 +14,14 @@
 //     provides transfer integrity without the CPU overhead of TLS on potentially
 //     gigabytes of already-compressed objects.
 //
-// See REFERENCE.md §20 for the full protocol specification.
+// When BrokerURL is configured the HMAC/HTTP announce path is supplemented (or
+// replaced) by an MQTT control plane: the receiver subscribes to announce
+// topics for its configured repositories, computes the delta against its own
+// Bloom filter, and publishes a ReadyMessage carrying its session token and the
+// list of absent hashes — all without any inbound firewall rules (outbound
+// TCP 8883 only).  The data channel (plain HTTP PUT) is unchanged.
+//
+// See REFERENCE.md §20 for the HTTP protocol and §21 for the MQTT control plane.
 package receiver
 
 import (
@@ -25,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/pkg/observe"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -99,6 +107,27 @@ type Config struct {
 	// the coordination service can build the routing table.
 	Repos []string
 
+	// BrokerURL is the MQTT broker address (e.g. "tls://broker.cern.ch:8883").
+	// When non-empty the receiver connects to the broker, publishes a retained
+	// presence message, and subscribes to announce topics for the configured
+	// repositories.  This replaces the HTTP coordination service client for
+	// discovery and presence tracking.  The HTTP announce endpoint remains
+	// active for backward compatibility.
+	// Leave empty to disable MQTT (default).
+	BrokerURL string
+
+	// BrokerClientCert is the path to the PEM-encoded client TLS certificate
+	// for authenticating with the MQTT broker.
+	BrokerClientCert string
+
+	// BrokerClientKey is the path to the PEM-encoded client TLS private key.
+	BrokerClientKey string
+
+	// BrokerCACert is the path to the PEM-encoded CA certificate used to
+	// verify the broker's server certificate.  When empty the system pool
+	// is used.
+	BrokerCACert string
+
 	// MaxObjectSize is the maximum body size in bytes accepted for a single
 	// PUT /api/v1/objects/{hash} request.  Requests exceeding this limit are
 	// rejected with HTTP 413 before any bytes are written to disk.
@@ -147,7 +176,9 @@ type Receiver struct {
 	cfg          Config
 	store        *sessionStore
 	inv          *inventory
-	coord        *CoordClient // nil when CoordURL is empty
+	coord        *CoordClient    // nil when CoordURL is empty
+	mqttMu       sync.RWMutex    // guards mqttClient
+	mqttClient   *broker.Client  // nil when BrokerURL is empty; always access under mqttMu
 	control      *http.Server
 	data         *http.Server
 	stopClean    chan struct{}        // signal to stop the cleanup goroutine
@@ -306,6 +337,14 @@ func (r *Receiver) Start() error {
 	// Start the coordination service client (no-op when CoordURL is empty).
 	r.coord.Start()
 
+	// Start the MQTT control plane (no-op when BrokerURL is empty).
+	if err := r.startMQTT(); err != nil {
+		// MQTT is supplemental — log the error but do not abort startup so
+		// the HTTP announce path continues to work.
+		r.cfg.Obs.Logger.Error("receiver: MQTT startup failed — continuing without broker",
+			"error", err)
+	}
+
 	return nil
 }
 
@@ -323,6 +362,9 @@ func (r *Receiver) Shutdown(ctx context.Context) error {
 		close(r.stopClean)
 		// Deregister from the coordination service before closing listeners.
 		r.coord.Stop()
+		// Disconnect from the MQTT broker before closing listeners so an
+		// explicit offline presence is published before the TCP connection closes.
+		r.stopMQTT()
 		// Shut down the control channel first to stop new announces.
 		ctlErr = r.control.Shutdown(ctx)
 		// Then the data channel once in-flight PUTs can complete.

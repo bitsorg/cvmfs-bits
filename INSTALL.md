@@ -8,6 +8,7 @@
 4. [Configuration](#4-configuration)
 5. [Option A — Single-Node Deployment](#5-option-a--single-node-deployment)
 6. [Option B — Distributed Deployment with Stratum 1 Pre-Warming](#6-option-b--distributed-deployment-with-stratum-1-pre-warming)
+   - [6.3 MQTT Control Plane (optional)](#63-mqtt-control-plane-optional)
 7. [Systemd Setup](#7-systemd-setup)
 8. [Health Check and Smoke Test](#8-health-check-and-smoke-test)
 9. [Upgrading](#9-upgrading)
@@ -27,10 +28,17 @@
   - *S3-compatible:* credentials with `s3:PutObject`, `s3:HeadObject`, `s3:ListObjectsV2` on the CAS bucket
 - `make` and standard POSIX shell tools
 
-**Required for Option B only:**
+**Required for Option B (HTTP path) only:**
 
 - Each Stratum 1 node must run the receiver agent (see §6)
-- Network connectivity from the pre-publisher to every configured Stratum 1 HTTPS endpoint
+- Network connectivity from the pre-publisher to every configured Stratum 1 HTTPS endpoint (inbound port 9100 on each S1)
+
+**Required for Option B (MQTT path) only:**
+
+- Each Stratum 1 node must run the receiver agent (see §6)
+- A shared MQTT broker (e.g. Eclipse Mosquitto or EMQ X) reachable from both the pre-publisher and all Stratum 1 receivers — typically hosted on Stratum 0 infrastructure
+- mTLS certificates for the broker, publisher, and each receiver node (one client certificate per node)
+- Only outbound TCP 8883 from each Stratum 1 site to the broker; no inbound firewall rules required at Stratum 1
 
 **Not required:**
 
@@ -245,6 +253,111 @@ distribution:
 ```
 
 For a full topology diagram see [REFERENCE.md §6](REFERENCE.md#6-option-b--distributed-pre-processor-with-stratum-1-pre-warming).
+
+### 6.3 MQTT Control Plane (optional)
+
+The default Option B announce uses HTTPS from the publisher to each receiver
+(inbound port 9100 on each Stratum 1).  If your Stratum 1 sites sit behind
+strict firewalls you can use the **MQTT control plane** instead — receivers
+connect outbound to a shared broker (only outbound TCP 8883 required).
+
+See [REFERENCE.md §20.11](REFERENCE.md#2011-mqtt-control-plane-optional) for
+the full topic schema, security model, and flow diagram.
+
+**Step 1 — Broker setup**
+
+Deploy an MQTT broker on Stratum 0 infrastructure (or a dedicated host) with:
+
+- TLS listener on port 8883 (Let's Encrypt or an internal CA)
+- mTLS client certificate verification enabled
+- Per-client topic ACLs: each node may only publish to its own presence/ready
+  topics and subscribe to announce topics for its configured repositories
+
+Example Mosquitto config:
+
+```ini
+# /etc/mosquitto/mosquitto.conf
+listener 8883
+certfile   /etc/mosquitto/certs/broker.crt
+keyfile    /etc/mosquitto/certs/broker.key
+cafile     /etc/mosquitto/certs/ca.crt
+require_certificate true
+use_identity_as_username true
+
+# ACL file referenced here; see Mosquitto acl_file documentation
+acl_file /etc/mosquitto/acl
+```
+
+**Step 2 — Issue per-node client certificates**
+
+Issue one client certificate per node (broker, publisher, and each receiver)
+from your internal CA:
+
+```sh
+# Example using openssl — adapt to your PKI tooling
+openssl req -new -newkey rsa:4096 -nodes \
+  -subj "/CN=stratum1-cern" \
+  -keyout stratum1-cern.key -out stratum1-cern.csr
+openssl x509 -req -in stratum1-cern.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -days 730 -out stratum1-cern.crt
+```
+
+**Step 3 — Receiver config**
+
+Add MQTT flags to the receiver on each Stratum 1 node:
+
+```sh
+cvmfs-prepub \
+  --config /etc/cvmfs-prepub/receiver.yaml \
+  --mode receiver \
+  --node-id stratum1-cern \
+  --broker-url tls://broker.cern.ch:8883 \
+  --broker-client-cert /etc/cvmfs-prepub/tls/stratum1-cern.crt \
+  --broker-client-key  /etc/cvmfs-prepub/tls/stratum1-cern.key \
+  --broker-ca-cert     /etc/cvmfs-prepub/tls/ca.crt
+```
+
+Or add to the receiver YAML config:
+
+```yaml
+broker_url:         tls://broker.cern.ch:8883
+broker_client_cert: /etc/cvmfs-prepub/tls/stratum1-cern.crt
+broker_client_key:  /etc/cvmfs-prepub/tls/stratum1-cern.key
+broker_ca_cert:     /etc/cvmfs-prepub/tls/ca.crt
+node_id:            stratum1-cern
+repos:
+  - atlas.cern.ch
+  - cms.cern.ch
+```
+
+**Step 4 — Publisher config**
+
+Add matching MQTT flags to the pre-publisher (Stratum 0):
+
+```yaml
+distribution:
+  broker_url:         tls://broker.cern.ch:8883
+  broker_client_cert: /etc/cvmfs-prepub/tls/publisher.crt
+  broker_client_key:  /etc/cvmfs-prepub/tls/publisher.key
+  broker_ca_cert:     /etc/cvmfs-prepub/tls/ca.crt
+  mqtt_quorum_timeout: 30s
+  quorum: 0.75
+```
+
+When `broker_url` is set in the publisher config the MQTT path takes precedence
+over the HTTP announce path.  The `stratum1_endpoints` list is still used for
+direct HTTP object PUTs (the data channel) — include the plain-HTTP data address
+for each receiver.
+
+**Verifying connectivity:**
+
+```sh
+# On each Stratum 1 node, check the receiver published its presence
+mosquitto_sub -h broker.cern.ch -p 8883 \
+  --cafile ca.crt --cert client.crt --key client.key \
+  -t 'cvmfs/receivers/+/presence' -C 1 | python3 -m json.tool
+# Should show {"node_id":"stratum1-cern","online":true,"bloom_ready":true,...}
+```
 
 ---
 

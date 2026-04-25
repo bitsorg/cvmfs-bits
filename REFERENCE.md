@@ -2663,6 +2663,144 @@ are also registered and available at this endpoint.
 
 ---
 
+### 20.11 MQTT Control Plane (Optional)
+
+The HTTP announce path (§20.2) requires each Stratum 1 node to expose an
+inbound HTTPS port to the pre-publisher.  In environments where Stratum 1 sites
+sit behind strict firewalls, this forces firewall rule changes at each site.
+
+The **MQTT control plane** is an optional alternative that inverts the
+connection direction: receivers and publishers both open outbound connections to
+a shared broker (e.g. on Stratum 0 infrastructure), so no inbound firewall rules
+are needed at Stratum 1 sites — only **outbound TCP 8883**.
+
+When `--broker-url` is set on both the publisher and receivers, the MQTT path
+completely replaces the HTTP announce for announce/ready negotiation.  The data
+channel (plain HTTP PUT — §20.3) is unchanged.
+
+#### Topic schema
+
+```
+cvmfs/repos/{repo}/announce
+    Publisher → all receivers.  Payload: AnnounceMessage (JSON).
+    QoS 1, retained=false.
+
+cvmfs/receivers/{node_id}/presence
+    Receiver → all observers.  Payload: PresenceMessage (JSON).
+    QoS 1, retained=true.  LWT publishes same topic with Online=false.
+
+cvmfs/publishers/{publisher_id}/ready/{payload_id}/{node_id}
+    Receiver → specific publisher.  Payload: ReadyMessage (JSON).
+    QoS 1, retained=false.
+```
+
+Topic path components (`{repo}`, `{node_id}`, `{publisher_id}`,
+`{payload_id}`) are validated at construction time to reject characters that
+have special meaning in MQTT (`/`, `+`, `#`, NUL) and empty strings, preventing
+topic-injection attacks.
+
+#### Flow
+
+```
+Publisher                              Broker                    Receiver(s)
+    │                                     │                           │
+    │── subscribe(ready/pay-A/+) ─────────►│                           │
+    │── publish(repos/atlas/announce) ────►│─── deliver ─────────────►│
+    │                                     │    AnnounceMessage         │
+    │                                     │       PayloadID, Hashes   │
+    │                                     │       TotalBytes          │
+    │                                     │                           │
+    │                                     │◄── publish(ready/…) ──────│
+    │◄── deliver ReadyMessage ────────────│    SessionToken,          │
+    │    NodeID, DataURL                  │    DataURL,               │
+    │    AbsentHashes                     │    AbsentHashes           │
+    │                                     │                           │
+    │─── PUT /api/v1/objects/{hash} ─────────────────────────────────►│
+    │    (plain HTTP data channel)        │    bearer=SessionToken    │
+```
+
+#### AnnounceMessage (publisher → receivers)
+
+```json
+{
+  "payload_id":   "<UUID>",
+  "publisher_id": "pub-<UUID>",
+  "repo":         "atlas.cern.ch",
+  "hashes":       ["<sha256hex>", "…"],
+  "total_bytes":  1234567
+}
+```
+
+`hashes` is the complete list of CAS objects in the payload.  The receiver
+subtracts its Bloom filter inventory to compute `absent_hashes`—the subset it
+does not yet hold—without a separate bloom-fetch round-trip.
+
+A receiver rejects announces with more than **1 000 000 hashes** or any
+individual hash string longer than **256 bytes**; such announces are treated as
+protocol errors and a ReadyMessage with an `error` field is returned so the
+publisher can count the node as a non-participant rather than timing out.
+
+#### ReadyMessage (receiver → publisher)
+
+```json
+{
+  "node_id":       "stratum1-cern",
+  "session_token": "<32-byte hex>",
+  "data_url":      "http://stratum1.cern.ch:9101",
+  "absent_hashes": ["<sha256hex>", "…"],
+  "error":         ""
+}
+```
+
+The publisher validates `data_url` against the SSRF guard (`rejectPrivateHost`)
+before opening any connection.  ReadyMessages with more than 1 000 000
+`absent_hashes` are treated as errors rather than iterating a potentially
+attacker-controlled list.
+
+#### Presence and LWT
+
+On connect each receiver publishes a **retained** `PresenceMessage` with
+`online=true` and its current `bloom_ready` state.  It also configures a
+Last-Will-and-Testament (LWT) on the same topic with `online=false`.
+
+If the receiver disconnects unexpectedly the broker publishes the LWT
+automatically, so publishers and monitoring tools see the node go offline
+without any application-level coordination.
+
+On reconnect the Paho auto-reconnect loop re-establishes subscriptions (because
+`SetCleanSession(false)` is used) and the registered reconnect handler
+re-publishes the retained `{online: true}` presence, overwriting the LWT that
+the broker had published.
+
+#### Quorum timeout
+
+The publisher collects ReadyMessages until either all expected receivers reply
+or the `mqtt_quorum_timeout` (default 30 s) fires.  It then pushes objects only
+to receivers that replied without error.  Quorum enforcement (§8.3) applies
+identically to both the HTTP and MQTT paths.
+
+#### Configuration flags
+
+**Receiver (`--mode receiver`):**
+
+| Flag | Description |
+|---|---|
+| `--broker-url tls://broker:8883` | MQTT broker URL (empty = MQTT disabled) |
+| `--broker-client-cert /etc/certs/s1.crt` | PEM client certificate for mTLS |
+| `--broker-client-key /etc/certs/s1.key` | PEM client private key for mTLS |
+| `--broker-ca-cert /etc/certs/ca.crt` | CA certificate to verify the broker |
+| `--node-id stratum1-cern` | Stable node identifier (required when broker URL is set) |
+
+**Publisher (`--mode publisher` / default):**
+
+| Flag | Description |
+|---|---|
+| `--broker-url tls://broker:8883` | MQTT broker URL (same broker as receivers) |
+| `--broker-client-cert …` | Client certificate (same flags as receiver) |
+| `--mqtt-quorum-timeout 30s` | How long to wait for ready replies before proceeding |
+
+---
+
 
 ## 32. Coordination Service Client Protocol
 
@@ -2858,12 +2996,50 @@ catalog fetch, rejecting any manifest not signed by the known repository key.
 
 ### 16.7 Stratum 1 Distribution Security
 
-Objects are pushed to Stratum 1 replicas over HTTPS.  The distributor validates
-all endpoints before connecting (§8.2): it requires HTTPS and rejects private or
-loopback IP addresses to prevent SSRF.  The quorum mechanism (§8.3) ensures that
-a publish is not considered successful unless a configurable fraction of replicas
-have received all objects, preventing a silent loss of availability on a subset
-of workers.
+**HTTP announce path.** Objects are pushed to Stratum 1 replicas over HTTPS.
+The distributor validates all endpoints before connecting (§8.2): it requires
+HTTPS and rejects private or loopback IP addresses to prevent SSRF.  The quorum
+mechanism (§8.3) ensures that a publish is not considered successful unless a
+configurable fraction of replicas have received all objects, preventing a silent
+loss of availability on a subset of workers.
+
+**MQTT control plane (§20.11).** When the MQTT broker is configured the
+following additional controls apply:
+
+- **mTLS authentication.** All connections to the broker use mutual TLS
+  (configurable via `--broker-client-cert`/`--broker-client-key`/`--broker-ca-cert`).
+  The broker authenticates every client with its certificate before allowing any
+  publish or subscribe.  Plain `tcp://` connections are rejected at startup if
+  any TLS certificate is configured, preventing credentials from being silently
+  dropped by the Paho library.
+
+- **Broker topic ACLs.** The broker should be configured with per-client ACLs so
+  that a receiver node can only publish to its own presence topic
+  (`cvmfs/receivers/{its-node-id}/presence`) and its own ready topics
+  (`cvmfs/publishers/+/ready/+/{its-node-id}`), and can only subscribe to the
+  announce topic for its configured repositories.  This prevents a compromised
+  node from forging ReadyMessages on behalf of another receiver.
+
+- **Topic injection prevention.** Topic path components (repo names, node IDs,
+  payload IDs) are validated by `validTopicSegment` before use.  Characters with
+  special MQTT meaning (`/`, `+`, `#`, NUL) and empty strings are rejected with
+  a panic to prevent structural topic injection.
+
+- **Input bounds.** Incoming `AnnounceMessage.Hashes` is capped at 1 000 000
+  entries; any individual hash string exceeding 256 bytes is also rejected.
+  `ReadyMessage.AbsentHashes` carries the same cap on the publisher side.  These
+  limits prevent a rogue broker client from causing GB-scale allocations in
+  `computeAbsentHashes` or the push-object loop.
+
+- **SSRF guard on DataURL.** The `DataURL` field of every `ReadyMessage` is
+  validated through `rejectPrivateHost` before any HTTP connection is opened.
+  Private/loopback addresses (RFC 1918, link-local, IPv6 ULA) are rejected.
+  A DNS lookup failure is treated as fail-closed rather than fail-open.
+
+- **Session token binding.** The `SessionToken` in a ReadyMessage is a 32-byte
+  cryptographically random bearer credential generated by the receiver for each
+  session.  It is transmitted only over the mTLS-protected MQTT channel and then
+  used on the plain-HTTP data channel, binding the two channels together.
 
 ### 16.8 Client Verification
 

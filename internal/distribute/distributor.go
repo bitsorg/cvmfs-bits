@@ -32,6 +32,7 @@ import (
 
 	"github.com/bits-and-blooms/bloom/v3"
 
+	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/pkg/observe"
 )
@@ -103,6 +104,27 @@ type Config struct {
 	// holds, reducing unnecessary network traffic.
 	// Set to 0 (default) to disable delta push and always push all objects.
 	BloomQueryTimeout time.Duration
+
+	// BrokerConfig, when non-nil, enables the MQTT control plane.  The
+	// distributor will publish AnnounceMessages to the broker and collect
+	// ReadyMessages from receivers rather than using the HTTP announce protocol.
+	// The data channel (plain-HTTP PUT) is used unchanged for the actual
+	// object transfer.  When nil the HTTP announce path is used (default).
+	BrokerConfig *broker.Config
+
+	// Repo is the CVMFS repository name being published (e.g. "atlas.cern.ch").
+	// Required when BrokerConfig is set so the distributor can publish to the
+	// correct announce topic.
+	Repo string
+
+	// TotalBytes is the total compressed size of all objects in this payload.
+	// Passed to receivers in the AnnounceMessage for disk-space pre-checks.
+	// Zero means unknown (receivers skip the disk-space check).
+	TotalBytes int64
+
+	// MQTTQuorumTimeout is how long to wait for ready replies from receivers
+	// before deciding quorum is not reachable.  Defaults to 30 s.
+	MQTTQuorumTimeout time.Duration
 }
 
 // ValidateEndpoints checks all configured endpoints and returns an error if
@@ -542,6 +564,13 @@ func announce(ctx context.Context, endpoint, payloadID string, hashes []string, 
 // receiver.  If an endpoint returns 404 on announce it is assumed to be a legacy
 // receiver and the distributor falls back to direct HTTPS PUTs without a session.
 func Distribute(ctx context.Context, payloadID string, hashes []string, casBackend cas.Backend, cfg Config, log *DistLog) (int, int, error) {
+	// MQTT control plane: when a broker is configured, use pub/sub for
+	// discovery and announce, then push via the plain-HTTP data channel.
+	// Falls through to the HTTP announce path when BrokerConfig is nil.
+	if cfg.BrokerConfig != nil && cfg.BrokerConfig.BrokerURL != "" {
+		return distributeMQTT(ctx, payloadID, hashes, casBackend, log, cfg)
+	}
+
 	ctx, span := cfg.Obs.Tracer.Start(ctx, "distribute.push")
 	defer span.End()
 

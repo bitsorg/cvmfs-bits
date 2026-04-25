@@ -27,17 +27,24 @@ gateway lease enforces mutual exclusion at the path level.
 
 ## Deployment options
 
-| | Option A | Option B |
-|---|---|---|
-| **Pre-processes tar** | ✓ | ✓ |
-| **Bypasses overlay FS** | ✓ | ✓ |
-| **Pre-warms Stratum 1** | ✗ | ✓ |
-| **New infrastructure** | None | Receiver agent on each S1 (or shared S3) |
-| **Phase** | 1 | 2 |
+| | Option A | Option B (HTTP) | Option B (MQTT) |
+|---|---|---|---|
+| **Pre-processes tar** | ✓ | ✓ | ✓ |
+| **Bypasses overlay FS** | ✓ | ✓ | ✓ |
+| **Pre-warms Stratum 1** | ✗ | ✓ | ✓ |
+| **Inbound firewall rules at S1** | None | HTTPS 9100 | None (outbound 8883 only) |
+| **New infrastructure** | None | Receiver agent on each S1 | Receiver agent + MQTT broker |
+| **Phase** | 1 | 2 | 2 |
 
-See [REFERENCE.md §5](REFERENCE.md#5-option-a--inline-pre-processor) and
-[§6](REFERENCE.md#6-option-b--distributed-pre-processor-with-stratum-1-pre-warming)
-for full topology diagrams and trade-off analysis.
+The MQTT variant of Option B is useful when Stratum 1 sites are behind strict
+firewalls: receivers connect outbound to a shared broker (typically on Stratum 0
+infrastructure) rather than exposing an inbound port.  The data channel (object
+PUT) is identical in both variants.
+
+See [REFERENCE.md §5](REFERENCE.md#5-option-a--inline-pre-processor),
+[§6](REFERENCE.md#6-option-b--distributed-pre-processor-with-stratum-1-pre-warming),
+and [§20.11](REFERENCE.md#2011-mqtt-control-plane-optional) for full topology
+diagrams, trade-off analysis, and MQTT topic schema.
 
 ## Documentation
 
@@ -55,8 +62,10 @@ Key sections in REFERENCE.md:
 - [§10 Configuration Reference](REFERENCE.md#10-configuration-reference) — annotated YAML config
 - [§12 Deployment Roadmap](REFERENCE.md#12-deployment-roadmap) — phased rollout with exit criteria per phase
 - [§16 Security, Confidentiality, Integrity, and Traceability](REFERENCE.md#16-security-confidentiality-integrity-and-traceability) — audit trail, supply-chain fields, tamper-evident publishing
+- [§16.7 Stratum 1 Distribution Security](REFERENCE.md#167-stratum-1-distribution-security) — SSRF guard, MQTT mTLS, topic ACLs, input bounds
 - [§17 Comparison with Traditional `cvmfs_server publish`](REFERENCE.md#17-comparison-with-traditional-cvmfs_server-publish) — head-to-head table, where the fundamental difference lies, and when to use each approach
 - [§18 Provenance and Transparency Log](REFERENCE.md#18-provenance-and-transparency-log) — four-layer attribution chain, Rekor integration, CI OIDC token validation, and offline verification workflow
+- [§20.11 MQTT Control Plane](REFERENCE.md#2011-mqtt-control-plane-optional) — topic schema, flow, presence/LWT, security controls, configuration flags
 
 ## Repository layout
 
