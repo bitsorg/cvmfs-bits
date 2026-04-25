@@ -2189,13 +2189,24 @@ sender (distributor)             control :9100 (HTTPS)    data :9101 (HTTP)
 ```
 
 Sessions are kept in memory and swept by a background goroutine every minute.
+Expired entries are also pruned inline on every `get` / `getByPayload` lookup,
+so the store does not accumulate stale entries between cleanup sweeps.
 A session that expires mid-transfer causes subsequent PUTs to return `401`;
 the sender re-announces to obtain a fresh session and continues from where the
 distribution log shows objects were last confirmed.
 
+The session store is capped at **10,000 concurrent live sessions**.  If the
+cap is reached, expired entries are pruned inline before a new session is
+created.  If the store is still full after pruning, the announce request is
+rejected with `429 Too Many Requests` until a slot becomes available.
+
 The data channel uses unique per-PUT temporary files (`{finalPath}.{8-hex}.tmp`
 opened with `O_EXCL`) so that concurrent PUTs targeting the same hash cannot
-corrupt each other's in-progress write.
+corrupt each other's in-progress write.  At startup the receiver performs a
+background sweep of the CAS tree and removes any orphaned `.tmp` files left
+behind by a previous crash before the atomic rename could complete.  The sweep
+is context-cancellable so `Shutdown()` can interrupt it on a stalling
+filesystem.
 
 ### 20.7 Backward Compatibility and Fallback
 
@@ -2220,6 +2231,12 @@ distributor.
 | `--cas-root` | `/var/lib/cvmfs-prepub/cas` | Local CAS root directory (e.g. `/srv/cvmfs/stratum1/cas`) |
 | `--session-ttl` | `1h` | How long an announce session remains valid |
 | `--disk-headroom` | `1.2` | Multiplier applied to `total_bytes` for the disk space pre-check |
+| `--max-object-size` | `1073741824` (1 GiB) | Maximum body size in bytes for a single `PUT /api/v1/objects/{hash}`; requests exceeding this limit are rejected with `413` before any bytes touch disk |
+| `--bloom-capacity` | `5000000` | Inventory Bloom filter capacity (must be consistent across all receivers the distributor compares) |
+| `--bloom-fp-rate` | `0.001` | Inventory Bloom filter false-positive rate (0 < rate < 1) |
+| `--coord-url` | `` | HepCDN coordination service base URL; empty disables coordination (see §22) |
+| `--node-id` | hostname | Stable identifier for this receiver node reported to the coordination service |
+| `--repos` | `` | Comma-separated list of CVMFS repositories served by this receiver (e.g. `atlas.cern.ch,cms.cern.ch`) |
 | `--dev` | `false` | Allow plain HTTP control channel and skip HMAC verification (tests only — never use in production) |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
@@ -2227,9 +2244,97 @@ The HMAC shared secret is read from the **`PREPUB_HMAC_SECRET`** environment
 variable.  It must be set to the same value on the publisher and every receiver.
 In `--dev` mode the secret is not required and HMAC verification is disabled.
 
+The coordination service bearer token is read from the **`PREPUB_COORD_TOKEN`**
+environment variable.  It is required whenever `--coord-url` is set (except in
+`--dev` mode, where a warning is emitted and the requests are unauthenticated).
+
 TLS certificate and key paths are validated at startup (file existence checked
 before any listener is bound); a missing file causes a clean error exit rather
 than a mid-run failure.
+
+### 20.9 Inventory Bloom Filter Endpoint
+
+The control channel exposes the receiver's local object inventory as a
+serialised Bloom filter at `GET /api/v1/bloom`.  The distributor (and the
+coordination service) fetch this endpoint before pushing a batch of objects so
+that they can skip objects the receiver already holds — **delta push mode**.
+
+**Request** — `GET https://<s1-host>:<control-port>/api/v1/bloom`
+
+| Header | Value |
+|---|---|
+| `Authorization` | `Bearer <token>` where `token = hex(HMAC-SHA256(HMACSecret, "bloom-read"))` |
+
+The token is derived from the same `PREPUB_HMAC_SECRET` shared between the
+publisher and receivers using a fixed label (`"bloom-read"`), so no per-request
+timestamp negotiation is needed.  In `--dev` mode the check is bypassed.
+A missing or invalid token returns `401 Unauthorized`.
+
+**Response — 200 OK:**
+
+- `Content-Type: application/octet-stream`
+- Body: binary-encoded `bloom.BloomFilter` (the format produced by
+  `bloom.BloomFilter.WriteTo` from `github.com/bits-and-blooms/bloom/v3`).
+  Callers deserialise with `bloom.BloomFilter.ReadFrom`.
+
+**Error responses:**
+
+| Status | Meaning |
+|---|---|
+| `200 OK` | Filter ready; body is the binary-encoded Bloom filter |
+| `401 Unauthorized` | Missing or invalid bearer token |
+| `503 Service Unavailable` | Inventory still building (CAS walk in progress); `Retry-After: 10` header set |
+| `405 Method Not Allowed` | Non-GET request |
+
+**Inventory lifecycle:**
+
+1. At receiver startup `populateFromCAS` walks the two-level CAS directory tree
+   (`{cas_root}/{aa}/{aabbcc…}[C]`) and adds every found hash to the filter.
+   While the walk is in progress `isReady()` returns `false` and the endpoint
+   returns `503`.
+2. After the walk completes `isReady()` becomes `true` and the endpoint returns
+   the populated filter.
+3. Every successful object PUT (§20.3) calls `inv.add(hash)` immediately after
+   the atomic rename, keeping the filter current without waiting for a new walk.
+
+**Delta push algorithm in the distributor:**
+
+```
+1.  announce(endpoint)              → session_token, data_endpoint
+2.  GET /api/v1/bloom               → BloomFilter bf
+3.  for hash in candidate_hashes:
+        if bf.TestString(hash): skip   // probably already present
+        else: push(hash)               // definitely absent
+```
+
+Bloom filters have **no false negatives**: if the filter reports a hash absent,
+the object is definitely not at that receiver.  False positives (the filter
+reports an object present when it is not) cause an object to be skipped; the
+receiver will then fetch it during normal CVMFS replication as a lazy repair.
+With the default parameters (5 M capacity, 0.1% FP rate) false positives are
+rare enough to be operationally acceptable.
+
+**Filter parameters** must be identical on all receivers that a single
+distributor queries, otherwise the bit arrays are not comparable.  The defaults
+(`--bloom-capacity 5000000`, `--bloom-fp-rate 0.001`) are suitable for
+repositories with up to five million distinct objects per Stratum 1 node.
+
+### 20.10 Prometheus Metrics Endpoint
+
+The control channel also serves Prometheus metrics at `GET /metrics` in the
+standard text exposition format.
+
+Receiver-specific metrics:
+
+| Metric | Type | Description |
+|---|---|---|
+| `cvmfs_receiver_objects_received_total` | Counter | CAS objects successfully received via PUT |
+| `cvmfs_receiver_bytes_received_total` | Counter | Compressed bytes received via PUT (on-wire size) |
+| `cvmfs_receiver_bloom_size` | Gauge | Approximate number of objects in the inventory Bloom filter |
+| `cvmfs_receiver_heartbeat_errors_total` | Counter | Coordination service heartbeat errors |
+
+The existing `cvmfs_prepub_*` metrics (jobs, pipeline, CAS upload durations)
+are also registered and available at this endpoint.
 
 **Sender (distributor)** — publisher-mode configuration
 
@@ -2633,3 +2738,130 @@ source pipeline.
 3. Add `.gitlab/cvmfs-prepub-publish.yml` to the bits-console repository (content from §21.5).
 4. For each community switching to cvmfs-prepub, change `publish_pipeline` in `communities/<name>/ui-config.yaml` and merge the MR.
 5. For Option B (Stratum 1 pre-warming), deploy the receiver on each Stratum 1 and add `distribution:` to the cvmfs-prepub config (INSTALL.md §6, REFERENCE.md §20).
+
+---
+
+## 22. Coordination Service Client Protocol
+
+The receiver embeds a lightweight coordination service client
+(`internal/distribute/receiver/coord_client.go`) that registers the node,
+sends periodic heartbeats, and deregisters on shutdown.  Coordination is
+disabled by default and enabled by setting `--coord-url`.
+
+### 22.1 Purpose
+
+The HepCDN coordination service maintains a live registry of receiver nodes,
+their available repositories, and their inventory health.  It uses this
+information to:
+
+- Route pre-warm traffic to nodes that are ready and hold the relevant repository.
+- Expose a topology map (`GET /route`) for WLCG site selection.
+- Receive publish-announce notifications (`POST /announce`) from the publisher
+  so that it can trigger pre-warming before the catalog flip.
+
+The coordination service itself is a separate binary that is not yet part of
+`cvmfs-bits`.  The client protocol described here defines the API it must
+implement so that receiver deployments can register without code changes when
+the service ships.
+
+### 22.2 Registration
+
+On startup (after both HTTP listeners are bound) the receiver POSTs to the
+coordination service to register itself.
+
+**Request** — `POST <coord_url>/api/v1/nodes`
+
+```json
+{
+  "node_id":  "stratum1-cern-01",
+  "repos":    ["atlas.cern.ch", "cms.cern.ch"],
+  "data_url": "http://stratum1-cern-01.example.com:9101"
+}
+```
+
+| Field | Description |
+|---|---|
+| `node_id` | Stable identifier for this node (defaults to OS hostname) |
+| `repos` | Repositories this node holds; used for routing |
+| `data_url` | Plain-HTTP data endpoint for object PUTs; the coord service may expose this to publishers for direct push |
+
+| Header | Value |
+|---|---|
+| `Authorization` | `Bearer <PREPUB_COORD_TOKEN>` |
+| `Content-Type` | `application/json` |
+
+**Expected response:** `200 OK` or `201 Created`.
+
+On failure the client logs an error, increments
+`cvmfs_receiver_heartbeat_errors_total`, and continues.  The heartbeat loop
+will retry registration implicitly (the coordination service should treat a
+heartbeat from an unknown node as a re-registration trigger).
+
+### 22.3 Heartbeat
+
+Every 30 seconds the receiver sends a PUT to update its health state.
+
+**Request** — `PUT <coord_url>/api/v1/nodes/{node_id}/heartbeat`
+
+```json
+{
+  "bloom_size": 3821044,
+  "ready":      true
+}
+```
+
+| Field | Description |
+|---|---|
+| `bloom_size` | Approximate number of objects in the inventory Bloom filter (from `inv.approximateSize()`) |
+| `ready` | `true` once the initial CAS walk has completed (`inv.isReady()`) |
+
+| Header | Value |
+|---|---|
+| `Authorization` | `Bearer <PREPUB_COORD_TOKEN>` |
+| `Content-Type` | `application/json` |
+
+**Expected response:** `200 OK` or `204 No Content`.
+
+On failure the client logs a warning and increments
+`cvmfs_receiver_heartbeat_errors_total`.  The heartbeat loop continues
+regardless of individual failures.
+
+### 22.4 Deregistration
+
+When the receiver receives a `SIGINT` or `SIGTERM` (or `Shutdown()` is called)
+it sends a DELETE before closing the HTTP listeners.
+
+**Request** — `DELETE <coord_url>/api/v1/nodes/{node_id}`
+
+| Header | Value |
+|---|---|
+| `Authorization` | `Bearer <PREPUB_COORD_TOKEN>` |
+
+**Expected response:** `200 OK`, `204 No Content`, or `404 Not Found`.
+
+`404` is treated as success — it means the coordination service already expired
+the registration (e.g., after a restart).  Any other non-success status is
+logged as a warning; shutdown continues regardless.
+
+The deregister call uses a hard 10-second deadline so that a slow coordination
+service does not delay the overall receiver shutdown.
+
+### 22.5 Client Configuration
+
+| CLI flag | Env var | Description |
+|---|---|---|
+| `--coord-url` | — | Base URL of the coordination service; empty disables all coordination |
+| `--node-id` | — | Stable node identifier; defaults to OS hostname |
+| `--repos` | — | Comma-separated repository list sent during registration |
+| — | `PREPUB_COORD_TOKEN` | Bearer token for authentication; required when `--coord-url` is set (unless `--dev`) |
+
+### 22.6 Security Considerations
+
+The `PREPUB_COORD_TOKEN` is read exclusively from the environment variable and
+never appears in CLI flags, log lines, or the binary.  The coordination service
+endpoint should be reached over HTTPS; the receiver's `sharedClient` enforces
+TLS 1.2 as the minimum acceptable version for all outbound HTTPS connections.
+
+When `--dev` is set and `PREPUB_COORD_TOKEN` is absent, the client sends
+requests with an empty `Authorization: Bearer ` header.  This is logged as a
+security warning and must never be used in production deployments.

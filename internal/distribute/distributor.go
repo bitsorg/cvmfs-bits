@@ -4,6 +4,7 @@
 package distribute
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -29,14 +30,22 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/bits-and-blooms/bloom/v3"
+
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
-// sharedClient is used for all HTTPS control-channel requests (announce) and
-// for legacy per-object PUTs to endpoints that do not support the announce
-// protocol.  TLS 1.2 is the minimum acceptable version.
+// sharedClient is used for all HTTPS control-channel requests (announce,
+// bloom fetch) and for legacy per-object PUTs to endpoints that do not support
+// the announce protocol.  TLS 1.2 is the minimum acceptable version.
+//
+// A 30 s client-level Timeout acts as a safety net for stalled connections
+// that do not honour per-request context deadlines (e.g. a receiver that
+// accepts the connection but then stops sending data).  Per-object and
+// per-announce contexts impose their own shorter deadlines on top.
 var sharedClient = &http.Client{
+	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -50,6 +59,10 @@ var sharedClient = &http.Client{
 // integrity without the CPU overhead of encrypting already-compressed objects.
 // Session tokens on this channel are scoped to a single payload and receiver,
 // so a captured token cannot be replayed against a different job or endpoint.
+//
+// No client-level Timeout is set here because individual object PUTs are
+// bounded by per-request context deadlines (cfg.Timeout).  A hard client
+// Timeout would prematurely kill legitimate large-object transfers.
 var dataClient = &http.Client{
 	Transport: &http.Transport{}, // plain HTTP — no TLS
 }
@@ -82,6 +95,14 @@ type Config struct {
 	// distributor automatically falls back to per-object PUTs for the remainder of that
 	// endpoint.
 	BatchSize int
+
+	// BloomQueryTimeout is the per-endpoint timeout for fetching a receiver's
+	// inventory Bloom filter before computing a delta push (GET /api/v1/bloom).
+	// When non-zero and the receiver supports the announce protocol, the
+	// distributor fetches the filter and skips objects the receiver already
+	// holds, reducing unnecessary network traffic.
+	// Set to 0 (default) to disable delta push and always push all objects.
+	BloomQueryTimeout time.Duration
 }
 
 // ValidateEndpoints checks all configured endpoints and returns an error if
@@ -147,6 +168,80 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
+// fetchReceiverBloom fetches and deserialises the inventory Bloom filter from a
+// receiver's control channel (GET /api/v1/bloom).
+//
+// A successful response is the binary encoding of a bloom.BloomFilter written
+// by bloom.BloomFilter.WriteTo.  The caller uses the filter to compute a
+// delta: objects already present at the receiver are skipped.
+//
+// Returns an error for any non-200 response or deserialisation failure.
+// A 503 response means the receiver is still building its inventory; the
+// caller should fall back to pushing all objects.
+// fetchReceiverBloom fetches and deserialises the inventory Bloom filter from a
+// receiver's control channel (GET /api/v1/bloom).
+// hmacSecret is the shared HMAC secret; the function derives the bloom-read
+// bearer token from it and attaches it to the Authorization header.
+func fetchReceiverBloom(ctx context.Context, endpoint, hmacSecret string) (*bloom.BloomFilter, error) {
+	url := strings.TrimRight(endpoint, "/") + "/api/v1/bloom"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetchReceiverBloom: building request: %w", err)
+	}
+	// Authenticate with the static bloom-read token derived from the shared secret.
+	if hmacSecret != "" {
+		mac := hmac.New(sha256.New, []byte(hmacSecret))
+		mac.Write([]byte("bloom-read"))
+		token := hex.EncodeToString(mac.Sum(nil))
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := sharedClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetchReceiverBloom: GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetchReceiverBloom: %s returned HTTP %d", url, resp.StatusCode)
+	}
+
+	bf := new(bloom.BloomFilter)
+	if err := readBloomFilter(bf, resp.Body, url); err != nil {
+		return nil, err
+	}
+	return bf, nil
+}
+
+// readBloomFilter wraps bloom.BloomFilter.ReadFrom with a panic recovery.
+// The bloom library's ReadFrom panics with "makeslice: len out of range" when
+// fed truncated or corrupt data (the header encodes the expected bitset length
+// and ReadFrom allocates that many bytes upfront).  We recover and return an
+// error so the distributor can fall back gracefully.
+func readBloomFilter(bf *bloom.BloomFilter, r io.Reader, url string) (retErr error) {
+	defer func() {
+		if p := recover(); p != nil {
+			retErr = fmt.Errorf("fetchReceiverBloom: corrupt filter body from %s: panic(%v)", url, p)
+		}
+	}()
+	if _, err := bf.ReadFrom(r); err != nil {
+		return fmt.Errorf("fetchReceiverBloom: deserialising filter from %s: %w", url, err)
+	}
+	return nil
+}
+
+// rejectPrivateHost resolves host and rejects it if any returned address falls
+// within a private/loopback range.  When host is already a numeric IP the check
+// is instantaneous and accurate.
+//
+// DNS TOCTOU limitation: when host is a hostname the DNS lookup happens at
+// endpoint-validation time (once per Distribute call), but the actual TCP
+// connection is made later inside pushObject.  A DNS rebinding attack could
+// make the hostname resolve to a public address at validation time and a
+// private address at connection time.  This is a known, fundamental limitation
+// of any DNS-based SSRF protection.  Mitigations belong in the network layer
+// (e.g. firewall rules that block egress to RFC-1918 ranges regardless of DNS)
+// and are outside the scope of this code.
 func rejectPrivateHost(host string) error {
 	// If the host is already a numeric IP address, check it directly —
 	// no DNS round-trip needed, and no fail-open window.
@@ -194,6 +289,16 @@ func OpenDistLog(path string) *DistLog {
 	return &DistLog{path: path}
 }
 
+// distLogEntry is the fixed struct written to the distribution log.
+// Using a named struct instead of map[string]string avoids a heap allocation
+// per Record call (the struct can be stack-allocated and its fields need no
+// runtime reflection on map keys).
+type distLogEntry struct {
+	Endpoint string `json:"endpoint"`
+	Hash     string `json:"hash"`
+	Time     string `json:"time"`
+}
+
 // Record appends a distribution entry to the log (endpoint, hash, timestamp).
 // The file is opened on the first call and reused for subsequent calls.
 // Call Sync or Close to flush to disk.
@@ -209,10 +314,10 @@ func (d *DistLog) Record(endpoint, hash string) error {
 		d.f = f
 	}
 
-	data, err := json.Marshal(map[string]string{
-		"endpoint": endpoint,
-		"hash":     hash,
-		"time":     time.Now().Format(time.RFC3339),
+	data, err := json.Marshal(distLogEntry{
+		Endpoint: endpoint,
+		Hash:     hash,
+		Time:     time.Now().Format(time.RFC3339),
 	})
 	if err != nil {
 		return fmt.Errorf("marshaling dist log entry: %w", err)
@@ -252,35 +357,65 @@ func (d *DistLog) Close() error {
 
 // Confirmed returns the list of object hashes that were successfully recorded
 // for the given endpoint by reading the distribution log file.
-func (d *DistLog) Confirmed(endpoint string) ([]string, error) {
+//
+// Individual corrupt log entries (e.g. from a crash mid-write) are silently
+// skipped rather than aborting the scan.  Objects whose entries were corrupted
+// will be re-pushed on the next distribution run; because PUT is idempotent
+// this is safe.  A non-zero skippedEntries count is returned so callers can
+// emit a diagnostic if desired.
+//
+// Each entry is parsed as a self-contained line of JSON.  Scanning line-by-line
+// (via bufio.Scanner) rather than with json.Decoder.More()/Decode() is
+// intentional: json.Decoder can spin or block indefinitely on an unterminated
+// token (e.g. a string without a closing quote written by a crash), whereas a
+// line scanner always advances by exactly one newline per iteration.
+func (d *DistLog) Confirmed(endpoint string) (hashes []string, skippedEntries int, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	data, err := os.ReadFile(d.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("reading dist log: %w", err)
+		return nil, 0, fmt.Errorf("reading dist log: %w", err)
 	}
 
-	var hashes []string
-	scanner := json.NewDecoder(bytes.NewReader(data))
+	// seen deduplicates: the same object may be recorded more than once for a
+	// given endpoint when pushOne retries succeed after a previous attempt that
+	// already called log.Record (e.g. the PUT succeeded but the ACK was lost, so
+	// the sender retried and recorded again).  Callers must not need to handle
+	// duplicates; we normalise here so that len(hashes) == count of distinct objects.
+	seen := make(map[string]struct{})
 
-	for scanner.More() {
+	lineScanner := bufio.NewScanner(bytes.NewReader(data))
+	for lineScanner.Scan() {
+		line := lineScanner.Bytes()
+		if len(line) == 0 {
+			continue // blank line — not a corrupt entry, just skip
+		}
 		var entry struct {
 			Endpoint string `json:"endpoint"`
 			Hash     string `json:"hash"`
 		}
-		if err := scanner.Decode(&entry); err != nil {
-			return nil, fmt.Errorf("decoding dist log: %w", err)
+		if decErr := json.Unmarshal(line, &entry); decErr != nil {
+			// Skip the malformed entry.  A single truncated write (e.g. crash
+			// mid-line) must not abort the entire scan and cause all objects to
+			// be re-pushed.  The corrupt bytes have already been written to disk
+			// and cannot be un-written; skipping is the least-disruptive option.
+			skippedEntries++
+			continue
 		}
 		if entry.Endpoint == endpoint {
-			hashes = append(hashes, entry.Hash)
+			if _, dup := seen[entry.Hash]; !dup {
+				seen[entry.Hash] = struct{}{}
+				hashes = append(hashes, entry.Hash)
+			}
 		}
 	}
+	// lineScanner.Err() returns nil at EOF — no real I/O errors from a bytes.Reader.
 
-	return hashes, nil
+	return hashes, skippedEntries, nil
 }
 
 // announceReq is the JSON body sent to POST {endpoint}/api/v1/announce.
@@ -367,7 +502,7 @@ func announce(ctx context.Context, endpoint, payloadID string, hashes []string, 
 	if err != nil {
 		return announceResult{}, fmt.Errorf("announce to %s: %w", endpoint, err)
 	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	defer func() { io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)); resp.Body.Close() }() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotFound {
 		// Receiver does not implement the announce protocol.
@@ -438,6 +573,7 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 			// data endpoint when the receiver supports the protocol and an
 			// HMAC secret is configured.
 			var sessionToken, dataEP string
+			announceSupported := false
 			if cfg.HMACSecret != "" {
 				ar, err := announce(ectx, endpoint, payloadID, hashes, cfg)
 				if err != nil {
@@ -449,6 +585,7 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 					return nil
 				}
 				if ar.supported {
+					announceSupported = true
 					sessionToken = ar.token
 					dataEP = ar.dataEndpoint
 					cfg.Obs.Logger.Info("announce accepted",
@@ -459,11 +596,79 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 				}
 			}
 
+			// Delta push: fetch the receiver's inventory Bloom filter and skip
+			// objects it already holds.  Only attempted when:
+			//   • the receiver supported the announce protocol (it also serves /api/v1/bloom), and
+			//   • BloomQueryTimeout > 0 (the operator has opted in).
+			// On any error we fall back to pushing all objects — the conservative choice.
+			effectiveHashes := hashes
+			if announceSupported && cfg.BloomQueryTimeout > 0 {
+				bctx, bcancel := context.WithTimeout(ectx, cfg.BloomQueryTimeout)
+				bf, berr := fetchReceiverBloom(bctx, endpoint, cfg.HMACSecret)
+				bcancel()
+				if berr != nil {
+					cfg.Obs.Logger.Warn("bloom fetch failed — pushing all objects",
+						"endpoint", endpoint, "error", berr)
+				} else {
+					filtered := make([]string, 0, len(hashes))
+					for _, h := range hashes {
+						if !bf.TestString(h) {
+							filtered = append(filtered, h)
+						}
+					}
+					skipped := len(hashes) - len(filtered)
+					cfg.Obs.Logger.Info("delta push computed",
+						"endpoint", endpoint,
+						"total", len(hashes),
+						"to_push", len(filtered),
+						"skipped", skipped)
+					effectiveHashes = filtered
+				}
+			}
+
+			// pushOne pushes a single object to the endpoint with per-object
+			// exponential backoff retry.  Transient network errors (connection
+			// refused, timeout, 5xx) are retried up to maxPushAttempts times;
+			// permanent errors (4xx other than 429) are not retried.
+			// Only after all attempts fail is the endpoint marked as failed.
+			const maxPushAttempts = 4
 			pushOne := func(hash string) {
 				start := time.Now()
-				if err := pushObject(ectx, endpoint, hash, casBackend, cfg.Timeout, sessionToken, dataEP); err != nil {
-					espan.RecordError(err)
-					cfg.Obs.Logger.Error("pushing object", "endpoint", endpoint, "hash", hash, "error", err)
+				var lastErr error
+				for attempt := 0; attempt < maxPushAttempts; attempt++ {
+					if attempt > 0 {
+						// Exponential backoff: 1s, 2s, 4s (capped at 30s).
+						secs := int64(1) << uint(attempt-1) // integer shift, then convert
+						backoff := time.Duration(math.Min(float64(time.Second)*float64(secs), float64(30*time.Second)))
+						cfg.Obs.Logger.Warn("retrying object push",
+							"endpoint", endpoint, "hash", hash,
+							"attempt", attempt+1, "backoff", backoff, "error", lastErr)
+						select {
+						case <-ectx.Done():
+							// Context cancelled during backoff wait.  This is not an
+							// endpoint fault — do not mark the endpoint as failed.
+							return
+						case <-time.After(backoff):
+						}
+					}
+					lastErr = pushObject(ectx, endpoint, hash, casBackend, cfg.Timeout, sessionToken, dataEP)
+					if lastErr == nil {
+						break
+					}
+					// Do not retry on context cancellation or permanent HTTP errors.
+					if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
+						break
+					}
+				}
+				if lastErr != nil {
+					// Context cancellation is not an endpoint failure.  Only record
+					// the endpoint as failed when the error is an actual push error.
+					if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
+						return
+					}
+					espan.RecordError(lastErr)
+					cfg.Obs.Logger.Error("pushing object (all attempts failed)",
+						"endpoint", endpoint, "hash", hash, "error", lastErr)
 					mu.Lock()
 					endpointFailed[endpoint] = true
 					mu.Unlock()
@@ -477,7 +682,7 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 
 			if cfg.BatchSize <= 0 {
 				// Batching disabled — one PUT per object (original behaviour).
-				for _, hash := range hashes {
+				for _, hash := range effectiveHashes {
 					pushOne(hash)
 				}
 				return nil
@@ -486,12 +691,12 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 			// Batching enabled.  Try the batch endpoint; fall back to per-object
 			// PUTs if the receiver signals it does not support batching.
 			batchSupported := true
-			for i := 0; i < len(hashes); i += cfg.BatchSize {
+			for i := 0; i < len(effectiveHashes); i += cfg.BatchSize {
 				end := i + cfg.BatchSize
-				if end > len(hashes) {
-					end = len(hashes)
+				if end > len(effectiveHashes) {
+					end = len(effectiveHashes)
 				}
-				batch := hashes[i:end]
+				batch := effectiveHashes[i:end]
 
 				if batchSupported {
 					start := time.Now()
@@ -570,6 +775,8 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 		return confirmed, totalEndpoints, fmt.Errorf("quorum not reached: %d/%d confirmations", confirmed, requiredConfirmations)
 	}
 
+	cfg.Obs.Logger.Info("distribution complete",
+		"confirmed", confirmed, "total", totalEndpoints, "objects", len(hashes))
 	return confirmed, totalEndpoints, nil
 }
 
@@ -616,6 +823,17 @@ func pushBatch(ctx context.Context, endpoint string, hashes []string, casBackend
 	// HTTP request body can be consumed as it is produced.
 	go func() {
 		for _, hash := range hashes {
+			// Explicit cancellation guard: if the CAS backend does not honour
+			// context cancellation promptly (e.g. it wraps a library that
+			// ignores it), this select ensures the goroutine exits as soon as
+			// the batch timeout fires without waiting for the backend I/O to
+			// unblock on its own.
+			select {
+			case <-ctx.Done():
+				pw.CloseWithError(ctx.Err())
+				return
+			default:
+			}
 			r, err := casBackend.Get(ctx, hash)
 			if err != nil {
 				pw.CloseWithError(fmt.Errorf("cas get %s: %w", hash, err))
@@ -654,6 +872,9 @@ func pushBatch(ctx context.Context, endpoint string, hashes []string, casBackend
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnsupportedMediaType {
+		// Drain before returning so the underlying TCP connection can be reused
+		// for subsequent per-object PUT fallback requests.
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck
 		return nil, &batchUnsupportedError{status: resp.StatusCode}
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {

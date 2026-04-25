@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,19 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// oidcClient is a TLS-hardened HTTP client used for OIDC discovery and JWKS
+// fetches.  It enforces TLS 1.2+ and does not share the process-global
+// DefaultTransport, preventing other packages from accidentally downgrading
+// its TLS configuration.
+var oidcClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	},
+}
 
 // OIDCClaims holds the subset of JWT claims used for provenance attribution.
 // The field names match the claim keys issued by GitHub Actions and GitLab CI.
@@ -262,7 +276,7 @@ func httpGet(ctx context.Context, url string, timeout time.Duration) ([]byte, er
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oidcClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}

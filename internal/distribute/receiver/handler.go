@@ -1,10 +1,12 @@
 package receiver
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -61,8 +63,16 @@ func (r *Receiver) announceHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Read the body up front so we can verify the HMAC over it.
-	body, err := io.ReadAll(io.LimitReader(req.Body, 64*1024))
+	// Bound the body size before reading so that an oversized request produces a
+	// clear 413 rather than a confusing 401 (which would arise from computing an
+	// HMAC over a silently truncated body that doesn't match the sender's HMAC).
+	// 64 KiB is ample for any legitimate announce payload.
+	req.Body = http.MaxBytesReader(w, req.Body, 64*1024)
+	body, err := io.ReadAll(req.Body)
+	if isErrMaxBytes(err) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	if err != nil {
 		http.Error(w, "reading body", http.StatusBadRequest)
 		return
@@ -141,7 +151,13 @@ func (r *Receiver) announceHandler(w http.ResponseWriter, req *http.Request) {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	s := r.store.create(ar.PayloadID, ttl)
+	s, ok := r.store.create(ar.PayloadID, ttl)
+	if !ok {
+		r.cfg.Obs.Logger.Warn("announce rejected: session store at capacity",
+			"payload_id", ar.PayloadID)
+		http.Error(w, "too many active sessions — try again later", http.StatusTooManyRequests)
+		return
+	}
 
 	r.cfg.Obs.Logger.Info("announce accepted",
 		"payload_id", ar.PayloadID,
@@ -190,6 +206,18 @@ func (r *Receiver) putObjectHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Enforce maximum object size before any I/O — including before the
+	// idempotent Stat check.  Without this, a caller with a valid session token
+	// can send an unbounded body to any PUT whose target already exists: the
+	// handler returns 200 immediately but the Go HTTP server then tries to drain
+	// the unread body (up to a hardcoded limit) before reusing the connection,
+	// tying up the goroutine for as long as the client sends data.
+	maxSize := r.cfg.MaxObjectSize
+	if maxSize <= 0 {
+		maxSize = 1 << 30 // 1 GiB default
+	}
+	req.Body = http.MaxBytesReader(w, req.Body, maxSize)
+
 	finalPath := casPath(r.cfg.CASRoot, hash)
 
 	// Idempotent: if the object is already present, skip the write.
@@ -224,7 +252,9 @@ func (r *Receiver) putObjectHandler(w http.ResponseWriter, req *http.Request) {
 
 	if copyErr != nil {
 		os.Remove(tmpPath)
-		if isErrNoDiskSpace(copyErr) {
+		if isErrMaxBytes(copyErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else if isErrNoDiskSpace(copyErr) {
 			http.Error(w, "insufficient storage", http.StatusInsufficientStorage)
 		} else {
 			http.Error(w, "write error", http.StatusInternalServerError)
@@ -237,7 +267,6 @@ func (r *Receiver) putObjectHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	_ = written
 
 	// Verify transfer integrity: computed SHA-256 of the received bytes must
 	// match the X-Content-SHA256 header supplied by the sender.
@@ -282,6 +311,12 @@ func (r *Receiver) putObjectHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Update the inventory filter so that subsequent bloom queries reflect the
+	// newly written object without waiting for the next CAS walk.
+	r.inv.add(hash)
+	r.cfg.Obs.Metrics.ReceiverObjectsReceived.Inc()
+	r.cfg.Obs.Metrics.ReceiverBytesReceived.Add(float64(written))
+	r.cfg.Obs.Metrics.ReceiverBloomSize.Set(float64(r.inv.approximateSize()))
 	r.cfg.Obs.Metrics.SpoolTransitions.WithLabelValues("received", "ok").Inc()
 	w.WriteHeader(http.StatusOK)
 }
@@ -356,6 +391,60 @@ func checkDiskSpace(root string, minBytes int64) error {
 	return nil
 }
 
+// sweepTmpFiles walks the two-level CAS directory tree and removes any files
+// whose name ends with ".tmp".  These are left behind when a PUT handler is
+// interrupted (process crash, kill signal) after creating the temp file but
+// before the atomic rename.  Their names are random (randomToken()[:8] suffix)
+// so they will never be matched by the CAS walk and accumulate indefinitely
+// without this cleanup.
+//
+// sweepTmpFiles is called once at receiver startup in a background goroutine.
+// It is a best-effort operation: individual removal failures are logged and
+// skipped rather than aborting the sweep.  The sweep respects ctx so that
+// Shutdown() can interrupt it promptly on a stalling filesystem.
+func sweepTmpFiles(ctx context.Context, casRoot string, logFn func(msg string, args ...any)) error {
+	prefixEntries, err := os.ReadDir(casRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // CAS not initialised yet — nothing to sweep
+		}
+		return fmt.Errorf("sweepTmpFiles: reading CAS root %q: %w", casRoot, err)
+	}
+	var removed int
+	for _, prefixEntry := range prefixEntries {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if !prefixEntry.IsDir() || len(prefixEntry.Name()) != 2 {
+			continue
+		}
+		subDir := filepath.Join(casRoot, prefixEntry.Name())
+		entries, err := os.ReadDir(subDir)
+		if err != nil {
+			logFn("receiver: sweepTmpFiles skipping unreadable subdir",
+				"dir", subDir, "error", err)
+			continue
+		}
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".tmp") {
+				continue
+			}
+			tmpPath := filepath.Join(subDir, e.Name())
+			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+				logFn("receiver: sweepTmpFiles failed to remove", "path", tmpPath, "error", err)
+			} else {
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		logFn("receiver: removed orphaned .tmp files", "count", removed)
+	}
+	return nil
+}
+
 // casPath constructs the CVMFS CAS filesystem path for a given hash.
 // Objects are stored at {root}/{hash[0:2]}/{hash}C where 'C' denotes a
 // compressed (zlib) object — the standard CVMFS on-disk layout.
@@ -381,13 +470,27 @@ func bearerToken(req *http.Request) string {
 	return strings.TrimSpace(token)
 }
 
-// isErrNoDiskSpace returns true if err indicates that the underlying write
-// failed because the filesystem is full.
+// isErrNoDiskSpace returns true if err (or any error in its chain) is ENOSPC,
+// indicating the filesystem is full.  Using errors.As with syscall.Errno is
+// more robust than string-matching err.Error(): it correctly unwraps *os.PathError
+// and similar wrappers, and is not sensitive to locale-specific message text.
 func isErrNoDiskSpace(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "no space left on device")
+	var errno syscall.Errno
+	return errors.As(err, &errno) && errno == syscall.ENOSPC
+}
+
+// isErrMaxBytes returns true if err is the sentinel error produced by
+// http.MaxBytesReader when the body exceeds the configured limit.
+func isErrMaxBytes(err error) bool {
+	if err == nil {
+		return false
+	}
+	// http.MaxBytesReader returns *http.MaxBytesError (Go 1.19+).
+	var mbe *http.MaxBytesError
+	return errors.As(err, &mbe)
 }
 
 // writeJSON serialises v as JSON and writes it to w with Content-Type

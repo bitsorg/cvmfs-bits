@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"cvmfs.io/prepub/pkg/observe"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Config holds the configuration for the receiver agent.
@@ -72,6 +73,38 @@ type Config struct {
 	// Never set in production; intended for integration tests only.
 	DevMode bool
 
+	// BloomCapacity is the expected number of distinct CAS objects for the
+	// inventory Bloom filter.  0 uses the package default (5 million).
+	BloomCapacity uint
+
+	// BloomFPRate is the desired false-positive rate for the inventory Bloom
+	// filter (0 < BloomFPRate < 1).  0 uses the package default (0.1%).
+	BloomFPRate float64
+
+	// CoordURL is the base URL of the HepCDN coordination service
+	// (e.g. "https://coord.hepcdn.example.com").  Empty disables coordination.
+	CoordURL string
+
+	// CoordToken is the bearer token used to authenticate with the coordination
+	// service.  Typically read from the PREPUB_COORD_TOKEN environment variable.
+	CoordToken string
+
+	// NodeID is the stable identifier for this receiver node, used in
+	// coordination service registration and heartbeat requests.
+	// Defaults to the system hostname if empty.
+	NodeID string
+
+	// Repos is the list of CVMFS repository names served by this receiver
+	// (e.g. ["atlas.cern.ch", "cms.cern.ch"]).  Sent during registration so
+	// the coordination service can build the routing table.
+	Repos []string
+
+	// MaxObjectSize is the maximum body size in bytes accepted for a single
+	// PUT /api/v1/objects/{hash} request.  Requests exceeding this limit are
+	// rejected with HTTP 413 before any bytes are written to disk.
+	// Defaults to 1 GiB (1 << 30).  Set to 0 to use the default.
+	MaxObjectSize int64
+
 	// Obs provides structured logging and metrics.
 	Obs *observe.Provider
 }
@@ -90,14 +123,37 @@ func (c *Config) dataEndpoint() string {
 	return fmt.Sprintf("http://%s:%s", host, port)
 }
 
+// controlEndpoint returns the base URL of the HTTPS control channel for this
+// receiver, used when registering with the coordination service so that the
+// service can route bloom-filter queries and announce requests to the node.
+func (c *Config) controlEndpoint() string {
+	host := c.DataHost // DataHost is the public hostname; same for both channels
+	if host == "" {
+		host = "localhost"
+	}
+	_, port, _ := net.SplitHostPort(c.ControlAddr)
+	if port == "" {
+		port = "9100"
+	}
+	scheme := "https"
+	if c.DevMode {
+		scheme = "http"
+	}
+	return fmt.Sprintf("%s://%s:%s", scheme, host, port)
+}
+
 // Receiver runs the two-channel pre-warming server.
 type Receiver struct {
-	cfg         Config
-	store       *sessionStore
-	control     *http.Server
-	data        *http.Server
-	stopClean   chan struct{} // signal to stop the cleanup goroutine
-	shutdownOnce sync.Once    // ensures Shutdown can be safely called multiple times
+	cfg          Config
+	store        *sessionStore
+	inv          *inventory
+	coord        *CoordClient // nil when CoordURL is empty
+	control      *http.Server
+	data         *http.Server
+	stopClean    chan struct{}        // signal to stop the cleanup goroutine
+	bgCtx        context.Context     // cancelled by Shutdown to stop background goroutines
+	bgCancel     context.CancelFunc  // cancels bgCtx
+	shutdownOnce sync.Once           // ensures Shutdown can be safely called multiple times
 }
 
 // New creates a Receiver from cfg but does not start any listeners.
@@ -119,15 +175,23 @@ func New(cfg Config) (*Receiver, error) {
 		cfg.DataAddr = ":9101"
 	}
 
+	inv := newInventory(cfg.BloomCapacity, cfg.BloomFPRate)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	r := &Receiver{
 		cfg:       cfg,
 		store:     newSessionStore(),
+		inv:       inv,
+		coord:     newCoordClient(cfg.CoordURL, cfg.CoordToken, cfg.NodeID, cfg.Repos, cfg.controlEndpoint(), cfg.dataEndpoint(), inv, cfg.Obs),
 		stopClean: make(chan struct{}),
+		bgCtx:     bgCtx,
+		bgCancel:  bgCancel,
 	}
 
-	// Control channel mux (HTTPS): announce only.
+	// Control channel mux (HTTPS): announce, bloom filter snapshot, metrics.
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/api/v1/announce", r.announceHandler)
+	controlMux.HandleFunc("/api/v1/bloom", r.bloomHandler)
+	controlMux.Handle("/metrics", promhttp.Handler())
 
 	r.control = &http.Server{
 		Addr:         cfg.ControlAddr,
@@ -144,11 +208,12 @@ func New(cfg Config) (*Receiver, error) {
 	dataMux.HandleFunc("/api/v1/objects/", r.putObjectHandler)
 
 	r.data = &http.Server{
-		Addr:        cfg.DataAddr,
-		Handler:     dataMux,
-		ReadTimeout: 0, // streaming: no read deadline on the body
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              cfg.DataAddr,
+		Handler:           dataMux,
+		ReadHeaderTimeout: 30 * time.Second,  // guards against Slowloris header drip
+		ReadTimeout:       0,                 // streaming: no per-body read deadline
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return r, nil
@@ -164,11 +229,42 @@ func (r *Receiver) Start() error {
 	// Start the background session reaper.
 	go r.runCleanup()
 
+	// Remove any .tmp files left by PUT handlers that were interrupted by a
+	// previous crash.  This must run before the data channel listener opens so
+	// that no new PUT can race with the sweep, and before the CAS walk so that
+	// orphaned temp files are not counted as CAS objects.
+	// Both goroutines receive bgCtx so Shutdown() can interrupt them promptly
+	// on a stalling filesystem (e.g. NFS timeout).
+	go func() {
+		if err := sweepTmpFiles(r.bgCtx, r.cfg.CASRoot, r.cfg.Obs.Logger.Info); err != nil &&
+			err != context.Canceled {
+			r.cfg.Obs.Logger.Warn("receiver: .tmp sweep failed", "error", err)
+		}
+	}()
+
+	// Populate the inventory Bloom filter from the on-disk CAS in the background.
+	// The filter is empty (and isReady() returns false) until the walk completes,
+	// so GET /api/v1/bloom returns 503 with Retry-After during the walk.
+	//
+	// Ordering note: the walk goroutine is started before the listeners are
+	// bound so that the walk begins as early as possible.  This is intentional:
+	// the control and data listeners are bound immediately after, and by the time
+	// a sender can reach the announce endpoint the walk is already in progress.
+	// If the walk finishes before any bloom query arrives the 503 window is zero.
+	go func() {
+		if err := r.inv.populateFromCAS(r.bgCtx, r.cfg.CASRoot, r.cfg.Obs.Logger.Info); err != nil &&
+			err != context.Canceled {
+			r.cfg.Obs.Logger.Error("inventory: CAS walk failed", "error", err)
+		}
+	}()
+
 	// Start the data channel first (plain HTTP — always succeeds if the port
 	// is free) so it is ready before senders receive announce responses.
 	dataLn, err := net.Listen("tcp", r.cfg.DataAddr)
 	if err != nil {
-		// On early failure, stop the cleanup goroutine to avoid a goroutine leak.
+		// On early failure, cancel background goroutines and stop the cleanup
+		// goroutine to avoid goroutine leaks.
+		r.bgCancel()
 		close(r.stopClean)
 		return fmt.Errorf("receiver: binding data channel %s: %w", r.cfg.DataAddr, err)
 	}
@@ -182,8 +278,9 @@ func (r *Receiver) Start() error {
 	// Start the control channel (HTTPS unless DevMode).
 	controlLn, err := net.Listen("tcp", r.cfg.ControlAddr)
 	if err != nil {
-		// On early failure, stop the cleanup goroutine and shut down the data channel
-		// to avoid a goroutine leak.
+		// On early failure, cancel background goroutines, stop the cleanup
+		// goroutine, and shut down the data channel to avoid goroutine leaks.
+		r.bgCancel()
 		close(r.stopClean)
 		_ = r.data.Shutdown(context.Background())
 		return fmt.Errorf("receiver: binding control channel %s: %w", r.cfg.ControlAddr, err)
@@ -206,6 +303,9 @@ func (r *Receiver) Start() error {
 		r.cfg.Obs.Logger.Info("receiver control channel listening (HTTPS)", "addr", r.cfg.ControlAddr)
 	}
 
+	// Start the coordination service client (no-op when CoordURL is empty).
+	r.coord.Start()
+
 	return nil
 }
 
@@ -214,8 +314,15 @@ func (r *Receiver) Start() error {
 func (r *Receiver) Shutdown(ctx context.Context) error {
 	var ctlErr, dataErr error
 	r.shutdownOnce.Do(func() {
-		// Stop the cleanup goroutine first.
+		// Cancel background goroutines (CAS walk, tmp sweep) first so they can
+		// exit before the process terminates.  On a stalling filesystem this
+		// prevents Shutdown from blocking waiting for goroutines that will never
+		// complete on their own.
+		r.bgCancel()
+		// Stop the cleanup goroutine.
 		close(r.stopClean)
+		// Deregister from the coordination service before closing listeners.
+		r.coord.Stop()
 		// Shut down the control channel first to stop new announces.
 		ctlErr = r.control.Shutdown(ctx)
 		// Then the data channel once in-flight PUTs can complete.
