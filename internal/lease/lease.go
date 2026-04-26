@@ -83,17 +83,30 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 	}
 }
 
-// signRequest signs the request using the cvmfs_gateway authentication scheme
-// observed from cvmfs_server/swissknife traffic:
+// computeSignature returns base64(hex(HMAC-SHA1(input, secret))), the
+// Authorization token value expected by cvmfs_gateway for all endpoints.
+func (c *Client) computeSignature(input []byte) string {
+	h := hmac.New(sha1.New, []byte(c.Secret))
+	h.Write(input)
+	return base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(h.Sum(nil))))
+}
+
+// signWithToken signs the request using the session token as the HMAC input.
 //
-//	Authorization: <key_id> <base64(hex(HMAC-SHA1(body, secret)))>
+// Per gateway/frontend/authz.go, all lease and payload requests that include
+// a token in the URL path use the token as the HMAC input:
 //
-// The signature is HMAC-SHA1 over the raw request body, hex-encoded, then
-// base64-encoded.  The header has no "HMAC" prefix — just key_id, a space,
-// and the signature.  For requests with no body (DELETE, GET) the HMAC is
-// computed over an empty byte string.
+//	DELETE /api/v1/leases/<token>      → HMAC over token  (cancel/abort)
+//	POST   /api/v1/leases/<token>      → HMAC over token  (commit)
+func (c *Client) signWithToken(req *http.Request, token string) {
+	sig := c.computeSignature([]byte(token))
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
+}
+
+// signRequest signs the request using the raw request body as the HMAC input.
+// Used for POST /api/v1/leases (new lease acquisition) where the body is
+// the JSON payload.  Reads and rebuffers req.Body so it remains readable.
 func (c *Client) signRequest(req *http.Request) error {
-	// Snapshot the body so we can both sign it and leave it readable for send.
 	var bodyBytes []byte
 	if req.Body != nil && req.Body != http.NoBody {
 		var err error
@@ -104,14 +117,8 @@ func (c *Client) signRequest(req *http.Request) error {
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		req.ContentLength = int64(len(bodyBytes))
 	}
-
-	h := hmac.New(sha1.New, []byte(c.Secret))
-	h.Write(bodyBytes)
-	// hex-encode the raw HMAC bytes, then base64-encode that hex string
-	hexHMAC := hex.EncodeToString(h.Sum(nil))
-	signature := base64.StdEncoding.EncodeToString([]byte(hexHMAC))
-
-	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, signature))
+	sig := c.computeSignature(bodyBytes)
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
 	return nil
 }
 
@@ -320,10 +327,8 @@ func (c *Client) Renew(ctx context.Context, token string) error {
 		return fmt.Errorf("creating request: %w", err)
 	}
 
-	if err := c.signRequest(req); err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("signing request: %w", err)
-	}
+	// PUT /api/v1/leases/<token> — HMAC over token string per authz.go.
+	c.signWithToken(req, token)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -361,10 +366,8 @@ func (c *Client) Release(ctx context.Context, token string, commit bool) error {
 		return fmt.Errorf("creating request: %w", err)
 	}
 
-	if err := c.signRequest(req); err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("signing request: %w", err)
-	}
+	// DELETE /api/v1/leases/<token> — HMAC over token string per authz.go.
+	c.signWithToken(req, token)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -395,9 +398,14 @@ func (c *Client) Release(ctx context.Context, token string, commit bool) error {
 // formatted number has exactly `digits` characters.
 func buildMsgHeader(token, hash string) []byte {
 	// Build prefix (everything before the header_size value) and suffix.
+	// header_size MUST be a JSON string (e.g. "164") not an integer (164).
+	// The gateway Go struct has `HeaderSize string` and calls strconv.Atoi on
+	// the value; sending an integer causes JSON decode failure in the gateway.
+	// The outer quotes are part of prefix/suffix; digits counts only the numeral
+	// characters inside them.
 	prefix := `{"api_version":"2","session_token":` + strconv.Quote(token) +
-		`,"payload_digest":` + strconv.Quote(hash) + `,"header_size":`
-	suffix := "}"
+		`,"payload_digest":` + strconv.Quote(hash) + `,"header_size":"`
+	suffix := `"}`
 	for digits := 1; digits <= 9; digits++ {
 		n := len(prefix) + digits + len(suffix)
 		s := strconv.Itoa(n)
@@ -424,9 +432,11 @@ func (c *Client) submitOneObject(ctx context.Context, payloadURL, token, hash st
 	req.Header.Set("Message-Size", strconv.Itoa(len(msgHeader)))
 	req.ContentLength = int64(len(body))
 
-	if err := c.signRequest(req); err != nil {
-		return fmt.Errorf("signing payload request: %w", err)
-	}
+	// Per gateway/frontend/authz.go: for POST /api/v1/payloads (no token in
+	// URL), HMAC is computed over the first Message-Size bytes of the body —
+	// i.e. the JSON header only, not the appended compressed object bytes.
+	sig := c.computeSignature(msgHeader)
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -552,18 +562,83 @@ func (c *Client) Heartbeat(ctx context.Context, token string, interval time.Dura
 // ── Backend interface implementation ─────────────────────────────────────────
 
 // Commit implements Backend for the gateway mode.  It uploads all staged CAS
-// objects to the gateway via SubmitPayload (using req.ObjectStore to read the
-// compressed bytes), then releases the lease with commit=true to trigger the
-// gateway's internal cvmfs_server publish call.
+// objects to the gateway via SubmitPayload, then finalises the publish by
+// POSTing to /api/v1/leases/<token> — distinct from DELETE which cancels.
+//
+// Per gateway/frontend/leases.go:
+//
+//	POST /api/v1/leases/<token>  → handleCommitLease (finalise/publish)
+//	DELETE /api/v1/leases/<token> → handleCancelLease (abort/rollback)
+//
+// The commit body carries the catalog root hashes and an optional snapshot tag:
+//
+//	{"old_root_hash":"","new_root_hash":"<catalogHash>","tag_name":"","tag_description":""}
+//
+// HMAC for POST /api/v1/leases/<token> is computed over the token string
+// (same rule as DELETE), per gateway/frontend/authz.go.
 func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
+	ctx, span := c.obs.Tracer.Start(ctx, "lease.commit")
+	defer span.End()
+
 	if req.ObjectStore == nil {
 		return fmt.Errorf("Commit: ObjectStore must be set in gateway mode")
 	}
+
+	// 1. Upload all CAS objects (chunks + catalog) to the gateway.
 	if err := c.SubmitPayload(ctx, req.Token, req.CatalogHash, req.ObjectHashes, req.ObjectStore); err != nil {
-		return err
+		span.RecordError(err)
+		return fmt.Errorf("gateway submit payload: %w", err)
 	}
-	if err := c.Release(ctx, req.Token, true); err != nil {
-		return fmt.Errorf("gateway release (commit): %w", err)
+
+	// 2. POST /api/v1/leases/<token> to finalise the publish transaction.
+	commitURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, req.Token)
+	commitBody, err := json.Marshal(map[string]interface{}{
+		"old_root_hash":   "",
+		"new_root_hash":   req.CatalogHash,
+		"tag_name":        "",
+		"tag_description": "",
+	})
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("marshalling commit body: %w", err)
+	}
+
+	postReq, err := http.NewRequestWithContext(ctx, "POST", commitURL, bytes.NewReader(commitBody))
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("creating commit request: %w", err)
+	}
+	postReq.Header.Set("Content-Type", "application/json")
+	postReq.ContentLength = int64(len(commitBody))
+	// POST /api/v1/leases/<token> — HMAC over token string per authz.go.
+	c.signWithToken(postReq, req.Token)
+
+	resp, err := c.client.Do(postReq)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("committing lease: %w", err)
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		span.RecordError(fmt.Errorf("status %d", resp.StatusCode))
+		return fmt.Errorf("gateway commit failed: status %d: %s", resp.StatusCode, data)
+	}
+
+	var result struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		// Non-fatal: commit likely succeeded if status was 200.
+		c.obs.Logger.Info("lease commit: could not decode response body", "error", err)
+		return nil
+	}
+	if result.Status != "ok" {
+		err := fmt.Errorf("gateway commit status %q: %s", result.Status, result.Reason)
+		span.RecordError(err)
+		return err
 	}
 	return nil
 }

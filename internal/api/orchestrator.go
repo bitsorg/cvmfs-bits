@@ -416,7 +416,17 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	defer cleanupCancel()
 
 	if j.LeaseToken != "" {
-		_ = o.Lease.Abort(cleanupCtx, j.LeaseToken)
+		if abortErr := o.Lease.Abort(cleanupCtx, j.LeaseToken); abortErr != nil {
+			// Log at ERROR so operators know the gateway lease was NOT released.
+			// The lease will eventually expire on the gateway (max_lease_time),
+			// but until then new jobs for the same repo/path will get path_busy.
+			o.Obs.Logger.Error("lease abort failed — stale lease left on gateway",
+				"job_id", j.ID,
+				"token", j.LeaseToken,
+				"error", abortErr,
+				"hint", "DELETE "+j.LeaseToken+" via gateway API or wait for lease expiry",
+			)
+		}
 	}
 
 	if !job.IsTerminal(j.State) {

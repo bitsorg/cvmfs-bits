@@ -102,10 +102,15 @@ func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {
 	_, span := g.obs.Tracer.Start(r.Context(), "fakegateway.lease")
 	defer span.End()
 
-	path := r.URL.Path[len("/api/v1/leases/"):]
+	// Extract the token from the URL, if any.
+	// Path is either "/api/v1/leases" (no token) or "/api/v1/leases/<token>".
+	token := r.URL.Path[len("/api/v1/leases"):]
+	if len(token) > 0 && token[0] == '/' {
+		token = token[1:]
+	}
 
-	if r.Method == "POST" {
-		// Acquire lease
+	if r.Method == "POST" && token == "" {
+		// Acquire new lease (POST /api/v1/leases).
 		if g.AcquireLatency > 0 {
 			time.Sleep(g.AcquireLatency)
 		}
@@ -118,20 +123,21 @@ func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var req struct {
+			Path string `json:"path"`
 			Repo string `json:"repo"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 
-		token := fmt.Sprintf("lease-%d", time.Now().UnixNano())
+		newToken := fmt.Sprintf("lease-%d", time.Now().UnixNano())
 		lease := &fakeLease{
-			token:     token,
-			path:      path,
+			token:     newToken,
+			path:      req.Path,
 			repo:      req.Repo,
 			expiresAt: time.Now().Add(5 * time.Minute),
 		}
 
 		g.mu.Lock()
-		g.leases[token] = lease
+		g.leases[newToken] = lease
 		g.mu.Unlock()
 
 		// Use the same response format as the real cvmfs_gateway:
@@ -139,14 +145,25 @@ func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":         "ok",
-			"session_token":  token,
+			"session_token":  newToken,
 			"max_lease_time": int(5 * time.Minute / time.Second), // 300
 		})
 
-	} else if r.Method == "PUT" {
-		// Renew lease
+	} else if r.Method == "POST" && token != "" {
+		// Commit lease (POST /api/v1/leases/<token>).
+		// The real gateway runs cvmfs_server publish here.  The fake just
+		// removes the lease and returns ok.
 		g.mu.Lock()
-		if lease, ok := g.leases[path]; ok {
+		delete(g.leases, token)
+		g.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	} else if r.Method == "PUT" {
+		// Renew lease (PUT /api/v1/leases/<token>).
+		g.mu.Lock()
+		if lease, ok := g.leases[token]; ok {
 			lease.expiresAt = time.Now().Add(5 * time.Minute)
 		}
 		g.mu.Unlock()
@@ -155,9 +172,9 @@ func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "renewed"})
 
 	} else if r.Method == "DELETE" {
-		// Release lease
+		// Cancel/abort lease (DELETE /api/v1/leases/<token>).
 		g.mu.Lock()
-		delete(g.leases, path)
+		delete(g.leases, token)
 		g.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
