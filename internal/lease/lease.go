@@ -174,10 +174,17 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 
 	// Encode each path segment individually so that slash separators are
 	// preserved as real URL path slashes while special characters within
-	// segments (spaces, +, etc.) are percent-encoded.
+	// segments are percent-encoded.
+	//
+	// url.PathEscape follows RFC 3986 and treats sub-delimiters (including +)
+	// as legal pchar characters that do not require encoding.  However, some
+	// gateway implementations and HTTP proxies misinterpret a literal + in a
+	// path segment as a space (a habit inherited from query-string parsing).
+	// We therefore encode + explicitly after PathEscape — PathEscape never
+	// emits a literal + in its output, so the replacement is safe.
 	var segs []string
 	for _, seg := range strings.Split(path, "/") {
-		segs = append(segs, url.PathEscape(seg))
+		segs = append(segs, strings.ReplaceAll(url.PathEscape(seg), "+", "%2B"))
 	}
 	leaseURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, strings.Join(segs, "/"))
 

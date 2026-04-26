@@ -120,7 +120,34 @@ func main() {
 
 	flag.Parse()
 
-	_ = config // reserved for future use
+	// ── Config file (applied after flag.Parse so CLI flags take precedence) ───
+	//
+	// Collect the set of flags that were explicitly provided on the command
+	// line.  Config-file values are only applied where a flag was NOT set
+	// explicitly, preserving the CLI-overrides-file contract.
+	if *config != "" {
+		explicit := make(map[string]bool)
+		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+		fc, err := loadFileConfig(*config)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cvmfs-prepub: %v\n", err)
+			os.Exit(1)
+		}
+		applyFileConfig(fc, explicit,
+			mode, logLevel, devMode,
+			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
+			s1Endpoints, s1Quorum, s1Timeout, s1BloomTimeout, s1MQTTTimeout,
+			brokerURL, brokerClientCert, brokerClientKey, brokerCACert,
+			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
+			sessionTTL, diskHeadroom,
+			nodeID, repos, coordURL,
+			bloomSnapshotDir, bloomNodeID,
+			bloomMaxSnapshotAge, bloomFilterCapacity, bloomFilterFPRate,
+			recvBloomCapacity, recvBloomFPRate,
+			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
+		)
+	}
 
 	// ── Observability (common setup) ──────────────────────────────────────────
 	obs, obsShutdown, err := observe.New("cvmfs-prepub")
