@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -310,46 +311,115 @@ func (c *Client) Release(ctx context.Context, token string, commit bool) error {
 	return nil
 }
 
-// SubmitPayload submits the catalog hash and object manifest to the gateway.
-// This tells the gateway which objects are available in the CAS and updates the
-// repository catalog. Must be called while holding a valid lease. The publish
-// is not finalized until Release is called with commit=true.
-func (c *Client) SubmitPayload(ctx context.Context, token string, catalogHash string, objectHashes []string) error {
-	ctx, span := c.obs.Tracer.Start(ctx, "lease.submit_payload")
-	defer span.End()
-
-	url := fmt.Sprintf("%s/api/v1/payloads", c.BaseURL)
-
-	payload := map[string]interface{}{
-		"token":         token,
-		"catalog_hash":  catalogHash,
-		"object_hashes": objectHashes,
+// buildMsgHeader constructs the JSON message header for the cvmfs_gateway
+// binary payload protocol.  The gateway framing is:
+//
+//	POST /api/v1/payloads
+//	Message-Size: N
+//
+//	<N bytes of JSON><compressed object bytes>
+//
+// where the JSON contains a "header_size" field that equals N — the byte
+// length of the JSON itself.  The circular dependency is resolved by
+// convergence: start with an estimate (digits=1) and increase until the
+// formatted number has exactly `digits` characters.
+func buildMsgHeader(token, hash string) []byte {
+	// Build prefix (everything before the header_size value) and suffix.
+	prefix := `{"api_version":"2","session_token":` + strconv.Quote(token) +
+		`,"payload_digest":` + strconv.Quote(hash) + `,"header_size":`
+	suffix := "}"
+	for digits := 1; digits <= 9; digits++ {
+		n := len(prefix) + digits + len(suffix)
+		s := strconv.Itoa(n)
+		if len(s) == digits {
+			return []byte(prefix + s + suffix)
+		}
 	}
-	body, _ := json.Marshal(payload)
+	// Unreachable for any practical token/hash length.
+	panic("buildMsgHeader: failed to converge on header_size")
+}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+// submitOneObject sends a single compressed CAS object to the gateway using
+// the binary payload framing protocol.  objBytes is the raw compressed content
+// as stored in the local CAS.
+func (c *Client) submitOneObject(ctx context.Context, payloadURL, token, hash string, objBytes []byte) error {
+	msgHeader := buildMsgHeader(token, hash)
+	body := append(msgHeader, objBytes...)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", payloadURL, bytes.NewReader(body))
 	if err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("creating request: %w", err)
+		return fmt.Errorf("creating payload request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Message-Size", strconv.Itoa(len(msgHeader)))
+	req.ContentLength = int64(len(body))
 
-	req.Header.Set("Content-Type", "application/json")
 	if err := c.signRequest(req); err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("signing request: %w", err)
+		return fmt.Errorf("signing payload request: %w", err)
 	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("submitting payload: %w", err)
+		return fmt.Errorf("POST payload: %w", err)
 	}
 	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		span.RecordError(fmt.Errorf("status %d", resp.StatusCode))
-		return fmt.Errorf("payload submission failed: status %d: %s", resp.StatusCode, data)
+		return fmt.Errorf("payload upload failed (hash=%s): status %d: %s", hash, resp.StatusCode, data)
+	}
+	return nil
+}
+
+// SubmitPayload uploads all staged CAS objects (file chunks + catalog) to the
+// gateway using the binary framing protocol required by cvmfs_gateway.
+//
+// Protocol per object:
+//
+//	POST /api/v1/payloads
+//	Authorization: <signed>
+//	Content-Type: application/octet-stream
+//	Message-Size: N
+//
+//	<N bytes of JSON message header><zlib-compressed object bytes>
+//
+// Objects are uploaded in the order given (objectHashes first, then
+// catalogHash last so the gateway sees the catalog only after all its
+// referenced chunks are present).
+//
+// store must be non-nil; it is used to read the compressed bytes for each
+// object from the local CAS before uploading.
+func (c *Client) SubmitPayload(ctx context.Context, token, catalogHash string, objectHashes []string, store ObjectReader) error {
+	ctx, span := c.obs.Tracer.Start(ctx, "lease.submit_payload")
+	defer span.End()
+
+	payloadURL := fmt.Sprintf("%s/api/v1/payloads", c.BaseURL)
+
+	// Upload file-chunk objects first, catalog last.
+	allHashes := append(append([]string(nil), objectHashes...), catalogHash)
+
+	for _, hash := range allHashes {
+		if hash == "" {
+			continue
+		}
+
+		// Read compressed object bytes from the local CAS.
+		rc, err := store.Get(ctx, hash)
+		if err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("reading object %s from CAS: %w", hash, err)
+		}
+		objBytes, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			span.RecordError(readErr)
+			return fmt.Errorf("reading object %s bytes: %w", hash, readErr)
+		}
+
+		if err := c.submitOneObject(ctx, payloadURL, token, hash, objBytes); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("gateway submit payload: %w", err)
+		}
 	}
 
 	return nil
@@ -411,12 +481,16 @@ func (c *Client) Heartbeat(ctx context.Context, token string, interval time.Dura
 
 // ── Backend interface implementation ─────────────────────────────────────────
 
-// Commit implements Backend for the gateway mode.  It submits the catalog hash
-// and object list to the gateway via SubmitPayload, then releases the lease
-// with commit=true to trigger the gateway's internal cvmfs_server publish call.
+// Commit implements Backend for the gateway mode.  It uploads all staged CAS
+// objects to the gateway via SubmitPayload (using req.ObjectStore to read the
+// compressed bytes), then releases the lease with commit=true to trigger the
+// gateway's internal cvmfs_server publish call.
 func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
-	if err := c.SubmitPayload(ctx, req.Token, req.CatalogHash, req.ObjectHashes); err != nil {
-		return fmt.Errorf("gateway submit payload: %w", err)
+	if req.ObjectStore == nil {
+		return fmt.Errorf("Commit: ObjectStore must be set in gateway mode")
+	}
+	if err := c.SubmitPayload(ctx, req.Token, req.CatalogHash, req.ObjectHashes, req.ObjectStore); err != nil {
+		return err
 	}
 	if err := c.Release(ctx, req.Token, true); err != nil {
 		return fmt.Errorf("gateway release (commit): %w", err)

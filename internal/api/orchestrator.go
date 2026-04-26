@@ -222,12 +222,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		return o.abortJob(ctx, j, err)
 	}
 
-	leasePath := j.Path
-	if leasePath == "" {
-		leasePath = j.Repo
-	}
-
-	token, err := o.Lease.Acquire(ctx, j.Repo, leasePath)
+	// j.Path == "" means a root-level repo lease; acquireLease handles that by
+	// constructing the path as "repo/" which is what the gateway expects.
+	token, err := o.Lease.Acquire(ctx, j.Repo, j.Path)
 	if err != nil {
 		span.RecordError(err)
 		logger.Error("failed to acquire lease", "error", err)
@@ -270,6 +267,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	if pipelineResult != nil {
 		req.CatalogHash = pipelineResult.CatalogHash
 		req.ObjectHashes = pipelineResult.ObjectHashes
+		req.ObjectStore = o.CAS
 	}
 
 	cancelHeartbeat() // stop renewal before committing (idempotent; defer fires again at return)

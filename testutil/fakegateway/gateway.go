@@ -3,18 +3,25 @@ package fakegateway
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"time"
 
 	"cvmfs.io/prepub/pkg/observe"
 )
 
+// Payload records a single object received via the binary gateway payload protocol.
+// Each call to POST /api/v1/payloads submits exactly one object.
 type Payload struct {
-	Token        string   `json:"token"`
-	CatalogHash  string   `json:"catalog_hash"`
-	ObjectHashes []string `json:"object_hashes"`
+	// SessionToken is the lease token that authorised this upload.
+	SessionToken string `json:"session_token"`
+	// PayloadDigest is the CAS hash of the uploaded object.
+	PayloadDigest string `json:"payload_digest"`
+	// ObjectSize is the byte length of the compressed object body.
+	ObjectSize int `json:"-"`
 }
 
 type fakeLease struct {
@@ -45,6 +52,11 @@ func New(obs *observe.Provider) *Gateway {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/repos", g.handleRepos)
+	// Register both the exact path (for POST /api/v1/leases acquire) and the
+	// subtree pattern (for PUT/DELETE /api/v1/leases/<token>).  Without the
+	// exact registration, Go's ServeMux would 301-redirect POST /api/v1/leases
+	// to /api/v1/leases/ — a redirect the client won't follow for non-GET.
+	mux.HandleFunc("/api/v1/leases", g.handleLease)
 	mux.HandleFunc("/api/v1/leases/", g.handleLease)
 	mux.HandleFunc("/api/v1/payloads", g.handlePayload)
 
@@ -169,10 +181,39 @@ func (g *Gateway) handlePayload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var payload Payload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+	// The real gateway protocol: Message-Size header + binary body.
+	// Body = <Message-Size bytes of JSON msg> + <compressed object bytes>.
+	msgSizeStr := r.Header.Get("Message-Size")
+	if msgSizeStr == "" {
+		http.Error(w, "missing message-size header", http.StatusBadRequest)
 		return
+	}
+	msgSize, err := strconv.Atoi(msgSizeStr)
+	if err != nil || msgSize < 0 {
+		http.Error(w, "invalid message-size header", http.StatusBadRequest)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil || len(body) < msgSize {
+		http.Error(w, "body shorter than message-size", http.StatusBadRequest)
+		return
+	}
+
+	// Parse the JSON message header.
+	var msg struct {
+		SessionToken  string `json:"session_token"`
+		PayloadDigest string `json:"payload_digest"`
+	}
+	if err := json.Unmarshal(body[:msgSize], &msg); err != nil {
+		http.Error(w, "invalid JSON message header", http.StatusBadRequest)
+		return
+	}
+
+	payload := Payload{
+		SessionToken:  msg.SessionToken,
+		PayloadDigest: msg.PayloadDigest,
+		ObjectSize:    len(body) - msgSize,
 	}
 
 	g.mu.Lock()

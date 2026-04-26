@@ -3,8 +3,16 @@ package lease
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 )
+
+// ObjectReader is a minimal read-only view of the local CAS used by the
+// gateway payload submission to stream compressed objects to the gateway.
+// *cas.LocalFS satisfies this interface.
+type ObjectReader interface {
+	Get(ctx context.Context, hash string) (io.ReadCloser, error)
+}
 
 // ErrCommittedNotRemounted is returned by Backend.Commit when the underlying
 // publish command durably committed the catalog to the repository backend but
@@ -34,6 +42,11 @@ type CommitRequest struct {
 	CatalogHash string
 	// ObjectHashes are the CAS object hashes to register with the gateway.
 	ObjectHashes []string
+
+	// ObjectStore provides read access to the local CAS so Commit can stream
+	// compressed object bytes to the gateway payload endpoint.  Must be set in
+	// gateway mode (NeedsPipeline==true); ignored by LocalBackend.
+	ObjectStore ObjectReader
 
 	// ── Local mode ───────────────────────────────────────────────────────────
 
