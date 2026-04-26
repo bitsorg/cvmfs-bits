@@ -112,10 +112,24 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 		return fmt.Errorf("creating new state directory: %w", err)
 	}
 
-	// Rename job directory
+	// Rename job directory.  If the destination already exists (left behind by
+	// a previous crash before the rename completed), remove it first so the
+	// rename can succeed.  The stale directory is superseded by the current
+	// job state being transitioned now.
 	if err := os.Rename(oldDir, newDir); err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("renaming job directory: %w", err)
+		if os.IsExist(err) || isErrExist(err) {
+			if rmErr := os.RemoveAll(newDir); rmErr != nil {
+				span.RecordError(rmErr)
+				return fmt.Errorf("removing stale job directory %s: %w", newDir, rmErr)
+			}
+			if err = os.Rename(oldDir, newDir); err != nil {
+				span.RecordError(err)
+				return fmt.Errorf("renaming job directory after stale removal: %w", err)
+			}
+		} else {
+			span.RecordError(err)
+			return fmt.Errorf("renaming job directory: %w", err)
+		}
 	}
 
 	// Fsync the new directory
@@ -336,4 +350,10 @@ func (s *Spool) FindJob(id string) (*job.Job, error) {
 		}
 	}
 	return nil, fmt.Errorf("job %q: %w", id, os.ErrNotExist)
+}
+
+// isErrExist reports whether err (or any wrapped error) indicates that a file
+// or directory already exists.  os.IsExist does not unwrap, so we check both.
+func isErrExist(err error) bool {
+	return os.IsExist(err) || errors.Is(err, os.ErrExist)
 }
