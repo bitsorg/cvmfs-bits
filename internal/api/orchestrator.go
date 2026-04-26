@@ -155,7 +155,11 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 			return o.abortJob(ctx, j, err)
 		}
 
-		logger.Info("running pipeline")
+		// The job directory was just renamed from incoming/ to staging/.
+		// Update TarPath to reflect the new location — the old absolute path
+		// now points to a non-existent directory.
+		j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
+		logger.Info("running pipeline", "tar", j.TarPath)
 		var err error
 		pipelineResult, err = pipeline.Run(ctx, j.TarPath, o.Pipeline)
 		if err != nil {
