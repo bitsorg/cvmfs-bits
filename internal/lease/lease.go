@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -131,23 +133,61 @@ func (c *Client) signRequest(req *http.Request) error {
 	return nil
 }
 
-// Acquire acquires a publish lease from the gateway for the given repository and path.
-// The lease is valid until the returned Lease.ExpiresAt time and is protected by
-// an HMAC-signed request. Returns an error if the gateway rejects the request.
-func (c *Client) Acquire(ctx context.Context, repo, path string) (*Lease, error) {
+// Acquire implements Backend.  It acquires a publish lease from the gateway
+// for the given repository and path, returning the opaque lease token.
+// The request is HMAC-signed; the gateway rejects replays and tampered requests.
+func (c *Client) Acquire(ctx context.Context, repo, path string) (string, error) {
+	l, err := c.acquireLease(ctx, repo, path)
+	if err != nil {
+		return "", err
+	}
+	return l.Token, nil
+}
+
+// acquireLease is the internal form of Acquire that returns the full *Lease
+// value (including ExpiresAt) for use by Probe and tests.
+func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, error) {
 	ctx, span := c.obs.Tracer.Start(ctx, "lease.acquire")
 	defer span.End()
 
 	start := time.Now()
 
-	url := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, path)
+	// Validate path before constructing the URL.  All three conditions produce
+	// malformed gateway URLs and are not valid CVMFS repository sub-paths:
+	//   - empty string              → "/api/v1/leases/" with no segment at all
+	//   - leading slash "/foo"      → strings.Split produces a leading "" segment,
+	//                                 joining gives "/foo", URL becomes "…/leases//foo"
+	//   - adjacent slashes "a//b"   → empty segment, URL becomes "…/leases/a//b"
+	//   - trailing slash "foo/"     → trailing "" segment, URL becomes "…/leases/foo/"
+	if path == "" {
+		return nil, fmt.Errorf("acquireLease: path must not be empty")
+	}
+	if path[0] == '/' {
+		return nil, fmt.Errorf("acquireLease: path %q must not start with a slash", path)
+	}
+	if path[len(path)-1] == '/' {
+		return nil, fmt.Errorf("acquireLease: path %q must not end with a slash", path)
+	}
+	if strings.Contains(path, "//") {
+		return nil, fmt.Errorf("acquireLease: path %q contains adjacent slashes", path)
+	}
+
+	// Encode each path segment individually so that slash separators are
+	// preserved as real URL path slashes while special characters within
+	// segments (spaces, +, etc.) are percent-encoded.
+	var segs []string
+	for _, seg := range strings.Split(path, "/") {
+		segs = append(segs, url.PathEscape(seg))
+	}
+	leaseURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, strings.Join(segs, "/"))
+
 	body := map[string]string{
 		"repo": repo,
 		"path": path,
 	}
 	payload, _ := json.Marshal(body)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", leaseURL, bytes.NewReader(payload))
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("creating request: %w", err)
@@ -305,20 +345,19 @@ func (c *Client) SubmitPayload(ctx context.Context, token string, catalogHash st
 	return nil
 }
 
-// Heartbeat starts a goroutine that periodically renews the lease at the given interval.
-// The returned cancel function stops the heartbeat and must be called when the lease
-// is no longer needed to prevent a goroutine leak.
+// Heartbeat implements Backend.  It starts a goroutine that periodically
+// renews the gateway lease identified by token at the given interval.
 //
-// If maxConsecutiveHeartbeatFailures back-to-back renewal errors occur, the heartbeat
-// calls cancelJob to signal that the lease has likely expired on the gateway and the
-// in-progress SubmitPayload should be aborted. This prevents the orchestrator from
-// blocking indefinitely on a gateway that has already evicted the lease.
-// Pass a no-op func() {} if early abort on heartbeat failure is not desired.
-func (c *Client) Heartbeat(ctx context.Context, lease *Lease, interval time.Duration, cancelJob context.CancelFunc) func() {
-	// Capture the token value once before spawning the goroutine.  The goroutine
-	// must not read lease.Token directly: the caller may zero it on the error
-	// path (e.g. abortJob), which would be an unsynchronised read otherwise.
-	token := lease.Token
+// If maxConsecutiveHeartbeatFailures back-to-back renewal errors occur,
+// onExpire is called to signal that the lease has likely expired and the
+// in-progress SubmitPayload should be aborted, preventing the orchestrator
+// from blocking indefinitely on a gateway that has already evicted the lease.
+//
+// The returned cancel func stops the goroutine and is safe to call multiple
+// times (sync.Once guard).  Pass a no-op func() {} for onExpire if early
+// abort on heartbeat failure is not desired.
+func (c *Client) Heartbeat(ctx context.Context, token string, interval time.Duration, onExpire context.CancelFunc) func() {
+	// token is already a value copy — no additional snapshot needed.
 
 	ticker := time.NewTicker(interval)
 	done := make(chan struct{})
@@ -342,7 +381,7 @@ func (c *Client) Heartbeat(ctx context.Context, lease *Lease, interval time.Dura
 							"lease heartbeat: consecutive failures — lease likely expired, aborting job",
 							"token", token, "failures", consecutive,
 						)
-						cancelJob()
+						onExpire()
 						return
 					}
 				} else {
@@ -359,3 +398,55 @@ func (c *Client) Heartbeat(ctx context.Context, lease *Lease, interval time.Dura
 		once.Do(func() { close(done) })
 	}
 }
+
+// ── Backend interface implementation ─────────────────────────────────────────
+
+// Commit implements Backend for the gateway mode.  It submits the catalog hash
+// and object list to the gateway via SubmitPayload, then releases the lease
+// with commit=true to trigger the gateway's internal cvmfs_server publish call.
+func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
+	if err := c.SubmitPayload(ctx, req.Token, req.CatalogHash, req.ObjectHashes); err != nil {
+		return fmt.Errorf("gateway submit payload: %w", err)
+	}
+	if err := c.Release(ctx, req.Token, true); err != nil {
+		return fmt.Errorf("gateway release (commit): %w", err)
+	}
+	return nil
+}
+
+// Abort implements Backend.  It releases the gateway lease without committing,
+// causing the gateway to discard the in-progress transaction.
+func (c *Client) Abort(ctx context.Context, token string) error {
+	if err := c.Release(ctx, token, false); err != nil {
+		return fmt.Errorf("gateway release (abort): %w", err)
+	}
+	return nil
+}
+
+// NeedsPipeline implements Backend.  The gateway backend always requires the
+// full compress / dedup / CAS-upload pipeline so that objects are available in
+// the CAS before the SubmitPayload call.
+func (c *Client) NeedsPipeline() bool { return true }
+
+// Probe implements Backend.  It acquires a sentinel lease against a reserved
+// probe path and immediately releases it, confirming the gateway API is
+// reachable and functioning correctly.
+func (c *Client) Probe(ctx context.Context) error {
+	pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	l, err := c.acquireLease(pctx, probeRepo, probeRepo)
+	if err != nil {
+		return fmt.Errorf("acquire lease: %w", err)
+	}
+	if err := c.Release(pctx, l.Token, false); err != nil {
+		// Non-fatal: the lease will expire naturally.  Log and surface so the
+		// probe can report the failure without blocking startup indefinitely.
+		return fmt.Errorf("release lease (non-blocking): %w", err)
+	}
+	return nil
+}
+
+// probeRepo is the sentinel repository name used by Probe.
+// It matches the value used historically by probe.probeGateway.
+const probeRepo = "__probe__"

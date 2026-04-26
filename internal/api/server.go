@@ -5,7 +5,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +51,10 @@ type Server struct {
 	notifyBus *notify.Bus
 	// spoolRoot is the root directory for job state storage.
 	spoolRoot string
+	// stagingRoot is the operator-configured directory from which tar_path
+	// references (JSON submissions) are allowed.  Empty disables JSON/tar_path
+	// mode — callers must upload the tar as multipart/form-data instead.
+	stagingRoot string
 	// jobWg tracks all background job goroutines so Shutdown can wait for them
 	// to reach a terminal state before the process exits.
 	jobWg sync.WaitGroup
@@ -57,16 +63,19 @@ type Server struct {
 // New creates a new API server.
 // apiToken is the expected bearer token for authenticated routes.
 // Pass an empty string to disable authentication (development only).
-func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.Spool, nb *notify.Bus, spoolRoot string) *Server {
+// stagingRoot, when non-empty, enables the JSON tar_path submission mode and
+// restricts acceptable tar_path values to files within that directory tree.
+func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.Spool, nb *notify.Bus, spoolRoot, stagingRoot string) *Server {
 	router := mux.NewRouter()
 	s := &Server{
-		router:    router,
-		obs:       obs,
-		apiToken:  apiToken,
-		orch:      orch,
-		sp:        sp,
-		notifyBus: nb,
-		spoolRoot: spoolRoot,
+		router:      router,
+		obs:         obs,
+		apiToken:    apiToken,
+		orch:        orch,
+		sp:          sp,
+		notifyBus:   nb,
+		spoolRoot:   spoolRoot,
+		stagingRoot: stagingRoot,
 		httpServer: &http.Server{
 			Handler: router,
 		},
@@ -150,12 +159,28 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // submitJob handles POST /api/v1/jobs
 //
-// Accepts multipart/form-data with fields:
+// Two submission modes are supported, selected by Content-Type:
+//
+// ── Multipart upload (Content-Type: multipart/form-data) ─────────────────────
 //
 //	repo        — repository name (e.g. "software.cern.ch")
 //	path        — gateway lease sub-path (e.g. "atlas/24.0")
 //	tar         — the tar file to publish (binary)
+//	tar_sha256  — optional hex-encoded SHA-256 of the tar; verified if present
 //	webhook_url — optional URL to POST when the job reaches a terminal state
+//
+// ── Staged tar reference (Content-Type: application/json) ────────────────────
+//
+// Used when the tar has already been transferred to the server's staging
+// directory (e.g. via rsync).  Requires --staging-root to be configured.
+//
+//	{
+//	  "repo":        "software.cern.ch",
+//	  "path":        "atlas/24.0",
+//	  "tar_path":    "/staging/atlas/payload-abc123.tar",
+//	  "tar_sha256":  "e3b0c44...",   // required — verified before accepting job
+//	  "webhook_url": "https://..."   // optional
+//	}
 //
 // Returns 202 Accepted with {"job_id": "<uuid>"}.  The caller should poll
 // GET /api/v1/jobs/{id} or subscribe to GET /api/v1/jobs/{id}/events.
@@ -163,61 +188,161 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	_, span := s.obs.Tracer.Start(r.Context(), "api.submit_job")
 	defer span.End()
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		http.Error(w, `{"error":"invalid multipart form"}`, http.StatusBadRequest)
-		return
-	}
+	contentType := r.Header.Get("Content-Type")
 
-	repo := r.FormValue("repo")
-	if repo == "" {
-		http.Error(w, `{"error":"repo field is required"}`, http.StatusBadRequest)
-		return
-	}
-	subPath := r.FormValue("path")
-	webhookURL := r.FormValue("webhook_url")
-
-	tarFile, _, err := r.FormFile("tar")
-	if err != nil {
-		http.Error(w, `{"error":"tar field is required"}`, http.StatusBadRequest)
-		return
-	}
-	defer tarFile.Close()
+	var (
+		repo, subPath, webhookURL string
+		spoolTarPath              string // final path inside the spool
+		submittedSHA256           string // caller-supplied; may be empty
+	)
 
 	jobID := uuid.New().String()
 	jobDir := filepath.Join(s.spoolRoot, "incoming", jobID)
-	if err := os.MkdirAll(jobDir, 0700); err != nil {
-		span.RecordError(err)
-		http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
-		return
+
+	if strings.HasPrefix(contentType, "application/json") {
+		// ── JSON / tar_path mode ─────────────────────────────────────────────
+		if s.stagingRoot == "" {
+			http.Error(w, `{"error":"tar_path submissions require --staging-root to be configured on this server"}`, http.StatusServiceUnavailable)
+			return
+		}
+
+		var req struct {
+			Repo       string `json:"repo"`
+			Path       string `json:"path"`
+			TarPath    string `json:"tar_path"`
+			TarSHA256  string `json:"tar_sha256"`
+			WebhookURL string `json:"webhook_url"`
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
+			return
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+			return
+		}
+		if req.Repo == "" {
+			http.Error(w, `{"error":"repo field is required"}`, http.StatusBadRequest)
+			return
+		}
+		if req.TarPath == "" {
+			http.Error(w, `{"error":"tar_path field is required"}`, http.StatusBadRequest)
+			return
+		}
+		// tar_sha256 is mandatory for JSON mode — it's the integrity guarantee.
+		if req.TarSHA256 == "" {
+			http.Error(w, `{"error":"tar_sha256 is required when using tar_path submission"}`, http.StatusBadRequest)
+			return
+		}
+
+		// Resolve and validate the path is within stagingRoot.
+		resolvedPath, err := resolveLocalTarPath(s.stagingRoot, req.TarPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid tar_path: %s"}`, jsonEscape(err.Error())), http.StatusBadRequest)
+			return
+		}
+
+		// Verify SHA-256 before touching the spool.
+		if err := verifySHA256(resolvedPath, req.TarSHA256); err != nil {
+			span.RecordError(err)
+			http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: %s"}`, jsonEscape(err.Error())), http.StatusBadRequest)
+			return
+		}
+
+		// Create spool job directory and move/link the tar into it.
+		if err := os.MkdirAll(jobDir, 0700); err != nil {
+			span.RecordError(err)
+			http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
+			return
+		}
+
+		spoolTarPath = filepath.Join(jobDir, "payload.tar")
+		if err := moveOrLink(resolvedPath, spoolTarPath); err != nil {
+			span.RecordError(err)
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"internal error moving tar to spool"}`, http.StatusInternalServerError)
+			return
+		}
+
+		repo = req.Repo
+		subPath = req.Path
+		webhookURL = req.WebhookURL
+		submittedSHA256 = req.TarSHA256
+
+	} else {
+		// ── Multipart upload mode (default) ─────────────────────────────────
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, `{"error":"invalid multipart form"}`, http.StatusBadRequest)
+			return
+		}
+
+		repo = r.FormValue("repo")
+		if repo == "" {
+			http.Error(w, `{"error":"repo field is required"}`, http.StatusBadRequest)
+			return
+		}
+		subPath = r.FormValue("path")
+		webhookURL = r.FormValue("webhook_url")
+		submittedSHA256 = r.FormValue("tar_sha256") // optional
+
+		tarFile, _, err := r.FormFile("tar")
+		if err != nil {
+			http.Error(w, `{"error":"tar field is required"}`, http.StatusBadRequest)
+			return
+		}
+		defer tarFile.Close()
+
+		if err := os.MkdirAll(jobDir, 0700); err != nil {
+			span.RecordError(err)
+			http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
+			return
+		}
+
+		spoolTarPath = filepath.Join(jobDir, "payload.tar")
+		spoolFile, err := os.OpenFile(spoolTarPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+		if err != nil {
+			span.RecordError(err)
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"internal error creating tar file"}`, http.StatusInternalServerError)
+			return
+		}
+
+		// Cap incoming tar size and optionally compute SHA-256 as we stream.
+		hasher := sha256.New()
+		dst := io.Writer(spoolFile)
+		if submittedSHA256 != "" {
+			dst = io.MultiWriter(spoolFile, hasher)
+		}
+		n, copyErr := io.Copy(dst, io.LimitReader(tarFile, maxTarSize+1))
+		spoolFile.Close()
+		if copyErr != nil {
+			span.RecordError(copyErr)
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"error writing tar to spool"}`, http.StatusInternalServerError)
+			return
+		}
+		if n > maxTarSize {
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"tar exceeds maximum allowed size"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+
+		// Verify the optional checksum.
+		if submittedSHA256 != "" {
+			computed := hex.EncodeToString(hasher.Sum(nil))
+			if !strings.EqualFold(computed, submittedSHA256) {
+				os.RemoveAll(jobDir)
+				http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: got %s, expected %s"}`, computed, submittedSHA256), http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
-	tarPath := filepath.Join(jobDir, "payload.tar")
-	spoolFile, err := os.OpenFile(tarPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-	if err != nil {
-		span.RecordError(err)
-		os.RemoveAll(jobDir)
-		http.Error(w, `{"error":"internal error creating tar file"}`, http.StatusInternalServerError)
-		return
-	}
-
-	// Cap incoming tar size before writing to spool.
-	n, copyErr := io.Copy(spoolFile, io.LimitReader(tarFile, maxTarSize+1))
-	spoolFile.Close()
-	if copyErr != nil {
-		span.RecordError(copyErr)
-		os.RemoveAll(jobDir)
-		http.Error(w, `{"error":"error writing tar to spool"}`, http.StatusInternalServerError)
-		return
-	}
-	if n > maxTarSize {
-		os.RemoveAll(jobDir)
-		http.Error(w, `{"error":"tar exceeds maximum allowed size"}`, http.StatusRequestEntityTooLarge)
-		return
-	}
-
-	j := job.NewJob(jobID, repo, "", tarPath)
+	j := job.NewJob(jobID, repo, "", spoolTarPath)
 	j.Path = subPath
 	j.WebhookURL = webhookURL
+	j.TarSHA256 = submittedSHA256
 
 	// Extract provenance metadata — from OIDC token (verified) or plain headers.
 	if s.orch.Provenance != nil {
@@ -263,6 +388,105 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, `{"job_id":%q}`, jobID)
+}
+
+// resolveLocalTarPath resolves tarPath to an absolute path and verifies that
+// it is contained within stagingRoot.  Returns an error if tarPath attempts a
+// directory traversal (e.g. via "../" components) or points outside the staging
+// tree.
+func resolveLocalTarPath(stagingRoot, tarPath string) (string, error) {
+	absStaging, err := filepath.Abs(stagingRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving staging root: %w", err)
+	}
+	abs, err := filepath.Abs(tarPath)
+	if err != nil {
+		return "", fmt.Errorf("resolving tar_path: %w", err)
+	}
+	// filepath.Rel returns a path starting with ".." when abs is outside absStaging.
+	rel, err := filepath.Rel(absStaging, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("tar_path %q is outside the configured staging directory %q", tarPath, stagingRoot)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", fmt.Errorf("tar_path does not exist or is not accessible: %w", err)
+	}
+	return abs, nil
+}
+
+// verifySHA256 opens the file at path, streams it through a SHA-256 hasher,
+// and compares the result against expectedHex (case-insensitive).  Returns a
+// descriptive error on mismatch.
+func verifySHA256(path, expectedHex string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening file for SHA-256 check: %w", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("hashing file: %w", err)
+	}
+	computed := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(computed, expectedHex) {
+		return fmt.Errorf("computed %s, caller supplied %s", computed, expectedHex)
+	}
+	return nil
+}
+
+// moveOrLink moves src to dst using the fastest available mechanism:
+//  1. os.Rename  — atomic and zero-copy when src and dst are on the same filesystem
+//  2. os.Link    — creates a hard link (zero-copy; both names refer to the same inode)
+//  3. copyFile   — full byte copy across filesystems; removes src on success
+func moveOrLink(src, dst string) error {
+	// Try atomic rename first.
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	// Try hard link (works only on the same filesystem, unlike Rename across mounts).
+	if err := os.Link(src, dst); err == nil {
+		// Remove the staging copy so the staging directory does not accumulate stale files.
+		_ = os.Remove(src)
+		return nil
+	}
+	// Fall back to a full copy.
+	if err := copyFile(src, dst); err != nil {
+		return err
+	}
+	_ = os.Remove(src)
+	return nil
+}
+
+// copyFile copies the contents of src to dst (created with 0600 permissions).
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("opening source: %w", err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("creating destination: %w", err)
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return fmt.Errorf("copying data: %w", err)
+	}
+	return out.Close()
+}
+
+// jsonEscape returns s with double-quote and backslash characters escaped so
+// it can be safely embedded as a JSON string value without a full marshal.
+// It is intentionally minimal — only the characters that break inline JSON
+// string literals are escaped.
+func jsonEscape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
 }
 
 // getJob returns the current state of a job.

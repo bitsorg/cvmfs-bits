@@ -95,7 +95,7 @@ func TestProbe_GatewayFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected probe to fail when gateway is unavailable")
 	}
-	if !strings.Contains(err.Error(), "gateway probe failed") {
+	if !strings.Contains(err.Error(), "backend probe failed") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }

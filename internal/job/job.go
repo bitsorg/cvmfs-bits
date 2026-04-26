@@ -74,6 +74,10 @@ type Job struct {
 	PackageName string
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string
+	// TarSHA256 is the hex-encoded SHA-256 digest of the tar file, recorded at
+	// submission time.  Non-empty when the caller provided a checksum (required
+	// for tar_path / JSON submissions; optional for multipart uploads).
+	TarSHA256 string
 	// State is the current FSM state.
 	State State
 	// CreatedAt is the job creation time.

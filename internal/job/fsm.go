@@ -15,7 +15,13 @@ import "fmt"
 //                             uploading → leased  (fast path: no Stratum 1s)
 var validTransitions = map[State]map[State]bool{
 	StateIncoming: {
-		StateStaging: true, // pipeline starts immediately — no lease needed yet
+		StateStaging: true, // gateway mode: compress/dedup pipeline starts immediately
+		// Local mode fast path: NeedsPipeline()==false → skip staging/uploading and
+		// acquire the cvmfs_server transaction directly.  The orchestrator is
+		// responsible for checking NeedsPipeline() before taking this path; the FSM
+		// permits the transition for both modes because enforcing the mode constraint
+		// at the FSM layer would couple job state to backend type.
+		StateLeased:  true,
 		StateAborted: true,
 		StateFailed:  true,
 	},

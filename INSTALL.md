@@ -7,12 +7,13 @@
 3. [Directory Layout and Permissions](#3-directory-layout-and-permissions)
 4. [Configuration](#4-configuration)
 5. [Option A — Single-Node Deployment](#5-option-a--single-node-deployment)
+   - [5.1 Local Mode (no cvmfs\_gateway)](#51-local-mode-no-cvmfs_gateway)
 6. [Option B — Distributed Deployment with Stratum 1 Pre-Warming](#6-option-b--distributed-deployment-with-stratum-1-pre-warming)
    - [6.3 MQTT Control Plane (optional)](#63-mqtt-control-plane-optional)
 7. [Systemd Setup](#7-systemd-setup)
 8. [Health Check and Smoke Test](#8-health-check-and-smoke-test)
 9. [Upgrading](#9-upgrading)
-10. [Uninstalling](#10-uninstalling)
+10. [Installing and Uninstalling](#10-installing-and-uninstalling)
 
 ---
 
@@ -202,6 +203,83 @@ CAS. No Stratum 1 receiver agent is needed.
 
 The existing `cvmfs_server publish` workflow continues to work in parallel; the
 gateway lease enforces mutual exclusion at the path level.
+
+### 5.1 Local Mode (no cvmfs_gateway)
+
+If your Stratum 0 does not run `cvmfs_gateway` — for example, a single-node
+test environment or a site that manages leases through `cvmfs_server` directly —
+you can use **local mode**. In this mode cvmfs-prepub calls `cvmfs_server
+transaction` and `cvmfs_server publish` as subprocesses instead of the gateway
+HTTP API. No gateway key or heartbeat is required.
+
+```
+[client]  ──POST /api/v1/jobs──►  [cvmfs-prepub :8080]
+                                         │
+                               unpack / compress / hash
+                                         │
+                                    local CAS write
+                                         │
+                              cvmfs_server transaction
+                                    (extract tar)
+                              cvmfs_server publish
+```
+
+**Requirements:**
+
+- The `cvmfs_server` binary must be on `PATH` for the service account (`cvmfs-prepub`).
+- The service user must be in the `cvmfs` group (or otherwise permitted to run
+  `cvmfs_server transaction`/`publish`).
+- At most one concurrent transaction is allowed per repository; a second request
+  for the same repo is rejected immediately (equivalent to a gateway 409 Conflict).
+
+**Service account setup:**
+
+```sh
+sudo usermod -aG cvmfs cvmfs-prepub
+```
+
+**Config changes** — set `publish_mode: local` in `/etc/cvmfs-prepub/config.yaml`
+and omit the `gateway:` block entirely:
+
+```yaml
+server:
+  listen: ":8080"
+
+spool_root: /var/spool/cvmfs-prepub
+
+publish_mode: local            # use cvmfs_server instead of cvmfs_gateway
+cvmfs_mount: /cvmfs            # filesystem root where repos are mounted
+
+cas:
+  type: localfs
+  root: /srv/cvmfs/cas
+
+pipeline:
+  workers: 0
+  compression: zlib
+  upload_concurrency: 16
+
+repositories:
+  - name: atlas.cern.ch
+```
+
+Or pass `--publish-mode local` and `--cvmfs-mount /cvmfs` on the command line:
+
+```sh
+cvmfs-prepub \
+    --config /etc/cvmfs-prepub/config.yaml \
+    --publish-mode local \
+    --cvmfs-mount /cvmfs
+```
+
+**Probe** — on startup (and via the health endpoint) the service verifies that
+`cvmfs_server` is reachable on `PATH`. The health check reports an error if the
+binary is missing before any job is submitted.
+
+**Lease window** — in local mode there is no server-side lease expiry. The
+service holds a per-repository in-process lock (fail-fast on conflict) for the
+duration of the `cvmfs_server publish` call only, keeping the exclusive window
+as short as possible.
 
 ---
 
@@ -454,16 +532,20 @@ mkdir -p /tmp/smoke/usr/share/test
 echo "hello cvmfs" > /tmp/smoke/usr/share/test/hello.txt
 tar -czf /tmp/smoke.tar.gz -C /tmp/smoke .
 
-# Submit the job
+# Submit the job (multipart/form-data: repo, path, and tar as separate fields)
 JOB=$(curl -sf -X POST http://localhost:8080/api/v1/jobs \
-  -H "Content-Type: application/octet-stream" \
-  --data-binary @/tmp/smoke.tar.gz \
-  -d '{"repo":"atlas.cern.ch","path":"/test/smoke"}' | jq -r .job_id)
+  -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+  -F "repo=atlas.cern.ch" \
+  -F "path=test/smoke" \
+  -F "tar=@/tmp/smoke.tar.gz;type=application/octet-stream" \
+  | jq -r .job_id)
 echo "job: $JOB"
 
 # Poll until terminal state
 for i in $(seq 1 30); do
-  STATE=$(curl -sf http://localhost:8080/api/v1/jobs/$JOB | jq -r .state)
+  STATE=$(curl -sf \
+    -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+    http://localhost:8080/api/v1/jobs/$JOB | jq -r .state)
   echo "$i: $STATE"
   [[ "$STATE" == "published" || "$STATE" == "failed" || "$STATE" == "aborted" ]] && break
   sleep 2
@@ -511,20 +593,176 @@ action is required unless a breaking schema change is explicitly called out.
 
 ---
 
-## 10. Uninstalling
+## 10. Installing and Uninstalling
+
+The repository ships a single `install.sh` script that handles both
+installation and removal.  It is idempotent — running it again updates what
+has changed and skips everything already correct.  Always run with `--dry-run`
+first to preview every action before committing.
+
+### Install
 
 ```sh
-# Stop and disable the service
+# 1. Build binaries first (places them in ./bin/)
+make build
+
+# 2. Preview — nothing is changed
+sudo ./install.sh --dry-run
+
+# 3. Install the publisher service
+sudo ./install.sh
+
+# 4. Install and automatically remove legacy bits-console spool daemon
+sudo ./install.sh --purge-legacy
+
+# 5. Install receiver agent on a Stratum-1 node
+sudo ./install.sh --mode receiver
+```
+
+After installation, edit the generated config templates before starting the
+service (or before the first real job):
+
+| File | Purpose |
+|---|---|
+| `/etc/cvmfs-prepub/config.yaml` | Publisher config — set `gateway.url`, `gateway.key_id`, `repositories`. |
+| `/etc/cvmfs-prepub/env` | Secrets — set `CVMFS_GATEWAY_SECRET`, `PREPUB_API_TOKEN` (mode 0600). |
+| `/etc/cvmfs-prepub/receiver.yaml` | Receiver config (Option B / `--mode receiver`). |
+
+Restart after editing:
+
+```sh
+sudo systemctl restart cvmfs-prepub
+curl http://localhost:8080/api/v1/health
+```
+
+### Uninstall
+
+```sh
+# 1. Preview every action — nothing is changed
+sudo ./install.sh uninstall --dry-run
+
+# 2. Remove the publisher (Stratum-0 node)
+sudo ./install.sh uninstall
+
+# 3. Remove the receiver agent (Stratum-1 node)
+sudo ./install.sh uninstall --mode receiver
+
+# 4. Remove both roles on a combined node
+sudo ./install.sh uninstall --mode all
+```
+
+### Uninstall options
+
+| Option | Effect |
+|---|---|
+| `--dry-run` | Print every action; make no changes. Always run this first. |
+| `--mode publisher` | Remove publisher binary, service, config, spool, CAS. (default) |
+| `--mode receiver` | Remove receiver binary, service, config, receiver CAS. |
+| `--mode all` | Remove all artifacts for both roles. |
+| `--keep-spool` | Preserve `/var/spool/cvmfs-prepub` (job history and WAL journal). |
+| `--keep-cas` | Preserve the local CAS data directory. |
+| `--keep-user` | Preserve the `cvmfs-prepub` system account. |
+| `--purge-legacy` | Also remove legacy bits-console spool daemon artifacts if found. |
+| `--yes` | Skip the interactive confirmation prompt (for automation). |
+
+### What gets removed
+
+**Publisher node** (`--mode publisher`, the default):
+
+| Artifact | Path | Notes |
+|---|---|---|
+| Binary | `/usr/local/bin/cvmfs-prepub` | |
+| Admin CLI | `/usr/local/bin/prepubctl` | |
+| Systemd unit | `/etc/systemd/system/cvmfs-prepub.service` | |
+| Configuration | `/etc/cvmfs-prepub/` | Includes TLS certs and env file |
+| Spool + WAL | `/var/spool/cvmfs-prepub/` | **All job history lost** — use `--keep-spool` |
+| Publisher CAS | `/srv/cvmfs/cas/` (or `cas.root` from config) | **All CAS objects lost** — use `--keep-cas` |
+| System account | `cvmfs-prepub` | `userdel` (no `-r`; home dir removed separately) |
+
+**Receiver node** (`--mode receiver`):
+
+| Artifact | Path | Notes |
+|---|---|---|
+| Binary | `/usr/local/bin/cvmfs-prepub` | |
+| Systemd unit | `/etc/systemd/system/cvmfs-prepub-receiver.service` | |
+| Configuration | `/etc/cvmfs-prepub/` | |
+| Receiver CAS | `/srv/cvmfs/stratum1/cas/` (or `cas.root` from receiver.yaml) | **All pre-warmed objects lost** — use `--keep-cas` |
+| System account | `cvmfs-prepub` | |
+
+The script reads `cas.root` from the config file if present, so custom CAS
+paths are handled automatically without editing the script.
+
+### Legacy bits-console spool daemon detection
+
+If the old `cvmfs-local-publish` daemon (bits-console spool service) is
+detected on the host, `install.sh` warns and optionally removes it.  These
+artifacts conflict with cvmfs-prepub because both attempt CVMFS transactions:
+
+| Legacy artifact | Default path |
+|---|---|
+| Systemd unit | `/etc/systemd/system/cvmfs-local-publish.service` |
+| Daemon binary | `/usr/local/sbin/cvmfs-local-publish.sh` |
+| Submit helper | `/usr/local/bin/cvmfs-spool-submit.sh` |
+| Configuration | `/etc/cvmfs-local-publish.conf` |
+| Spool directory | `/mnt/build/bits/spool` |
+
+Remove legacy artifacts during install:
+
+```sh
+sudo ./install.sh --purge-legacy
+```
+
+Or remove them separately after confirming cvmfs-prepub is working:
+
+```sh
+sudo ./install.sh uninstall --purge-legacy   # removes both sets of artifacts
+```
+
+### Preserving data for post-mortem inspection
+
+```sh
+# Stop the service but keep all data intact for forensics
+sudo ./install.sh uninstall --keep-spool --keep-cas --keep-user
+
+# Inspect the spool before final removal
+ls /var/spool/cvmfs-prepub/
+
+# Final cleanup when done
+sudo ./install.sh uninstall --yes
+```
+
+### Non-interactive removal (automation / Ansible)
+
+```sh
+sudo ./install.sh uninstall --yes --mode all
+```
+
+The exit code is 0 on success, 1 if any step failed (safe to use in `&&` chains).
+
+### Manual equivalent
+
+If you prefer not to run the script, the equivalent manual steps are:
+
+```sh
+# Publisher node — stop and remove
 sudo systemctl stop cvmfs-prepub
 sudo systemctl disable cvmfs-prepub
+sudo rm -f /etc/systemd/system/cvmfs-prepub.service
+sudo systemctl daemon-reload
+sudo rm -f /usr/local/bin/cvmfs-prepub /usr/local/bin/prepubctl
+sudo rm -rf /etc/cvmfs-prepub
+sudo rm -rf /var/spool/cvmfs-prepub          # CAUTION: deletes all job history
+sudo rm -rf /srv/cvmfs/cas                   # CAUTION: deletes all CAS objects
+sudo userdel cvmfs-prepub
 
-# Remove binaries
-sudo rm /usr/local/bin/cvmfs-prepub /usr/local/bin/prepubctl
-
-# Remove config and spool (CAUTION: deletes all job history)
-sudo rm -rf /etc/cvmfs-prepub /var/spool/cvmfs-prepub
-
-# Remove the system account
+# Receiver node (Option B) — additional steps on each Stratum-1 host
+sudo systemctl stop cvmfs-prepub-receiver
+sudo systemctl disable cvmfs-prepub-receiver
+sudo rm -f /etc/systemd/system/cvmfs-prepub-receiver.service
+sudo systemctl daemon-reload
+sudo rm -f /usr/local/bin/cvmfs-prepub
+sudo rm -rf /etc/cvmfs-prepub
+sudo rm -rf /srv/cvmfs/stratum1/cas          # CAUTION: deletes receiver cache
 sudo userdel cvmfs-prepub
 ```
 
@@ -622,13 +860,15 @@ compile_and_publish:
     - bits build --architecture $ARCHITECTURE --platform $PLATFORM
     # 4. Package the build output as a tar
     - tar -czf /tmp/build-output.tar.gz -C /tmp/bits-output .
-    # 5. Submit to cvmfs-prepub
+    # 5. Submit to cvmfs-prepub (multipart/form-data: repo, path, tar as separate fields)
     - |
+      PREPUB_REPO=$(echo "$PUBLISH_PATH" | cut -d/ -f3)
+      PREPUB_SUBPATH=$(echo "$PUBLISH_PATH" | cut -d/ -f4-)
       JOB_ID=$(curl -fsSL -X POST \
         -H "Authorization: Bearer $PREPUB_API_TOKEN" \
-        -H "X-Cvmfs-Path: $PUBLISH_PATH" \
-        -H "Content-Type: application/x-tar" \
-        --data-binary @/tmp/build-output.tar.gz \
+        -F "repo=${PREPUB_REPO}" \
+        -F "path=${PREPUB_SUBPATH}" \
+        -F "tar=@/tmp/build-output.tar.gz;type=application/octet-stream" \
         "${PREPUB_URL}/api/v1/jobs" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
       echo "Submitted cvmfs-prepub job: $JOB_ID"
     # 6. Poll until published (timeout 30 min)
