@@ -220,23 +220,36 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 		return nil, fmt.Errorf("lease acquisition failed: status %d: %s", resp.StatusCode, data)
 	}
 
+	// Real cvmfs_gateway response format:
+	//   {"status":"ok","session_token":"<tok>","max_lease_time":<seconds>}
 	var result struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
+		Status       string `json:"status"`
+		SessionToken string `json:"session_token"`
+		MaxLeaseTime int    `json:"max_lease_time"` // seconds
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("decoding lease response: %w", err)
 	}
+	if result.Status != "ok" {
+		err := fmt.Errorf("gateway returned status %q", result.Status)
+		span.RecordError(err)
+		return nil, fmt.Errorf("lease acquisition: %w", err)
+	}
+	if result.SessionToken == "" {
+		err := fmt.Errorf("gateway returned empty session_token")
+		span.RecordError(err)
+		return nil, err
+	}
 
 	c.obs.Metrics.LeaseAcquireDuration.Observe(time.Since(start).Seconds())
 
 	return &Lease{
-		Token:     result.Token,
+		Token:     result.SessionToken,
 		Path:      path,
 		Repo:      repo,
-		ExpiresAt: result.ExpiresAt,
+		ExpiresAt: time.Now().Add(time.Duration(result.MaxLeaseTime) * time.Second),
 	}, nil
 }
 
@@ -274,14 +287,21 @@ func (c *Client) Renew(ctx context.Context, token string) error {
 }
 
 // Release releases a held lease, optionally committing the publish.
-// If commit is true, the gateway finalizes the publish operation.
+// If commit is true, the gateway finalizes the publish (the catalog hash has
+// already been submitted via SubmitPayload).
 // If commit is false, the publish is rolled back and the objects remain inaccessible.
+//
+// The real cvmfs_gateway REST API uses a plain DELETE with no query parameters;
+// the gateway infers commit intent from whether SubmitPayload was called first.
 func (c *Client) Release(ctx context.Context, token string, commit bool) error {
 	ctx, span := c.obs.Tracer.Start(ctx, "lease.release")
 	defer span.End()
 
-	url := fmt.Sprintf("%s/api/v1/leases/%s?commit=%v", c.BaseURL, token, commit)
-	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	// Do not append ?commit=… — the real cvmfs_gateway does not accept that
+	// query parameter on DELETE /api/v1/leases/{token} and returns 405.
+	_ = commit
+	releaseURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, token)
+	req, err := http.NewRequestWithContext(ctx, "DELETE", releaseURL, nil)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("creating request: %w", err)
@@ -447,9 +467,10 @@ func (c *Client) Probe(ctx context.Context) error {
 		return fmt.Errorf("acquire lease: %w", err)
 	}
 	if err := c.Release(pctx, l.Token, false); err != nil {
-		// Non-fatal: the lease will expire naturally.  Log and surface so the
-		// probe can report the failure without blocking startup indefinitely.
-		return fmt.Errorf("release lease (non-blocking): %w", err)
+		// Non-fatal: the lease will expire naturally on its own.
+		// Log the warning but do not fail startup — the gateway is reachable
+		// (we acquired the lease) and a transient release error is not fatal.
+		c.obs.Logger.Warn("probe: lease release failed (non-fatal)", "error", err)
 	}
 	return nil
 }

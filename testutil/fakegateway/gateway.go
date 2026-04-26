@@ -107,10 +107,13 @@ func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {
 		g.leases[token] = lease
 		g.mu.Unlock()
 
+		// Use the same response format as the real cvmfs_gateway:
+		//   {"status":"ok","session_token":"<tok>","max_lease_time":<seconds>}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"token":      token,
-			"expires_at": lease.expiresAt,
+			"status":         "ok",
+			"session_token":  token,
+			"max_lease_time": int(5 * time.Minute / time.Second), // 300
 		})
 
 	} else if r.Method == "PUT" {

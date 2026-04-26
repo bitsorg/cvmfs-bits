@@ -243,10 +243,10 @@ func TestAcquireLease_PercentEncodesPath(t *testing.T) {
 		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/leases/") {
 			// RawPath holds the percent-encoded form; Path is already decoded.
 			capturedRawPath = r.URL.RawPath
-			// Return a minimal lease JSON so acquireLease does not error on decode.
+			// Return a minimal lease JSON matching the real cvmfs_gateway format.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"token":"tok","expires_at":"2099-01-01T00:00:00Z"}`))
+			_, _ = w.Write([]byte(`{"status":"ok","session_token":"tok","max_lease_time":300}`))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
