@@ -1,32 +1,27 @@
 // Package lease manages gateway lease acquisition, renewal, and release for
 // CVMFS publish operations. Leases provide short-term exclusive publish locks
-// on a repository path, protected by HMAC-SHA256 signed requests.
+// on a repository path, protected by HMAC-SHA1 signed requests (matching the
+// cvmfs_gateway Erlang implementation's expected auth format).
 package lease
 
 import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
+	"crypto/sha1"
 	"crypto/tls"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"cvmfs.io/prepub/pkg/observe"
 )
-
-// signatureWindow is the maximum age of a signed request that the gateway will
-// accept. Requests older than this are rejected as potential replays.
-// (The gateway must enforce the same window on its side.)
-const signatureWindow = 60 * time.Second
 
 // maxConsecutiveHeartbeatFailures is the number of back-to-back renewal errors
 // after which Heartbeat calls cancelJob to abort the in-progress publish.
@@ -85,21 +80,15 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 	}
 }
 
-// signRequest signs the request with HMAC-SHA256 over:
+// signRequest signs the request using the cvmfs_gateway authentication scheme:
 //
-//	method + " " + requestURI + " " + bodyHash + " " + unixTimestamp
+//	Authorization: HMAC <key_id>:<base64(HMAC-SHA1(body, secret))>
 //
-// This covers:
-//   - method:      prevents cross-verb replay
-//   - requestURI:  path + query string — prevents cross-endpoint replay AND
-//     parameter tampering (e.g. flipping ?commit=true→false). Fix #13.
-//   - bodyHash:    prevents body substitution attacks
-//   - timestamp:   prevents replay attacks beyond signatureWindow
+// The real cvmfs_gateway (Erlang implementation) computes HMAC-SHA1 over the
+// raw request body and base64-encodes the result.  For requests with no body
+// (e.g. DELETE, GET) the HMAC is computed over an empty byte string.
 func (c *Client) signRequest(req *http.Request) error {
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-
-	// Snapshot the body so we can both hash it and leave it readable for the
-	// actual HTTP send.
+	// Snapshot the body so we can both sign it and leave it readable for send.
 	var bodyBytes []byte
 	if req.Body != nil && req.Body != http.NoBody {
 		var err error
@@ -111,25 +100,11 @@ func (c *Client) signRequest(req *http.Request) error {
 		req.ContentLength = int64(len(bodyBytes))
 	}
 
-	bodyHash := sha256.Sum256(bodyBytes) // sha256("") for requests with no body
-	bodyHashHex := hex.EncodeToString(bodyHash[:])
+	h := hmac.New(sha1.New, []byte(c.Secret))
+	h.Write(bodyBytes)
+	signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
-	// RequestURI() returns path + query string (e.g. /api/v1/leases/tok?commit=true)
-	// so query parameters are covered by the signature.
-	//
-	// NOTE: The Host is intentionally omitted from the signed message.  Adding
-	// it would prevent cross-host replay but would require a matching change to
-	// the gateway's signature verifier.  Track in the gateway backlog before
-	// enabling host binding here.
-	message := req.Method + " " + req.URL.RequestURI() + " " + bodyHashHex + " " + ts
-
-	h := hmac.New(sha256.New, []byte(c.Secret))
-	h.Write([]byte(message))
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	// Include timestamp in the header so the gateway can verify the window.
-	req.Header.Set("Authorization", fmt.Sprintf("hmac-sha256 %s:%s", c.KeyID, signature))
-	req.Header.Set("X-Prepub-Timestamp", ts)
+	req.Header.Set("Authorization", fmt.Sprintf("HMAC %s:%s", c.KeyID, signature))
 	return nil
 }
 

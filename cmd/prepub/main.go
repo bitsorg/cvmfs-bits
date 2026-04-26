@@ -252,6 +252,15 @@ func runPublisher(
 			}
 		}
 
+		// CVMFS_GATEWAY_KEY_ID selects which key the gateway recognises.
+		// Must match a key_id in the gateway's key file
+		// (e.g. /etc/cvmfs/keys/<repo>.gw: "plain_text <key_id> <secret>").
+		// Defaults to "cvmfs-prepub" if not set.
+		gatewayKeyID := os.Getenv("CVMFS_GATEWAY_KEY_ID")
+		if gatewayKeyID == "" {
+			gatewayKeyID = "cvmfs-prepub"
+		}
+
 		switch casType {
 		case "localfs":
 			lfs, err := cas.NewLocalFS(casRoot)
@@ -265,7 +274,8 @@ func runPublisher(
 			os.Exit(1)
 		}
 
-		leaseBackend = lease.NewClient(gatewayURL, "cvmfs-prepub", gatewaySecret, obs)
+		leaseBackend = lease.NewClient(gatewayURL, gatewayKeyID, gatewaySecret, obs)
+		obs.Logger.Info("gateway credentials", "key_id", gatewayKeyID)
 		obs.Logger.Info("publish backend: gateway", "url", gatewayURL)
 
 	case "local":
