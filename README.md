@@ -32,14 +32,18 @@ gateway lease enforces mutual exclusion at the path level.
 | **Pre-processes tar** | ✓ | ✓ | ✓ |
 | **Bypasses overlay FS** | ✓ | ✓ | ✓ |
 | **Pre-warms Stratum 1** | ✗ | ✓ | ✓ |
-| **Inbound firewall rules at S1** | None | HTTPS 9100 | None (outbound 8883 only) |
+| **Inbound firewall rules at S1** | None | TCP 9100 (data push) | TCP 9100 (data push); outbound TCP 8883 to broker (control) |
 | **New infrastructure** | None | Receiver agent on each S1 | Receiver agent + MQTT broker |
 | **Phase** | 1 | 2 | 2 |
 
-The MQTT variant of Option B is useful when Stratum 1 sites are behind strict
-firewalls: receivers connect outbound to a shared broker (typically on Stratum 0
-infrastructure) rather than exposing an inbound port.  The data channel (object
-PUT) is identical in both variants.
+The MQTT variant of Option B shifts the **control plane** (announce/ready
+exchange) onto a shared broker — receivers connect outbound to the broker (TCP
+8883) so Stratum 1 sites need not be reachable from Stratum 0 for signalling.
+The **data plane** is identical in both variants: after the ready exchange the
+publisher connects directly to each receiver's HTTP endpoint (TCP 9100 inbound
+on each S1) to push CAS objects.  MQTT therefore helps when S1 sites cannot
+accept arbitrary inbound connections from S0, but each receiver must still
+accept the data push from S0 on port 9100.
 
 See [REFERENCE.md §5](REFERENCE.md#5-option-a--inline-pre-processor),
 [§6](REFERENCE.md#6-option-b--distributed-pre-processor-with-stratum-1-pre-warming),
@@ -133,4 +137,5 @@ traces observable in a single `go test` run without any external services.
 - Go 1.22+
 - `cvmfs_gateway` ≥ 1.2 (for the lease-and-payload API)
 - Write access to the CAS backend (local filesystem or S3-compatible)
-- Network access to each Stratum 1 (Option B only)
+- TCP 9100 inbound on each Stratum 1 for the CAS object data push (Option B only — both HTTP and MQTT variants)
+- TCP 8883 outbound from each Stratum 1 to the MQTT broker, plus TCP 8883 inbound on the broker host (Option B MQTT variant only)

@@ -39,12 +39,36 @@
 - Each Stratum 1 node must run the receiver agent (see §6)
 - A shared MQTT broker (e.g. Eclipse Mosquitto or EMQ X) reachable from both the pre-publisher and all Stratum 1 receivers — typically hosted on Stratum 0 infrastructure
 - mTLS certificates for the broker, publisher, and each receiver node (one client certificate per node)
-- Only outbound TCP 8883 from each Stratum 1 site to the broker; no inbound firewall rules required at Stratum 1
+- Each Stratum 1 node connects **outbound** to the broker (TCP 8883) for the MQTT control exchange — no inbound port is needed for signalling
+- Each Stratum 1 node still requires **TCP 9100 inbound** from the Stratum 0 publisher for the CAS object data push (identical to the HTTP path; MQTT only replaces the announce/ready control channel)
 
 **Not required:**
 
 - `cvmfs` client tools on the pre-publisher node
 - Squid or any proxy — access tracking is proxy-agnostic (see REFERENCE.md §8.1)
+
+### 1.1 Network Requirements
+
+The table below summarises inbound and outbound port requirements per site for
+each deployment option.
+
+| Site | Direction | Port / protocol | Required for | Notes |
+|---|---|---|---|---|
+| **Build runners** | outbound | TCP 8080 (HTTPS) to S0 | All options | POST to cvmfs-prepub REST API |
+| **Stratum 0** | inbound | TCP 8080 | All options | cvmfs-prepub REST API; TLS strongly recommended |
+| **Stratum 0** | inbound | TCP 8883 | MQTT only | MQTT broker, if hosted on S0 infrastructure |
+| **Stratum 0** | outbound | TCP 9100 to each S1 | Option B (HTTP + MQTT) | Data push — publisher connects to each receiver |
+| **Stratum 0** | outbound | TCP 8883 to broker | MQTT only | Publisher connects to MQTT broker for announce |
+| **Stratum 1** | inbound | TCP 9100 | Option B (HTTP + MQTT) | Receiver data endpoint — both HTTP and MQTT paths |
+| **Stratum 1** | outbound | TCP 8883 to broker | MQTT only | Receiver connects to MQTT broker for control exchange |
+| **MQTT broker host** | inbound | TCP 8883 | MQTT only | mTLS; one connection per publisher job + one persistent per receiver |
+
+**Key point:** MQTT replaces the Stratum 1 control-plane exposure — receivers
+subscribe outbound so S0 does not need to reach S1 for the announce/ready
+handshake.  However, once a receiver has signalled readiness (via the broker),
+the publisher connects *directly* to the receiver's HTTP data endpoint to push
+CAS objects.  **TCP 9100 inbound on each Stratum 1 is therefore required in
+both Option B variants.**
 
 ---
 
@@ -335,9 +359,13 @@ For a full topology diagram see [REFERENCE.md §6](REFERENCE.md#6-option-b--dist
 ### 6.3 MQTT Control Plane (optional)
 
 The default Option B announce uses HTTPS from the publisher to each receiver
-(inbound port 9100 on each Stratum 1).  If your Stratum 1 sites sit behind
-strict firewalls you can use the **MQTT control plane** instead — receivers
-connect outbound to a shared broker (only outbound TCP 8883 required).
+(inbound port 9100 on each Stratum 1).  If your Stratum 1 sites cannot accept
+inbound connections from the Stratum 0 publisher for signalling, you can use
+the **MQTT control plane** instead — the announce/ready exchange is routed
+through a shared broker so each receiver needs only outbound TCP 8883 for the
+control channel.  Note that the CAS object data push is unchanged: the
+publisher still connects directly to each receiver's HTTP endpoint (TCP 9100
+inbound on each S1) after receiving the ready signal via the broker.
 
 See [REFERENCE.md §20.11](REFERENCE.md#2011-mqtt-control-plane-optional) for
 the full topic schema, security model, and flow diagram.
