@@ -262,6 +262,39 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 	return nil
 }
 
+// findJobDir returns the actual on-disk directory for a job, regardless of
+// what the manifest's State field says.  It checks the expected directory for
+// hintState first (fast path), then scans all non-terminal state directories.
+// Returns "" if the directory cannot be found anywhere.
+func (s *Spool) findJobDir(id string, hintState job.State) string {
+	// Fast path: the manifest state matches the actual directory.
+	expected := filepath.Join(s.Root, string(hintState), id)
+	if _, err := os.Stat(expected); err == nil {
+		return expected
+	}
+
+	// Slow path: crash left the directory in a different state directory.
+	// Search all non-terminal states (terminal jobs are never recovered).
+	nonTerminal := []job.State{
+		job.StateIncoming,
+		job.StateStaging,
+		job.StateUploading,
+		job.StateDistributing,
+		job.StateLeased,
+		job.StateCommitting,
+	}
+	for _, state := range nonTerminal {
+		if state == hintState {
+			continue // already checked above
+		}
+		candidate := filepath.Join(s.Root, string(state), id)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
 // ResetForRecovery moves a non-terminal job back to the incoming state for reprocessing
 // after a service crash. It bypasses normal FSM transition rules because recovery is
 // an administrative operation, not a regular workflow step.
@@ -274,7 +307,15 @@ func (s *Spool) ResetForRecovery(j *job.Job) error {
 		return fmt.Errorf("cannot reset terminal job %s in state %s", j.ID, j.State)
 	}
 
-	oldDir := s.JobDir(j) // capture before we mutate j.State
+	// Locate the actual on-disk directory for this job.  After a crash the
+	// manifest's State field may not match the real directory location — e.g.
+	// the manifest was rewritten with state=leased but the directory rename
+	// to leased/ never completed, so the directory is still in staging/.
+	// Use s.JobDir(j) as the first guess, then scan all non-terminal states.
+	oldDir := s.findJobDir(j.ID, j.State)
+	if oldDir == "" {
+		return fmt.Errorf("resetting job for recovery: cannot find on-disk directory for job %s (state=%s)", j.ID, j.State)
+	}
 
 	j.RecoveryCount++
 	j.State = job.StateIncoming
