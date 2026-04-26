@@ -422,27 +422,25 @@ func buildMsgHeader(token, hash string) []byte {
 // the binary payload framing protocol.  objBytes is the raw compressed content
 // as stored in the local CAS.
 //
-// We use the new-style /api/v1/payloads/<token> endpoint (rather than the
-// legacy /api/v1/payloads) because:
-//  1. The new endpoint signs with the session token (simpler, matches the
-//     commit/cancel pattern).
-//  2. Some gateway deployments only route the token-URL form to the object-
-//     store backend correctly.
+// Uses POST /api/v1/payloads (base endpoint, no token in URL).  The gateway
+// router does not expose a /api/v1/payloads/<token> route; sending to that URL
+// causes a 30-second hang with no response (no matching Erlang/Go handler).
 //
-// The binary framing is identical for both endpoints:
+// Binary framing:
 //
 //	Message-Size: N
 //	<N bytes JSON header><compressed object bytes>
+//
+// HMAC is computed over the JSON header bytes only (first Message-Size bytes).
+// The gateway authz module extracts those bytes before verifying the signature.
 func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, hash string, objBytes []byte) error {
-	// Use /api/v1/payloads/<token> — HMAC over token string.
-	// url.PathEscape encodes characters like '=' (base32 padding) that are
-	// legal in URLs but confuse some HTTP routers when used raw in path segments.
-	payloadURL := basePayloadURL + "/" + url.PathEscape(token)
-
+	// POST /api/v1/payloads — real cvmfs_gateway only exposes the base endpoint;
+	// there is no /api/v1/payloads/<token> route in the gateway router.
+	// Sending to the token-URL form causes a 30-second hang (no matching handler).
 	msgHeader := buildMsgHeader(token, hash)
 	body := append(msgHeader, objBytes...)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", payloadURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", basePayloadURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("creating payload request: %w", err)
 	}
@@ -450,8 +448,12 @@ func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, has
 	req.Header.Set("Message-Size", strconv.Itoa(len(msgHeader)))
 	req.ContentLength = int64(len(body))
 
-	// POST /api/v1/payloads/<token> — HMAC over token string per authz.go.
-	c.signWithToken(req, token)
+	// POST /api/v1/payloads — HMAC over the JSON message header bytes only
+	// (the first Message-Size bytes of the body).  The gateway's authz module
+	// extracts those bytes and verifies the signature against them.
+	// Signing over the token string or the full body both produce invalid_hmac.
+	sig := c.computeSignature(msgHeader)
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -513,7 +515,7 @@ func (c *Client) SubmitPayload(ctx context.Context, token, catalogHash string, o
 
 		if err := c.submitOneObject(ctx, payloadURL, token, hash, objBytes); err != nil {
 			span.RecordError(err)
-			return fmt.Errorf("gateway submit payload: %w", err)
+			return fmt.Errorf("object %s: %w", hash, err)
 		}
 	}
 
