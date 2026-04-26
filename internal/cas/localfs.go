@@ -90,24 +90,27 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 		return fmt.Errorf("renaming to final path: %w", err)
 	}
 
-	// Fix #11: Verify the written bytes match the expected hash.
-	// A kernel I/O error or incomplete write could silently corrupt the object
-	// without the rename failing.
-	written, err := os.Open(path)
-	if err != nil {
-		os.Remove(path)
-		return fmt.Errorf("opening written object for verification: %w", err)
-	}
-	defer written.Close()
-
-	gotHash, _, err := cvmfshash.HashReader(written)
-	if err != nil {
-		os.Remove(path)
-		return fmt.Errorf("hashing written object: %w", err)
-	}
-	if gotHash != hash {
-		os.Remove(path)
-		return fmt.Errorf("CAS write integrity check failed: expected %s, got %s", hash, gotHash)
+	// Fix #11 (revised): Verify the written file has the expected size.
+	//
+	// The original read-back approach hashed the on-disk bytes and compared
+	// them to the `hash` key — but the CAS key is the SHA-256 of the
+	// *uncompressed* content while the stored bytes are zlib-compressed.
+	// Those two hashes will never match, causing every upload to fail.
+	//
+	// A size check is sufficient here: io.Copy already returns an error on a
+	// short write, Sync() flushes to stable storage, and Rename() is atomic.
+	// Together they guarantee the file is complete and durable.  The size check
+	// adds one extra layer against silent truncation.
+	if size > 0 {
+		info, err := os.Stat(path)
+		if err != nil {
+			os.Remove(path)
+			return fmt.Errorf("stat after write: %w", err)
+		}
+		if info.Size() != size {
+			os.Remove(path)
+			return fmt.Errorf("CAS write size mismatch: expected %d bytes, got %d", size, info.Size())
+		}
 	}
 
 	return nil

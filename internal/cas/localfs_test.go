@@ -21,7 +21,7 @@ func TestLocalFS_ObjectFileMode(t *testing.T) {
 	}
 
 	data := []byte("test content for file-mode check")
-	// Compute the correct hash so Put's integrity check passes.
+	// Compute hash so it can be used as the CAS key.
 	hash, _, err := cvmfshash.HashReader(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("HashReader: %v", err)
