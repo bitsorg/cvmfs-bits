@@ -1,6 +1,9 @@
 # Compiled binaries (produced by `make build`)
-prepub
-prepubctl
+# Use rooted patterns so these never accidentally match source directories
+# (e.g. cmd/prepub/ was being silently gitignored by the bare "prepub" pattern)
+/bin/
+/prepub
+/prepubctl
 
 # Go build cache and test output
 *.test
