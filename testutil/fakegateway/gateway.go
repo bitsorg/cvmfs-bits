@@ -44,6 +44,7 @@ func New(obs *observe.Provider) *Gateway {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/repos", g.handleRepos)
 	mux.HandleFunc("/api/v1/leases/", g.handleLease)
 	mux.HandleFunc("/api/v1/payloads", g.handlePayload)
 
@@ -69,6 +70,20 @@ func (g *Gateway) SubmittedPayloads() []Payload {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]Payload{}, g.payloads...)
+}
+
+// handleRepos serves GET /api/v1/repos — used by Client.Probe for the startup
+// health check.  It returns the list of configured repositories.
+func (g *Gateway) handleRepos(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"repos":  []string{},
+	})
 }
 
 func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {

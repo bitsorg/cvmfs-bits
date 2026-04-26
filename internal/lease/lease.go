@@ -222,10 +222,12 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 
 	// Real cvmfs_gateway response format:
 	//   {"status":"ok","session_token":"<tok>","max_lease_time":<seconds>}
+	// On error: {"status":"error","reason":"<msg>"}
 	var result struct {
 		Status       string `json:"status"`
 		SessionToken string `json:"session_token"`
 		MaxLeaseTime int    `json:"max_lease_time"` // seconds
+		Reason       string `json:"reason"`          // populated on error
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -233,7 +235,12 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 		return nil, fmt.Errorf("decoding lease response: %w", err)
 	}
 	if result.Status != "ok" {
-		err := fmt.Errorf("gateway returned status %q", result.Status)
+		var err error
+		if result.Reason != "" {
+			err = fmt.Errorf("gateway returned status %q: %s", result.Status, result.Reason)
+		} else {
+			err = fmt.Errorf("gateway returned status %q", result.Status)
+		}
 		span.RecordError(err)
 		return nil, fmt.Errorf("lease acquisition: %w", err)
 	}
@@ -455,26 +462,35 @@ func (c *Client) Abort(ctx context.Context, token string) error {
 // the CAS before the SubmitPayload call.
 func (c *Client) NeedsPipeline() bool { return true }
 
-// Probe implements Backend.  It acquires a sentinel lease against a reserved
-// probe path and immediately releases it, confirming the gateway API is
-// reachable and functioning correctly.
+// Probe implements Backend.  It issues a signed GET /api/v1/repos request to
+// confirm the gateway is reachable and that HMAC authentication is accepted.
+//
+// We deliberately avoid acquiring a lease here: lease acquisition requires a
+// valid, configured repository name, which the probe code does not know.
+// GET /api/v1/repos is the lightest gateway endpoint that still exercises the
+// full HTTP + auth path.
 func (c *Client) Probe(ctx context.Context) error {
 	pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	l, err := c.acquireLease(pctx, probeRepo, probeRepo)
+	probeURL := fmt.Sprintf("%s/api/v1/repos", c.BaseURL)
+	req, err := http.NewRequestWithContext(pctx, "GET", probeURL, nil)
 	if err != nil {
-		return fmt.Errorf("acquire lease: %w", err)
+		return fmt.Errorf("probe: creating request: %w", err)
 	}
-	if err := c.Release(pctx, l.Token, false); err != nil {
-		// Non-fatal: the lease will expire naturally on its own.
-		// Log the warning but do not fail startup — the gateway is reachable
-		// (we acquired the lease) and a transient release error is not fatal.
-		c.obs.Logger.Warn("probe: lease release failed (non-fatal)", "error", err)
+	if err := c.signRequest(req); err != nil {
+		return fmt.Errorf("probe: signing request: %w", err)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("probe: GET /api/v1/repos: %w", err)
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("probe: GET /api/v1/repos returned %d: %s", resp.StatusCode, body)
 	}
 	return nil
 }
-
-// probeRepo is the sentinel repository name used by Probe.
-// It matches the value used historically by probe.probeGateway.
-const probeRepo = "__probe__"

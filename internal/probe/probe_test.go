@@ -79,7 +79,7 @@ func TestProbe_GatewayFailure(t *testing.T) {
 	obs := newObs(t)
 	cas := fakecas.New(obs)
 
-	// Stand up a server that always returns 503 for lease requests.
+	// Stand up a server that always returns 503 (gateway health endpoint will fail).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte(`{"error":"unavailable"}`))
