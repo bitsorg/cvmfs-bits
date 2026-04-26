@@ -11,11 +11,12 @@ import (
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -80,13 +81,15 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 	}
 }
 
-// signRequest signs the request using the cvmfs_gateway authentication scheme:
+// signRequest signs the request using the cvmfs_gateway authentication scheme
+// observed from cvmfs_server/swissknife traffic:
 //
-//	Authorization: HMAC <key_id>:<base64(HMAC-SHA1(body, secret))>
+//	Authorization: <key_id> <base64(hex(HMAC-SHA1(body, secret)))>
 //
-// The real cvmfs_gateway (Erlang implementation) computes HMAC-SHA1 over the
-// raw request body and base64-encodes the result.  For requests with no body
-// (e.g. DELETE, GET) the HMAC is computed over an empty byte string.
+// The signature is HMAC-SHA1 over the raw request body, hex-encoded, then
+// base64-encoded.  The header has no "HMAC" prefix — just key_id, a space,
+// and the signature.  For requests with no body (DELETE, GET) the HMAC is
+// computed over an empty byte string.
 func (c *Client) signRequest(req *http.Request) error {
 	// Snapshot the body so we can both sign it and leave it readable for send.
 	var bodyBytes []byte
@@ -102,9 +105,11 @@ func (c *Client) signRequest(req *http.Request) error {
 
 	h := hmac.New(sha1.New, []byte(c.Secret))
 	h.Write(bodyBytes)
-	signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	// hex-encode the raw HMAC bytes, then base64-encode that hex string
+	hexHMAC := hex.EncodeToString(h.Sum(nil))
+	signature := base64.StdEncoding.EncodeToString([]byte(hexHMAC))
 
-	req.Header.Set("Authorization", fmt.Sprintf("HMAC %s:%s", c.KeyID, signature))
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, signature))
 	return nil
 }
 
@@ -127,47 +132,43 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 
 	start := time.Now()
 
-	// Validate path before constructing the URL.  All three conditions produce
-	// malformed gateway URLs and are not valid CVMFS repository sub-paths:
-	//   - empty string              → "/api/v1/leases/" with no segment at all
-	//   - leading slash "/foo"      → strings.Split produces a leading "" segment,
-	//                                 joining gives "/foo", URL becomes "…/leases//foo"
-	//   - adjacent slashes "a//b"   → empty segment, URL becomes "…/leases/a//b"
-	//   - trailing slash "foo/"     → trailing "" segment, URL becomes "…/leases/foo/"
+	// Validate path when non-empty.  These conditions produce malformed gateway
+	// URLs and are not valid CVMFS repository sub-paths:
+	//   - leading slash "/foo"      → URL becomes "…/leases//foo"
+	//   - adjacent slashes "a//b"   → URL becomes "…/leases/a//b"
+	//   - trailing slash "foo/"     → URL becomes "…/leases/foo/"
+	// An empty path means a root-level repo lease — allowed.
+	if path != "" {
+		if path[0] == '/' {
+			return nil, fmt.Errorf("acquireLease: path %q must not start with a slash", path)
+		}
+		if path[len(path)-1] == '/' {
+			return nil, fmt.Errorf("acquireLease: path %q must not end with a slash", path)
+		}
+		if strings.Contains(path, "//") {
+			return nil, fmt.Errorf("acquireLease: path %q contains adjacent slashes", path)
+		}
+	}
+
+	// The cvmfs_gateway REST API expects POST /api/v1/leases with a JSON body
+	// matching what cvmfs_server/swissknife sends:
+	//   {"path":"repo/subpath","api_version":"2","hostname":"publisher.host"}
+	// For root-level leases the path is "repo/" (trailing slash required by gateway).
+	leaseURL := fmt.Sprintf("%s/api/v1/leases", c.BaseURL)
+
+	var fullPath string
 	if path == "" {
-		return nil, fmt.Errorf("acquireLease: path must not be empty")
-	}
-	if path[0] == '/' {
-		return nil, fmt.Errorf("acquireLease: path %q must not start with a slash", path)
-	}
-	if path[len(path)-1] == '/' {
-		return nil, fmt.Errorf("acquireLease: path %q must not end with a slash", path)
-	}
-	if strings.Contains(path, "//") {
-		return nil, fmt.Errorf("acquireLease: path %q contains adjacent slashes", path)
+		fullPath = repo + "/"
+	} else {
+		fullPath = repo + "/" + path
 	}
 
-	// Encode each path segment individually so that slash separators are
-	// preserved as real URL path slashes while special characters within
-	// segments are percent-encoded.
-	//
-	// url.PathEscape follows RFC 3986 and treats sub-delimiters (including +)
-	// as legal pchar characters that do not require encoding.  However, some
-	// gateway implementations and HTTP proxies misinterpret a literal + in a
-	// path segment as a space (a habit inherited from query-string parsing).
-	// We therefore encode + explicitly after PathEscape — PathEscape never
-	// emits a literal + in its output, so the replacement is safe.
-	var segs []string
-	for _, seg := range strings.Split(path, "/") {
-		segs = append(segs, strings.ReplaceAll(url.PathEscape(seg), "+", "%2B"))
-	}
-	leaseURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, strings.Join(segs, "/"))
-
-	body := map[string]string{
-		"repo": repo,
-		"path": path,
-	}
-	payload, _ := json.Marshal(body)
+	hostname, _ := os.Hostname()
+	payload, _ := json.Marshal(map[string]interface{}{
+		"path":        fullPath,
+		"api_version": "2",
+		"hostname":    hostname,
+	})
 
 	req, err := http.NewRequestWithContext(ctx, "POST", leaseURL, bytes.NewReader(payload))
 	if err != nil {
