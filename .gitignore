@@ -6,6 +6,7 @@ prepubctl
 *.test
 *.out
 /vendor/
+prepub-go-tmp-*
 
 # Test coverage
 coverage.html
