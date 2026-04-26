@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -114,15 +115,79 @@ func (c *Client) signRequest(req *http.Request) error {
 	return nil
 }
 
+// errPathBusy is a sentinel returned by acquireLease when the gateway responds
+// with status "path_busy" (another publisher holds the lease).  It is
+// intentionally unexported; Acquire handles it internally with retry logic.
+var errPathBusy = fmt.Errorf("path_busy: another publisher holds the lease")
+
+// leaseRetryConfig controls the backoff behaviour for path_busy retries.
+const (
+	// leaseRetryMax is the upper bound on total retry time.  The gateway's
+	// default max_lease_time is 300 s, so 5 min is enough to outlast any
+	// normally-behaving concurrent publisher.
+	leaseRetryMax = 5 * time.Minute
+	// leaseRetryBase is the initial delay between retries.
+	leaseRetryBase = 5 * time.Second
+	// leaseRetryMaxDelay caps the per-attempt sleep so we don't wait too long
+	// between retries when there is a long contention window.
+	leaseRetryMaxDelay = 30 * time.Second
+)
+
 // Acquire implements Backend.  It acquires a publish lease from the gateway
 // for the given repository and path, returning the opaque lease token.
-// The request is HMAC-signed; the gateway rejects replays and tampered requests.
+//
+// When the gateway returns "path_busy" (another publisher currently holds the
+// lease), Acquire retries with exponential backoff for up to leaseRetryMax.
+// This handles both stale leases from previous failed jobs (which the gateway
+// eventually expires) and legitimate concurrent publishers (who will release
+// the lease when they finish).
 func (c *Client) Acquire(ctx context.Context, repo, path string) (string, error) {
-	l, err := c.acquireLease(ctx, repo, path)
-	if err != nil {
-		return "", err
+	deadline := time.Now().Add(leaseRetryMax)
+	delay := leaseRetryBase
+	attempt := 0
+
+	for {
+		l, err := c.acquireLease(ctx, repo, path)
+		if err == nil {
+			return l.Token, nil
+		}
+
+		if !errors.Is(err, errPathBusy) {
+			// Hard error (auth failure, network error, etc.) — do not retry.
+			return "", err
+		}
+
+		// path_busy: check whether we still have time left to retry.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return "", fmt.Errorf("lease acquisition: path still busy after %s (%d attempts)", leaseRetryMax, attempt)
+		}
+
+		sleep := delay
+		if sleep > remaining {
+			sleep = remaining
+		}
+		attempt++
+		c.obs.Logger.Info("lease path_busy — retrying",
+			"attempt", attempt,
+			"repo", repo,
+			"path", path,
+			"retry_in", sleep,
+			"time_remaining", remaining.Round(time.Second),
+		)
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(sleep):
+		}
+
+		// Exponential backoff, capped at leaseRetryMaxDelay.
+		delay *= 2
+		if delay > leaseRetryMaxDelay {
+			delay = leaseRetryMaxDelay
+		}
 	}
-	return l.Token, nil
 }
 
 // acquireLease is the internal form of Acquire that returns the full *Lease
@@ -210,6 +275,11 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("decoding lease response: %w", err)
+	}
+	if result.Status == "path_busy" {
+		// Another publisher holds the lease; signal the caller to retry.
+		span.RecordError(errPathBusy)
+		return nil, errPathBusy
 	}
 	if result.Status != "ok" {
 		var err error
