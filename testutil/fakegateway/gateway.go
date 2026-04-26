@@ -153,12 +153,19 @@ func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {
 	} else if r.Method == "POST" && token != "" {
 		// Commit lease (POST /api/v1/leases/<token>).
 		// The real gateway runs cvmfs_server publish here.  The fake just
-		// removes the lease and returns ok.
+		// removes the lease and returns ok, or rejects unknown tokens.
 		g.mu.Lock()
-		delete(g.leases, token)
+		_, exists := g.leases[token]
+		if exists {
+			delete(g.leases, token)
+		}
 		g.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
+		if !exists {
+			json.NewEncoder(w).Encode(map[string]string{"status": "error", "reason": "invalid_lease"})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 
 	} else if r.Method == "PUT" {

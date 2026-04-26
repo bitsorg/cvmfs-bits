@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -129,9 +130,9 @@ var errPathBusy = fmt.Errorf("path_busy: another publisher holds the lease")
 
 // leaseRetryConfig controls the backoff behaviour for path_busy retries.
 const (
-	// leaseRetryMax is the upper bound on total retry time.  The gateway's
-	// default max_lease_time is 300 s, so 5 min is enough to outlast any
-	// normally-behaving concurrent publisher.
+	// leaseRetryMax is the upper bound on total retry time.  The real CERN
+	// gateway max_lease_time is 7200 s (2 hours), so we don't try to outlast
+	// a hung lease — we just wait long enough for a normally-finishing publisher.
 	leaseRetryMax = 5 * time.Minute
 	// leaseRetryBase is the initial delay between retries.
 	leaseRetryBase = 5 * time.Second
@@ -320,7 +321,7 @@ func (c *Client) Renew(ctx context.Context, token string) error {
 	ctx, span := c.obs.Tracer.Start(ctx, "lease.renew")
 	defer span.End()
 
-	url := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, token)
+	url := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(token))
 	req, err := http.NewRequestWithContext(ctx, "PUT", url, nil)
 	if err != nil {
 		span.RecordError(err)
@@ -359,7 +360,7 @@ func (c *Client) Release(ctx context.Context, token string, commit bool) error {
 	// Do not append ?commit=… — the real cvmfs_gateway does not accept that
 	// query parameter on DELETE /api/v1/leases/{token} and returns 405.
 	_ = commit
-	releaseURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, token)
+	releaseURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(token))
 	req, err := http.NewRequestWithContext(ctx, "DELETE", releaseURL, nil)
 	if err != nil {
 		span.RecordError(err)
@@ -434,7 +435,9 @@ func buildMsgHeader(token, hash string) []byte {
 //	<N bytes JSON header><compressed object bytes>
 func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, hash string, objBytes []byte) error {
 	// Use /api/v1/payloads/<token> — HMAC over token string.
-	payloadURL := basePayloadURL + "/" + token
+	// url.PathEscape encodes characters like '=' (base32 padding) that are
+	// legal in URLs but confuse some HTTP routers when used raw in path segments.
+	payloadURL := basePayloadURL + "/" + url.PathEscape(token)
 
 	msgHeader := buildMsgHeader(token, hash)
 	body := append(msgHeader, objBytes...)
@@ -603,7 +606,7 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	}
 
 	// 2. POST /api/v1/leases/<token> to finalise the publish transaction.
-	commitURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, req.Token)
+	commitURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(req.Token))
 	commitBody, err := json.Marshal(map[string]interface{}{
 		"old_root_hash":   "",
 		"new_root_hash":   req.CatalogHash,

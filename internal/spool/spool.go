@@ -117,7 +117,7 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 	// rename can succeed.  The stale directory is superseded by the current
 	// job state being transitioned now.
 	if err := os.Rename(oldDir, newDir); err != nil {
-		if os.IsExist(err) || isErrExist(err) {
+		if isErrExist(err) {
 			if rmErr := os.RemoveAll(newDir); rmErr != nil {
 				span.RecordError(rmErr)
 				return fmt.Errorf("removing stale job directory %s: %w", newDir, rmErr)
