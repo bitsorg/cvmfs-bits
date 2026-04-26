@@ -59,6 +59,7 @@ func New(obs *observe.Provider) *Gateway {
 	mux.HandleFunc("/api/v1/leases", g.handleLease)
 	mux.HandleFunc("/api/v1/leases/", g.handleLease)
 	mux.HandleFunc("/api/v1/payloads", g.handlePayload)
+	mux.HandleFunc("/api/v1/payloads/", g.handlePayload)
 
 	g.server = httptest.NewServer(mux)
 	return g

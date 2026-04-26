@@ -420,7 +420,22 @@ func buildMsgHeader(token, hash string) []byte {
 // submitOneObject sends a single compressed CAS object to the gateway using
 // the binary payload framing protocol.  objBytes is the raw compressed content
 // as stored in the local CAS.
-func (c *Client) submitOneObject(ctx context.Context, payloadURL, token, hash string, objBytes []byte) error {
+//
+// We use the new-style /api/v1/payloads/<token> endpoint (rather than the
+// legacy /api/v1/payloads) because:
+//  1. The new endpoint signs with the session token (simpler, matches the
+//     commit/cancel pattern).
+//  2. Some gateway deployments only route the token-URL form to the object-
+//     store backend correctly.
+//
+// The binary framing is identical for both endpoints:
+//
+//	Message-Size: N
+//	<N bytes JSON header><compressed object bytes>
+func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, hash string, objBytes []byte) error {
+	// Use /api/v1/payloads/<token> — HMAC over token string.
+	payloadURL := basePayloadURL + "/" + token
+
 	msgHeader := buildMsgHeader(token, hash)
 	body := append(msgHeader, objBytes...)
 
@@ -432,11 +447,8 @@ func (c *Client) submitOneObject(ctx context.Context, payloadURL, token, hash st
 	req.Header.Set("Message-Size", strconv.Itoa(len(msgHeader)))
 	req.ContentLength = int64(len(body))
 
-	// Per gateway/frontend/authz.go: for POST /api/v1/payloads (no token in
-	// URL), HMAC is computed over the first Message-Size bytes of the body —
-	// i.e. the JSON header only, not the appended compressed object bytes.
-	sig := c.computeSignature(msgHeader)
-	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
+	// POST /api/v1/payloads/<token> — HMAC over token string per authz.go.
+	c.signWithToken(req, token)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
