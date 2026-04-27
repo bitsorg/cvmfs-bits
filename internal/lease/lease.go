@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -385,74 +386,100 @@ func (c *Client) Release(ctx context.Context, token string, commit bool) error {
 	return nil
 }
 
-// buildMsgHeader constructs the JSON message header for the cvmfs_gateway
-// binary payload protocol.  The gateway framing is:
+// buildCvmfsPackHeader constructs the CVMFS object pack text header for a
+// single CAS blob.  The format is defined by ObjectPackProducer in
+// cvmfs/pack.cc:
 //
-//	POST /api/v1/payloads
-//	Message-Size: N
+//	V2\n
+//	S<objSize>\n
+//	N1\n
+//	--\n
+//	C <hashStr> <objSize>\n
 //
-//	<N bytes of JSON><compressed object bytes>
-//
-// where the JSON contains a "header_size" field that equals N — the byte
-// length of the JSON itself.  The circular dependency is resolved by
-// convergence: start with an estimate (digits=1) and increase until the
-// formatted number has exactly `digits` characters.
-func buildMsgHeader(token, hash string) []byte {
-	// Build prefix (everything before the header_size value) and suffix.
-	// header_size MUST be a JSON string (e.g. "164") not an integer (164).
-	// The gateway Go struct has `HeaderSize string` and calls strconv.Atoi on
-	// the value; sending an integer causes JSON decode failure in the gateway.
-	// The outer quotes are part of prefix/suffix; digits counts only the numeral
-	// characters inside them.
-	prefix := `{"api_version":"2","session_token":` + strconv.Quote(token) +
-		`,"payload_digest":` + strconv.Quote(hash) + `,"header_size":"`
-	suffix := `"}`
-	for digits := 1; digits <= 9; digits++ {
-		n := len(prefix) + digits + len(suffix)
-		s := strconv.Itoa(n)
-		if len(s) == digits {
-			return []byte(prefix + s + suffix)
-		}
-	}
-	// Unreachable for any practical token/hash length.
-	panic("buildMsgHeader: failed to converge on header_size")
+// hashStr is the hex-encoded SHA-256 of the object bytes being uploaded.
+// objSize is the byte length of the object payload that follows the header.
+// The receiver (ObjectPackConsumer) reads exactly len(header) bytes as the
+// pack TOC text, verifies its digest, then reads objSize bytes as the object.
+func buildCvmfsPackHeader(hashStr string, objSize int) []byte {
+	return []byte(fmt.Sprintf("V2\nS%d\nN1\n--\nC %s %d\n",
+		objSize, hashStr, objSize))
 }
 
 // submitOneObject sends a single compressed CAS object to the gateway using
-// the binary payload framing protocol.  objBytes is the raw compressed content
-// as stored in the local CAS.
+// the correct CVMFS binary payload framing protocol.
 //
-// Uses POST /api/v1/payloads (base endpoint, no token in URL).  The gateway
-// router does not expose a /api/v1/payloads/<token> route; sending to that URL
-// causes a 30-second hang with no response (no matching Erlang/Go handler).
+// HTTP body layout (confirmed from gateway/frontend/{authz,payloads}.go and
+// cvmfs/receiver/{reactor,payload_processor}.cc):
 //
-// Binary framing:
+//	POST /api/v1/payloads
+//	Content-Type: application/octet-stream
+//	Message-Size: N          (N = byte length of the JSON message wrapper)
+//	Authorization: <KEY_ID> <HMAC>
 //
-//	Message-Size: N
-//	<N bytes JSON header><compressed object bytes>
+//	[N bytes: JSON message wrapper]
+//	[header_size bytes: CVMFS pack text header]
+//	[remaining bytes: compressed object data]
 //
-// HMAC is computed over the JSON header bytes only (first Message-Size bytes).
-// The gateway authz module extracts those bytes before verifying the signature.
+// JSON wrapper fields:
+//   - session_token:  the lease token
+//   - payload_digest: SHA-256 hex of the pack text header (NOT the object hash)
+//   - header_size:    byte length of the pack text header (NOT the JSON size)
+//   - api_version:    "2"
+//
+// HMAC for the deprecated POST /payloads endpoint is computed over the first
+// Message-Size bytes of the body (the JSON wrapper bytes).
+//
+// The pack text header carries a SHA-256 of the compressed object bytes.
+// The receiver (cvmfs_receiver) hashes the received object bytes and compares
+// to the hash in the pack TOC; a mismatch returns "other_error".
 func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, hash string, objBytes []byte) error {
-	// POST /api/v1/payloads — real cvmfs_gateway only exposes the base endpoint;
-	// there is no /api/v1/payloads/<token> route in the gateway router.
-	// Sending to the token-URL form causes a 30-second hang (no matching handler).
-	msgHeader := buildMsgHeader(token, hash)
-	body := append(msgHeader, objBytes...)
+	// Compute SHA-256 of the compressed object bytes.  This is what the
+	// receiver (ObjectPackConsumer / PayloadProcessor) will hash and compare
+	// against the pack TOC entry to verify upload integrity.
+	objHashArr := sha256.Sum256(objBytes)
+	objHashStr := hex.EncodeToString(objHashArr[:])
+
+	// Build the CVMFS object pack text header (the TOC that precedes the data).
+	packHeader := buildCvmfsPackHeader(objHashStr, len(objBytes))
+
+	// Compute SHA-256 of the pack text header itself.
+	// This is payload_digest: the receiver calls shash::HashString(raw_header_, &digest)
+	// and compares to the value we send.  A 64-char hex → auto-detected as SHA-256.
+	packHeaderDigestArr := sha256.Sum256(packHeader)
+	packHeaderDigest := hex.EncodeToString(packHeaderDigestArr[:])
+
+	// Build the JSON message wrapper.
+	// header_size = byte length of the pack text header (NOT the JSON itself).
+	// payload_digest = SHA-256 of the pack text header (NOT the object content hash).
+	msgJSON, err := json.Marshal(map[string]interface{}{
+		"api_version":    "2",
+		"session_token":  token,
+		"payload_digest": packHeaderDigest,
+		"header_size":    strconv.Itoa(len(packHeader)),
+	})
+	if err != nil {
+		return fmt.Errorf("marshalling payload JSON: %w", err)
+	}
+
+	// HTTP body = [JSON (message-size bytes)][pack header text][compressed object bytes]
+	body := make([]byte, 0, len(msgJSON)+len(packHeader)+len(objBytes))
+	body = append(body, msgJSON...)
+	body = append(body, packHeader...)
+	body = append(body, objBytes...)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", basePayloadURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("creating payload request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Message-Size", strconv.Itoa(len(msgHeader)))
+	req.Header.Set("Message-Size", strconv.Itoa(len(msgJSON)))
 	req.ContentLength = int64(len(body))
 
-	// POST /api/v1/payloads — HMAC over the JSON message header bytes only
-	// (the first Message-Size bytes of the body).  The gateway's authz module
-	// extracts those bytes and verifies the signature against them.
-	// Signing over the token string or the full body both produce invalid_hmac.
-	sig := c.computeSignature(msgHeader)
+	// POST /api/v1/payloads (deprecated): HMAC over the first Message-Size
+	// bytes of the body (the JSON wrapper).
+	// Per gateway/frontend/authz.go WithAuthz: payloads without a token in the
+	// URL use the JSON message bytes for HMAC.
+	sig := c.computeSignature(msgJSON)
 	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
 
 	resp, err := c.client.Do(req)
@@ -471,14 +498,14 @@ func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, has
 // SubmitPayload uploads all staged CAS objects (file chunks + catalog) to the
 // gateway using the binary framing protocol required by cvmfs_gateway.
 //
-// Protocol per object:
+// Protocol per object (see submitOneObject for full details):
 //
 //	POST /api/v1/payloads
-//	Authorization: <signed>
+//	Authorization: <KEY_ID> <HMAC-over-JSON>
 //	Content-Type: application/octet-stream
-//	Message-Size: N
+//	Message-Size: N       (byte length of JSON wrapper)
 //
-//	<N bytes of JSON message header><zlib-compressed object bytes>
+//	[N bytes JSON wrapper][pack header text (header_size bytes)][compressed bytes]
 //
 // Objects are uploaded in the order given (objectHashes first, then
 // catalogHash last so the gateway sees the catalog only after all its
