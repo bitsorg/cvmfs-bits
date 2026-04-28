@@ -636,9 +636,16 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 
 	// 2. POST /api/v1/leases/<token> to finalise the publish transaction.
 	commitURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(req.Token))
+
+	// Use NewRootHashSuffixed if provided; otherwise fall back to CatalogHash for backward compatibility.
+	newHash := req.NewRootHashSuffixed
+	if newHash == "" {
+		newHash = req.CatalogHash
+	}
+
 	commitBody, err := json.Marshal(map[string]interface{}{
-		"old_root_hash":   "",
-		"new_root_hash":   req.CatalogHash,
+		"old_root_hash":   req.OldRootHash,
+		"new_root_hash":   newHash,
 		"tag_name":        "",
 		"tag_description": "",
 	})

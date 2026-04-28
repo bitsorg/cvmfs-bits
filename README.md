@@ -19,8 +19,9 @@ lot of cache misses worker nodes.
 1. **Unpacks and processes** files in parallel — compress, SHA-256 hash, deduplicate against the existing CAS — without touching the overlay filesystem or holding any lock.
 2. **Uploads objects** to the CAS backend (S3 or local filesystem) before acquiring a gateway lease.
 3. **Pre-warms Stratum 1 replicas** with the new objects before the catalog is committed (Option B), so replication becomes catalog-only after the flip.
-4. **Commits atomically** via the `cvmfs_gateway` lease-and-payload API, which handles manifest signing and catalog merging.
-5. **Recovers automatically** from crashes at any stage — every state transition is an atomic filesystem rename backed by a WAL journal.
+4. **Merges catalogs directly** by fetching the current CVMFS catalog from Stratum 0, applying the new entries to the correct sub-catalog SQLite database, finalising (compress + SHA-256), and committing via the `cvmfs_gateway` lease API. No overlay filesystem is required; catalog merging is done entirely in Go using the CVMFS schema 2.5 SQLite format.
+5. **Supports private share directories** — files can be published under a hidden, randomly-named path (analogous to a Google Docs share link) that is invisible in `readdir()` but accessible by direct path, using the CVMFS `kFlagHidden` catalog flag.
+6. **Recovers automatically** from crashes at any stage — every state transition is an atomic filesystem rename backed by a WAL journal.
 
 The existing `cvmfs_server publish` workflow continues to work in parallel; the
 gateway lease enforces mutual exclusion at the path level.
@@ -90,7 +91,8 @@ cvmfs-bits/
 │   └── access/          # Pluggable access-event tracking (Phase 3)
 ├── pkg/
 │   ├── observe/         # OTel tracing + Prometheus metrics + slog logger
-│   └── cvmfshash/       # CVMFS content hash format utilities
+│   ├── cvmfshash/       # CVMFS content hash format utilities
+│   └── cvmfscatalog/    # CVMFS catalog: schema 2.5 SQLite, MD5 path encoding, merge, secret dirs
 ├── testutil/
 │   ├── fakegateway/     # In-process cvmfs_gateway with chaos controls
 │   ├── fakecas/         # In-memory CAS with latency/failure injection
@@ -137,5 +139,7 @@ traces observable in a single `go test` run without any external services.
 - Go 1.22+
 - `cvmfs_gateway` ≥ 1.2 (for the lease-and-payload API)
 - Write access to the CAS backend (local filesystem or S3-compatible)
+- HTTP read access to the Stratum 0 CAS (required for manifest fetch and catalog download during merge)
 - TCP 9100 inbound on each Stratum 1 for the CAS object data push (Option B only — both HTTP and MQTT variants)
 - TCP 8883 outbound from each Stratum 1 to the MQTT broker, plus TCP 8883 inbound on the broker host (Option B MQTT variant only)
+- No `cvmfs` client tools required on the pre-publisher node — catalog merging is done natively in Go

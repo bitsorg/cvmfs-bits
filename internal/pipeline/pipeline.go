@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"cvmfs.io/prepub/internal/pipeline/dedup"
 	"cvmfs.io/prepub/internal/pipeline/unpack"
 	"cvmfs.io/prepub/internal/pipeline/upload"
+	"cvmfs.io/prepub/pkg/cvmfscatalog"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
@@ -26,6 +28,8 @@ import (
 type Config struct {
 	// Workers is the number of concurrent compress workers.
 	Workers int
+	// ChunkSize is the max size of a file before chunking (0 = no chunking).
+	ChunkSize int64
 	// UploadConc is the max concurrent uploads to CAS (unused, reserved for future).
 	UploadConc int
 	// CAS is the content-addressable storage backend.
@@ -41,9 +45,13 @@ type Config struct {
 
 // Result is returned after a successful pipeline run.
 type Result struct {
-	// CatalogHash is the SHA256 hash of the deduplicated CVMFS catalog.
-	CatalogHash string
-	// ObjectHashes are the SHA256 hashes of all objects (files and catalog) pushed to CAS.
+	// CatalogEntries are the CVMFS catalog entries collected from the tar.
+	// These are passed to cvmfscatalog.Merge() after the gateway lease is acquired.
+	// The catalog is NOT finalised here — merging with the existing repository
+	// catalog happens in the orchestrator after lease acquisition.
+	CatalogEntries []cvmfscatalog.Entry
+	// ObjectHashes are the SHA256 hashes of all CAS objects (file chunks only,
+	// NOT including catalog — the catalog hashes come from cvmfscatalog.Merge).
 	ObjectHashes []string
 	// NFiles is the total number of files processed from the tar.
 	NFiles int
@@ -111,10 +119,23 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 	// (catalog) is blocked when the context is cancelled, we return an explicit
 	// error rather than silently dropping the entry.  This means the catalog
 	// and CAS can never silently diverge — the job fails and must be retried.
+	//
+	// Fix L5: detect duplicate paths in the tar.  The tar format allows
+	// multiple entries with the same path (later entries typically override
+	// earlier ones), but CVMFS requires each path to appear exactly once in a
+	// catalog.  Without detection, resultsByPath silently retains only the last
+	// hash while the catalog may accumulate duplicate rows.  We fail fast
+	// instead of producing a silently inconsistent publish.
 	eg.Go(func() error {
 		defer close(compressChan)
 		defer close(catalogChan)
+		seenPaths := make(map[string]struct{})
 		for entry := range unpackChan {
+			if _, dup := seenPaths[entry.Path]; dup {
+				return fmt.Errorf("fan-out: duplicate path %q in tar — each path must appear exactly once", entry.Path)
+			}
+			seenPaths[entry.Path] = struct{}{}
+
 			select {
 			case compressChan <- entry:
 			case <-egCtx.Done():
@@ -134,7 +155,10 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 	// Stage 3a: Compress + hash worker pool → compressOut.
 	eg.Go(func() error {
 		defer close(compressOut)
-		return compress.Run(egCtx, compressChan, compressOut, cfg.Workers, cfg.Obs)
+		return compress.Run(egCtx, compressChan, compressOut, compress.Config{
+			Workers:   cfg.Workers,
+			ChunkSize: cfg.ChunkSize,
+		}, cfg.Obs)
 	})
 
 	// Stage 3b: Build catalog from catalogChan.
@@ -178,22 +202,113 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 	uploadLogPath := filepath.Join(cfg.SpoolDir, "upload.log")
 	uploadLog := upload.OpenUploadLog(uploadLogPath)
 
+	// Fix H2: store only the hash strings we need for catalog patching, not the
+	// full compress.Result (which holds the compressed byte slices that are
+	// already in CAS and should be GC'd after upload).
+	type chunkMeta struct {
+		offset           int64
+		uncompressedSize int64
+		hash             string
+	}
+	type fileMeta struct {
+		bulkHash string
+		chunks   []chunkMeta // nil for non-chunked files
+	}
+
 	var result Result
 	var resultMu sync.Mutex
 	seenHashes := make(map[string]bool)
+	resultsByPath := make(map[string]fileMeta)
 
 	eg.Go(func() error {
 		_, uspan := cfg.Obs.Tracer.Start(egCtx, "pipeline.upload")
 		defer uspan.End()
 
 		for compResult := range compressOut {
+			// Fix N7: build the chunk-meta slice before acquiring the mutex so
+			// the allocation and copy work happens outside the critical section,
+			// keeping lock hold-time as short as possible.
+			var fm fileMeta
+			if compResult.FileEntry.Mode.IsRegular() {
+				if len(compResult.Chunks) > 0 {
+					chunks := make([]chunkMeta, len(compResult.Chunks))
+					for i, ch := range compResult.Chunks {
+						chunks[i] = chunkMeta{
+							offset:           ch.Offset,
+							uncompressedSize: ch.UncompressedSize,
+							hash:             ch.Hash,
+						}
+					}
+					fm = fileMeta{bulkHash: compResult.Hash, chunks: chunks}
+				} else {
+					fm = fileMeta{bulkHash: compResult.Hash}
+				}
+			}
+
+			// Fix H3: merge all counter updates into a single lock acquisition
+			// to avoid two separate round-trips to the mutex.
 			resultMu.Lock()
 			result.NFiles++
 			result.NBytesRaw += compResult.FileEntry.Size
+			// Fix H2: store only lightweight hash metadata, not compressed bytes.
+			if compResult.FileEntry.Mode.IsRegular() {
+				resultsByPath[compResult.FileEntry.Path] = fm
+			}
 			resultMu.Unlock()
 
+			// Handle non-regular files
+			if !compResult.FileEntry.Mode.IsRegular() {
+				continue
+			}
+
+			// Handle chunked files: upload each chunk independently
+			if len(compResult.Chunks) > 0 {
+				for _, chunk := range compResult.Chunks {
+					isDup, err := dedupChecker.Check(egCtx, chunk.Hash)
+					if err != nil {
+						uspan.RecordError(err)
+						return fmt.Errorf("dedup check chunk %s: %w", chunk.Hash, err)
+					}
+
+					resultMu.Lock()
+					alreadySeen := seenHashes[chunk.Hash]
+					if !isDup && !alreadySeen {
+						seenHashes[chunk.Hash] = true
+					}
+					resultMu.Unlock()
+
+					if isDup || alreadySeen {
+						if alreadySeen && !isDup {
+							cfg.Obs.Metrics.PipelineDedupHits.Inc()
+						}
+						resultMu.Lock()
+						result.ObjectHashes = append(result.ObjectHashes, chunk.Hash)
+						resultMu.Unlock()
+						continue
+					}
+
+					// Upload chunk to CAS
+					if err := upload.PutWithRetry(egCtx, cfg.CAS, chunk.Hash, chunk.Compressed, chunk.CompressedSize); err != nil {
+						uspan.RecordError(err)
+						return fmt.Errorf("cas put chunk %s: %w", chunk.Hash, err)
+					}
+					dedupChecker.Add(chunk.Hash)
+					if err := uploadLog.Record(chunk.Hash); err != nil {
+						uspan.RecordError(err)
+						return fmt.Errorf("recording upload %s: %w", chunk.Hash, err)
+					}
+
+					resultMu.Lock()
+					result.NBytesComp += chunk.CompressedSize
+					result.ObjectHashes = append(result.ObjectHashes, chunk.Hash)
+					resultMu.Unlock()
+				}
+				continue
+			}
+
+			// Handle non-chunked files (original logic)
 			hash := compResult.Hash
-			if hash == "" || !compResult.FileEntry.Mode.IsRegular() {
+			if hash == "" {
 				continue
 			}
 
@@ -252,46 +367,51 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 		return nil, fmt.Errorf("pipeline: %w", err)
 	}
 
-	// Finalize catalog: compress + hash the SQLite file, upload it.
-	compPath, catalogHash, err := builder.Finalize(ctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("finalizing catalog: %w", err)
-	}
+	// Patch catalog entries with hashes and chunks from compress results.
+	// Fix C2: hex decode errors are now propagated rather than silently ignored.
+	rawEntries := builder.Entries()
+	result.CatalogEntries = make([]cvmfscatalog.Entry, len(rawEntries))
+	for i, e := range rawEntries {
+		result.CatalogEntries[i] = *e
 
-	if compPath != "" {
-		cf, err := os.Open(compPath)
+		// Skip non-regular files
+		if !e.Mode.IsRegular() {
+			continue
+		}
+
+		// Look up the lightweight metadata for this entry.
+		fm, ok := resultsByPath[e.FullPath]
+		if !ok || fm.bulkHash == "" {
+			continue
+		}
+
+		hashBytes, err := hex.DecodeString(fm.bulkHash)
 		if err != nil {
-			span.RecordError(err)
-			return nil, fmt.Errorf("opening compressed catalog: %w", err)
+			return nil, fmt.Errorf("decoding hash for %s: %w", e.FullPath, err)
 		}
-		fi, err := cf.Stat()
-		if err != nil {
-			cf.Close()
-			span.RecordError(err)
-			return nil, fmt.Errorf("stat compressed catalog: %w", err)
-		}
-		putErr := cfg.CAS.Put(ctx, catalogHash, cf, fi.Size())
-		// Fix #21: always check cf.Close() — a flush error on the read side is
-		// rare but indicates the OS released the file before CAS finished reading.
-		if closeErr := cf.Close(); closeErr != nil && putErr == nil {
-			putErr = fmt.Errorf("closing catalog file after upload: %w", closeErr)
-		}
-		if putErr != nil {
-			span.RecordError(putErr)
-			return nil, fmt.Errorf("uploading catalog: %w", putErr)
-		}
+		result.CatalogEntries[i].Hash = hashBytes
+		result.CatalogEntries[i].HashAlgo = cvmfscatalog.HashSha256
+		result.CatalogEntries[i].CompAlgo = cvmfscatalog.CompZlib
 
-		// Fix #15: Record the catalog object in the upload log so that crash
-		// recovery knows the catalog was successfully written to CAS.
-		if err := uploadLog.Record(catalogHash); err != nil {
-			span.RecordError(err)
-			return nil, fmt.Errorf("recording catalog upload: %w", err)
+		// For chunked files: populate chunk records.
+		if len(fm.chunks) > 0 {
+			chunks := make([]cvmfscatalog.ChunkRecord, len(fm.chunks))
+			for j, ch := range fm.chunks {
+				// Fix C2: propagate decode error instead of silently using nil bytes.
+				chBytes, decErr := hex.DecodeString(ch.hash)
+				if decErr != nil {
+					return nil, fmt.Errorf("decoding chunk hash for %s at offset %d: %w",
+						e.FullPath, ch.offset, decErr)
+				}
+				chunks[j] = cvmfscatalog.ChunkRecord{
+					Offset: ch.offset,
+					Size:   ch.uncompressedSize,
+					Hash:   chBytes,
+				}
+			}
+			result.CatalogEntries[i].Chunks = chunks
 		}
 	}
-
-	result.CatalogHash = catalogHash
-	result.ObjectHashes = append(result.ObjectHashes, catalogHash)
 
 	// Shared filter (Option B): persist the updated filter so peer nodes can
 	// merge it on their next job start.  Non-fatal — a failed save only means
@@ -306,9 +426,9 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 	cfg.Obs.Logger.InfoContext(ctx, "pipeline complete",
 		"files", result.NFiles,
 		"objects", len(result.ObjectHashes),
+		"catalog_entries", len(result.CatalogEntries),
 		"bytes_raw", result.NBytesRaw,
 		"bytes_comp", result.NBytesComp,
-		"catalog_hash", catalogHash,
 	)
 
 	return &result, nil

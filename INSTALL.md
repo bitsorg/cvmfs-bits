@@ -167,6 +167,11 @@ gateway:
   lease_ttl: 120s
   heartbeat_interval: 40s
 
+# HTTP base URL of the Stratum 0 CAS — used by the catalog merge to fetch the
+# current .cvmfspublished manifest and download the root catalog before commit.
+# Typically the same host as the gateway but on port 80/443 (the CVMFS HTTP server).
+stratum0_url: http://localhost:8000   # e.g. http://stratum0.example.org
+
 cas:
   type: localfs
   root: /srv/cvmfs/cas

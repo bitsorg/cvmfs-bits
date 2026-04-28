@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"cvmfs.io/prepub/internal/pipeline"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
+	"cvmfs.io/prepub/pkg/cvmfscatalog"
+	"cvmfs.io/prepub/pkg/cvmfshash"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
@@ -45,6 +48,13 @@ type Orchestrator struct {
 	// (e.g. "/cvmfs").  Only used in local publish mode; ignored by the
 	// gateway backend.
 	CVMFSMount string
+	// Stratum0URL is the HTTP base URL of the Stratum 0 CAS, used to fetch the
+	// current .cvmfspublished manifest and download the root catalog for the
+	// direct SQLite catalog merge (gateway mode only).
+	// Example: "http://stratum0.example.org"
+	// If empty, the catalog merge step is skipped and the commit will use an
+	// empty old_root_hash (only safe for the initial publish of a new repository).
+	Stratum0URL string
 	// Distribute contains configuration for Stratum 1 push distribution.
 	// nil disables distribution (typical for local mode).
 	Distribute *distribute.Config
@@ -245,6 +255,76 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	cancelHeartbeat := o.Lease.Heartbeat(ctx, token, 10*time.Second, leaseCancel)
 	defer cancelHeartbeat()
 
+	// ── Phase 3.5: catalog merge (gateway mode only) ──────────────────────────
+	// Merge happens AFTER lease acquisition so that the manifest/catalog we
+	// download reflects the version we are merging onto — no other publisher
+	// can commit to the same path while we hold the lease.
+	//
+	// The merge: fetches the current root manifest → downloads the root SQLite
+	// catalog → applies the new entries → finalises (compress+hash) → writes
+	// compressed catalog(s) to the spool job directory → uploads them to CAS.
+	var mergeResult *cvmfscatalog.MergeResult
+	if pipelineResult != nil && o.Stratum0URL != "" {
+		logger.Info("merging catalog", "repo", j.Repo, "path", j.Path)
+		mergeResult, err = cvmfscatalog.Merge(leaseCtx, cvmfscatalog.MergeConfig{
+			Stratum0URL: o.Stratum0URL,
+			RepoName:    j.Repo,
+			LeasePath:   j.Path,
+			TempDir:     o.Spool.JobDir(j),
+		}, pipelineResult.CatalogEntries)
+		if err != nil {
+			span.RecordError(err)
+			logger.Error("catalog merge failed", "error", err)
+			cancelHeartbeat()
+			leaseCancel()
+			return o.abortJob(ctx, j, fmt.Errorf("catalog merge: %w", err))
+		}
+
+		// Upload the merged catalog file(s) to the CAS so SubmitPayload can
+		// stream them to the gateway.  Finalize() wrote each catalog to
+		// TempDir/data/XY/hashC (CVMFS on-disk format); the CAS stores objects
+		// by plain hash (no suffix).
+		for _, catHash := range mergeResult.AllCatalogHashes {
+			// Path written by cvmfscatalog.Finalize: data/XY/hash + "C"
+			catFilePath := filepath.Join(o.Spool.JobDir(j),
+				cvmfshash.ObjectPath(catHash)+"C")
+			f, openErr := os.Open(catFilePath)
+			if openErr != nil {
+				cancelHeartbeat()
+				leaseCancel()
+				return o.abortJob(ctx, j,
+					fmt.Errorf("opening merged catalog %s: %w", catHash, openErr))
+			}
+			fi, statErr := f.Stat()
+			if statErr != nil {
+				f.Close()
+				cancelHeartbeat()
+				leaseCancel()
+				return o.abortJob(ctx, j,
+					fmt.Errorf("stat merged catalog %s: %w", catHash, statErr))
+			}
+			putErr := o.CAS.Put(leaseCtx, catHash, f, fi.Size())
+			closeErr := f.Close()
+			if putErr != nil {
+				cancelHeartbeat()
+				leaseCancel()
+				return o.abortJob(ctx, j,
+					fmt.Errorf("uploading merged catalog %s: %w", catHash, putErr))
+			}
+			if closeErr != nil {
+				logger.Warn("merged catalog file close error (upload already complete)",
+					"hash", catHash, "error", closeErr)
+			}
+		}
+		logger.Info("catalog merge complete",
+			"old_root", mergeResult.OldRootHash,
+			"new_root", mergeResult.NewRootHash,
+			"catalogs", len(mergeResult.AllCatalogHashes))
+	} else if pipelineResult != nil && o.Stratum0URL == "" {
+		logger.Warn("Stratum0URL not configured — skipping catalog merge; " +
+			"commit will use empty old_root_hash (only correct for initial publish)")
+	}
+
 	// ── Phase 4: commit ───────────────────────────────────────────────────────
 	if err := o.transition(leaseCtx, j, job.StateCommitting); err != nil {
 		span.RecordError(err)
@@ -265,9 +345,16 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		CVMFSDir: cvmfsDir,
 	}
 	if pipelineResult != nil {
-		req.CatalogHash = pipelineResult.CatalogHash
+		// File object hashes (catalog hashes added below from merge result).
 		req.ObjectHashes = pipelineResult.ObjectHashes
 		req.ObjectStore = o.CAS
+	}
+	if mergeResult != nil {
+		// Catalog hashes go into ObjectHashes so SubmitPayload uploads them.
+		// The root catalog goes last (Merge returns leaf-first, root-last).
+		req.ObjectHashes = append(req.ObjectHashes, mergeResult.AllCatalogHashes...)
+		req.OldRootHash = mergeResult.OldRootHash
+		req.NewRootHashSuffixed = mergeResult.NewRootHashSuffixed
 	}
 
 	cancelHeartbeat() // stop renewal before committing (idempotent; defer fires again at return)
@@ -299,9 +386,12 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	if o.Provenance != nil && j.Provenance != nil {
 		var catalogHash string
 		var objectHashes []string
+		if mergeResult != nil {
+			catalogHash = mergeResult.NewRootHash // root catalog hash (plain hex)
+			objectHashes = append(objectHashes, mergeResult.AllCatalogHashes...)
+		}
 		if pipelineResult != nil {
-			catalogHash = pipelineResult.CatalogHash
-			objectHashes = pipelineResult.ObjectHashes
+			objectHashes = append(pipelineResult.ObjectHashes, objectHashes...)
 		}
 		rec := &provenance.Record{
 			JobID:        j.ID,

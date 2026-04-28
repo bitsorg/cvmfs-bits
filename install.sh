@@ -476,6 +476,11 @@ gateway:
   lease_ttl: 120s
   heartbeat_interval: 40s
 
+# ── Stratum 0 HTTP endpoint (for manifest fetch and catalog download) ──────────
+# Required for the direct catalog merge (pkg/cvmfscatalog).
+# Use the public HTTP URL of the Stratum 0 CAS — NOT the gateway port (4929).
+stratum0_url: http://localhost:8000   # e.g. http://stratum0.example.org
+
 # ── CAS backend ───────────────────────────────────────────────────────────────
 cas:
   type: localfs
@@ -548,6 +553,9 @@ EOF
 # S3 credentials (S3 CAS backend only)
 # AWS_ACCESS_KEY_ID=
 # AWS_SECRET_ACCESS_KEY=
+
+# Override gateway key_id at runtime (optional; value in config.yaml takes precedence)
+# CVMFS_GATEWAY_KEY_ID=
 EOF
         chown "root:${SERVICE_USER}" "$env_file"
         chmod 0600 "$env_file"
@@ -743,8 +751,8 @@ do_install() {
     if $DRY_RUN; then
         info "Re-run without --dry-run to apply the above changes."
     else
-        info "1. Edit /etc/cvmfs-prepub/config.yaml — set gateway URL, key, repos."
-        info "2. Set secrets in /etc/cvmfs-prepub/env (mode 0600)."
+        info "1. Edit /etc/cvmfs-prepub/config.yaml — set gateway URL, key_id, stratum0_url, and repos."
+        info "2. Set secrets in /etc/cvmfs-prepub/env (mode 0600): CVMFS_GATEWAY_SECRET."
         info "3. Restart the service:  systemctl restart ${SVC_PUB}"
         info "4. Verify health:        curl http://localhost:8080/api/v1/health"
         info "5. Run the smoke test from INSTALL.md §8."

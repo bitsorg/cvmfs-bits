@@ -32,7 +32,7 @@ func newTestServer(t *testing.T) (*Server, *spool.Spool, *Orchestrator) {
 	}
 	nb := notify.NewBus()
 	orch := &Orchestrator{Spool: sp, Notify: nb, Obs: obs}
-	srv := New(obs, "" /*no auth*/, orch, sp, nb, dir)
+	srv := New(obs, "" /*no auth*/, orch, sp, nb, dir, dir)
 	return srv, sp, orch
 }
 
