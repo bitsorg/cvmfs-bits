@@ -18,6 +18,7 @@ import (
 	"cvmfs.io/prepub/testutil/fakecas"
 	"cvmfs.io/prepub/testutil/fakegateway"
 	"cvmfs.io/prepub/testutil/fakestratum1"
+	testobserve "cvmfs.io/prepub/testutil/observe"
 )
 
 type Cluster struct {
@@ -35,8 +36,8 @@ func NewCluster(t testing.TB, nStratum1 int) *Cluster {
 	// Create a new Prometheus registry for this cluster
 	reg := prometheus.NewRegistry()
 
-	// Create observability provider
-	recorder := &observe.SpanRecorder{}
+	// Create observability provider with an in-memory span recorder for tests.
+	recorder := &testobserve.SpanRecorder{}
 	obs, shutdown, err := observe.New("test-cluster",
 		observe.WithPrometheus(reg),
 		observe.WithTestExporter(recorder),

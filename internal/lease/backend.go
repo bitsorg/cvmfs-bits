@@ -52,6 +52,17 @@ type CommitRequest struct {
 	// gateway mode (NeedsPipeline==true); ignored by LocalBackend.
 	ObjectStore ObjectReader
 
+	// ── Tagging (gateway mode) ───────────────────────────────────────────────
+
+	// TagName is the optional CVMFS snapshot tag to create on commit.
+	// The gateway writes this into the repository's history database when
+	// non-empty, making the published revision reachable by name.
+	// Validated by job.ValidateTagName before the job is accepted.
+	TagName string
+	// TagDescription is a human-readable comment stored alongside TagName.
+	// Passed to the gateway commit body; ignored when TagName is empty.
+	TagDescription string
+
 	// ── Local mode ───────────────────────────────────────────────────────────
 
 	// TarPath is the absolute path to the spool tar file to unpack (local mode).

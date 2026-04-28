@@ -43,11 +43,12 @@ func WithPrometheus(reg prometheus.Registerer) Option {
 }
 
 // WithTestExporter enables in-memory span recording for tests.
-// The returned *SpanRecorder is used to inspect recorded spans.
-func WithTestExporter(recorder *SpanRecorder) Option {
+// Any sdktrace.SpanExporter may be passed; the typical choice is a
+// *testutil/observe.SpanRecorder which records spans in memory.
+func WithTestExporter(exporter sdktrace.SpanExporter) Option {
 	return func(opts *providerOpts) {
 		opts.testExporter = true
-		opts.traceExporter = recorder
+		opts.traceExporter = exporter
 	}
 }
 

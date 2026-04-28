@@ -7,12 +7,7 @@ package lease
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha1"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -85,49 +79,10 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 	}
 }
 
-// computeSignature returns base64(hex(HMAC-SHA1(input, secret))), the
-// Authorization token value expected by cvmfs_gateway for all endpoints.
-func (c *Client) computeSignature(input []byte) string {
-	h := hmac.New(sha1.New, []byte(c.Secret))
-	h.Write(input)
-	return base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(h.Sum(nil))))
-}
-
-// signWithToken signs the request using the session token as the HMAC input.
-//
-// Per gateway/frontend/authz.go, all lease and payload requests that include
-// a token in the URL path use the token as the HMAC input:
-//
-//	DELETE /api/v1/leases/<token>      → HMAC over token  (cancel/abort)
-//	POST   /api/v1/leases/<token>      → HMAC over token  (commit)
-func (c *Client) signWithToken(req *http.Request, token string) {
-	sig := c.computeSignature([]byte(token))
-	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
-}
-
-// signRequest signs the request using the raw request body as the HMAC input.
-// Used for POST /api/v1/leases (new lease acquisition) where the body is
-// the JSON payload.  Reads and rebuffers req.Body so it remains readable.
-func (c *Client) signRequest(req *http.Request) error {
-	var bodyBytes []byte
-	if req.Body != nil && req.Body != http.NoBody {
-		var err error
-		bodyBytes, err = io.ReadAll(req.Body)
-		if err != nil {
-			return fmt.Errorf("reading request body for signing: %w", err)
-		}
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
-	}
-	sig := c.computeSignature(bodyBytes)
-	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
-	return nil
-}
-
 // errPathBusy is a sentinel returned by acquireLease when the gateway responds
 // with status "path_busy" (another publisher holds the lease).  It is
 // intentionally unexported; Acquire handles it internally with retry logic.
-var errPathBusy = fmt.Errorf("path_busy: another publisher holds the lease")
+var errPathBusy = errors.New("path_busy: another publisher holds the lease")
 
 // leaseRetryConfig controls the backoff behaviour for path_busy retries.
 const (
@@ -212,16 +167,18 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 	//   - leading slash "/foo"      → URL becomes "…/leases//foo"
 	//   - adjacent slashes "a//b"   → URL becomes "…/leases/a//b"
 	//   - trailing slash "foo/"     → URL becomes "…/leases/foo/"
+	// Errors below intentionally omit the internal function name (acquireLease);
+	// callers and stack traces provide that context.
 	// An empty path means a root-level repo lease — allowed.
 	if path != "" {
 		if path[0] == '/' {
-			return nil, fmt.Errorf("acquireLease: path %q must not start with a slash", path)
+			return nil, fmt.Errorf("lease path %q must not start with a slash", path)
 		}
 		if path[len(path)-1] == '/' {
-			return nil, fmt.Errorf("acquireLease: path %q must not end with a slash", path)
+			return nil, fmt.Errorf("lease path %q must not end with a slash", path)
 		}
 		if strings.Contains(path, "//") {
-			return nil, fmt.Errorf("acquireLease: path %q contains adjacent slashes", path)
+			return nil, fmt.Errorf("lease path %q contains adjacent slashes", path)
 		}
 	}
 
@@ -267,8 +224,9 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		span.RecordError(fmt.Errorf("status %d", resp.StatusCode))
-		return nil, fmt.Errorf("lease acquisition failed: status %d: %s", resp.StatusCode, data)
+		err := fmt.Errorf("lease acquisition failed: status %d: %s", resp.StatusCode, data)
+		span.RecordError(err)
+		return nil, err
 	}
 
 	// Real cvmfs_gateway response format:
@@ -291,6 +249,9 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 		return nil, errPathBusy
 	}
 	if result.Status != "ok" {
+		// Build a single, self-contained error — do not add an outer "lease
+		// acquisition: " wrapper, because that would produce redundant text
+		// like "lease acquisition: gateway returned status ...".
 		var err error
 		if result.Reason != "" {
 			err = fmt.Errorf("gateway returned status %q: %s", result.Status, result.Reason)
@@ -298,7 +259,7 @@ func (c *Client) acquireLease(ctx context.Context, repo, path string) (*Lease, e
 			err = fmt.Errorf("gateway returned status %q", result.Status)
 		}
 		span.RecordError(err)
-		return nil, fmt.Errorf("lease acquisition: %w", err)
+		return nil, err
 	}
 	if result.SessionToken == "" {
 		err := fmt.Errorf("gateway returned empty session_token")
@@ -340,8 +301,10 @@ func (c *Client) Renew(ctx context.Context, token string) error {
 	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		span.RecordError(fmt.Errorf("status %d", resp.StatusCode))
-		return fmt.Errorf("lease renewal failed: status %d", resp.StatusCode)
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		err := fmt.Errorf("lease renewal failed: status %d: %s", resp.StatusCode, data)
+		span.RecordError(err)
+		return err
 	}
 
 	return nil
@@ -379,171 +342,10 @@ func (c *Client) Release(ctx context.Context, token string, commit bool) error {
 	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		span.RecordError(fmt.Errorf("status %d", resp.StatusCode))
-		return fmt.Errorf("lease release failed: status %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-// buildCvmfsPackHeader constructs the CVMFS object pack text header for a
-// single CAS blob.  The format is defined by ObjectPackProducer in
-// cvmfs/pack.cc:
-//
-//	V2\n
-//	S<objSize>\n
-//	N1\n
-//	--\n
-//	C <hashStr> <objSize>\n
-//
-// hashStr is the hex-encoded SHA-256 of the object bytes being uploaded.
-// objSize is the byte length of the object payload that follows the header.
-// The receiver (ObjectPackConsumer) reads exactly len(header) bytes as the
-// pack TOC text, verifies its digest, then reads objSize bytes as the object.
-func buildCvmfsPackHeader(hashStr string, objSize int) []byte {
-	return []byte(fmt.Sprintf("V2\nS%d\nN1\n--\nC %s %d\n",
-		objSize, hashStr, objSize))
-}
-
-// submitOneObject sends a single compressed CAS object to the gateway using
-// the correct CVMFS binary payload framing protocol.
-//
-// HTTP body layout (confirmed from gateway/frontend/{authz,payloads}.go and
-// cvmfs/receiver/{reactor,payload_processor}.cc):
-//
-//	POST /api/v1/payloads
-//	Content-Type: application/octet-stream
-//	Message-Size: N          (N = byte length of the JSON message wrapper)
-//	Authorization: <KEY_ID> <HMAC>
-//
-//	[N bytes: JSON message wrapper]
-//	[header_size bytes: CVMFS pack text header]
-//	[remaining bytes: compressed object data]
-//
-// JSON wrapper fields:
-//   - session_token:  the lease token
-//   - payload_digest: SHA-256 hex of the pack text header (NOT the object hash)
-//   - header_size:    byte length of the pack text header (NOT the JSON size)
-//   - api_version:    "2"
-//
-// HMAC for the deprecated POST /payloads endpoint is computed over the first
-// Message-Size bytes of the body (the JSON wrapper bytes).
-//
-// The pack text header carries a SHA-256 of the compressed object bytes.
-// The receiver (cvmfs_receiver) hashes the received object bytes and compares
-// to the hash in the pack TOC; a mismatch returns "other_error".
-func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, hash string, objBytes []byte) error {
-	// Compute SHA-256 of the compressed object bytes.  This is what the
-	// receiver (ObjectPackConsumer / PayloadProcessor) will hash and compare
-	// against the pack TOC entry to verify upload integrity.
-	objHashArr := sha256.Sum256(objBytes)
-	objHashStr := hex.EncodeToString(objHashArr[:])
-
-	// Build the CVMFS object pack text header (the TOC that precedes the data).
-	packHeader := buildCvmfsPackHeader(objHashStr, len(objBytes))
-
-	// Compute SHA-256 of the pack text header itself.
-	// This is payload_digest: the receiver calls shash::HashString(raw_header_, &digest)
-	// and compares to the value we send.  A 64-char hex → auto-detected as SHA-256.
-	packHeaderDigestArr := sha256.Sum256(packHeader)
-	packHeaderDigest := hex.EncodeToString(packHeaderDigestArr[:])
-
-	// Build the JSON message wrapper.
-	// header_size = byte length of the pack text header (NOT the JSON itself).
-	// payload_digest = SHA-256 of the pack text header (NOT the object content hash).
-	msgJSON, err := json.Marshal(map[string]interface{}{
-		"api_version":    "2",
-		"session_token":  token,
-		"payload_digest": packHeaderDigest,
-		"header_size":    strconv.Itoa(len(packHeader)),
-	})
-	if err != nil {
-		return fmt.Errorf("marshalling payload JSON: %w", err)
-	}
-
-	// HTTP body = [JSON (message-size bytes)][pack header text][compressed object bytes]
-	body := make([]byte, 0, len(msgJSON)+len(packHeader)+len(objBytes))
-	body = append(body, msgJSON...)
-	body = append(body, packHeader...)
-	body = append(body, objBytes...)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", basePayloadURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("creating payload request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Message-Size", strconv.Itoa(len(msgJSON)))
-	req.ContentLength = int64(len(body))
-
-	// POST /api/v1/payloads (deprecated): HMAC over the first Message-Size
-	// bytes of the body (the JSON wrapper).
-	// Per gateway/frontend/authz.go WithAuthz: payloads without a token in the
-	// URL use the JSON message bytes for HMAC.
-	sig := c.computeSignature(msgJSON)
-	req.Header.Set("Authorization", fmt.Sprintf("%s %s", c.KeyID, sig))
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("POST payload: %w", err)
-	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("payload upload failed (hash=%s): status %d: %s", hash, resp.StatusCode, data)
-	}
-	return nil
-}
-
-// SubmitPayload uploads all staged CAS objects (file chunks + catalog) to the
-// gateway using the binary framing protocol required by cvmfs_gateway.
-//
-// Protocol per object (see submitOneObject for full details):
-//
-//	POST /api/v1/payloads
-//	Authorization: <KEY_ID> <HMAC-over-JSON>
-//	Content-Type: application/octet-stream
-//	Message-Size: N       (byte length of JSON wrapper)
-//
-//	[N bytes JSON wrapper][pack header text (header_size bytes)][compressed bytes]
-//
-// Objects are uploaded in the order given (objectHashes first, then
-// catalogHash last so the gateway sees the catalog only after all its
-// referenced chunks are present).
-//
-// store must be non-nil; it is used to read the compressed bytes for each
-// object from the local CAS before uploading.
-func (c *Client) SubmitPayload(ctx context.Context, token, catalogHash string, objectHashes []string, store ObjectReader) error {
-	ctx, span := c.obs.Tracer.Start(ctx, "lease.submit_payload")
-	defer span.End()
-
-	payloadURL := fmt.Sprintf("%s/api/v1/payloads", c.BaseURL)
-
-	// Upload file-chunk objects first, catalog last.
-	allHashes := append(append([]string(nil), objectHashes...), catalogHash)
-
-	for _, hash := range allHashes {
-		if hash == "" {
-			continue
-		}
-
-		// Read compressed object bytes from the local CAS.
-		rc, err := store.Get(ctx, hash)
-		if err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("reading object %s from CAS: %w", hash, err)
-		}
-		objBytes, readErr := io.ReadAll(rc)
-		rc.Close()
-		if readErr != nil {
-			span.RecordError(readErr)
-			return fmt.Errorf("reading object %s bytes: %w", hash, readErr)
-		}
-
-		if err := c.submitOneObject(ctx, payloadURL, token, hash, objBytes); err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("object %s: %w", hash, err)
-		}
+		err := fmt.Errorf("lease release failed: status %d: %s", resp.StatusCode, data)
+		span.RecordError(err)
+		return err
 	}
 
 	return nil
@@ -625,7 +427,7 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	defer span.End()
 
 	if req.ObjectStore == nil {
-		return fmt.Errorf("Commit: ObjectStore must be set in gateway mode")
+		return fmt.Errorf("ObjectStore must be set when using the gateway backend")
 	}
 
 	// 1. Upload all CAS objects (chunks + catalog) to the gateway.
@@ -646,8 +448,8 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	commitBody, err := json.Marshal(map[string]interface{}{
 		"old_root_hash":   req.OldRootHash,
 		"new_root_hash":   newHash,
-		"tag_name":        "",
-		"tag_description": "",
+		"tag_name":        req.TagName,
+		"tag_description": req.TagDescription,
 	})
 	if err != nil {
 		span.RecordError(err)
@@ -673,8 +475,9 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		span.RecordError(fmt.Errorf("status %d", resp.StatusCode))
-		return fmt.Errorf("gateway commit failed: status %d: %s", resp.StatusCode, data)
+		err := fmt.Errorf("gateway commit failed: status %d: %s", resp.StatusCode, data)
+		span.RecordError(err)
+		return err
 	}
 
 	var result struct {
@@ -722,21 +525,21 @@ func (c *Client) Probe(ctx context.Context) error {
 	probeURL := fmt.Sprintf("%s/api/v1/repos", c.BaseURL)
 	req, err := http.NewRequestWithContext(pctx, "GET", probeURL, nil)
 	if err != nil {
-		return fmt.Errorf("probe: creating request: %w", err)
+		return fmt.Errorf("creating request: %w", err)
 	}
 	if err := c.signRequest(req); err != nil {
-		return fmt.Errorf("probe: signing request: %w", err)
+		return fmt.Errorf("signing request: %w", err)
 	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("probe: GET /api/v1/repos: %w", err)
+		return fmt.Errorf("GET /api/v1/repos: %w", err)
 	}
 	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("probe: GET /api/v1/repos returned %d: %s", resp.StatusCode, body)
+		return fmt.Errorf("GET /api/v1/repos returned %d: %s", resp.StatusCode, body)
 	}
 	return nil
 }

@@ -565,12 +565,16 @@ mkdir -p /tmp/smoke/usr/share/test
 echo "hello cvmfs" > /tmp/smoke/usr/share/test/hello.txt
 tar -czf /tmp/smoke.tar.gz -C /tmp/smoke .
 
-# Submit the job (multipart/form-data: repo, path, and tar as separate fields)
+# Submit the job (multipart/form-data).
+# tag_name and tag_description are optional; include them to create a named
+# snapshot browsable via `cvmfs_server tag`.
 JOB=$(curl -sf -X POST http://localhost:8080/api/v1/jobs \
   -H "Authorization: Bearer $PREPUB_API_TOKEN" \
   -F "repo=atlas.cern.ch" \
   -F "path=test/smoke" \
   -F "tar=@/tmp/smoke.tar.gz;type=application/octet-stream" \
+  -F "tag_name=smoke-test-1.0" \
+  -F "tag_description=Smoke test publish" \
   | jq -r .job_id)
 echo "job: $JOB"
 
@@ -584,6 +588,10 @@ for i in $(seq 1 30); do
   sleep 2
 done
 ```
+
+Tag names must match `^[A-Za-z0-9._-]+$` and be at most 255 characters long.
+Omit `tag_name` to publish without creating a named snapshot (the default
+`generic` tag applied by the gateway still marks the catalog revision).
 
 ### Admin CLI
 

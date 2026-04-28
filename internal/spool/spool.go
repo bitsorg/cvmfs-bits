@@ -38,7 +38,7 @@ func New(root string, obs *observe.Provider) (*Spool, error) {
 	for _, dir := range []string{root, "incoming", "staging", "uploading", "distributing", "leased", "committing", "published", "failed", "aborted"} {
 		path := filepath.Join(root, dir)
 		if err := os.MkdirAll(path, 0700); err != nil {
-			return nil, fmt.Errorf("creating spool directory %s: %w", path, err)
+			return nil, fmt.Errorf("creating spool directory %q: %w", path, err)
 		}
 	}
 	return &Spool{
@@ -101,7 +101,7 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 	if err := f.Sync(); err != nil {
 		f.Close()
 		span.RecordError(err)
-		return fmt.Errorf("fsyncing old directory: %w", err)
+		return fmt.Errorf("syncing old directory before rename: %w", err)
 	}
 	f.Close()
 
@@ -120,7 +120,7 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 		if isErrExist(err) {
 			if rmErr := os.RemoveAll(newDir); rmErr != nil {
 				span.RecordError(rmErr)
-				return fmt.Errorf("removing stale job directory %s: %w", newDir, rmErr)
+				return fmt.Errorf("removing stale job directory %q: %w", newDir, rmErr)
 			}
 			if err = os.Rename(oldDir, newDir); err != nil {
 				span.RecordError(err)

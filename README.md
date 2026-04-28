@@ -1,6 +1,6 @@
 # cvmfs-prepub
 
-A fast, resiliant Go service for pre-processing and publishing software releases
+A fast, resilient Go service for pre-processing and publishing software releases
 into [CVMFS](https://cernvm.cern.ch/fs/) without holding the repository transaction
 lock during file processing.
 
@@ -10,7 +10,7 @@ The standard CVMFS publishing workflow acquires an exclusive lock on the Stratum
 repository for the full duration of tar extraction, compression, hashing, and CAS
 upload — serialising work that is intrinsically parallel. After the catalog is
 committed, Stratum 1 replicas must fetch all new objects from scratch, causing a
-lot of cache misses worker nodes.
+lot of cache misses on worker nodes.
 
 ## What this does
 
@@ -22,20 +22,28 @@ lot of cache misses worker nodes.
 4. **Merges catalogs directly** by fetching the current CVMFS catalog from Stratum 0, applying the new entries to the correct sub-catalog SQLite database, finalising (compress + SHA-256), and committing via the `cvmfs_gateway` lease API. No overlay filesystem is required; catalog merging is done entirely in Go using the CVMFS schema 2.5 SQLite format.
 5. **Supports private share directories** — files can be published under a hidden, randomly-named path (analogous to a Google Docs share link) that is invisible in `readdir()` but accessible by direct path, using the CVMFS `kFlagHidden` catalog flag.
 6. **Recovers automatically** from crashes at any stage — every state transition is an atomic filesystem rename backed by a WAL journal.
+7. **Supports release tagging** — an optional `tag_name` / `tag_description` can be set on any job; the tag is embedded in the catalog commit so the published snapshot is browsable by name via `cvmfs_server tag`.
 
 The existing `cvmfs_server publish` workflow continues to work in parallel; the
 gateway lease enforces mutual exclusion at the path level.
 
 ## Deployment options
 
-| | Option A | Option B (HTTP) | Option B (MQTT) |
-|---|---|---|---|
-| **Pre-processes tar** | ✓ | ✓ | ✓ |
-| **Bypasses overlay FS** | ✓ | ✓ | ✓ |
-| **Pre-warms Stratum 1** | ✗ | ✓ | ✓ |
-| **Inbound firewall rules at S1** | None | TCP 9100 (data push) | TCP 9100 (data push); outbound TCP 8883 to broker (control) |
-| **New infrastructure** | None | Receiver agent on each S1 | Receiver agent + MQTT broker |
-| **Phase** | 1 | 2 | 2 |
+| | Local mode | Option A | Option B (HTTP) | Option B (MQTT) |
+|---|---|---|---|---|
+| **Pre-processes tar** | ✓ | ✓ | ✓ | ✓ |
+| **Bypasses overlay FS** | ✗ | ✓ | ✓ | ✓ |
+| **Pre-warms Stratum 1** | ✗ | ✗ | ✓ | ✓ |
+| **Requires cvmfs_gateway** | ✗ | ✓ | ✓ | ✓ |
+| **Inbound firewall rules at S1** | None | None | TCP 9100 (data push) | TCP 9100 (data push); outbound TCP 8883 to broker (control) |
+| **New infrastructure** | None | None | Receiver agent on each S1 | Receiver agent + MQTT broker |
+| **Phase** | 1 | 1 | 2 | 2 |
+
+**Local mode** (`--publish-mode local`) is the simplest deployment: it drives
+`cvmfs_server publish` directly on the Stratum 0 node without a gateway.
+File processing still happens in parallel before the lock is acquired, but the
+overlay filesystem is used for the commit step.  Use this to get started without
+a `cvmfs_gateway` installation.
 
 The MQTT variant of Option B shifts the **control plane** (announce/ready
 exchange) onto a shared broker — receivers connect outbound to the broker (TCP
@@ -55,7 +63,7 @@ diagrams, trade-off analysis, and MQTT topic schema.
 
 | Document | Contents |
 |---|---|
-| **[REFERENCE.md](REFERENCE.md)** | Full architecture, subsystem design, Go package layout, configuration reference, security considerations, deployment roadmap, comparison with the traditional workflow, and provenance/transparency log |
+| **[REFERENCE.md](REFERENCE.md)** | Full architecture, subsystem design, Go package layout, configuration reference, security considerations, deployment roadmap, comparison with the traditional workflow, provenance/transparency log, and REST API reference |
 | **[INSTALL.md](INSTALL.md)** | Build instructions, configuration, systemd setup, and smoke-test procedure |
 
 Key sections in REFERENCE.md:
@@ -71,22 +79,25 @@ Key sections in REFERENCE.md:
 - [§17 Comparison with Traditional `cvmfs_server publish`](REFERENCE.md#17-comparison-with-traditional-cvmfs_server-publish) — head-to-head table, where the fundamental difference lies, and when to use each approach
 - [§18 Provenance and Transparency Log](REFERENCE.md#18-provenance-and-transparency-log) — four-layer attribution chain, Rekor integration, CI OIDC token validation, and offline verification workflow
 - [§20.11 MQTT Control Plane](REFERENCE.md#2011-mqtt-control-plane-optional) — topic schema, flow, presence/LWT, security controls, configuration flags
+- [§38 REST API Reference](REFERENCE.md#38-cvmfs-prepub-rest-api-reference) — full endpoint specification for the cvmfs-prepub HTTP API
 
 ## Repository layout
 
 ```
 cvmfs-bits/
 ├── cmd/
-│   ├── prepub/          # Main service binary
+│   ├── prepub/          # Main service binary; probe.go holds startup readiness checks
 │   └── prepubctl/       # Admin CLI (drain, abort, status)
 ├── internal/
-│   ├── api/             # REST server and Orchestrator
-│   ├── job/             # Job struct and FSM
+│   ├── api/             # REST server (server.go) and Orchestrator (orchestrator.go)
+│   ├── job/             # Job struct, FSM state definitions, ValidateTagName
 │   ├── spool/           # Atomic spool directory manager + WAL journal
 │   ├── cas/             # CAS backend (local FS; S3 in roadmap)
-│   ├── lease/           # cvmfs_gateway lease client with heartbeat
+│   ├── lease/           # cvmfs_gateway lease client (lease.go), HMAC auth (auth.go),
+│   │                    #   payload commit (payload.go), lease.Backend interface
 │   ├── pipeline/        # Processing stages (unpack, compress, dedup, upload, catalog)
-│   ├── distribute/      # Stratum 1 pre-warmer with quorum gating
+│   ├── distribute/      # Stratum 1 pre-warmer (distributor.go); per-object and batch
+│   │                    #   push logic in push.go; quorum gating
 │   ├── gc/              # Lifecycle GC scheduler (Phase 3)
 │   └── access/          # Pluggable access-event tracking (Phase 3)
 ├── pkg/
@@ -97,6 +108,7 @@ cvmfs-bits/
 │   ├── fakegateway/     # In-process cvmfs_gateway with chaos controls
 │   ├── fakecas/         # In-memory CAS with latency/failure injection
 │   ├── fakestratum1/    # In-process Stratum 1 receiver with partition simulation
+│   ├── observe/         # In-memory OTel span recorder for test assertions
 │   └── simulate/        # Cluster simulator wiring all fakes; integration tests
 ├── docs/                # Architecture SVG diagrams
 ├── REFERENCE.md         # Full design and implementation reference
@@ -114,9 +126,18 @@ make build
 # Run the cluster integration test (simulates a full publish in-process)
 make run-sim
 
-# Start the service (Option A, local CAS)
+# Start the service (Option A, local CAS, with cvmfs_gateway)
 ./cvmfs-prepub \
   --gateway-url http://localhost:4929 \
+  --cas-type localfs \
+  --cas-root /srv/cvmfs/cas \
+  --spool-root /var/spool/cvmfs-prepub \
+  --listen :8080
+
+# Start the service (local mode — no gateway required)
+./cvmfs-prepub \
+  --publish-mode local \
+  --cvmfs-mount /cvmfs \
   --cas-type localfs \
   --cas-root /srv/cvmfs/cas \
   --spool-root /var/spool/cvmfs-prepub \
@@ -137,7 +158,7 @@ traces observable in a single `go test` run without any external services.
 ## Requirements
 
 - Go 1.22+
-- `cvmfs_gateway` ≥ 1.2 (for the lease-and-payload API)
+- `cvmfs_gateway` ≥ 1.2 (for the lease-and-payload API; not required in local mode)
 - Write access to the CAS backend (local filesystem or S3-compatible)
 - HTTP read access to the Stratum 0 CAS (required for manifest fetch and catalog download during merge)
 - TCP 9100 inbound on each Stratum 1 for the CAS object data push (Option B only — both HTTP and MQTT variants)

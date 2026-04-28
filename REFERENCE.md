@@ -57,6 +57,9 @@ into CVMFS, complementing the existing overlay-based publishing workflow.
 36. Phased Deployment Plan
 37. Open Questions and Future Work
 
+### Part VII — REST API Reference
+38. cvmfs-prepub REST API Reference
+
 ---
 
 # PART I — INTRODUCTION AND CONTEXT
@@ -3458,6 +3461,411 @@ authoritative record of what was written to or deleted from CAS.
 ---
 
 
+# PART VII — REST API REFERENCE
+
+> **Who should read this part:** Operators and CI system integrators who submit
+> jobs to cvmfs-prepub programmatically, or who want a precise reference for
+> every endpoint.
+
+---
+
+## 38. cvmfs-prepub REST API Reference
+
+This section is the authoritative specification for the HTTP API exposed by the
+`cvmfs-prepub` publisher.  The API is implemented in `internal/api/server.go`.
+
+### 38.1 Base URL and Authentication
+
+The service listens on the address configured by `--listen` (default `:8080`).
+TLS is strongly recommended in production; use a reverse proxy (nginx, Caddy) or
+configure `--tls-cert` / `--tls-key` on the binary directly.
+
+All endpoints under `/api/v1/jobs` require a bearer token:
+
+```
+Authorization: Bearer <PREPUB_API_TOKEN>
+```
+
+The token is set via the `PREPUB_API_TOKEN` environment variable (or
+`--api-token` flag).  If the token is empty the service runs in **dev mode** —
+all authenticated routes accept unauthenticated requests.  Never deploy dev mode
+in production.
+
+Health and metrics endpoints are unauthenticated and can be served on a separate
+internal port by a reverse proxy if needed.
+
+### 38.2 Endpoint Summary
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/v1/health` | None | Liveness probe |
+| `GET` | `/api/v1/metrics` | None | Prometheus metrics |
+| `POST` | `/api/v1/jobs` | Required | Submit a new publish job |
+| `GET` | `/api/v1/jobs/{id}` | Required | Get job status |
+| `POST` | `/api/v1/jobs/{id}/abort` | Required | Request job abort |
+| `GET` | `/api/v1/jobs/{id}/events` | Required | Subscribe to SSE event stream |
+
+---
+
+### 38.3 GET /api/v1/health
+
+Returns a liveness response.  Use this for load-balancer health checks and
+startup probes.  The check is intentionally lightweight — it does not probe the
+gateway or CAS; use the startup readiness check (§38.7) for dependency health.
+
+**Request:** `GET /api/v1/health`
+
+No headers required.
+
+**Response — 200 OK:**
+
+```json
+{"status":"healthy"}
+```
+
+`Content-Type: application/json`
+
+---
+
+### 38.4 GET /api/v1/metrics
+
+Exposes Prometheus metrics in the standard text exposition format.  Mount this
+at a scrape target in your Prometheus configuration.
+
+**Request:** `GET /api/v1/metrics`
+
+**Response — 200 OK:** Prometheus text format.
+
+Key metrics exposed:
+
+| Metric | Type | Description |
+|---|---|---|
+| `cvmfs_prepub_jobs_submitted_total` | Counter | Jobs accepted by the API |
+| `cvmfs_prepub_jobs_published_total` | Counter | Jobs that reached `published` state |
+| `cvmfs_prepub_jobs_failed_total` | Counter | Jobs that reached `failed` state |
+| `cvmfs_prepub_pipeline_abort_total` | Counter | Jobs explicitly aborted |
+| `cvmfs_prepub_pipeline_duration_seconds` | Histogram | End-to-end job duration |
+| `cvmfs_prepub_cas_upload_duration_seconds` | Histogram | CAS object upload latency |
+| `cvmfs_prepub_distribute_duration_seconds` | Histogram | Stratum 1 distribution latency |
+
+---
+
+### 38.5 POST /api/v1/jobs
+
+Submits a new publish job.  Returns immediately with a `job_id`; the job runs
+asynchronously.  Use `GET /api/v1/jobs/{id}` or the SSE stream to track progress.
+
+The endpoint supports two submission modes, selected by the request
+`Content-Type`.
+
+#### 38.5.1 Multipart upload (Content-Type: multipart/form-data)
+
+Upload the tar file directly as a form field.  This is the standard mode for CI
+pipelines.
+
+**Request fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `repo` | string | Yes | Repository name (e.g. `atlas.cern.ch`) |
+| `path` | string | No | Gateway lease sub-path (e.g. `atlas/24.0`). Empty = root lease. |
+| `tar` | file | Yes | The tar archive to publish (binary). Maximum 10 GiB. |
+| `tar_sha256` | string | No | Hex-encoded SHA-256 of the tar. If present, verified before the job starts. Mismatch → 400. |
+| `webhook_url` | string | No | URL to POST when the job reaches a terminal state. |
+| `tag_name` | string | No | Snapshot tag name to embed in the catalog commit. Must match `^[A-Za-z0-9._-]+$`, max 255 chars. Empty = no tag. |
+| `tag_description` | string | No | Human-readable description for the snapshot tag. |
+
+**Example:**
+
+```sh
+curl -sf -X POST https://prepub.example.com/api/v1/jobs \
+  -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+  -F "repo=atlas.cern.ch" \
+  -F "path=atlas/24.0" \
+  -F "tar=@atlas-24.0.tar;type=application/octet-stream" \
+  -F "tar_sha256=$(sha256sum atlas-24.0.tar | cut -d' ' -f1)" \
+  -F "tag_name=atlas-24.0.0" \
+  -F "tag_description=ATLAS 24.0.0 release"
+```
+
+#### 38.5.2 Staged tar reference (Content-Type: application/json)
+
+Use this when the tar has already been transferred to the server's staging
+directory (e.g. via rsync or a prior pipeline step).  Requires `--staging-root`
+to be configured on the server; submissions are rejected if it is not set.
+
+**Request body:**
+
+```json
+{
+  "repo":            "atlas.cern.ch",
+  "path":            "atlas/24.0",
+  "tar_path":        "/staging/atlas/atlas-24.0.tar",
+  "tar_sha256":      "e3b0c44298fc1c...",
+  "webhook_url":     "https://ci.example.com/hooks/cvmfs",
+  "tag_name":        "atlas-24.0.0",
+  "tag_description": "ATLAS 24.0.0 release"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `repo` | string | Yes | Repository name |
+| `path` | string | No | Gateway lease sub-path |
+| `tar_path` | string | Yes | Absolute path to the tar file; must be inside `--staging-root` |
+| `tar_sha256` | string | Yes | Hex SHA-256 of the tar (mandatory in this mode; verified before moving to spool) |
+| `webhook_url` | string | No | Webhook URL for terminal-state notification |
+| `tag_name` | string | No | Snapshot tag name (same rules as multipart mode) |
+| `tag_description` | string | No | Human-readable tag description |
+
+The server validates that `tar_path` is within the configured `--staging-root`
+(directory traversal attempts are rejected with `400`) and moves or hard-links
+the file into the spool atomically.
+
+#### 38.5.3 Response
+
+**202 Accepted:**
+
+```json
+{"job_id": "3f7a2b1c-0000-0000-0000-aabbccddeeff"}
+```
+
+The caller should poll `GET /api/v1/jobs/{id}` or subscribe to
+`GET /api/v1/jobs/{id}/events` to track the job to completion.
+
+#### 38.5.4 Error responses
+
+| Status | Condition |
+|---|---|
+| `400 Bad Request` | Missing required field, invalid JSON, `tar_sha256` mismatch, invalid `tag_name`, or `tar_path` outside staging root |
+| `401 Unauthorized` | Missing or invalid bearer token |
+| `413 Request Entity Too Large` | Tar file exceeds 10 GiB |
+| `503 Service Unavailable` | JSON/`tar_path` mode requested but `--staging-root` not configured |
+| `500 Internal Server Error` | Spool directory creation or write failure |
+
+---
+
+### 38.6 GET /api/v1/jobs/{id}
+
+Returns the current state of a job.
+
+**Request:** `GET /api/v1/jobs/{id}`
+
+`Authorization: Bearer <token>` required.
+
+**Response — 200 OK:**
+
+```json
+{
+  "job_id":             "3f7a2b1c-0000-0000-0000-aabbccddeeff",
+  "state":              "published",
+  "repo":               "atlas.cern.ch",
+  "path":               "atlas/24.0",
+  "n_objects":          14823,
+  "n_bytes_raw":        4831838208,
+  "n_bytes_compressed": 1923145728,
+  "error":              "",
+  "created_at":         "2025-05-01T12:00:00Z",
+  "updated_at":         "2025-05-01T12:04:37Z"
+}
+```
+
+| Field | Description |
+|---|---|
+| `job_id` | Unique identifier (UUID) assigned at submission |
+| `state` | Current FSM state (see §38.6.1) |
+| `repo` | Repository name |
+| `path` | Gateway lease sub-path (empty = root) |
+| `n_objects` | Number of CAS objects written (0 until pipeline completes) |
+| `n_bytes_raw` | Uncompressed size of all objects in bytes |
+| `n_bytes_compressed` | Compressed size of all objects as stored in the CAS |
+| `error` | Non-empty only when `state` is `failed` |
+| `created_at` | UTC timestamp of job submission |
+| `updated_at` | UTC timestamp of the most recent state transition |
+
+Fields with zero/empty values are omitted from the JSON response.
+
+#### 38.6.1 Job states
+
+| State | Terminal | Description |
+|---|---|---|
+| `queued` | No | Job accepted; waiting for a worker goroutine |
+| `processing` | No | Pipeline running: unpacking, hashing, deduplicating, uploading |
+| `distributing` | No | Pushing objects to Stratum 1 receivers (Option B only) |
+| `leased` | No | Gateway lease acquired; catalog merge in progress |
+| `committing` | No | Payload submitted to gateway; waiting for commit acknowledgement |
+| `published` | **Yes** | Catalog committed and manifest signed; job complete |
+| `failed` | **Yes** | Unrecoverable error; `error` field contains details |
+| `aborted` | **Yes** | Job was cancelled via `POST /api/v1/jobs/{id}/abort` |
+
+#### 38.6.2 Error responses
+
+| Status | Condition |
+|---|---|
+| `401 Unauthorized` | Missing or invalid bearer token |
+| `404 Not Found` | No job with the given ID |
+| `500 Internal Server Error` | Spool read failure |
+
+---
+
+### 38.7 POST /api/v1/jobs/{id}/abort
+
+Requests cancellation of a running job.  The abort is **asynchronous**: the
+endpoint signals the job's context and returns `202 Accepted`; the job
+transitions to `aborted` when the running stage detects cancellation.
+
+A job that has already reached a terminal state (`published`, `failed`,
+`aborted`) cannot be aborted — the endpoint returns `409 Conflict`.
+
+**Request:** `POST /api/v1/jobs/{id}/abort`
+
+`Authorization: Bearer <token>` required.  No request body.
+
+**Response — 202 Accepted:**
+
+```json
+{"status":"aborting"}
+```
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| `401 Unauthorized` | Missing or invalid bearer token |
+| `404 Not Found` | No job with the given ID |
+| `409 Conflict` | Job is already in a terminal state, or completed between lookup and cancel (narrow race) |
+| `500 Internal Server Error` | Spool read failure |
+
+---
+
+### 38.8 GET /api/v1/jobs/{id}/events
+
+Streams state-change events as a **Server-Sent Events (SSE)** stream.  The
+connection stays open until the job reaches a terminal state or the client
+disconnects.  Use this instead of polling to receive real-time progress updates.
+
+**Request:** `GET /api/v1/jobs/{id}/events`
+
+```
+Authorization: Bearer <token>
+Accept: text/event-stream
+```
+
+**Response — 200 OK:**
+
+```
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+X-Accel-Buffering: no
+```
+
+Events are emitted each time the job changes state.  Each event has the form:
+
+```
+event: state_change
+data: {"job_id":"...","state":"...","time":"2025-05-01T12:01:00Z","error":""}
+
+```
+
+(Note the blank line terminator required by the SSE protocol.)
+
+| Field | Description |
+|---|---|
+| `job_id` | The job UUID |
+| `state` | New state (see §38.6.1) |
+| `time` | UTC timestamp of the transition |
+| `error` | Non-empty only when `state` is `failed` |
+
+The stream closes automatically once a terminal state event is delivered.
+
+**Example (curl):**
+
+```sh
+curl -sN \
+  -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+  -H "Accept: text/event-stream" \
+  https://prepub.example.com/api/v1/jobs/$JOB/events
+```
+
+**Error responses (before streaming begins):**
+
+| Status | Condition |
+|---|---|
+| `401 Unauthorized` | Missing or invalid bearer token |
+| `404 Not Found` | No job with the given ID |
+| `500 Internal Server Error` | Server does not support streaming (should not occur) |
+
+---
+
+### 38.9 Webhook notifications
+
+When `webhook_url` is set on a submitted job, the server POSTs a JSON payload
+to that URL once the job reaches a terminal state (`published`, `failed`, or
+`aborted`).  The webhook delivery is best-effort: failures are logged but do not
+affect the job outcome.
+
+**Webhook request (POST to webhook_url):**
+
+```json
+{
+  "job_id":     "3f7a2b1c-0000-0000-0000-aabbccddeeff",
+  "state":      "published",
+  "repo":       "atlas.cern.ch",
+  "path":       "atlas/24.0",
+  "error":      "",
+  "updated_at": "2025-05-01T12:04:37Z"
+}
+```
+
+The receiving server should respond with any 2xx status.  Non-2xx responses are
+logged at Warn and the webhook is not retried.
+
+---
+
+### 38.10 Provenance headers
+
+When provenance tracking is enabled (`--oidc-issuers` or plain
+`X-Provenance-*` headers), the submitter can attach build attribution metadata
+to a job.  These fields are stored in the job manifest and optionally submitted
+to the Rekor transparency log after publish (see §34).
+
+**Unverified provenance (plain headers):**
+
+```
+X-Provenance-Git-Repo:    atlas-release/atlas-sw
+X-Provenance-Git-SHA:     c4e9f2a...
+X-Provenance-Git-Ref:     refs/heads/main
+X-Provenance-Actor:       atlas-releaser
+X-Provenance-Pipeline-ID: 14280931847
+```
+
+These headers are accepted as caller-supplied metadata (`verified: false`).
+
+**Verified provenance (OIDC token):**
+
+```
+X-OIDC-Token: eyJhbGciOiJSUzI1NiI...
+```
+
+When `--oidc-issuers` is configured, the server validates the JWT against the
+issuer's JWKS.  If validation succeeds, the token's claims override the plain
+headers and the record is written with `verified: true`.  Supported providers:
+GitHub Actions and GitLab CI (SaaS and self-hosted).  See §34 for details.
+
+---
+
+### 38.11 Size limits and timeouts
+
+| Limit | Value | Notes |
+|---|---|---|
+| Maximum tar size (multipart) | 10 GiB | Configurable at compile time via `maxTarSize` |
+| JSON request body | 1 MiB | Applied to `tar_path` mode requests |
+| Tag name length | 255 chars | Enforced by `job.ValidateTagName` |
+| Tag name charset | `^[A-Za-z0-9._-]+$` | Only letters, digits, dot, underscore, hyphen |
+| Graceful shutdown wait | Context deadline | `Shutdown` waits for all in-flight jobs; context caps the wait |
+
+---
 
 # PART VI — ROADMAP
 

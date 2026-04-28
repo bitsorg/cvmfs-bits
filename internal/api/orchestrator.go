@@ -341,9 +341,11 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	// Build the commit request, populating fields for whichever backend is active.
 	cvmfsDir := filepath.Join(o.CVMFSMount, j.Repo, j.Path)
 	req := lease.CommitRequest{
-		Token:    token,
-		TarPath:  j.TarPath,
-		CVMFSDir: cvmfsDir,
+		Token:          token,
+		TarPath:        j.TarPath,
+		CVMFSDir:       cvmfsDir,
+		TagName:        j.TagName,
+		TagDescription: j.TagDescription,
 	}
 	if pipelineResult != nil {
 		// File object hashes (catalog hashes added below from merge result).

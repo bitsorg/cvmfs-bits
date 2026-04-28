@@ -3,8 +3,34 @@
 package job
 
 import (
+	"fmt"
+	"regexp"
 	"time"
 )
+
+// tagNameRE is the allowlist for valid CVMFS snapshot tag names.
+// Only ASCII alphanumerics plus dot, underscore, and hyphen are permitted.
+// This matches the set of characters that CVMFS accepts in tag names and
+// is more restrictive than the previous denylist ("space or slash") so that
+// future CVMFS restrictions cannot silently corrupt a snapshot database.
+var tagNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// ValidateTagName returns a non-nil error when name is not a valid CVMFS tag
+// name.  An empty name is always valid — it simply means "publish without a
+// named snapshot".  When non-empty the name must be ≤ 255 characters and may
+// only contain ASCII letters, digits, dots (.), underscores (_), and hyphens (-).
+func ValidateTagName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if len(name) > 255 {
+		return fmt.Errorf("tag name too long (%d chars, max 255)", len(name))
+	}
+	if !tagNameRE.MatchString(name) {
+		return fmt.Errorf("tag name %q contains invalid characters (allowed: A-Z a-z 0-9 . _ -)", name)
+	}
+	return nil
+}
 
 // State represents a job's position in the FSM lifecycle.
 type State string
@@ -98,6 +124,14 @@ type Job struct {
 	RecoveryCount int `json:"recovery_count,omitempty"`
 	// WebhookURL is an optional URL to POST when the job reaches a terminal state.
 	WebhookURL string `json:"webhook_url,omitempty"`
+	// TagName is the optional CVMFS snapshot tag to create for this publish.
+	// When non-empty the gateway records a named tag in the repository's history
+	// database, making this revision reachable by name (e.g. "v3.14.0").
+	// Must satisfy ValidateTagName: ≤255 chars, no spaces or forward slashes.
+	TagName string `json:"tag_name,omitempty"`
+	// TagDescription is a human-readable comment stored alongside TagName.
+	// Ignored when TagName is empty.
+	TagDescription string `json:"tag_description,omitempty"`
 	// Provenance contains build identity and Rekor transparency log receipt.
 	Provenance *Provenance `json:"provenance,omitempty"`
 }

@@ -1,7 +1,11 @@
 package lease
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +15,20 @@ import (
 
 	"cvmfs.io/prepub/pkg/observe"
 )
+
+// mockObjectReader is a minimal ObjectReader for tests. It stores raw
+// "compressed" bytes keyed by hash.
+type mockObjectReader struct {
+	objects map[string][]byte
+}
+
+func (m *mockObjectReader) Get(_ context.Context, hash string) (io.ReadCloser, error) {
+	b, ok := m.objects[hash]
+	if !ok {
+		return nil, fmt.Errorf("mock: object not found: %s", hash)
+	}
+	return io.NopCloser(bytes.NewReader(b)), nil
+}
 
 func newTestClient(t *testing.T, srv *httptest.Server) *Client {
 	t.Helper()
@@ -228,22 +246,27 @@ func TestHeartbeat_ResetConsecutiveOnSuccess(t *testing.T) {
 	}
 }
 
-// ── acquireLease URL encoding tests ──────────────────────────────────────────
+// ── acquireLease JSON body tests ─────────────────────────────────────────────
 
-// TestAcquireLease_PercentEncodesPath verifies that special characters in the
-// repository sub-path are percent-encoded in the URL while slash separators
-// are preserved as literal slashes.  For example, the path "a b/c+d" must
-// produce the URL segment "a%20b/c%2Bd" not "a b/c+d".
+// TestAcquireLease_PathInJSONBody verifies that the repository sub-path is
+// sent correctly in the POST /api/v1/leases JSON body as the "path" field.
+// The gateway API uses a JSON body (not URL segments) for the lease path, so
+// no URL percent-encoding is applied; the path value is transmitted verbatim
+// as a JSON string (where only '"' and '\' need escaping per RFC 8259).
 //
-// We inspect r.URL.RawPath (the undecoded wire path) rather than r.URL.Path
-// (which Go's HTTP server always URL-decodes before handing it to handlers).
-func TestAcquireLease_PercentEncodesPath(t *testing.T) {
-	var capturedRawPath string
+// For example, the path "a b/c+d" must appear in the JSON body as
+// "repo.example.com/a b/c+d" — space and plus sign are valid JSON characters.
+func TestAcquireLease_PathInJSONBody(t *testing.T) {
+	var capturedPath string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/leases/") {
-			// RawPath holds the percent-encoded form; Path is already decoded.
-			capturedRawPath = r.URL.RawPath
-			// Return a minimal lease JSON matching the real cvmfs_gateway format.
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/leases" {
+			var body struct {
+				Path string `json:"path"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decoding request body: %v", err)
+			}
+			capturedPath = body.Path
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok","session_token":"tok","max_lease_time":300}`))
@@ -255,31 +278,48 @@ func TestAcquireLease_PercentEncodesPath(t *testing.T) {
 
 	c := newTestClient(t, srv)
 
-	// "a b/c+d" — space must become %20, plus must become %2B, slash is preserved.
+	// "a b/c+d" — spaces and plus signs are valid JSON string characters.
 	_, _ = c.acquireLease(context.Background(), "repo.example.com", "a b/c+d")
 
-	const wantSuffix = "/a%20b/c%2Bd"
-	if !strings.HasSuffix(capturedRawPath, wantSuffix) {
-		t.Errorf("URL raw path %q does not end with %q (percent-encoding bug)", capturedRawPath, wantSuffix)
+	const wantPath = "repo.example.com/a b/c+d"
+	if capturedPath != wantPath {
+		t.Errorf("JSON body path = %q; want %q", capturedPath, wantPath)
 	}
 }
 
-// TestAcquireLease_RejectsEmptyPath verifies that an empty path is rejected
-// before any HTTP request is made.
-func TestAcquireLease_RejectsEmptyPath(t *testing.T) {
+// TestAcquireLease_EmptyPathAcquiresRootLease verifies that an empty sub-path
+// produces a root-level lease whose JSON body "path" field is "repo/" (trailing
+// slash required by the gateway for root-level transactions).
+// An empty path is valid and represents a full-repository publish lease.
+func TestAcquireLease_EmptyPathAcquiresRootLease(t *testing.T) {
+	var capturedPath string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("HTTP request should not have been made for empty path")
-		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/leases" {
+			var body struct {
+				Path string `json:"path"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decoding request body: %v", err)
+			}
+			capturedPath = body.Path
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok","session_token":"tok","max_lease_time":300}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
 
 	c := newTestClient(t, srv)
 	_, err := c.acquireLease(context.Background(), "repo.example.com", "")
-	if err == nil {
-		t.Fatal("expected error for empty path, got nil")
+	if err != nil {
+		t.Fatalf("acquireLease with empty path: %v", err)
 	}
-	if !strings.Contains(err.Error(), "empty") {
-		t.Errorf("unexpected error: %v", err)
+	// Root-level lease must have a trailing slash in the path field.
+	const wantPath = "repo.example.com/"
+	if capturedPath != wantPath {
+		t.Errorf("JSON body path = %q; want %q (root-level lease needs trailing slash)", capturedPath, wantPath)
 	}
 }
 
@@ -319,6 +359,159 @@ func TestAcquireLease_RejectsLeadingSlash(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "start with a slash") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// ── Commit tag field tests ────────────────────────────────────────────────────
+
+// TestCommit_SendsTagFields verifies that Client.Commit forwards TagName and
+// TagDescription from CommitRequest into the POST body sent to the gateway's
+// commit endpoint.
+func TestCommit_SendsTagFields(t *testing.T) {
+	const (
+		token       = "lease-tok-abc"
+		catalogHash = "deadbeef"
+		wantTag     = "v3.14.0"
+		wantDesc    = "PI release"
+	)
+
+	var (
+		mu            sync.Mutex
+		capturedBody  []byte
+		commitCalled  bool
+		payloadCalled bool
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/payloads":
+			// Accept the payload upload without inspection.
+			mu.Lock()
+			payloadCalled = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/leases/"):
+			// Commit endpoint — capture the request body.
+			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			capturedBody = data
+			commitCalled = true
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+
+	store := &mockObjectReader{
+		objects: map[string][]byte{
+			catalogHash: []byte("fake-compressed-catalog"),
+		},
+	}
+
+	req := CommitRequest{
+		Token:          token,
+		CatalogHash:    catalogHash,
+		ObjectStore:    store,
+		TagName:        wantTag,
+		TagDescription: wantDesc,
+	}
+
+	if err := c.Commit(context.Background(), req); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	mu.Lock()
+	body := capturedBody
+	called := commitCalled
+	pCalled := payloadCalled
+	mu.Unlock()
+
+	if !pCalled {
+		t.Error("payload upload endpoint was never called")
+	}
+	if !called {
+		t.Fatal("commit endpoint was never called")
+	}
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode commit body %q: %v", body, err)
+	}
+	if v := got["tag_name"]; v != wantTag {
+		t.Errorf("commit body tag_name = %q; want %q", v, wantTag)
+	}
+	if v := got["tag_description"]; v != wantDesc {
+		t.Errorf("commit body tag_description = %q; want %q", v, wantDesc)
+	}
+}
+
+// TestCommit_EmptyTagName checks that when TagName is empty the commit body
+// still contains a "tag_name" key (empty string) so the gateway receives a
+// well-formed request.
+func TestCommit_EmptyTagName(t *testing.T) {
+	const (
+		token       = "lease-tok-empty"
+		catalogHash = "cafe1234"
+	)
+
+	var (
+		mu           sync.Mutex
+		capturedBody []byte
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/payloads":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/leases/"):
+			data, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			capturedBody = data
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	store := &mockObjectReader{
+		objects: map[string][]byte{catalogHash: []byte("data")},
+	}
+
+	req := CommitRequest{
+		Token:       token,
+		CatalogHash: catalogHash,
+		ObjectStore: store,
+		// TagName and TagDescription are intentionally left empty.
+	}
+	if err := c.Commit(context.Background(), req); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	mu.Lock()
+	body := capturedBody
+	mu.Unlock()
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode commit body: %v", err)
+	}
+	// key must be present (even if empty string) for a well-formed request
+	if _, ok := got["tag_name"]; !ok {
+		t.Error("commit body is missing \"tag_name\" key")
+	}
+	if v, _ := got["tag_name"].(string); v != "" {
+		t.Errorf("commit body tag_name = %q; want empty string", v)
 	}
 }
 

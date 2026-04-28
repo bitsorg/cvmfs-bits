@@ -38,7 +38,6 @@ import (
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/pipeline"
 	"cvmfs.io/prepub/internal/pipeline/dedup"
-	"cvmfs.io/prepub/internal/probe"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
 	"cvmfs.io/prepub/pkg/observe"
@@ -291,7 +290,7 @@ func runPublisher(
 	// Startup probe: confirm backends are reachable before accepting jobs.
 	obs.Logger.Info("running startup probe")
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := probe.Run(probeCtx, casBackend, leaseBackend, obs); err != nil {
+	if err := runProbe(probeCtx, casBackend, leaseBackend, obs); err != nil {
 		probeCancel()
 		obs.Logger.Error("startup probe failed", "error", err)
 		os.Exit(1)

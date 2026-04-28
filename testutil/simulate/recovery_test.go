@@ -3,6 +3,8 @@ package simulate
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,13 +12,32 @@ import (
 	"cvmfs.io/prepub/internal/job"
 )
 
-// setupJob creates a new job, writes its manifest to the spool, and places a
-// tar file containing the given file content in the cluster's spool root.
+// setupJob creates a new job and places payload.tar inside the job's incoming
+// spool directory.
+//
+// The tar file MUST live inside the job directory (not at the spool root) so
+// that spool.Transition's atomic rename of incoming/<id>/ → staging/<id>/
+// carries the tar along.  After the rename the orchestrator derives the new
+// tar path as staging/<id>/payload.tar, which must already exist.
+//
+// The incoming directory is created here; calling WriteManifest afterwards is
+// idempotent w.r.t. the directory (os.MkdirAll is a no-op on an existing dir).
 func setupJob(t *testing.T, cluster *Cluster, id, repo string, files map[string]string) *job.Job {
 	t.Helper()
 	tarBuf := createTestTar(files)
 	j := job.NewJob(id, repo, "test-pkg", "")
-	j.TarPath = saveTarToFile(t, tarBuf, cluster.SpoolRoot)
+
+	// Pre-create the incoming job directory so that payload.tar resides inside
+	// it before any manifest is written.
+	incomingDir := filepath.Join(cluster.SpoolRoot, "incoming", id)
+	if err := os.MkdirAll(incomingDir, 0700); err != nil {
+		t.Fatalf("setupJob: creating incoming dir %q: %v", incomingDir, err)
+	}
+	tarPath := filepath.Join(incomingDir, "payload.tar")
+	if err := os.WriteFile(tarPath, tarBuf.Bytes(), 0644); err != nil {
+		t.Fatalf("setupJob: writing payload.tar: %v", err)
+	}
+	j.TarPath = tarPath
 	return j
 }
 

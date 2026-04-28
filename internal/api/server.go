@@ -191,9 +191,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
 
 	var (
-		repo, subPath, webhookURL string
-		spoolTarPath              string // final path inside the spool
-		submittedSHA256           string // caller-supplied; may be empty
+		repo, subPath, webhookURL  string
+		tagName, tagDescription    string
+		spoolTarPath               string // final path inside the spool
+		submittedSHA256            string // caller-supplied; may be empty
 	)
 
 	jobID := uuid.New().String()
@@ -207,11 +208,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var req struct {
-			Repo       string `json:"repo"`
-			Path       string `json:"path"`
-			TarPath    string `json:"tar_path"`
-			TarSHA256  string `json:"tar_sha256"`
-			WebhookURL string `json:"webhook_url"`
+			Repo           string `json:"repo"`
+			Path           string `json:"path"`
+			TarPath        string `json:"tar_path"`
+			TarSHA256      string `json:"tar_sha256"`
+			WebhookURL     string `json:"webhook_url"`
+			TagName        string `json:"tag_name"`
+			TagDescription string `json:"tag_description"`
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
@@ -233,6 +236,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		// tar_sha256 is mandatory for JSON mode — it's the integrity guarantee.
 		if req.TarSHA256 == "" {
 			http.Error(w, `{"error":"tar_sha256 is required when using tar_path submission"}`, http.StatusBadRequest)
+			return
+		}
+		// Validate tag name before any filesystem I/O so an invalid tag never
+		// causes the staging tar to be moved into the spool only to be cleaned up.
+		if err := job.ValidateTagName(req.TagName); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
 		}
 
@@ -269,6 +278,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		subPath = req.Path
 		webhookURL = req.WebhookURL
 		submittedSHA256 = req.TarSHA256
+		tagName = req.TagName
+		tagDescription = req.TagDescription
 
 	} else {
 		// ── Multipart upload mode (default) ─────────────────────────────────
@@ -285,6 +296,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		subPath = r.FormValue("path")
 		webhookURL = r.FormValue("webhook_url")
 		submittedSHA256 = r.FormValue("tar_sha256") // optional
+		tagName = r.FormValue("tag_name")
+		tagDescription = r.FormValue("tag_description")
+
+		if err := job.ValidateTagName(tagName); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 
 		tarFile, _, err := r.FormFile("tar")
 		if err != nil {
@@ -343,6 +361,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.Path = subPath
 	j.WebhookURL = webhookURL
 	j.TarSHA256 = submittedSHA256
+	j.TagName = tagName
+	j.TagDescription = tagDescription
 
 	// Extract provenance metadata — from OIDC token (verified) or plain headers.
 	if s.orch.Provenance != nil {
@@ -430,7 +450,7 @@ func verifySHA256(path, expectedHex string) error {
 	}
 	computed := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(computed, expectedHex) {
-		return fmt.Errorf("computed %s, caller supplied %s", computed, expectedHex)
+		return fmt.Errorf("SHA-256 mismatch: file on disk=%s, caller supplied=%s", computed, expectedHex)
 	}
 	return nil
 }
@@ -462,19 +482,19 @@ func moveOrLink(src, dst string) error {
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("opening source: %w", err)
+		return fmt.Errorf("opening source %q: %w", src, err)
 	}
 	defer in.Close()
 
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
 	if err != nil {
-		return fmt.Errorf("creating destination: %w", err)
+		return fmt.Errorf("creating destination %q: %w", dst, err)
 	}
 
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
 		os.Remove(dst)
-		return fmt.Errorf("copying data: %w", err)
+		return fmt.Errorf("copying data from %q to %q: %w", src, dst, err)
 	}
 	return out.Close()
 }
