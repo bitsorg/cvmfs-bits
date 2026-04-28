@@ -43,8 +43,8 @@ func (b *Builder) Add(ctx context.Context, e unpack.FileEntry, hash string) erro
 		Size:      e.Size,
 		Mtime:     e.ModTime.Unix(),
 		MtimeNs:   0,
-		UID:       0,
-		GID:       0,
+		UID:       e.UID,
+		GID:       e.GID,
 		LinkCount: 1,
 	}
 
@@ -59,6 +59,16 @@ func (b *Builder) Add(ctx context.Context, e unpack.FileEntry, hash string) erro
 		// The hash will be computed during merge
 		entry.HashAlgo = cvmfscatalog.HashSha256
 		entry.CompAlgo = cvmfscatalog.CompZlib
+	}
+
+	// Copy user xattrs from the tar PAX headers.  Synthetic xattrs
+	// (user.cvmfs.hash, user.cvmfs.compression, user.cvmfs.chunk_list) are
+	// injected later in pipeline.RunFromReader once the content hash is known.
+	if len(e.Xattrs) > 0 {
+		entry.Xattr = make(map[string][]byte, len(e.Xattrs))
+		for k, v := range e.Xattrs {
+			entry.Xattr[k] = v
+		}
 	}
 
 	b.entries = append(b.entries, entry)

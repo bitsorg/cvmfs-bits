@@ -11,6 +11,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"cvmfs.io/prepub/pkg/cvmfsdirtab"
+	"cvmfs.io/prepub/pkg/cvmfshash"
 )
 
 func TestHashSuffix(t *testing.T) {
@@ -723,6 +726,304 @@ func TestMergeClosesChainOnNestedDownloadError(t *testing.T) {
 	if !containsAny(errStr, "nested", "downloading") {
 		t.Errorf("error %q should mention nested catalog download", errStr)
 	}
+}
+
+// ── Catalog-split helper unit tests ──────────────────────────────────────────
+
+func TestPlanSplits_CvmfsCatalogMarker(t *testing.T) {
+	entries := []Entry{
+		// marker file — parent /data/run1 should become a split
+		{FullPath: "/data/run1/.cvmfscatalog", Mode: 0o100644},
+		// regular files under the same parent (not triggers)
+		{FullPath: "/data/run1/result.root", Mode: 0o100644},
+		// marker at a deeper level
+		{FullPath: "/data/run1/sub/.cvmfscatalog", Mode: 0o100644},
+	}
+	// targetAbsPath = "" → root lease, all paths are in scope
+	got := planSplits(entries, "", nil)
+	want := []string{"/data/run1", "/data/run1/sub"}
+	if len(got) != len(want) {
+		t.Fatalf("planSplits: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("planSplits[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestPlanSplits_CvmfsCatalogAtRoot(t *testing.T) {
+	// /.cvmfscatalog at repo root — should be ignored (can't split root)
+	entries := []Entry{
+		{FullPath: "/.cvmfscatalog", Mode: 0o100644},
+	}
+	got := planSplits(entries, "", nil)
+	if len(got) != 0 {
+		t.Errorf("planSplits: expected no splits for root marker, got %v", got)
+	}
+}
+
+func TestPlanSplits_LeaseBoundary(t *testing.T) {
+	// Only paths strictly under targetAbsPath are included.
+	entries := []Entry{
+		{FullPath: "/other/dir/.cvmfscatalog", Mode: 0o100644}, // outside lease
+		{FullPath: "/atlas/24.0/evtdisp/.cvmfscatalog", Mode: 0o100644}, // inside lease
+	}
+	got := planSplits(entries, "/atlas/24.0", nil)
+	if len(got) != 1 || got[0] != "/atlas/24.0/evtdisp" {
+		t.Errorf("planSplits with lease boundary: got %v, want [\"/atlas/24.0/evtdisp\"]", got)
+	}
+}
+
+func TestPlanSplits_Dirtab(t *testing.T) {
+	dt, err := parseDirtabForTest(t, "/data/*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []Entry{
+		{FullPath: "/data/run1", Mode: fs.ModeDir | 0o755},
+		{FullPath: "/data/run2", Mode: fs.ModeDir | 0o755},
+		{FullPath: "/data/run1/file.txt", Mode: 0o100644}, // not a dir, should be ignored
+	}
+	got := planSplits(entries, "", dt)
+	if len(got) != 2 {
+		t.Fatalf("planSplits with dirtab: got %v, want 2 entries", got)
+	}
+	if got[0] != "/data/run1" || got[1] != "/data/run2" {
+		t.Errorf("planSplits with dirtab: got %v", got)
+	}
+}
+
+func TestPlanSplits_DirtabNegation(t *testing.T) {
+	// /data/* matches but *.svn is excluded via negation
+	dt, err := parseDirtabForTest(t, "/data/*\n! *.svn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []Entry{
+		{FullPath: "/data/run1", Mode: fs.ModeDir | 0o755},
+		{FullPath: "/data/repo.svn", Mode: fs.ModeDir | 0o755},
+	}
+	got := planSplits(entries, "", dt)
+	if len(got) != 1 || got[0] != "/data/run1" {
+		t.Errorf("planSplits with dirtab negation: got %v, want [\"/data/run1\"]", got)
+	}
+}
+
+func TestFindOwner(t *testing.T) {
+	// With splitPaths = ["/foo", "/foo/bar", "/foo/bar/baz"]:
+	//  - Entries strictly UNDER a split path go to that split's catalog.
+	//  - A path that IS a split point itself (e.g. "/foo/bar") is strictly
+	//    under its parent split ("/foo"), so it goes to /foo's catalog.
+	//    That catalog then receives AddNestedMount("/foo/bar", ...).
+	//  - A path that has NO split-path strict prefix (e.g. "/foo" itself,
+	//    since nothing in splitPaths is a prefix of "/foo") goes to the
+	//    leaf catalog (return "").
+	splitPaths := []string{"/foo", "/foo/bar", "/foo/bar/baz"}
+	cases := []struct {
+		entry string
+		want  string
+	}{
+		{"/foo/file.txt", "/foo"},
+		{"/foo/bar/file.txt", "/foo/bar"},
+		{"/foo/bar/baz/deep.txt", "/foo/bar/baz"},
+		// /foo/bar is itself a split point, but /foo is a strict prefix of it:
+		// the /foo/bar directory entry is routed to /foo's catalog.
+		{"/foo/bar", "/foo"},
+		// /foo has no parent split → goes to leaf catalog.
+		{"/foo", ""},
+		{"/other/path", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		got := findOwner(splitPaths, tc.entry)
+		if got != tc.want {
+			t.Errorf("findOwner(%q) = %q, want %q", tc.entry, got, tc.want)
+		}
+	}
+}
+
+func TestSafePathID_Unique(t *testing.T) {
+	// Two paths that share a simplified form must produce different IDs.
+	id1 := safePathID("/a/b_c")
+	id2 := safePathID("/a_b/c")
+	if id1 == id2 {
+		t.Errorf("safePathID collision: %q == %q for different paths", id1, id2)
+	}
+}
+
+func TestSafePathID_Empty(t *testing.T) {
+	id := safePathID("")
+	if id == "" {
+		t.Error("safePathID(\"\") must not return empty string")
+	}
+}
+
+// TestMergeWithCvmfsCatalogSplit verifies end-to-end that:
+//   - a .cvmfscatalog marker in the entries triggers a new nested catalog,
+//   - files under the marker's parent directory are routed to the new catalog,
+//   - AllCatalogHashes contains two entries (new child + root), and
+//   - the new root hash differs from the old root hash.
+func TestMergeWithCvmfsCatalogSplit(t *testing.T) {
+	tmpdir := t.TempDir()
+	casTmpDir := filepath.Join(tmpdir, "cas")
+	os.MkdirAll(casTmpDir, 0o755)
+
+	now := time.Now().Unix()
+
+	// ── 1. Build a root catalog with a directory that will be split ───────
+	rootCatalogPath := filepath.Join(tmpdir, "root_setup.db")
+	rootCat, err := Create(rootCatalogPath, "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	rootCat.Upsert(Entry{
+		FullPath:  "/data",
+		Name:      "data",
+		Mode:      fs.ModeDir | 0o755,
+		Size:      4096,
+		Mtime:     now,
+		LinkCount: 1,
+	})
+	oldHash, _, err := rootCat.Finalize(casTmpDir)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	compressedRoot := compressCatalog(t, rootCatalogPath)
+
+	manifest := []byte("C" + oldHash + "-\nD3600\nNtestrepo.cern.ch\nS1\n--\n")
+
+	// ── 2. HTTP server ─────────────────────────────────────────────────────
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/testrepo/.cvmfspublished":
+			w.Write(manifest)
+		case "/testrepo/data/" + oldHash[:2] + "/" + oldHash + "C":
+			w.Write(compressedRoot)
+		default:
+			http.Error(w, "not found: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// ── 3. Merge with entries that include a .cvmfscatalog marker ─────────
+	mergeDir := filepath.Join(tmpdir, "merge")
+	os.MkdirAll(mergeDir, 0o755)
+
+	entries := []Entry{
+		// The directory that will become a split point
+		{FullPath: "/data/run1", Name: "run1", Mode: fs.ModeDir | 0o755, Size: 4096, Mtime: now, LinkCount: 1},
+		// The .cvmfscatalog marker — triggers split at /data/run1
+		{FullPath: "/data/run1/.cvmfscatalog", Name: ".cvmfscatalog", Mode: 0o100644, Size: 0, Mtime: now, LinkCount: 1},
+		// A file under the split — must go into the new nested catalog
+		{FullPath: "/data/run1/result.root", Name: "result.root", Mode: 0o100644, Size: 1000, Mtime: now, LinkCount: 1},
+	}
+
+	result, err := Merge(context.Background(), MergeConfig{
+		Stratum0URL: srv.URL,
+		RepoName:    "testrepo",
+		LeasePath:   "",
+		TempDir:     mergeDir,
+		HTTPClient:  srv.Client(),
+	}, entries)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+
+	// ── 4. Assertions ──────────────────────────────────────────────────────
+	if result.OldRootHash != oldHash {
+		t.Errorf("OldRootHash: got %s, want %s", result.OldRootHash, oldHash)
+	}
+	if result.NewRootHash == oldHash {
+		t.Error("NewRootHash must differ from OldRootHash after split")
+	}
+	// Expect 2 hashes: the new nested catalog first, root last
+	if len(result.AllCatalogHashes) != 2 {
+		t.Fatalf("AllCatalogHashes: got %d, want 2 (new child + root)", len(result.AllCatalogHashes))
+	}
+	if result.AllCatalogHashes[1] != result.NewRootHash {
+		t.Errorf("AllCatalogHashes[last] should equal NewRootHash")
+	}
+	// Child and root must be distinct
+	if result.AllCatalogHashes[0] == result.AllCatalogHashes[1] {
+		t.Error("child catalog hash must differ from root catalog hash")
+	}
+
+	// Verify the root catalog now has a nested_catalogs entry at /data/run1
+	newRootDBPath := filepath.Join(mergeDir, cvmfshash.ObjectPath(result.NewRootHash)+"C")
+	if _, statErr := os.Stat(newRootDBPath); statErr != nil {
+		t.Fatalf("new root CAS file not found: %v", statErr)
+	}
+}
+
+// TestMergeWithDirtabSplit verifies that a DirtabContent rule in MergeConfig
+// causes matching directories to be split into new nested catalogs.
+func TestMergeWithDirtabSplit(t *testing.T) {
+	tmpdir := t.TempDir()
+	casTmpDir := filepath.Join(tmpdir, "cas")
+	os.MkdirAll(casTmpDir, 0o755)
+	now := time.Now().Unix()
+
+	// Minimal root catalog
+	rootCatalogPath := filepath.Join(tmpdir, "root_setup.db")
+	rootCat, err := Create(rootCatalogPath, "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	oldHash, _, err := rootCat.Finalize(casTmpDir)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	compressedRoot := compressCatalog(t, rootCatalogPath)
+	manifest := []byte("C" + oldHash + "-\nD3600\nNtestrepo.cern.ch\nS1\n--\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/testrepo/.cvmfspublished":
+			w.Write(manifest)
+		case "/testrepo/data/" + oldHash[:2] + "/" + oldHash + "C":
+			w.Write(compressedRoot)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	mergeDir := filepath.Join(tmpdir, "merge")
+	os.MkdirAll(mergeDir, 0o755)
+
+	entries := []Entry{
+		// Directory matched by dirtab /releases/*
+		{FullPath: "/releases/v1.0", Name: "v1.0", Mode: fs.ModeDir | 0o755, Size: 4096, Mtime: now, LinkCount: 1},
+		// File under the split directory — goes to the new nested catalog
+		{FullPath: "/releases/v1.0/lib.so", Name: "lib.so", Mode: 0o100644, Size: 500, Mtime: now, LinkCount: 1},
+	}
+
+	result, err := Merge(context.Background(), MergeConfig{
+		Stratum0URL:   srv.URL,
+		RepoName:      "testrepo",
+		LeasePath:     "",
+		TempDir:       mergeDir,
+		HTTPClient:    srv.Client(),
+		DirtabContent: []byte("/releases/*\n"),
+	}, entries)
+	if err != nil {
+		t.Fatalf("Merge with dirtab: %v", err)
+	}
+
+	// Expect 2 hashes: new child (/releases/v1.0) first, root last
+	if len(result.AllCatalogHashes) != 2 {
+		t.Fatalf("AllCatalogHashes: got %d, want 2 (dirtab split + root)", len(result.AllCatalogHashes))
+	}
+	if result.AllCatalogHashes[1] != result.NewRootHash {
+		t.Errorf("AllCatalogHashes[last] should equal NewRootHash")
+	}
+}
+
+// parseDirtabForTest is a test helper that parses a dirtab string.
+func parseDirtabForTest(t *testing.T, content string) (*cvmfsdirtab.Dirtab, error) {
+	t.Helper()
+	return cvmfsdirtab.Parse([]byte(content))
 }
 
 // containsAny returns true if s contains at least one of the given substrings.

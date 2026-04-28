@@ -267,10 +267,11 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	if pipelineResult != nil && o.Stratum0URL != "" {
 		logger.Info("merging catalog", "repo", j.Repo, "path", j.Path)
 		mergeResult, err = cvmfscatalog.Merge(leaseCtx, cvmfscatalog.MergeConfig{
-			Stratum0URL: o.Stratum0URL,
-			RepoName:    j.Repo,
-			LeasePath:   j.Path,
-			TempDir:     o.Spool.JobDir(j),
+			Stratum0URL:   o.Stratum0URL,
+			RepoName:      j.Repo,
+			LeasePath:     j.Path,
+			TempDir:       o.Spool.JobDir(j),
+			DirtabContent: pipelineResult.DirtabContent,
 		}, pipelineResult.CatalogEntries)
 		if err != nil {
 			span.RecordError(err)

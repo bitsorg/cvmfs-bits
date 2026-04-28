@@ -970,3 +970,136 @@ func TestNestedCatalogsUniqueConstraint(t *testing.T) {
 		t.Error("expected UNIQUE constraint violation on duplicate nested_catalogs INSERT, got nil")
 	}
 }
+
+// ── xattr feature ─────────────────────────────────────────────────────────────
+
+// TestUpsertXattrStored verifies that xattrs written via Upsert are persisted
+// in the xattr BLOB column. FlagXattr is an in-memory-only tracking constant
+// and must NOT appear in the DB flags column (real CVMFS uses bit 14 for
+// kFlagDirBindMountpoint; xattr presence is signalled by a non-NULL BLOB).
+func TestUpsertXattrStored(t *testing.T) {
+	tmpdir := t.TempDir()
+	cat, err := Create(filepath.Join(tmpdir, "cat.db"), "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer cat.Close()
+
+	now := time.Now().Unix()
+	entry := Entry{
+		FullPath:  "/tagged.bin",
+		Name:      "tagged.bin",
+		Mode:      0o100644,
+		Size:      100,
+		Mtime:     now,
+		LinkCount: 1,
+		Xattr: map[string][]byte{
+			"user.myapp.version": []byte("1.2.3"),
+			"user.myapp.env":     []byte("prod"),
+		},
+	}
+	if err := cat.Upsert(entry); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// Read raw xattr BLOB and flags from the DB.
+	var blob []byte
+	var flags int
+	row := cat.db.QueryRow(
+		"SELECT xattr, flags FROM catalog WHERE name = 'tagged.bin'")
+	if err := row.Scan(&blob, &flags); err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+
+	// FlagXattr must NOT appear in the persisted flags: it is an internal
+	// prepub constant that is masked out before the DB write.
+	if flags&FlagXattr != 0 {
+		t.Errorf("FlagXattr must not be stored in the DB flags column (got flags=%d)", flags)
+	}
+
+	// Xattr presence is determined solely by the BLOB being non-NULL.
+	if len(blob) == 0 {
+		t.Fatal("xattr BLOB is empty")
+	}
+}
+
+// TestUpsertNoXattrNullBlob verifies that an entry with no xattrs stores a
+// NULL BLOB and that FlagXattr is absent from the DB flags column.
+func TestUpsertNoXattrNullBlob(t *testing.T) {
+	tmpdir := t.TempDir()
+	cat, err := Create(filepath.Join(tmpdir, "cat.db"), "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer cat.Close()
+
+	entry := Entry{
+		FullPath:  "/plain.bin",
+		Name:      "plain.bin",
+		Mode:      0o100644,
+		Size:      10,
+		Mtime:     time.Now().Unix(),
+		LinkCount: 1,
+	}
+	if err := cat.Upsert(entry); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	var blob []byte
+	var flags int
+	row := cat.db.QueryRow(
+		"SELECT xattr, flags FROM catalog WHERE name = 'plain.bin'")
+	if err := row.Scan(&blob, &flags); err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+
+	if flags&FlagXattr != 0 {
+		t.Errorf("FlagXattr unexpectedly set for entry with no xattrs (flags=%d)", flags)
+	}
+	if blob != nil {
+		t.Errorf("expected NULL xattr BLOB, got %d bytes", len(blob))
+	}
+}
+
+// TestXattrDeltaTracking verifies that SelfXattr is incremented and decremented
+// correctly as entries with and without xattrs are added and removed.
+func TestXattrDeltaTracking(t *testing.T) {
+	tmpdir := t.TempDir()
+	cat, err := Create(filepath.Join(tmpdir, "cat.db"), "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer cat.Close()
+
+	now := time.Now().Unix()
+	withXattr := Entry{
+		FullPath:  "/x.bin",
+		Name:      "x.bin",
+		Mode:      0o100644,
+		Size:      1,
+		Mtime:     now,
+		LinkCount: 1,
+		Xattr:     map[string][]byte{"user.a": []byte("b")},
+	}
+	noXattr := Entry{
+		FullPath:  "/y.bin",
+		Name:      "y.bin",
+		Mode:      0o100644,
+		Size:      1,
+		Mtime:     now,
+		LinkCount: 1,
+	}
+
+	cat.Upsert(withXattr)
+	cat.Upsert(noXattr)
+
+	if cat.delta.SelfXattr != 1 {
+		t.Errorf("after two upserts, SelfXattr=%d, want 1", cat.delta.SelfXattr)
+	}
+
+	// Remove the one with xattr; delta should go to 0.
+	cat.Remove("/x.bin")
+	if cat.delta.SelfXattr != 0 {
+		t.Errorf("after removing xattr entry, SelfXattr=%d, want 0", cat.delta.SelfXattr)
+	}
+}

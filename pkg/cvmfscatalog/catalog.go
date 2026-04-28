@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"cvmfs.io/prepub/pkg/cvmfshash"
+	"cvmfs.io/prepub/pkg/cvmfsxattr"
 
 	_ "modernc.org/sqlite"
 )
@@ -268,6 +269,7 @@ func applyUniqueIndexes(db *sql.DB) error {
 }
 
 // trackAdd increments the appropriate self-count based on entry flags.
+// FlagXattr is orthogonal to the file-type counters and is tracked separately.
 func (c *Catalog) trackAdd(flags int) {
 	switch {
 	case flags&FlagDir != 0:
@@ -277,9 +279,13 @@ func (c *Catalog) trackAdd(flags int) {
 	default:
 		c.delta.SelfRegular++
 	}
+	if flags&FlagXattr != 0 {
+		c.delta.SelfXattr++
+	}
 }
 
 // trackRemove decrements the appropriate self-count based on entry flags.
+// FlagXattr is orthogonal to the file-type counters and is tracked separately.
 func (c *Catalog) trackRemove(flags int) {
 	switch {
 	case flags&FlagDir != 0:
@@ -288,6 +294,9 @@ func (c *Catalog) trackRemove(flags int) {
 		c.delta.SelfSymlink--
 	default:
 		c.delta.SelfRegular--
+	}
+	if flags&FlagXattr != 0 {
+		c.delta.SelfXattr--
 	}
 }
 
@@ -309,7 +318,13 @@ func (c *Catalog) upsertEntry(e Entry) error {
 		}
 	}
 
-	flags := e.Flags()
+	// internalFlags includes FlagXattr for in-memory statistics tracking.
+	// dbFlags strips FlagXattr before writing to SQLite: the real CVMFS
+	// catalog_sql.h uses bit 14 (0x4000) for kFlagDirBindMountpoint, bit 15
+	// for kFlagHidden, and bit 16 for kFlagDirectIo; there is no separate
+	// xattr bit — xattr presence is indicated by a non-NULL BLOB column.
+	internalFlags := e.Flags()
+	dbFlags := internalFlags &^ FlagXattr
 	hardlinks := e.Hardlinks()
 
 	tx, err := c.db.Begin()
@@ -319,12 +334,19 @@ func (c *Catalog) upsertEntry(e Entry) error {
 	defer tx.Rollback() // no-op after Commit
 
 	// Check for an existing entry so we can replace it atomically.
+	// Read both the stored flags and whether the xattr BLOB is non-NULL so
+	// that trackRemove can correctly decrement SelfXattr (FlagXattr is never
+	// stored in the DB flags column; we reconstruct it from the BLOB).
 	var existingFlags int
+	var existingXattrPresent bool
 	hasExisting := false
 	if scanErr := tx.QueryRow(
-		"SELECT flags FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-	).Scan(&existingFlags); scanErr == nil {
+		"SELECT flags, (xattr IS NOT NULL) FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+	).Scan(&existingFlags, &existingXattrPresent); scanErr == nil {
 		hasExisting = true
+		if existingXattrPresent {
+			existingFlags |= FlagXattr
+		}
 		if _, delErr := tx.Exec(
 			"DELETE FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
 		); delErr != nil {
@@ -332,15 +354,20 @@ func (c *Catalog) upsertEntry(e Entry) error {
 		}
 	}
 
-	// Insert the new row.
+	// Serialize xattr map to the CVMFS binary TLV BLOB.
+	// cvmfsxattr.Marshal returns nil for an empty map, keeping the column NULL
+	// for entries with no extended attributes.
+	xattrBlob := cvmfsxattr.Marshal(e.Xattr)
+
+	// Insert the new row using dbFlags (FlagXattr masked out).
 	if _, insErr := tx.Exec(`
 		INSERT INTO catalog (
 			md5path_1, md5path_2, parent_1, parent_2, hardlinks, hash, size, mode,
 			mtime, mtimens, flags, name, symlink, uid, gid, xattr
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p1, p2, parentP1, parentP2, hardlinks, e.Hash, e.Size,
-		UnixMode(e.Mode), e.Mtime, e.MtimeNs, flags, e.Name,
-		e.Symlink, e.UID, e.GID, nil,
+		UnixMode(e.Mode), e.Mtime, e.MtimeNs, dbFlags, e.Name,
+		e.Symlink, e.UID, e.GID, xattrBlob,
 	); insErr != nil {
 		return fmt.Errorf("inserting entry %s: %w", e.FullPath, insErr)
 	}
@@ -368,9 +395,9 @@ func (c *Catalog) upsertEntry(e Entry) error {
 	// committed.  Updating before commit would permanently corrupt the delta
 	// if the transaction were subsequently rolled back.
 	if hasExisting {
-		c.trackRemove(existingFlags)
+		c.trackRemove(existingFlags) // existingFlags already has FlagXattr set if BLOB was non-NULL
 	}
-	c.trackAdd(flags)
+	c.trackAdd(internalFlags) // internalFlags has FlagXattr set if new entry has xattrs
 	return nil
 }
 
@@ -398,18 +425,24 @@ func (c *Catalog) Remove(absPath string) error {
 	defer tx.Rollback() // no-op after Commit
 
 	// Fetch existing flags so we can decrement the right counter after commit.
+	// Also read whether the xattr BLOB is non-NULL: FlagXattr is never stored
+	// in the flags column, so we reconstruct it here for trackRemove.
 	// Fix N4: if the entry is absent we return ErrNotFound so callers that
 	// treat deletion as idempotent (e.g. Merge) can distinguish "not found"
 	// from a genuine database error.
 	var flags int
+	var xattrPresent bool
 	scanErr := tx.QueryRow(
-		"SELECT flags FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-	).Scan(&flags)
+		"SELECT flags, (xattr IS NOT NULL) FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+	).Scan(&flags, &xattrPresent)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if scanErr != nil {
 		return fmt.Errorf("querying entry %s: %w", absPath, scanErr)
+	}
+	if xattrPresent {
+		flags |= FlagXattr
 	}
 
 	// Delete catalog entry.
@@ -649,6 +682,30 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 	// We can't VACUUM after Close(), so skip for now.
 
 	return hash, savedDelta, nil
+}
+
+// LookupFileHash returns the content hash and hash algorithm of a regular file
+// stored at absPath in this catalog.  The hash algorithm is extracted from the
+// entry's flags column.  Returns ("", 0, false, nil) when no entry exists for
+// the path or when the stored entry has no content hash (e.g. directories or
+// symlinks that were written without a hash).
+func (c *Catalog) LookupFileHash(absPath string) (hashHex string, algo HashAlgo, found bool, err error) {
+	p1, p2 := MD5Path(absPath)
+	var hashBlob []byte
+	var flags int
+	scanErr := c.db.QueryRow(
+		"SELECT hash, flags FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+	).Scan(&hashBlob, &flags)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return "", 0, false, nil
+	}
+	if scanErr != nil {
+		return "", 0, false, fmt.Errorf("looking up %q: %w", absPath, scanErr)
+	}
+	if len(hashBlob) == 0 {
+		return "", 0, false, nil
+	}
+	return hex.EncodeToString(hashBlob), HashAlgoFromFlags(flags), true, nil
 }
 
 // SchemaVersion returns the schema version.

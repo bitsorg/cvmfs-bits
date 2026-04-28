@@ -34,6 +34,14 @@ const (
 	FlagDirNestedRoot  = 32
 	FlagFileChunk      = 64
 	FlagFileExternal   = 128
+	// FlagXattr is an INTERNAL prepub flag used only for in-memory statistics
+	// tracking (SelfXattr delta).  It is NEVER written to the SQLite flags
+	// column: the real CVMFS catalog_sql.h occupies bit 14 with
+	// kFlagDirBindMountpoint (0x4000) and has no separate xattr flag bit —
+	// xattr presence is determined purely by whether the xattr BLOB is NULL.
+	// Bits 8-10 = hash algo, bits 11-13 = comp algo, bit 14 = bind-mountpoint,
+	// bit 15 = hidden, bit 16 = direct-I/O.
+	FlagXattr = 1 << 17 // safely above all known CVMFS flag bits; internal only
 	FlagHidden         = 0x8000
 	FlagPosHash        = 8
 	FlagPosComp        = 11
@@ -63,7 +71,13 @@ type Entry struct {
 	LinkCount      uint32 // 1 for normal non-hardlinked files/dirs
 	IsHidden       bool
 	IsNestedRoot   bool // set on root entry of a nested catalog
-	Chunks         []ChunkRecord // for chunked files
+	Chunks         []ChunkRecord  // for chunked files
+	// Xattr holds extended attributes to store in the catalog xattr BLOB.
+	// A nil map means no xattrs; FlagXattr is set in the flags column when
+	// this map is non-empty.  User xattrs (from the source tar PAX headers)
+	// and synthetic xattrs (user.cvmfs.hash, user.cvmfs.compression,
+	// user.cvmfs.chunk_list) are merged here before the entry is written.
+	Xattr          map[string][]byte
 }
 
 // MD5Path returns (md5path_1, md5path_2) for the given absolute CVMFS path.
@@ -140,6 +154,9 @@ func (e *Entry) Flags() int {
 	f |= int(e.CompAlgo) << FlagPosComp
 	if e.IsHidden {
 		f |= FlagHidden
+	}
+	if len(e.Xattr) > 0 {
+		f |= FlagXattr
 	}
 	return f
 }

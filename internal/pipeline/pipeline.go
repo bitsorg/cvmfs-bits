@@ -53,6 +53,11 @@ type Result struct {
 	// ObjectHashes are the SHA256 hashes of all CAS objects (file chunks only,
 	// NOT including catalog — the catalog hashes come from cvmfscatalog.Merge).
 	ObjectHashes []string
+	// DirtabContent is the raw content of the .cvmfsdirtab file if one was
+	// present in the tar payload.  It is passed to cvmfscatalog.MergeConfig so
+	// that catalog-split rules from the new publish take effect immediately.
+	// Nil when no .cvmfsdirtab was found in the tar.
+	DirtabContent []byte
 	// NFiles is the total number of files processed from the tar.
 	NFiles int
 	// NBytesRaw is the sum of uncompressed content bytes.
@@ -126,6 +131,13 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 	// catalog.  Without detection, resultsByPath silently retains only the last
 	// hash while the catalog may accumulate duplicate rows.  We fail fast
 	// instead of producing a silently inconsistent publish.
+	//
+	// .cvmfsdirtab capture: when a .cvmfsdirtab file is encountered its raw
+	// content is saved so cvmfscatalog.Merge can apply the split rules without
+	// a second round-trip to the stratum0 CAS.  The capture runs inside the
+	// fan-out goroutine (serial), so no additional locking is needed; the
+	// result is read only after eg.Wait() (happens-before guarantee).
+	var capturedDirtab []byte
 	eg.Go(func() error {
 		defer close(compressChan)
 		defer close(catalogChan)
@@ -135,6 +147,13 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 				return fmt.Errorf("fan-out: duplicate path %q in tar — each path must appear exactly once", entry.Path)
 			}
 			seenPaths[entry.Path] = struct{}{}
+
+			// Capture .cvmfsdirtab content (last one wins on duplicate paths,
+			// but duplicates are rejected above so there is at most one).
+			if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && len(entry.Data) > 0 {
+				capturedDirtab = make([]byte, len(entry.Data))
+				copy(capturedDirtab, entry.Data)
+			}
 
 			select {
 			case compressChan <- entry:
@@ -367,6 +386,9 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 		return nil, fmt.Errorf("pipeline: %w", err)
 	}
 
+	// Propagate the captured .cvmfsdirtab content (safe to read after eg.Wait).
+	result.DirtabContent = capturedDirtab
+
 	// Patch catalog entries with hashes and chunks from compress results.
 	// Fix C2: hex decode errors are now propagated rather than silently ignored.
 	rawEntries := builder.Entries()
@@ -410,6 +432,23 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 				}
 			}
 			result.CatalogEntries[i].Chunks = chunks
+		}
+
+		// Inject synthetic xattrs now that Hash, CompAlgo, and Chunks are
+		// populated.  SyntheticAttrs generates user.cvmfs.hash,
+		// user.cvmfs.compression, and (for chunked files) user.cvmfs.chunk_list.
+		// These are merged on top of any user xattrs already present in the
+		// entry so that synthetic keys always reflect the actual pipeline output.
+		synthetic := cvmfscatalog.SyntheticAttrs(&result.CatalogEntries[i])
+		if len(synthetic) > 0 {
+			if result.CatalogEntries[i].Xattr == nil {
+				result.CatalogEntries[i].Xattr = synthetic
+			} else {
+				// cvmfsxattr.Merge writes src keys into dst, with src winning.
+				for k, v := range synthetic {
+					result.CatalogEntries[i].Xattr[k] = v
+				}
+			}
 		}
 	}
 

@@ -88,6 +88,47 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	return m, nil
 }
 
+// DownloadObject fetches and decompresses a regular content object (NOT a
+// catalog) from a stratum0 HTTP CAS.  hashHex is the plain hex hash without
+// any suffix; algo is the hash algorithm used to construct the URL suffix
+// ("" for SHA-1, "-" for SHA-256, "~" for RipeMD-160 — matching HashSuffix).
+// The function decompresses the zlib-compressed payload and returns the raw
+// bytes.  This is used, for example, to retrieve the .cvmfsdirtab file stored
+// in an existing repository so its split rules can be applied to new entries.
+func DownloadObject(ctx context.Context, client *http.Client, stratum0URL, repoName, hashHex string, algo HashAlgo) ([]byte, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	suffix := HashSuffix(algo)
+	casPath := hashHex[:2] + "/" + hashHex + suffix
+	url := stratum0URL + "/" + repoName + "/data/" + casPath
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching object: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, url)
+	}
+
+	zr, err := zlib.NewReader(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("creating zlib reader for object: %w", err)
+	}
+	defer zr.Close()
+
+	data, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, fmt.Errorf("reading decompressed object: %w", err)
+	}
+	return data, nil
+}
+
 // DownloadCatalog fetches and decompresses a catalog from a stratum0 HTTP CAS.
 // hashHex is the plain hex hash (without suffix). The "C" suffix is appended to the filename.
 // The result is written to destPath as a plain (decompressed) SQLite file.

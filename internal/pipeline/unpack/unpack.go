@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// paxXattrPrefix is the standard prefix that GNU tar uses when encoding
+// extended attributes in PAX records: SCHILY.xattr.<xattr-name>.
+const paxXattrPrefix = "SCHILY.xattr."
+
 // MaxFileSize is the default per-entry size limit (1 GiB).
 // Callers may pass a custom limit via ExtractWithOptions.
 const MaxFileSize int64 = 1 << 30 // 1 GiB
@@ -22,6 +26,12 @@ type FileEntry struct {
 	Size       int64
 	Data       []byte
 	LinkTarget string // for symlinks
+	UID        uint32
+	GID        uint32
+	// Xattrs contains extended attributes extracted from the tar PAX headers.
+	// Keys are the bare xattr names (e.g. "user.myapp.tag"), values are the
+	// raw attribute bytes.  Nil means no xattrs were present.
+	Xattrs     map[string][]byte
 }
 
 // Options controls extraction behaviour.
@@ -77,11 +87,36 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 
 		cleanPath := filepath.Clean(header.Name)
 
+		// Clamp negative UID/GID values (malformed tar) to 0.
+		uid := header.Uid
+		if uid < 0 {
+			uid = 0
+		}
+		gid := header.Gid
+		if gid < 0 {
+			gid = 0
+		}
+
 		entry := FileEntry{
 			Path:    cleanPath,
 			Mode:    fs.FileMode(header.Mode),
 			ModTime: header.ModTime,
 			Size:    header.Size,
+			UID:     uint32(uid),
+			GID:     uint32(gid),
+		}
+
+		// Extract extended attributes from PAX records.
+		// GNU tar encodes xattrs as "SCHILY.xattr.<name>" PAX entries.
+		for k, v := range header.PAXRecords {
+			name, ok := strings.CutPrefix(k, paxXattrPrefix)
+			if !ok || name == "" {
+				continue
+			}
+			if entry.Xattrs == nil {
+				entry.Xattrs = make(map[string][]byte)
+			}
+			entry.Xattrs[name] = []byte(v)
 		}
 
 		switch header.Typeflag {
