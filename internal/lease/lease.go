@@ -52,8 +52,24 @@ type Client struct {
 	Secret string
 	// obs provides logging and metrics.
 	obs *observe.Provider
-	// client is the HTTP client with TLS 1.2+ enforced.
+	// client is the HTTP client with TLS 1.2+ enforced, used for all operations
+	// except Commit (which uses commitClient).
 	client *http.Client
+	// commitClient is used exclusively for the commit POST.  It has no
+	// client-level timeout so that the caller's context controls the deadline.
+	// The cvmfs_receiver commit operation (catalog merge + RSA signing) can
+	// legitimately exceed 30 s, particularly on the first publish or in
+	// entropy-starved containers.
+	commitClient *http.Client
+}
+
+// newTLSTransport returns an http.Transport with TLS 1.2+ enforced.
+func newTLSTransport() *http.Transport {
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
 }
 
 // NewClient creates a new lease client with the given gateway base URL and HMAC credentials.
@@ -69,12 +85,13 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 		// deployments should prefer TLS 1.3 where the gateway supports it — Go
 		// will automatically negotiate 1.3 when both sides support it.
 		client: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					MinVersion: tls.VersionTLS12,
-				},
-			},
+			Timeout:   30 * time.Second,
+			Transport: newTLSTransport(),
+		},
+		// No Timeout: let the context passed to Commit() control the deadline.
+		// This allows the cvmfs_receiver to take as long as it needs.
+		commitClient: &http.Client{
+			Transport: newTLSTransport(),
 		},
 	}
 }
@@ -466,7 +483,10 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	// POST /api/v1/leases/<token> — HMAC over token string per authz.go.
 	c.signWithToken(postReq, req.Token)
 
-	resp, err := c.client.Do(postReq)
+	// Use commitClient (no client-level timeout) so that slow cvmfs_receiver
+	// operations (catalog merge, RSA signing) are not cut short.  The caller's
+	// ctx provides the deadline.
+	resp, err := c.commitClient.Do(postReq)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("committing lease: %w", err)
