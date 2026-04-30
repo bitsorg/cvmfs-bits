@@ -112,10 +112,10 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE TABLE IF NOT EXISTS nested_catalogs (
-	md5path_1 INTEGER,
-	md5path_2 INTEGER,
-	sha1 BLOB,
-	size INTEGER
+	path TEXT,
+	sha1 TEXT,
+	size INTEGER,
+	CONSTRAINT pk_nested_catalogs PRIMARY KEY (path)
 );
 
 CREATE TABLE IF NOT EXISTS statistics (
@@ -225,12 +225,17 @@ func Open(dbPath string) (*Catalog, error) {
 	}
 	// err == sql.ErrNoRows → root catalog, rootPrefix stays ""
 
-	// Fix N3: apply UNIQUE indexes idempotently so catalogs created before
-	// the constraints were introduced also get them enforced on open.
-	if err := applyUniqueIndexes(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("applying unique indexes: %w", err)
-	}
+	// NOTE: applyUniqueIndexes is intentionally NOT called here.
+	//
+	// Open() is used for read-only access to existing catalogs — including
+	// catalogs created by cvmfs_server mkfs / cvmfs_server publish, which use
+	// the native CVMFS schema (nested_catalogs has "path TEXT PRIMARY KEY", not
+	// our md5path_1/md5path_2 columns).  Attempting to create our custom indexes
+	// on a foreign catalog fails with "no such column: md5path_1".
+	//
+	// Our unique indexes are write-path guards; they are applied in Create() where
+	// we control the schema.  Catalogs we create already have the indexes on disk,
+	// so reopening them via Open() requires no retrofitting.
 
 	return &Catalog{
 		db:         db,
@@ -258,14 +263,9 @@ func applyUniqueIndexes(db *sql.DB) error {
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_path_offset
 			 ON chunks (md5path_1, md5path_2, offset)`,
 		},
-		{
-			// Fix N6: each nested catalog mount point must appear at most once.
-			// Without this, a second AddNestedMount for the same path produces a
-			// duplicate row that FindNestedMount silently ignores (returns first).
-			"nested catalog path uniqueness",
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_nested_catalogs_path
-			 ON nested_catalogs (md5path_1, md5path_2)`,
-		},
+		// NOTE: nested_catalogs uses "path TEXT PRIMARY KEY" matching the CVMFS
+		// native schema (catalog_sql.cc line 273).  The PRIMARY KEY constraint
+		// already enforces uniqueness, so no additional UNIQUE INDEX is needed.
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s.sql); err != nil {
@@ -494,6 +494,12 @@ func (c *Catalog) Close() error {
 
 // AddNestedMount adds a nested catalog entry and updates the directory's FlagDirNestedMount.
 //
+// The nested_catalogs table uses the CVMFS native schema (catalog_sql.cc line 273):
+//   path TEXT PRIMARY KEY, sha1 TEXT, size INTEGER
+// sha1 is stored as a plain 40-char hex string WITHOUT the content-type suffix,
+// matching WritableCatalog::InsertNestedCatalog which calls content_hash.ToString()
+// (ToString() defaults to with_suffix=false — see hash.h line 241).
+//
 // Fix N1/C3: the INSERT into nested_catalogs and the UPDATE of the directory
 // entry's flags are wrapped in a single transaction so a crash between them
 // cannot leave the catalog in a structurally inconsistent state.
@@ -501,35 +507,29 @@ func (c *Catalog) Close() error {
 // Fix N1/C1: c.delta.SelfNested is incremented only after the transaction
 // commits successfully, so a rollback never permanently corrupts the in-memory
 // statistics delta.
-func (c *Catalog) AddNestedMount(path, hashHex string, size int64) error {
-	hashBytes, err := decodeHex(hashHex)
-	if err != nil {
-		return fmt.Errorf("decoding hash %s: %w", hashHex, err)
-	}
-
-	p1, p2 := MD5Path(path)
+func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
+	p1, p2 := MD5Path(mountPath)
 
 	tx, err := c.db.Begin()
 	if err != nil {
-		return fmt.Errorf("beginning transaction for AddNestedMount %s: %w", path, err)
+		return fmt.Errorf("beginning transaction for AddNestedMount %s: %w", mountPath, err)
 	}
 	defer tx.Rollback() // no-op after Commit
 
 	if _, err := tx.Exec(`
-		INSERT INTO nested_catalogs (md5path_1, md5path_2, sha1, size)
-		VALUES (?, ?, ?, ?)
-	`, p1, p2, hashBytes, size); err != nil {
-		return fmt.Errorf("inserting nested catalog at %s: %w", path, err)
+		INSERT INTO nested_catalogs (path, sha1, size) VALUES (?, ?, ?)
+	`, mountPath, hashHex, size); err != nil {
+		return fmt.Errorf("inserting nested catalog at %s: %w", mountPath, err)
 	}
 
 	if _, err := tx.Exec(`
 		UPDATE catalog SET flags = flags | ? WHERE md5path_1 = ? AND md5path_2 = ?
 	`, FlagDirNestedMount, p1, p2); err != nil {
-		return fmt.Errorf("updating directory flags for nested mount at %s: %w", path, err)
+		return fmt.Errorf("updating directory flags for nested mount at %s: %w", mountPath, err)
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
-		return fmt.Errorf("committing AddNestedMount for %s: %w", path, commitErr)
+		return fmt.Errorf("committing AddNestedMount for %s: %w", mountPath, commitErr)
 	}
 
 	// Update in-memory delta only after the transaction commits (Fix N1/C1).
@@ -541,34 +541,33 @@ func (c *Catalog) AddNestedMount(path, hashHex string, size int64) error {
 // this catalog.  If found, it returns the compressed catalog hash (hex) and
 // compressed size stored in the nested_catalogs table.
 // Returns found=false (no error) when no row exists for absPath.
+//
+// nested_catalogs uses the CVMFS native schema: path TEXT PRIMARY KEY, sha1 TEXT.
+// sha1 is the plain 40-char hex hash (no suffix) — returned directly.
 func (c *Catalog) FindNestedMount(absPath string) (hashHex string, size int64, found bool, err error) {
-	p1, p2 := MD5Path(absPath)
-	var hashBlob []byte
+	var sha1Hex string
 	var sz int64
 	row := c.db.QueryRow(
-		"SELECT sha1, size FROM nested_catalogs WHERE md5path_1 = ? AND md5path_2 = ?",
-		p1, p2)
-	if scanErr := row.Scan(&hashBlob, &sz); scanErr != nil {
+		"SELECT sha1, size FROM nested_catalogs WHERE path = ?", absPath)
+	if scanErr := row.Scan(&sha1Hex, &sz); scanErr != nil {
 		if errors.Is(scanErr, sql.ErrNoRows) {
 			return "", 0, false, nil
 		}
 		return "", 0, false, fmt.Errorf("querying nested catalog at %q: %w", absPath, scanErr)
 	}
-	return hex.EncodeToString(hashBlob), sz, true, nil
+	return sha1Hex, sz, true, nil
 }
 
 // UpdateNestedMount replaces the hash and size of an existing nested catalog
 // row identified by absPath.  Returns an error if no row is found (the caller
 // must ensure the nested catalog entry was previously inserted via AddNestedMount).
+//
+// hashHex is the plain 40-char hex hash (no suffix), stored as TEXT — matching
+// the CVMFS native nested_catalogs schema.
 func (c *Catalog) UpdateNestedMount(absPath, hashHex string, size int64) error {
-	hashBytes, err := decodeHex(hashHex)
-	if err != nil {
-		return fmt.Errorf("decoding hash for nested catalog at %q: %w", absPath, err)
-	}
-	p1, p2 := MD5Path(absPath)
 	res, err := c.db.Exec(
-		"UPDATE nested_catalogs SET sha1 = ?, size = ? WHERE md5path_1 = ? AND md5path_2 = ?",
-		hashBytes, size, p1, p2)
+		"UPDATE nested_catalogs SET sha1 = ?, size = ? WHERE path = ?",
+		hashHex, size, absPath)
 	if err != nil {
 		return fmt.Errorf("updating nested catalog at %q: %w", absPath, err)
 	}
@@ -578,10 +577,6 @@ func (c *Catalog) UpdateNestedMount(absPath, hashHex string, size int64) error {
 	return nil
 }
 
-// decodeHex decodes a hex string to bytes using encoding/hex (Fix M4).
-func decodeHex(s string) ([]byte, error) {
-	return hex.DecodeString(s)
-}
 
 // Finalize increments revision, sets last_modified, flushes statistics delta,
 // compresses the database, writes it to destDir in CAS format, and returns the
