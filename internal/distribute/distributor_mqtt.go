@@ -345,7 +345,7 @@ func pushToReceiver(
 			}
 			// Pass "" as the legacy endpoint — pushObject uses sessionToken +
 			// dataEndpoint for the data-channel path, ignoring the first arg.
-			lastErr = pushObject(ctx, "", hash, casBackend, cfg.Timeout, rm.SessionToken, rm.DataURL)
+			lastErr = pushObject(ctx, "", hash, casBackend, cfg.Timeout, rm.SessionToken, rm.DataURL, cfg.DevMode)
 			if lastErr == nil {
 				break
 			}
