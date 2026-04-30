@@ -106,7 +106,9 @@ func DownloadObject(ctx context.Context, client *http.Client, stratum0URL, repoN
 		client = http.DefaultClient
 	}
 	suffix := HashSuffix(algo)
-	casPath := hashHex[:2] + "/" + hashHex + suffix
+	// CVMFS CAS path: data/<first2>/<remaining38>[suffix]
+	// The filename is hash[2:], NOT the full hash — matching shash::MakePath().
+	casPath := hashHex[:2] + "/" + hashHex[2:] + suffix
 	url := stratum0URL + "/" + repoName + "/data/" + casPath
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -143,8 +145,9 @@ func DownloadCatalog(ctx context.Context, client *http.Client, stratum0URL, repo
 		client = http.DefaultClient
 	}
 
-	// Construct the CAS path: data/XY/hashC
-	casPath := hashHex[:2] + "/" + hashHex + "C"
+	// Construct the CAS path: data/<first2>/<remaining38>C
+	// The filename is hash[2:], NOT the full hash — matching shash::MakePath().
+	casPath := hashHex[:2] + "/" + hashHex[2:] + "C"
 	url := stratum0URL + "/" + repoName + "/data/" + casPath
 
 	// Fetch the file

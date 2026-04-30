@@ -24,6 +24,20 @@ import (
 // can check for this sentinel and continue rather than fail (Fix N4).
 var ErrNotFound = errors.New("catalog: entry not found")
 
+// cvmfsStatCounters is the canonical list of counter names that cvmfs_receiver's
+// SqlGetCounter queries via: SELECT value FROM statistics WHERE counter = :counter
+// The names match DeltaCounters::FillFieldsMap("self_", …) and FillFieldsMap("subtree_", …)
+// in cvmfs/catalog_counters.h.  Every catalog MUST have a row for each of these
+// or the receiver will crash with an assert failure inside Sql::LazyInit.
+var cvmfsStatCounters = []string{
+	"self_regular", "self_symlink", "self_special", "self_dir", "self_nested",
+	"self_chunked", "self_chunks", "self_file_size", "self_chunked_size",
+	"self_xattr", "self_external", "self_external_file_size",
+	"subtree_regular", "subtree_symlink", "subtree_special", "subtree_dir", "subtree_nested",
+	"subtree_chunked", "subtree_chunks", "subtree_file_size", "subtree_chunked_size",
+	"subtree_xattr", "subtree_external", "subtree_external_file_size",
+}
+
 // Catalog represents a CVMFS catalog (SQLite database).
 type Catalog struct {
 	db         *sql.DB
@@ -105,20 +119,8 @@ CREATE TABLE IF NOT EXISTS nested_catalogs (
 );
 
 CREATE TABLE IF NOT EXISTS statistics (
-	self_regular INTEGER DEFAULT 0,
-	self_symlink INTEGER DEFAULT 0,
-	self_dir INTEGER DEFAULT 0,
-	self_nested INTEGER DEFAULT 0,
-	subtree_regular INTEGER DEFAULT 0,
-	subtree_symlink INTEGER DEFAULT 0,
-	subtree_dir INTEGER DEFAULT 0,
-	subtree_nested INTEGER DEFAULT 0,
-	self_xattr INTEGER DEFAULT 0,
-	subtree_xattr INTEGER DEFAULT 0,
-	self_external INTEGER DEFAULT 0,
-	subtree_external INTEGER DEFAULT 0,
-	self_special INTEGER DEFAULT 0,
-	subtree_special INTEGER DEFAULT 0
+	counter TEXT PRIMARY KEY,
+	value   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS properties (
@@ -159,15 +161,16 @@ CREATE TABLE IF NOT EXISTS properties (
 		}
 	}
 
-	// Initialize statistics with zeros
-	if _, err := db.Exec(`INSERT INTO statistics (
-		self_regular, self_symlink, self_dir, self_nested,
-		subtree_regular, subtree_symlink, subtree_dir, subtree_nested,
-		self_xattr, subtree_xattr, self_external, subtree_external,
-		self_special, subtree_special
-	) VALUES (0,0,0,0,0,0,0,0,0,0,0,0,0,0)`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("initializing statistics: %w", err)
+	// Initialize statistics with zeros — one row per CVMFS counter name.
+	// The schema matches what cvmfs_receiver's SqlGetCounter expects:
+	//   SELECT value FROM statistics WHERE counter = :counter
+	for _, ctr := range cvmfsStatCounters {
+		if _, err := db.Exec(
+			`INSERT OR IGNORE INTO statistics (counter, value) VALUES (?, 0)`, ctr,
+		); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("initializing statistics counter %s: %w", ctr, err)
+		}
 	}
 
 	c := &Catalog{
@@ -604,27 +607,42 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 		return "", Statistics{}, fmt.Errorf("updating last_modified: %w", err)
 	}
 
-	if _, err := tx.Exec(`UPDATE statistics SET
-		self_regular     = self_regular     + ?,
-		self_symlink     = self_symlink     + ?,
-		self_dir         = self_dir         + ?,
-		self_nested      = self_nested      + ?,
-		subtree_regular  = subtree_regular  + ?,
-		subtree_symlink  = subtree_symlink  + ?,
-		subtree_dir      = subtree_dir      + ?,
-		subtree_nested   = subtree_nested   + ?,
-		self_xattr       = self_xattr       + ?,
-		subtree_xattr    = subtree_xattr    + ?,
-		self_external    = self_external    + ?,
-		subtree_external = subtree_external + ?,
-		self_special     = self_special     + ?,
-		subtree_special  = subtree_special  + ?`,
-		c.delta.SelfRegular, c.delta.SelfSymlink, c.delta.SelfDir, c.delta.SelfNested,
-		c.delta.SubtreeRegular, c.delta.SubtreeSymlink, c.delta.SubtreeDir, c.delta.SubtreeNested,
-		c.delta.SelfXattr, c.delta.SubtreeXattr, c.delta.SelfExternal, c.delta.SubtreeExternal,
-		c.delta.SelfSpecial, c.delta.SubtreeSpecial,
-	); err != nil {
-		return "", Statistics{}, fmt.Errorf("flushing statistics: %w", err)
+	// Flush the in-memory statistics delta to the key-value statistics table.
+	// Each counter is a separate row: UPDATE statistics SET value = value + ?
+	// WHERE counter = ?  This matches the (counter TEXT PRIMARY KEY, value INTEGER)
+	// schema that cvmfs_receiver's SqlGetCounter expects.
+	deltaMap := map[string]int64{
+		"self_regular":           c.delta.SelfRegular,
+		"self_symlink":           c.delta.SelfSymlink,
+		"self_dir":               c.delta.SelfDir,
+		"self_nested":            c.delta.SelfNested,
+		"self_xattr":             c.delta.SelfXattr,
+		"self_external":          c.delta.SelfExternal,
+		"self_special":           c.delta.SelfSpecial,
+		"self_chunked":           0,
+		"self_chunks":            0,
+		"self_file_size":         0,
+		"self_chunked_size":      0,
+		"self_external_file_size": 0,
+		"subtree_regular":        c.delta.SubtreeRegular,
+		"subtree_symlink":        c.delta.SubtreeSymlink,
+		"subtree_dir":            c.delta.SubtreeDir,
+		"subtree_nested":         c.delta.SubtreeNested,
+		"subtree_xattr":          c.delta.SubtreeXattr,
+		"subtree_external":       c.delta.SubtreeExternal,
+		"subtree_special":        c.delta.SubtreeSpecial,
+		"subtree_chunked":        0,
+		"subtree_chunks":         0,
+		"subtree_file_size":      0,
+		"subtree_chunked_size":   0,
+		"subtree_external_file_size": 0,
+	}
+	for counter, delta := range deltaMap {
+		if _, err := tx.Exec(
+			`UPDATE statistics SET value = value + ? WHERE counter = ?`, delta, counter,
+		); err != nil {
+			return "", Statistics{}, fmt.Errorf("flushing statistics counter %s: %w", counter, err)
+		}
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
@@ -713,25 +731,58 @@ func (c *Catalog) SchemaVersion() string {
 	return "2.5"
 }
 
-// GetStatistics reads current statistics from the database.
+// GetStatistics reads current statistics from the key-value statistics table.
+// Each CVMFS counter is stored as a separate row: (counter TEXT, value INTEGER).
 func (c *Catalog) GetStatistics() (*Statistics, error) {
-	stats := &Statistics{}
-	row := c.db.QueryRow(`
-		SELECT
-			self_regular, self_symlink, self_dir, self_nested,
-			subtree_regular, subtree_symlink, subtree_dir, subtree_nested,
-			self_xattr, subtree_xattr, self_external, subtree_external,
-			self_special, subtree_special
-		FROM statistics
-	`)
-	err := row.Scan(
-		&stats.SelfRegular, &stats.SelfSymlink, &stats.SelfDir, &stats.SelfNested,
-		&stats.SubtreeRegular, &stats.SubtreeSymlink, &stats.SubtreeDir, &stats.SubtreeNested,
-		&stats.SelfXattr, &stats.SubtreeXattr, &stats.SelfExternal, &stats.SubtreeExternal,
-		&stats.SelfSpecial, &stats.SubtreeSpecial,
-	)
+	rows, err := c.db.Query(`SELECT counter, value FROM statistics`)
 	if err != nil {
-		return nil, fmt.Errorf("reading statistics: %w", err)
+		return nil, fmt.Errorf("querying statistics: %w", err)
+	}
+	defer rows.Close()
+
+	stats := &Statistics{}
+	for rows.Next() {
+		var counter string
+		var value int64
+		if err := rows.Scan(&counter, &value); err != nil {
+			return nil, fmt.Errorf("scanning statistics row: %w", err)
+		}
+		switch counter {
+		case "self_regular":
+			stats.SelfRegular = value
+		case "self_symlink":
+			stats.SelfSymlink = value
+		case "self_dir":
+			stats.SelfDir = value
+		case "self_nested":
+			stats.SelfNested = value
+		case "self_xattr":
+			stats.SelfXattr = value
+		case "self_external":
+			stats.SelfExternal = value
+		case "self_special":
+			stats.SelfSpecial = value
+		case "subtree_regular":
+			stats.SubtreeRegular = value
+		case "subtree_symlink":
+			stats.SubtreeSymlink = value
+		case "subtree_dir":
+			stats.SubtreeDir = value
+		case "subtree_nested":
+			stats.SubtreeNested = value
+		case "subtree_xattr":
+			stats.SubtreeXattr = value
+		case "subtree_external":
+			stats.SubtreeExternal = value
+		case "subtree_special":
+			stats.SubtreeSpecial = value
+		// self_chunked, self_chunks, self_file_size, self_chunked_size,
+		// self_external_file_size and their subtree_ counterparts are tracked
+		// for completeness but not mapped to Statistics fields yet.
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating statistics rows: %w", err)
 	}
 	return stats, nil
 }

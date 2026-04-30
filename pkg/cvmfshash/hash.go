@@ -8,16 +8,26 @@ import (
 	"io"
 )
 
-// ObjectPath returns the CAS path for a hash matching CVMFS directory structure.
-// Format: "data/XX/XXXXXXXXXXX..." where XX is the first two hex characters of the hash.
-// The hash may include a CVMFS content-type suffix (e.g., "C" for catalogs) as the
-// 41st character; this is preserved as-is so the path maps directly to the on-disk layout.
-// This 2-level directory structure balances fanout for fast lookups.
+// ObjectPath returns the CAS path for a hash matching the CVMFS standard
+// on-disk directory structure.
+//
+// CVMFS stores CAS objects at:
+//
+//	data/<first2hex>/<remaining38hex>[suffix]
+//
+// i.e. the filename is hash[2:], NOT the full hash.  Using the full hash as the
+// filename is a common mistake that produces paths like data/ab/abcdef... instead
+// of the correct data/ab/cdef...  The receiver's LocalUploader::FinalizeStreamedUpload
+// calls shash.MakePath() which generates the correct hash[2:] filename, so our
+// local CAS layout must match.
+//
+// The hash argument may include a CVMFS content-type suffix (e.g., "C" for
+// catalogs) beyond the 40 hex chars; the suffix is preserved in the filename.
 func ObjectPath(hash string) string {
 	if len(hash) < 2 {
 		return "data/00/" + hash
 	}
-	return "data/" + hash[:2] + "/" + hash
+	return "data/" + hash[:2] + "/" + hash[2:]
 }
 
 // HashReader reads all data from r, computes its SHA-1 hash, and returns
