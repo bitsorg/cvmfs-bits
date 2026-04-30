@@ -179,21 +179,35 @@ CREATE TABLE IF NOT EXISTS properties (
 		rootPrefix: rootPrefix,
 	}
 
-	// Insert root directory entry
+	// Insert root directory entry.
+	//
+	// The CVMFS receiver (catalog_mgr_rw.cc) calls LookupPath(rootPrefix) on a
+	// nested catalog when loading it via AttachFreely / LoadFreeCatalog.  Because
+	// is_regular_mountpoint_ = (mountpoint == root_prefix), NormalizePath returns
+	// MD5(path) unchanged, so LookupPath("/test/smoke") computes MD5("/test/smoke").
+	//
+	// For root catalogs (rootPrefix == ""), LookupPath("") → MD5("") matches the
+	// entry at FullPath="" as before.
+	// For nested catalogs (rootPrefix != ""), the entry MUST be stored at
+	// MD5(rootPrefix) — achieved by setting FullPath = rootPrefix here.
 	isNestedRoot := rootPrefix != ""
+	rootEntryPath := "" // repo root catalog
+	if isNestedRoot {
+		rootEntryPath = rootPrefix // nested catalog: root entry at MD5(rootPrefix)
+	}
 	rootEntry := Entry{
-		FullPath:      "",
-		Name:          "",
-		Mode:          fs.ModeDir | 0o755,
-		Size:          4096,
-		Mtime:         now,
-		MtimeNs:       0,
-		UID:           0,
-		GID:           0,
-		LinkCount:     1,
-		HashAlgo:      HashSha256,
-		CompAlgo:      CompZlib,
-		IsNestedRoot:  isNestedRoot,
+		FullPath:     rootEntryPath,
+		Name:         "",
+		Mode:         fs.ModeDir | 0o755,
+		Size:         4096,
+		Mtime:        now,
+		MtimeNs:      0,
+		UID:          0,
+		GID:          0,
+		LinkCount:    1,
+		HashAlgo:     HashSha256,
+		CompAlgo:     CompZlib,
+		IsNestedRoot: isNestedRoot,
 	}
 
 	if err := c.upsertEntry(rootEntry); err != nil {
@@ -509,6 +523,8 @@ func (c *Catalog) Close() error {
 // statistics delta.
 func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 	p1, p2 := MD5Path(mountPath)
+	parentPath, _ := ParentAbsPath(mountPath)
+	pp1, pp2 := MD5Path(parentPath)
 
 	tx, err := c.db.Begin()
 	if err != nil {
@@ -522,6 +538,31 @@ func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 		return fmt.Errorf("inserting nested catalog at %s: %w", mountPath, err)
 	}
 
+	// Guarantee the mount-point directory entry exists in the catalog table.
+	//
+	// The receiver's DiffRec walker calls Listing(parent) which queries
+	// "SELECT … FROM catalog WHERE parent_1=? AND parent_2=?".  If the
+	// mount-point row is absent the diff walker never sees the directory, never
+	// calls GraftNestedCatalog, and the nested catalog is silently dropped.
+	//
+	// The path-routing step may or may not have already inserted this entry
+	// (e.g. it is missing when the tar root "." entry was routed to the child
+	// catalog rather than this parent).  INSERT OR IGNORE + UPDATE FLAGS is
+	// therefore idempotent: it creates a minimal dir entry when none exists and
+	// only OR-sets FlagDirNestedMount when one already does.
+	name := filepath.Base(mountPath)
+	dirMode := UnixMode(fs.ModeDir | 0o755)
+	dirFlags := FlagDir | FlagDirNestedMount
+	now := time.Now().Unix()
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO catalog (
+			md5path_1, md5path_2, parent_1, parent_2,
+			hardlinks, hash, size, mode, mtime, mtimens,
+			flags, name, symlink, uid, gid, xattr
+		) VALUES (?, ?, ?, ?, 1, NULL, 4096, ?, ?, 0, ?, ?, '', 0, 0, NULL)
+	`, p1, p2, pp1, pp2, dirMode, now, dirFlags, name); err != nil {
+		return fmt.Errorf("inserting mount dir entry for %s: %w", mountPath, err)
+	}
 	if _, err := tx.Exec(`
 		UPDATE catalog SET flags = flags | ? WHERE md5path_1 = ? AND md5path_2 = ?
 	`, FlagDirNestedMount, p1, p2); err != nil {

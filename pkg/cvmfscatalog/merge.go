@@ -59,8 +59,9 @@ func HashSuffix(algo HashAlgo) string {
 
 // catalogChainNode is one level in the root→leaf catalog hierarchy.
 type catalogChainNode struct {
-	cat  *Catalog
-	path string // absolute root prefix for this catalog ("" for repo root)
+	cat   *Catalog
+	path  string // absolute root prefix for this catalog ("" for repo root)
+	isNew bool   // true when freshly created for this publish (not downloaded from stratum0)
 }
 
 // Merge fetches the current root catalog from stratum0, walks the nested
@@ -199,6 +200,22 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		defer chain[i].cat.Close()
 	}
 
+	// ── Step 3.3: Ensure the chain ends exactly at the lease path ─────────────
+	// The CVMFS receiver (catalog_merge_tool_impl.h) calls GraftNestedCatalog /
+	// SwapNestedCatalog for the entry at targetAbsPath and PANICs if no matching
+	// catalog object exists in the commit payload.  If the existing chain already
+	// ends at targetAbsPath (a prior publish created a nested catalog there),
+	// no action is needed.
+	if targetAbsPath != "" && chain[len(chain)-1].path != targetAbsPath {
+		leaseCatDBPath := filepath.Join(cfg.TempDir, "lease_"+safePathID(targetAbsPath)+".db")
+		leaseCat, createErr := Create(leaseCatDBPath, targetAbsPath)
+		if createErr != nil {
+			return nil, fmt.Errorf("creating lease catalog at %q: %w", targetAbsPath, createErr)
+		}
+		defer leaseCat.Close()
+		chain = append(chain, catalogChainNode{cat: leaseCat, path: targetAbsPath, isNew: true})
+	}
+
 	// ── Step 3.5: Rewrite entry paths from relative to absolute ─────────────
 	// The pipeline produces paths relative to the tar root, e.g.
 	// "usr/share/test-pkg/hello.txt". CVMFS requires absolute paths with the
@@ -212,6 +229,12 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		case rel == "." || rel == "":
 			// Tar root entry → the lease directory itself.
 			entries[i].FullPath = prefix
+			if prefix != "" {
+				// This entry becomes the root of the lease nested catalog.
+				// FlagDirNestedRoot must be set so GraftNestedCatalog /
+				// SwapNestedCatalog can validate the catalog root entry.
+				entries[i].IsNestedRoot = true
+			}
 		case strings.HasPrefix(rel, "/"):
 			// Already absolute — pipeline has already prefixed this entry.
 			// Pass through unchanged to avoid double-prefixing (e.g. if the
@@ -366,20 +389,31 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 	}
 
 	// ── Step 6: Finalise the existing chain bottom-up ─────────────────────────
-	// Same invariant as before: childHash / childSize / childPath / childDelta
-	// track the previously-finalised child so we can update its parent's row.
+	// childHash / childSize / childPath / childDelta track the previously-
+	// finalised child so we can register it in its parent's nested_catalogs.
+	// childIsNew distinguishes a freshly-created catalog (Step 3.3) from one
+	// that was downloaded from stratum0: new catalogs need AddNestedMount
+	// (INSERT into nested_catalogs + guarantee dir entry), while existing ones
+	// need UpdateNestedMount (UPDATE the existing nested_catalogs row).
 	var childHash string
 	var childSize int64
 	var childPath string
 	var childDelta Statistics
+	var childIsNew bool
 
 	for i := len(chain) - 1; i >= 0; i-- {
 		node := chain[i]
 
 		if childHash != "" {
-			if updErr := node.cat.UpdateNestedMount(childPath, childHash, childSize); updErr != nil {
-				return nil, fmt.Errorf("updating nested mount %q in catalog at %q: %w",
-					childPath, node.path, updErr)
+			var nestErr error
+			if childIsNew {
+				nestErr = node.cat.AddNestedMount(childPath, childHash, childSize)
+			} else {
+				nestErr = node.cat.UpdateNestedMount(childPath, childHash, childSize)
+			}
+			if nestErr != nil {
+				return nil, fmt.Errorf("registering nested mount %q in catalog at %q: %w",
+					childPath, node.path, nestErr)
 			}
 
 			node.cat.delta.SubtreeRegular += childDelta.SelfRegular + childDelta.SubtreeRegular
@@ -407,6 +441,7 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		childSize = fi.Size()
 		childPath = node.path
 		childDelta = delta
+		childIsNew = node.isNew
 	}
 
 	// After the loop: childHash holds the new root catalog hash (SHA-1 of its
