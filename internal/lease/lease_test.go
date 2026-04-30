@@ -38,8 +38,12 @@ func newTestClient(t *testing.T, srv *httptest.Server) *Client {
 	}
 	t.Cleanup(shutdown)
 	c := NewClient(srv.URL, "key", "secret", obs)
-	// Use the test server's client so TLS certs are trusted.
+	// Use the test server's client so TLS certs are trusted for both
+	// regular requests (c.client) and commit requests (c.commitClient,
+	// which skips the per-client timeout so slow receiver operations
+	// don't time out in production).
 	c.client = srv.Client()
+	c.commitClient = srv.Client()
 	return c
 }
 

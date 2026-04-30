@@ -124,8 +124,8 @@ func TestMerge(t *testing.T) {
 		t.Fatalf("Merge failed: %v", err)
 	}
 
-	if mergeResult.OldRootHash != oldHash {
-		t.Errorf("Expected OldRootHash %s, got %s", oldHash, mergeResult.OldRootHash)
+	if mergeResult.OldRootHash != oldHash+"C" {
+		t.Errorf("Expected OldRootHash %s, got %s", oldHash+"C", mergeResult.OldRootHash)
 	}
 
 	if mergeResult.NewRootHash == "" {
@@ -354,8 +354,8 @@ func TestMergeNestedCatalog(t *testing.T) {
 	}
 
 	// ── 5. Assertions ──────────────────────────────────────────────────────
-	if result.OldRootHash != rootHash {
-		t.Errorf("OldRootHash: got %s, want %s", result.OldRootHash, rootHash)
+	if result.OldRootHash != rootHash+"C" {
+		t.Errorf("OldRootHash: got %s, want %s", result.OldRootHash, rootHash+"C")
 	}
 	if result.NewRootHash == "" {
 		t.Error("NewRootHash is empty")
@@ -505,8 +505,8 @@ func TestMergeNestedCatalogChain(t *testing.T) {
 	}
 
 	// ── 6. Assertions ──────────────────────────────────────────────────────
-	if result.OldRootHash != rootHash {
-		t.Errorf("OldRootHash: got %s, want %s", result.OldRootHash, rootHash)
+	if result.OldRootHash != rootHash+"C" {
+		t.Errorf("OldRootHash: got %s, want %s", result.OldRootHash, rootHash+"C")
 	}
 	if result.NewRootHash == rootHash {
 		t.Error("NewRootHash should differ from OldRootHash")
@@ -953,8 +953,8 @@ func TestMergeWithCvmfsCatalogSplit(t *testing.T) {
 	}
 
 	// ── 4. Assertions ──────────────────────────────────────────────────────
-	if result.OldRootHash != oldHash {
-		t.Errorf("OldRootHash: got %s, want %s", result.OldRootHash, oldHash)
+	if result.OldRootHash != oldHash+"C" {
+		t.Errorf("OldRootHash: got %s, want %s", result.OldRootHash, oldHash+"C")
 	}
 	if result.NewRootHash == oldHash {
 		t.Error("NewRootHash must differ from OldRootHash after split")

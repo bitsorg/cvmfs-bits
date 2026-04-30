@@ -35,7 +35,7 @@ type MergeConfig struct {
 
 // MergeResult holds the result of a merge operation.
 type MergeResult struct {
-	OldRootHash         string   // plain hex from manifest (no suffix)
+	OldRootHash         string   // SHA-1 hex + 'C' catalog content-type suffix (e.g. "abc123...C"); empty on first publish
 	NewRootHash         string   // plain hex of new root catalog (no suffix)
 	NewRootHashSuffixed string   // new root hash with CVMFS algorithm suffix (e.g. "abc-" for SHA-256)
 	AllCatalogHashes    []string // hashes in order: leaf/new-children first, root last (no suffix)
@@ -118,8 +118,14 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 	}
 
 	result := &MergeResult{}
-	if manifest != nil {
-		result.OldRootHash = manifest.RootHash
+	if manifest != nil && manifest.RootHash != "" {
+		// OldRootHash must carry the 'C' catalog content-type suffix so that
+		// the receiver's LoadCatalogByHash assertion
+		//   assert(shash::kSuffixCatalog == effective_hash.suffix)
+		// is satisfied.  manifest.RootHash is the plain 40-char SHA-1 (algorithm
+		// suffixes like "-rmd160" are stripped by ParseManifest); we add 'C'
+		// here to produce the 41-char suffixed form the receiver expects.
+		result.OldRootHash = manifest.RootHash + "C"
 	}
 
 	// Finalize() always SHA-256 hashes the compressed bytes, so the suffix on

@@ -162,6 +162,7 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	cvmfsMount := "/cvmfs"
 	casType := "localfs"
 	casRoot := "/var/lib/cas"
+	stratum0URL := ""
 	s1Endpoints := ""
 	s1Quorum := 1.0
 	s1Timeout := 60 * time.Second
@@ -196,6 +197,7 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
+		&stratum0URL,
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
@@ -236,6 +238,7 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	cvmfsMount := "/cvmfs"
 	casType := "localfs"
 	casRoot := "/var/lib/cas"
+	stratum0URL := ""
 	s1Endpoints := ""
 	s1Quorum := 1.0
 	s1Timeout := 60 * time.Second
@@ -258,6 +261,7 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
+		&stratum0URL,
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
@@ -285,6 +289,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	mode, logLevel := "publisher", "info"
 	devMode := false
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot := "/sp", "", ":8080", "gateway", "https://gw", "/cvmfs", "localfs", "/cas"
+	stratum0URL := ""
 	s1Quorum := 1.0
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout := 60*time.Second, time.Duration(0), 30*time.Second
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert := "", "", "", ""
@@ -304,6 +309,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
+		&stratum0URL,
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
