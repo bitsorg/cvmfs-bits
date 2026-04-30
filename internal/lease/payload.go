@@ -6,11 +6,30 @@ package lease
 // a text TOC header (buildCvmfsPackHeader) and wrapped in an outer JSON
 // message (submitOneObject).  SubmitPayload drives the sequence: chunks first,
 // catalog last, so the gateway can verify referential integrity.
+//
+// IMPORTANT — CVMFS hash algorithm constraint:
+//
+// The C++ cvmfs_receiver uses shash::MkFromHexPtr / shash::MkFromSuffixedHexPtr
+// to parse the hashes we send.  Those functions recognise only the algorithms
+// in CVMFS's Algorithms enum:
+//
+//   kMd5    (16 bytes → 32 hex chars, no suffix)
+//   kSha1   (20 bytes → 40 hex chars, no suffix)
+//   kRmd160 (20 bytes → 47 hex chars with "-rmd160" suffix)
+//   kShake128 (20 bytes → 49 hex chars with "-shake128" suffix)
+//
+// SHA-2 256-bit (64 hex chars) is NOT in the enum.  Using it causes
+// MkFromHexPtr to return algorithm=kAny (default-constructed), which makes
+// GetContextSize(kAny) hit its default: PANIC(...) branch → abort() → SIGABRT.
+//
+// Therefore ALL hashes embedded in the ObjectPack wire format MUST use SHA-1:
+//   • payload_digest   — SHA-1 of the pack text header
+//   • C <hashStr>      — SHA-1 of the compressed object bytes
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto/sha1" //nolint:gosec // CVMFS wire protocol requires SHA-1; see above
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -29,10 +48,11 @@ import (
 //	--\n
 //	C <hashStr> <objSize>\n
 //
-// hashStr is the hex-encoded SHA-256 of the object bytes being uploaded.
-// objSize is the byte length of the object payload that follows the header.
-// The receiver (ObjectPackConsumer) reads exactly len(header) bytes as the
-// pack TOC text, verifies its digest, then reads objSize bytes as the object.
+// hashStr is the hex-encoded SHA-1 of the compressed object bytes being
+// uploaded.  SHA-1 produces a 40-char hex string that the C++ receiver can
+// parse via shash::MkFromSuffixedHexPtr (kSha1, no suffix required).
+// objSize is the byte length of the compressed object payload that follows
+// the header.
 func buildCvmfsPackHeader(hashStr string, objSize int) []byte {
 	return []byte(fmt.Sprintf("V2\nS%d\nN1\n--\nC %s %d\n",
 		objSize, hashStr, objSize))
@@ -62,15 +82,30 @@ func buildCvmfsPackHeader(hashStr string, objSize int) []byte {
 // HMAC for the deprecated POST /payloads endpoint is computed over the first
 // Message-Size bytes of the body (the JSON wrapper bytes).
 func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, hash string, objBytes []byte) error {
-	// Compute SHA-256 of the compressed object bytes.
-	objHashArr := sha256.Sum256(objBytes)
+	// Compute SHA-1 of the compressed object bytes.
+	//
+	// The C++ ObjectPackConsumer parses the hash from the "C <hash> <size>"
+	// line using shash::MkFromSuffixedHexPtr.  That function only recognises
+	// SHA-1 (40 hex, no suffix), RIPEMD-160 (47 hex), and SHAKE-128 (49 hex).
+	// A SHA-256 hash (64 hex chars) hits the default: PANIC path in
+	// GetContextSize, aborting the receiver.  Use SHA-1 here so that the
+	// receiver can hash the bytes it receives (also SHA-1) and compare them to
+	// event.id without crashing.
+	objHashArr := sha1.Sum(objBytes) //nolint:gosec // required by CVMFS wire protocol
 	objHashStr := hex.EncodeToString(objHashArr[:])
 
 	// Build the CVMFS object pack text header (the TOC that precedes the data).
 	packHeader := buildCvmfsPackHeader(objHashStr, len(objBytes))
 
-	// Compute SHA-256 of the pack text header itself.
-	packHeaderDigestArr := sha256.Sum256(packHeader)
+	// Compute SHA-1 of the pack text header itself.
+	//
+	// payload_digest is passed to ObjectPackConsumer(expected_digest, header_size).
+	// The consumer calls shash::HashString(raw_header, &digest) where
+	// digest.algorithm = expected_digest.algorithm.  A SHA-256 payload_digest
+	// sets algorithm=kAny, causing GetContextSize(kAny) → PANIC → SIGABRT on
+	// the very first payload.  SHA-1 (40 hex chars) is correctly parsed as
+	// kSha1 and works with the receiver's hash infrastructure.
+	packHeaderDigestArr := sha1.Sum(packHeader) //nolint:gosec // required by CVMFS wire protocol
 	packHeaderDigest := hex.EncodeToString(packHeaderDigestArr[:])
 
 	// Build the JSON message wrapper.
