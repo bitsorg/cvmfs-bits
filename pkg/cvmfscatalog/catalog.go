@@ -118,6 +118,20 @@ CREATE TABLE IF NOT EXISTS nested_catalogs (
 	CONSTRAINT pk_nested_catalogs PRIMARY KEY (path)
 );
 
+-- Required for schema 2.5 revision >= 4.
+-- SqlNestedCatalogListing (catalog_sql.cc) uses:
+--   SELECT path, sha1, size FROM nested_catalogs
+--   UNION ALL SELECT path, sha1, size FROM bind_mountpoints
+-- for catalogs with schema_revision >= 4.  Without this table the
+-- sqlite3_prepare_v2 call in Sql::LazyInit fails and the receiver
+-- crashes with assert(success) (displayed as sql.h:496 in optimised builds).
+CREATE TABLE IF NOT EXISTS bind_mountpoints (
+	path TEXT,
+	sha1 TEXT,
+	size INTEGER,
+	CONSTRAINT pk_bind_mountpoints PRIMARY KEY (path)
+);
+
 CREATE TABLE IF NOT EXISTS statistics (
 	counter TEXT PRIMARY KEY,
 	value   INTEGER NOT NULL DEFAULT 0
