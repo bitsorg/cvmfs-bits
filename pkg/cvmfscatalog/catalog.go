@@ -213,13 +213,17 @@ func Open(dbPath string) (*Catalog, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
-	// Read root_prefix from properties
+	// Read root_prefix from properties.
+	// CVMFS only writes root_prefix for non-root catalogs (catalog_sql.cc line 374:
+	// "if (!root_path.empty()) SetProperty(root_prefix, ...)").  The root catalog
+	// has no root_prefix row — default to "" in that case.
 	var rootPrefix string
 	err = db.QueryRow("SELECT value FROM properties WHERE key = 'root_prefix'").Scan(&rootPrefix)
-	if err != nil {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		db.Close()
 		return nil, fmt.Errorf("reading root_prefix: %w", err)
 	}
+	// err == sql.ErrNoRows → root catalog, rootPrefix stays ""
 
 	// Fix N3: apply UNIQUE indexes idempotently so catalogs created before
 	// the constraints were introduced also get them enforced on open.
