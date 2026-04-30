@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,11 @@ import (
 	"strconv"
 	"strings"
 )
+
+// ErrCatalogNotFound is returned by DownloadCatalog when the server responds
+// with HTTP 404.  Callers (e.g. Merge) use this sentinel to distinguish
+// "catalog missing / repository not yet initialised" from other I/O errors.
+var ErrCatalogNotFound = errors.New("catalog not found (404)")
 
 // Manifest represents a parsed .cvmfspublished manifest.
 type Manifest struct {
@@ -153,6 +159,9 @@ func DownloadCatalog(ctx context.Context, client *http.Client, stratum0URL, repo
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrCatalogNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("http %d: %s", resp.StatusCode, url)
 	}

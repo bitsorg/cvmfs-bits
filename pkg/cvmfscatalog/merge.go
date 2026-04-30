@@ -88,43 +88,76 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 	}
 
 	// ── Step 1: Fetch the current manifest ──────────────────────────────────
+	// A 404 on .cvmfspublished means the repository has never been published
+	// (first publish ever).  We treat this identically to "start from empty".
 	manifestURL := cfg.Stratum0URL + "/" + cfg.RepoName + "/.cvmfspublished"
 	resp, err := cfg.HTTPClient.Get(manifestURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetching manifest: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+
+	// emptyRoot is set when there is no existing catalog to merge into.
+	emptyRoot := false
+	var manifest *Manifest
+
+	if resp.StatusCode == http.StatusNotFound {
+		// First publish: no manifest yet — start from an empty root catalog.
+		emptyRoot = true
+	} else if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("manifest http %d: %s", resp.StatusCode, manifestURL)
-	}
-	manifestData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading manifest: %w", err)
-	}
-	manifest, err := ParseManifest(manifestData)
-	if err != nil {
-		return nil, fmt.Errorf("parsing manifest: %w", err)
+	} else {
+		manifestData, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("reading manifest: %w", err)
+		}
+		manifest, err = ParseManifest(manifestData)
+		if err != nil {
+			return nil, fmt.Errorf("parsing manifest: %w", err)
+		}
 	}
 
-	result := &MergeResult{OldRootHash: manifest.RootHash}
+	result := &MergeResult{}
+	if manifest != nil {
+		result.OldRootHash = manifest.RootHash
+	}
 
 	// Finalize() always SHA-256 hashes the compressed bytes, so the suffix on
 	// new_root_hash is always "-" regardless of the old repository's algorithm.
-	hashAlgo := manifest.HashAlgo
-	if hashAlgo == 0 {
-		hashAlgo = HashSha1
+	hashAlgo := HashSha1
+	if manifest != nil && manifest.HashAlgo != 0 {
+		hashAlgo = manifest.HashAlgo
 	}
 	_ = hashAlgo
 
 	// ── Step 2: Download and open root catalog ───────────────────────────────
+	// If the manifest doesn't exist (first publish) or the catalog object is
+	// missing (state corruption from a previously crashed receiver commit),
+	// create a fresh empty root catalog and continue.  In both cases the
+	// new publish will produce a fully self-consistent catalog tree.
 	rootDBPath := filepath.Join(cfg.TempDir, "root.db")
-	if err := DownloadCatalog(ctx, cfg.HTTPClient, cfg.Stratum0URL, cfg.RepoName,
-		manifest.RootHash, rootDBPath); err != nil {
-		return nil, fmt.Errorf("downloading root catalog: %w", err)
+	var rootCat *Catalog
+	if !emptyRoot && manifest != nil {
+		dlErr := DownloadCatalog(ctx, cfg.HTTPClient, cfg.Stratum0URL, cfg.RepoName,
+			manifest.RootHash, rootDBPath)
+		if dlErr != nil && !errors.Is(dlErr, ErrCatalogNotFound) {
+			return nil, fmt.Errorf("downloading root catalog: %w", dlErr)
+		}
+		if errors.Is(dlErr, ErrCatalogNotFound) {
+			// Catalog object missing despite manifest existing — treat as empty.
+			emptyRoot = true
+		}
 	}
-	rootCat, err := Open(rootDBPath)
-	if err != nil {
-		return nil, fmt.Errorf("opening root catalog: %w", err)
+	if emptyRoot {
+		rootCat, err = Create(rootDBPath, "")
+		if err != nil {
+			return nil, fmt.Errorf("creating empty root catalog: %w", err)
+		}
+	} else {
+		rootCat, err = Open(rootDBPath)
+		if err != nil {
+			return nil, fmt.Errorf("opening root catalog: %w", err)
+		}
 	}
 
 	// ── Step 2.5: Resolve dirtab content ────────────────────────────────────
