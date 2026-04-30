@@ -164,9 +164,34 @@ func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, has
 	}
 	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }() //nolint:errcheck
 
+	// Read and parse the JSON response body.
+	//
+	// The cvmfs_gateway payload endpoint ALWAYS returns HTTP 200 regardless of
+	// whether the upload succeeded or failed.  The actual outcome is in the JSON
+	// body as {"status":"ok"} or {"status":"error","reason":"uploader_error",...}.
+	// Checking only resp.StatusCode (as before) caused uploader_error responses
+	// to be silently treated as successes, leaving the CAS object unstored and
+	// causing a downstream HTTP 404 when CommitProcessor tried to fetch the
+	// catalog from Stratum 0.
+	respData, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != 200 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("payload upload failed (hash=%s): status %d: %s", hash, resp.StatusCode, data)
+		return fmt.Errorf("payload upload failed (hash=%s): status %d: %s", hash, resp.StatusCode, respData)
+	}
+	if readErr != nil {
+		return fmt.Errorf("reading payload response (hash=%s): %w", hash, readErr)
+	}
+
+	var result struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if jsonErr := json.Unmarshal(respData, &result); jsonErr != nil {
+		// If body is not JSON, fall through — a non-200 status was already caught above.
+		return fmt.Errorf("parsing payload response (hash=%s): %w — body: %s", hash, jsonErr, respData)
+	}
+	if result.Status != "ok" {
+		return fmt.Errorf("payload upload rejected by gateway (hash=%s): status=%s reason=%s",
+			hash, result.Status, result.Reason)
 	}
 	return nil
 }

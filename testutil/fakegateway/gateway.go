@@ -246,7 +246,8 @@ func (g *Gateway) handlePayload(w http.ResponseWriter, r *http.Request) {
 	g.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	// The real cvmfs_gateway always returns {"status":"ok"} on success for payloads.
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (g *Gateway) randomFail(failRate float64) bool {

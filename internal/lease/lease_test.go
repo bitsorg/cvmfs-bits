@@ -393,7 +393,9 @@ func TestCommit_SendsTagFields(t *testing.T) {
 			mu.Lock()
 			payloadCalled = true
 			mu.Unlock()
-			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+
 
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/leases/"):
 			// Commit endpoint — capture the request body.
@@ -473,7 +475,8 @@ func TestCommit_EmptyTagName(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/payloads":
-			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/leases/"):
 			data, _ := io.ReadAll(r.Body)
 			mu.Lock()
