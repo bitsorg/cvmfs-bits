@@ -677,7 +677,7 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 						case <-time.After(backoff):
 						}
 					}
-					lastErr = pushObject(ectx, endpoint, hash, casBackend, cfg.Timeout, sessionToken, dataEP)
+					lastErr = pushObject(ectx, endpoint, hash, casBackend, cfg.Timeout, sessionToken, dataEP, cfg.DevMode)
 					if lastErr == nil {
 						break
 					}

@@ -143,7 +143,10 @@ func max(a, b int) int {
 // is pushed directly to the HTTPS control endpoint.
 //
 // Both paths propagate OTel trace context for observability.
-func pushObject(ctx context.Context, endpoint, hash string, backend cas.Backend, timeout time.Duration, sessionToken, dataEndpoint string) error {
+//
+// devMode disables the SSRF check on the data endpoint so that private/Docker
+// network addresses are accepted during local testing.
+func pushObject(ctx context.Context, endpoint, hash string, backend cas.Backend, timeout time.Duration, sessionToken, dataEndpoint string, devMode bool) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -168,8 +171,12 @@ func pushObject(ctx context.Context, endpoint, hash string, backend cas.Backend,
 			return fmt.Errorf("data endpoint URL %q has no host", dataEndpoint)
 		}
 		// Reject private/loopback addresses (same check as endpoint validation).
-		if err := rejectPrivateHost(u.Hostname()); err != nil {
-			return fmt.Errorf("data endpoint %q: %w", dataEndpoint, err)
+		// In devMode this check is skipped so that Docker-internal hostnames
+		// (e.g. stratum1-a resolving to 172.x.x.x) are accepted.
+		if !devMode {
+			if err := rejectPrivateHost(u.Hostname()); err != nil {
+				return fmt.Errorf("data endpoint %q: %w", dataEndpoint, err)
+			}
 		}
 
 		// Read the full object so we can compute X-Content-SHA256 before streaming.
