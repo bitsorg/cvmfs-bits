@@ -61,6 +61,12 @@ type fileConfig struct {
 	StagingRoot string `yaml:"staging_root"`
 	PublishMode string `yaml:"publish_mode"`
 	CVMFSMount  string `yaml:"cvmfs_mount"`
+	// Stratum0URL is the base URL of the Stratum 0 CVMFS server
+	// (e.g. "http://stratum0/cvmfs").  Required in gateway mode so the
+	// orchestrator can fetch the existing root catalog for merging.
+	// Without this the catalog merge step is skipped (only valid for the
+	// very first publish of an empty repository).
+	Stratum0URL string `yaml:"stratum0_url"`
 
 	Server struct {
 		Listen  string `yaml:"listen"`
@@ -163,6 +169,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	mode, logLevel *string,
 	devMode *bool,
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot *string,
+	stratum0URL *string,
 	s1Endpoints *string,
 	s1Quorum *float64,
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout *time.Duration,
@@ -209,6 +216,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("publish-mode", publishMode, fc.PublishMode)
 	str("gateway-url", gatewayURL, fc.Gateway.URL)
 	str("cvmfs-mount", cvmfsMount, fc.CVMFSMount)
+	str("stratum0-url", stratum0URL, fc.Stratum0URL)
 	str("cas-type", casType, fc.CAS.Type)
 	str("cas-root", casRoot, fc.CAS.Root)
 

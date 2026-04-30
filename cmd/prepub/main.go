@@ -57,6 +57,7 @@ func main() {
 	publishMode  := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
 	gatewayURL   := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
 	cvmfsMount   := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
+	stratum0URL  := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
 	casType      := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
 	casRoot      := flag.String("cas-root", "/var/lib/cvmfs-prepub/cas", "CAS root directory [publisher|receiver]")
 
@@ -136,6 +137,7 @@ func main() {
 		applyFileConfig(fc, explicit,
 			mode, logLevel, devMode,
 			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
+			stratum0URL,
 			s1Endpoints, s1Quorum, s1Timeout, s1BloomTimeout, s1MQTTTimeout,
 			brokerURL, brokerClientCert, brokerClientKey, brokerCACert,
 			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
@@ -164,7 +166,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *cvmfsMount, *casType, *casRoot,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *cvmfsMount, *stratum0URL, *casType, *casRoot,
 			*bloomSnapshotDir, *bloomNodeID, *bloomMaxSnapshotAge, *bloomFilterCapacity, *bloomFilterFPRate,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*s1Endpoints, *s1Quorum, *s1Timeout, *s1BloomTimeout, *s1MQTTTimeout,
@@ -185,7 +187,7 @@ func main() {
 func runPublisher(
 	obs *observe.Provider,
 	devMode bool,
-	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot string,
+	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, stratum0URL, casType, casRoot string,
 	bloomSnapshotDir, bloomNodeID string,
 	bloomMaxSnapshotAge time.Duration,
 	bloomFilterCapacity uint,
@@ -393,10 +395,11 @@ func runPublisher(
 	}
 
 	orch := &api.Orchestrator{
-		Spool:      sp,
-		CAS:        casBackend,
-		Lease:      leaseBackend,
-		CVMFSMount: cvmfsMount,
+		Spool:       sp,
+		CAS:         casBackend,
+		Lease:       leaseBackend,
+		CVMFSMount:  cvmfsMount,
+		Stratum0URL: stratum0URL,
 		Pipeline: pipeline.Config{
 			Workers:      4,
 			UploadConc:   4,
