@@ -38,11 +38,14 @@ type CommitRequest struct {
 
 	// ── Gateway mode ─────────────────────────────────────────────────────────
 
-	// CatalogHash is the SHA-256 hash of the CVMFS catalog (gateway mode).
+	// CatalogHash is the SHA-1 hash of the CVMFS root catalog (gateway mode).
+	// Unused when AllCatalogHashes are passed via ObjectHashes.
 	CatalogHash string
-	// OldRootHash is the plain hex hash of the previous root catalog (for proper chain commits).
+	// OldRootHash is the plain hex SHA-1 of the previous root catalog (no suffix).
 	OldRootHash string
-	// NewRootHashSuffixed is the hash with CVMFS algorithm suffix applied (e.g. "abc123-" for SHA-256).
+	// NewRootHashSuffixed is the SHA-1 root catalog hash with CVMFS catalog
+	// content-type suffix 'C' appended (e.g. "abc123...C", 41 chars).  This is
+	// what the receiver's reactor.cc sends to CommitProcessor as new_root_hash.
 	NewRootHashSuffixed string
 	// ObjectHashes are the CAS object hashes to register with the gateway.
 	ObjectHashes []string

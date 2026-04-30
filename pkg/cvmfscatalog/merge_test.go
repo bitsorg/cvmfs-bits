@@ -363,8 +363,8 @@ func TestMergeNestedCatalog(t *testing.T) {
 	if result.NewRootHash == rootHash {
 		t.Error("NewRootHash should differ from OldRootHash after mutation")
 	}
-	// SHA-256 suffix must always be "-"
-	if want := result.NewRootHash + "-"; result.NewRootHashSuffixed != want {
+	// NewRootHashSuffixed must carry the CVMFS catalog content-type suffix 'C'.
+	if want := result.NewRootHash + "C"; result.NewRootHashSuffixed != want {
 		t.Errorf("NewRootHashSuffixed: got %s, want %s", result.NewRootHashSuffixed, want)
 	}
 	// Chain: nested leaf first, root last → two hashes total
@@ -511,7 +511,7 @@ func TestMergeNestedCatalogChain(t *testing.T) {
 	if result.NewRootHash == rootHash {
 		t.Error("NewRootHash should differ from OldRootHash")
 	}
-	if want := result.NewRootHash + "-"; result.NewRootHashSuffixed != want {
+	if want := result.NewRootHash + "C"; result.NewRootHashSuffixed != want {
 		t.Errorf("NewRootHashSuffixed: got %s, want %s", result.NewRootHashSuffixed, want)
 	}
 	// Three levels → three hashes: /a/b leaf, /a middle, root
@@ -529,24 +529,46 @@ func TestMergeNestedCatalogChain(t *testing.T) {
 }
 
 func TestMergeHTTPError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
-	defer server.Close()
+	// A 404 on .cvmfspublished is intentionally treated as "first publish ever"
+	// (no existing catalog) and must NOT return an error.
+	t.Run("404_is_first_publish", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+		}))
+		defer server.Close()
 
-	tmpdir := t.TempDir()
+		tmpdir := t.TempDir()
+		_, err := Merge(context.Background(), MergeConfig{
+			Stratum0URL: server.URL,
+			RepoName:    "testrepo",
+			LeasePath:   "",
+			TempDir:     tmpdir,
+			HTTPClient:  server.Client(),
+		}, []Entry{})
+		if err != nil {
+			t.Errorf("404 should be treated as first-publish (no error), got: %v", err)
+		}
+	})
 
-	_, err := Merge(context.Background(), MergeConfig{
-		Stratum0URL: server.URL,
-		RepoName:    "testrepo",
-		LeasePath:   "",
-		TempDir:     tmpdir,
-		HTTPClient:  server.Client(),
-	}, []Entry{})
+	// A 500 Internal Server Error must propagate as an error.
+	t.Run("500_is_error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}))
+		defer server.Close()
 
-	if err == nil {
-		t.Errorf("Expected error when manifest fetch fails")
-	}
+		tmpdir := t.TempDir()
+		_, err := Merge(context.Background(), MergeConfig{
+			Stratum0URL: server.URL,
+			RepoName:    "testrepo",
+			LeasePath:   "",
+			TempDir:     tmpdir,
+			HTTPClient:  server.Client(),
+		}, []Entry{})
+		if err == nil {
+			t.Errorf("Expected error when manifest fetch returns 500")
+		}
+	})
 }
 
 // TestMergeStatisticsPropagation verifies that statistics deltas are correctly

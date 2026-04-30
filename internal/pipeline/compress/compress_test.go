@@ -1,8 +1,10 @@
 package compress
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
-	"crypto/sha256"
+	"crypto/sha1" //nolint:gosec // CVMFS protocol requires SHA-1
 	"encoding/hex"
 	"fmt"
 	"io/fs"
@@ -12,6 +14,21 @@ import (
 	"cvmfs.io/prepub/internal/pipeline/unpack"
 	"cvmfs.io/prepub/pkg/observe"
 )
+
+// compressZlib compresses data with zlib and returns the compressed bytes.
+func compressZlib(data []byte) []byte {
+	var buf bytes.Buffer
+	w, _ := zlib.NewWriterLevel(&buf, zlib.BestCompression)
+	w.Write(data) //nolint:errcheck
+	w.Close()     //nolint:errcheck
+	return buf.Bytes()
+}
+
+// sha1Hex returns the hex-encoded SHA-1 of b.
+func sha1Hex(b []byte) string {
+	h := sha1.Sum(b) //nolint:gosec
+	return hex.EncodeToString(h[:])
+}
 
 func TestCompressSmallFileNotChunked(t *testing.T) {
 	// File smaller than chunk size should not be chunked
@@ -125,7 +142,8 @@ func TestCompressChunked(t *testing.T) {
 }
 
 func TestCompressBulkHashMatchesFullContent(t *testing.T) {
-	// Bulk hash for a chunked file should match hash of full content
+	// The hash for a non-chunked file must be SHA-1 of the zlib-compressed bytes
+	// (CVMFS CAS convention: CAS key = SHA-1(zlib(content))).
 	data := []byte("test data for hashing")
 	entry := unpack.FileEntry{
 		Path:    "/test.bin",
@@ -135,23 +153,25 @@ func TestCompressBulkHashMatchesFullContent(t *testing.T) {
 		Data:    data,
 	}
 
-	result, err := compressEntry(entry, 0) // No chunking to get single hash
+	result, err := compressEntry(entry, 0) // No chunking
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
 
-	// Manually compute expected hash
-	h := sha256.New()
-	h.Write(data)
-	expectedHash := hex.EncodeToString(h.Sum(nil))
+	// Expected: SHA-1 of zlib-compressed bytes
+	expectedHash := sha1Hex(compressZlib(data))
 
 	if result.Hash != expectedHash {
 		t.Errorf("Hash mismatch: expected %s, got %s", expectedHash, result.Hash)
 	}
+	if len(result.Hash) != 40 {
+		t.Errorf("SHA-1 hash must be 40 hex chars, got %d", len(result.Hash))
+	}
 }
 
 func TestCompressChunkHashesCorrect(t *testing.T) {
-	// Each chunk hash should match the SHA256 of that chunk's uncompressed data
+	// Each chunk hash must be SHA-1 of the chunk's zlib-COMPRESSED bytes
+	// (CVMFS CAS convention: CAS key = SHA-1(zlib(content))).
 	data := []byte("chunk0chunk1chunk2")
 	entry := unpack.FileEntry{
 		Path:    "/chunked.bin",
@@ -174,12 +194,13 @@ func TestCompressChunkHashesCorrect(t *testing.T) {
 	}
 
 	for i, chunk := range result.Chunks {
-		h := sha256.New()
-		h.Write([]byte(expectedChunks[i]))
-		expectedHash := hex.EncodeToString(h.Sum(nil))
-
+		// Expected: SHA-1 of the zlib-compressed chunk bytes
+		expectedHash := sha1Hex(compressZlib([]byte(expectedChunks[i])))
 		if chunk.Hash != expectedHash {
 			t.Errorf("Chunk %d hash mismatch: expected %s, got %s", i, expectedHash, chunk.Hash)
+		}
+		if len(chunk.Hash) != 40 {
+			t.Errorf("Chunk %d: SHA-1 hash must be 40 hex chars, got %d", i, len(chunk.Hash))
 		}
 	}
 }
@@ -198,7 +219,7 @@ func TestCompressDirectory(t *testing.T) {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
 
-	if result.Hash != "0000000000000000000000000000000000000000000000000000000000000000" {
+	if result.Hash != "0000000000000000000000000000000000000000" {
 		t.Errorf("Expected zero sentinel hash for directory, got %s", result.Hash)
 	}
 	if result.Compressed != nil {
@@ -220,7 +241,7 @@ func TestCompressSymlink(t *testing.T) {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
 
-	if result.Hash != "0000000000000000000000000000000000000000000000000000000000000000" {
+	if result.Hash != "0000000000000000000000000000000000000000" {
 		t.Errorf("Expected zero sentinel hash for symlink, got %s", result.Hash)
 	}
 	if result.Compressed != nil {
@@ -305,7 +326,7 @@ func TestCompressEntryChunkedGuardNonPositiveChunkSize(t *testing.T) {
 	}
 
 	for _, badSize := range []int64{0, -1, -1024} {
-		_, err := compressEntryChunked(entry, badSize, "aabbcc")
+		_, err := compressEntryChunked(entry, badSize)
 		if err == nil {
 			t.Errorf("chunkSize=%d: expected error, got nil", badSize)
 		}

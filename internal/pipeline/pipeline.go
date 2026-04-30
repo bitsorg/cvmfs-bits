@@ -50,8 +50,9 @@ type Result struct {
 	// The catalog is NOT finalised here — merging with the existing repository
 	// catalog happens in the orchestrator after lease acquisition.
 	CatalogEntries []cvmfscatalog.Entry
-	// ObjectHashes are the SHA256 hashes of all CAS objects (file chunks only,
-	// NOT including catalog — the catalog hashes come from cvmfscatalog.Merge).
+	// ObjectHashes are the SHA-1 hashes (of zlib-compressed content) for all
+	// CAS objects (file chunks only, NOT including catalog — the catalog hashes
+	// come from cvmfscatalog.Merge).  These are the CAS keys used by SubmitPayload.
 	ObjectHashes []string
 	// DirtabContent is the raw content of the .cvmfsdirtab file if one was
 	// present in the tar payload.  It is passed to cvmfscatalog.MergeConfig so
@@ -412,7 +413,7 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 			return nil, fmt.Errorf("decoding hash for %s: %w", e.FullPath, err)
 		}
 		result.CatalogEntries[i].Hash = hashBytes
-		result.CatalogEntries[i].HashAlgo = cvmfscatalog.HashSha256
+		result.CatalogEntries[i].HashAlgo = cvmfscatalog.HashSha1
 		result.CatalogEntries[i].CompAlgo = cvmfscatalog.CompZlib
 
 		// For chunked files: populate chunk records.

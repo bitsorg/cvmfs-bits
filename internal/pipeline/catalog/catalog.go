@@ -57,7 +57,7 @@ func (b *Builder) Add(ctx context.Context, e unpack.FileEntry, hash string) erro
 	if e.Mode.IsRegular() && hash != "" {
 		// For now, don't store hash in the entry collection
 		// The hash will be computed during merge
-		entry.HashAlgo = cvmfscatalog.HashSha256
+		entry.HashAlgo = cvmfscatalog.HashSha1
 		entry.CompAlgo = cvmfscatalog.CompZlib
 	}
 

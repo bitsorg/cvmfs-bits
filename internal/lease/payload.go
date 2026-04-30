@@ -75,7 +75,7 @@ func buildCvmfsPackHeader(hashStr string, objSize int) []byte {
 //
 // JSON wrapper fields:
 //   - session_token:  the lease token
-//   - payload_digest: SHA-256 hex of the pack text header (NOT the object hash)
+//   - payload_digest: SHA-1 hex of the pack text header (NOT the object hash)
 //   - header_size:    byte length of the pack text header (NOT the JSON size)
 //   - api_version:    "2"
 //
@@ -93,6 +93,26 @@ func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, has
 	// event.id without crashing.
 	objHashArr := sha1.Sum(objBytes) //nolint:gosec // required by CVMFS wire protocol
 	objHashStr := hex.EncodeToString(objHashArr[:])
+
+	// Propagate the CVMFS content-type suffix from the CAS key to the C line.
+	//
+	// CAS keys for catalog objects are stored as "sha1C" (41 chars) where the
+	// trailing 'C' is the CVMFS catalog content-type suffix.  The receiver's
+	// LocalUploader uses event.id.MakePath() to derive the storage path, so
+	// the C line hash MUST include the 'C' suffix for catalogs — otherwise the
+	// object lands at data/XY/sha1 instead of data/XY/sha1C and CommitProcessor
+	// cannot find it when fetching the new root catalog from stratum0.
+	//
+	// The sha1.Any equality comparison ignores the suffix, so the receiver's
+	// hash-verification step (file_hash != event.id) still passes regardless of
+	// whether the suffix is present.
+	//
+	// For regular file objects the CAS key is plain sha1 (40 chars) and no
+	// suffix is appended.
+	const sha1HexLen = 40
+	if len(hash) > sha1HexLen {
+		objHashStr += hash[sha1HexLen:] // append content-type suffix, e.g. "C"
+	}
 
 	// Build the CVMFS object pack text header (the TOC that precedes the data).
 	packHeader := buildCvmfsPackHeader(objHashStr, len(objBytes))

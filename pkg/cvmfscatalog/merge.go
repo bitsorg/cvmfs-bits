@@ -345,9 +345,12 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		childDelta = delta
 	}
 
-	// After the loop: childHash holds the new root catalog hash.
+	// After the loop: childHash holds the new root catalog hash (SHA-1 of its
+	// compressed bytes).  NewRootHashSuffixed appends the CVMFS catalog
+	// content-type suffix 'C' so the receiver stores it at data/XY/hashC and
+	// CommitProcessor can fetch it at the same content-typed path.
 	result.NewRootHash = childHash
-	result.NewRootHashSuffixed = childHash + HashSuffix(HashSha256)
+	result.NewRootHashSuffixed = childHash + "C"
 
 	return result, nil
 }

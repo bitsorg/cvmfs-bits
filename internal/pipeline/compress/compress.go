@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"runtime"
 
@@ -27,7 +26,7 @@ type Config struct {
 type Chunk struct {
 	Offset           int64  // byte offset in the uncompressed file
 	UncompressedSize int64  // size of this chunk's uncompressed data
-	Hash             string // hex SHA-256 of uncompressed chunk bytes (= CAS key)
+	Hash             string // hex SHA-1 of compressed chunk bytes (= CAS key)
 	Compressed       []byte // zlib-compressed chunk data
 	CompressedSize   int64  // size of Compressed in bytes
 }
@@ -36,7 +35,7 @@ type Chunk struct {
 type Result struct {
 	// FileEntry is the original unpacked entry.
 	FileEntry unpack.FileEntry
-	// Hash is the SHA256 hash of the uncompressed content (or bulk hash for chunked files).
+	// Hash is the SHA-1 hash of the compressed content (= CAS key, CVMFS convention).
 	Hash string
 	// Compressed is the zlib-compressed content bytes (nil for chunked files).
 	Compressed []byte
@@ -128,24 +127,18 @@ func compressEntry(entry unpack.FileEntry, chunkSize int64) (Result, error) {
 	result := Result{FileEntry: entry}
 
 	// Directories and symlinks get a zero-hash sentinel — no content to store.
+	// 40 zeros is the SHA-1-length zero sentinel (matches CVMFS CAS key width).
 	if !entry.Mode.IsRegular() {
-		result.Hash = "0000000000000000000000000000000000000000000000000000000000000000"
+		result.Hash = "0000000000000000000000000000000000000000"
 		return result, nil
 	}
 
-	// Hash original content.
-	hash, _, err := cvmfshash.HashReader(bytes.NewReader(entry.Data))
-	if err != nil {
-		return result, fmt.Errorf("hashing: %w", err)
-	}
-	result.Hash = hash
-
-	// Check if we should chunk this file
+	// Check if we should chunk this file (before compression, based on raw size).
 	if chunkSize > 0 && int64(len(entry.Data)) > chunkSize {
-		return compressEntryChunked(entry, chunkSize, hash)
+		return compressEntryChunked(entry, chunkSize)
 	}
 
-	// Compress with zlib. NewWriterLevel only errors on invalid level
+	// Compress with zlib first. NewWriterLevel only errors on invalid level
 	// constants, but we check it anyway for correctness.
 	var compBuf bytes.Buffer
 	w, err := zlib.NewWriterLevel(&compBuf, zlib.BestCompression)
@@ -161,10 +154,20 @@ func compressEntry(entry unpack.FileEntry, chunkSize int64) (Result, error) {
 
 	result.Compressed = compBuf.Bytes()
 	result.CompressedSize = int64(len(result.Compressed))
+
+	// Hash the COMPRESSED bytes. CVMFS CAS convention: SHA-1(zlib(content)).
+	// The receiver's ObjectPackConsumer also hashes the received (compressed) bytes
+	// and compares with the C line hash, so both sides must hash the same bytes.
+	hash, _, err := cvmfshash.HashReader(bytes.NewReader(result.Compressed))
+	if err != nil {
+		return result, fmt.Errorf("hashing compressed bytes: %w", err)
+	}
+	result.Hash = hash
+
 	return result, nil
 }
 
-func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, bulkHash string) (Result, error) {
+func compressEntryChunked(entry unpack.FileEntry, chunkSize int64) (Result, error) {
 	// Fix C4: guard against a non-positive chunkSize reaching this function.
 	// compressEntry already checks this via the caller, but a defensive check
 	// here prevents subtle bugs if compressEntryChunked is ever called directly.
@@ -172,7 +175,7 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, bulkHash stri
 		return Result{}, fmt.Errorf("compressEntryChunked: chunkSize must be positive, got %d", chunkSize)
 	}
 
-	result := Result{FileEntry: entry, Hash: bulkHash}
+	result := Result{FileEntry: entry}
 
 	data := entry.Data
 	var chunks []Chunk
@@ -183,7 +186,8 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, bulkHash stri
 	// split into thousands of chunks this materially reduces GC pressure.
 	var compBuf bytes.Buffer
 
-	// Split data into chunks and compress each independently.
+	// Split data into chunks, compress each independently, and hash the
+	// COMPRESSED bytes.  CVMFS CAS convention: SHA-1(zlib(content)).
 	for offset < int64(len(data)) {
 		chunkEnd := offset + chunkSize
 		if chunkEnd > int64(len(data)) {
@@ -192,11 +196,6 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, bulkHash stri
 
 		chunkData := data[offset:chunkEnd]
 		uncompressedSize := int64(len(chunkData))
-
-		// Hash this chunk's uncompressed data.
-		chunkHasher := sha256.New()
-		chunkHasher.Write(chunkData)
-		chunkHashHex := fmt.Sprintf("%064x", chunkHasher.Sum(nil))
 
 		// Compress this chunk, reusing the buffer from the previous iteration.
 		compBuf.Reset()
@@ -218,15 +217,33 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, bulkHash stri
 		compressed := make([]byte, compressedSize)
 		copy(compressed, compBuf.Bytes())
 
+		// Hash the compressed chunk bytes (CVMFS CAS key = SHA-1 of zlib bytes).
+		chunkHash, _, hashErr := cvmfshash.HashReader(bytes.NewReader(compressed))
+		if hashErr != nil {
+			return result, fmt.Errorf("hashing compressed chunk at offset %d: %w", offset, hashErr)
+		}
+
 		chunks = append(chunks, Chunk{
 			Offset:           offset,
 			UncompressedSize: uncompressedSize,
-			Hash:             chunkHashHex,
+			Hash:             chunkHash,
 			Compressed:       compressed,
 			CompressedSize:   compressedSize,
 		})
 
 		offset = chunkEnd
+	}
+
+	// For chunked files, Hash holds the SHA-1 of the FIRST chunk's compressed
+	// bytes as the "bulk hash" (used for catalog entry and dedup key of the
+	// overall file object).  The first chunk's hash is a stable, deterministic
+	// representative that the CVMFS catalog stores for chunked files.
+	// If there are no chunks (empty file that somehow reached here), use the
+	// 40-zero sentinel.
+	if len(chunks) > 0 {
+		result.Hash = chunks[0].Hash
+	} else {
+		result.Hash = "0000000000000000000000000000000000000000"
 	}
 
 	result.Chunks = chunks

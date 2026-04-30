@@ -77,8 +77,8 @@ func TestAdd_RegularFile(t *testing.T) {
 		t.Errorf("Mtime = %d; want 1700000000", got.Mtime)
 	}
 	// Regular file with a hash should have algo fields set.
-	if got.HashAlgo != cvmfscatalog.HashSha256 {
-		t.Errorf("HashAlgo = %v; want HashSha256", got.HashAlgo)
+	if got.HashAlgo != cvmfscatalog.HashSha1 {
+		t.Errorf("HashAlgo = %v; want HashSha1", got.HashAlgo)
 	}
 }
 

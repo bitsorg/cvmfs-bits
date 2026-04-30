@@ -283,8 +283,13 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 
 		// Upload the merged catalog file(s) to the CAS so SubmitPayload can
 		// stream them to the gateway.  Finalize() wrote each catalog to
-		// TempDir/data/XY/hashC (CVMFS on-disk format); the CAS stores objects
-		// by plain hash (no suffix).
+		// TempDir/data/XY/hashC (CVMFS on-disk format).
+		//
+		// The CAS key includes the 'C' content-type suffix ("sha1C", 41 chars)
+		// so that SubmitPayload can propagate the suffix into the ObjectPack C
+		// line.  The receiver's LocalUploader then stores the object at
+		// data/XY/sha1C, and CommitProcessor can find it there when it fetches
+		// the new root catalog from stratum0.
 		for _, catHash := range mergeResult.AllCatalogHashes {
 			// Path written by cvmfscatalog.Finalize: data/XY/hash + "C"
 			catFilePath := filepath.Join(o.Spool.JobDir(j),
@@ -304,7 +309,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 				return o.abortJob(ctx, j,
 					fmt.Errorf("stat merged catalog %s: %w", catHash, statErr))
 			}
-			putErr := o.CAS.Put(leaseCtx, catHash, f, fi.Size())
+			// Use "sha1C" (with 'C' suffix) as the CAS key so that
+			// ObjectPath("sha1C") resolves to data/XY/sha1C — the same path
+			// where Finalize wrote the compressed catalog file.
+			putErr := o.CAS.Put(leaseCtx, catHash+"C", f, fi.Size())
 			closeErr := f.Close()
 			if putErr != nil {
 				cancelHeartbeat()
@@ -355,7 +363,12 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	if mergeResult != nil {
 		// Catalog hashes go into ObjectHashes so SubmitPayload uploads them.
 		// The root catalog goes last (Merge returns leaf-first, root-last).
-		req.ObjectHashes = append(req.ObjectHashes, mergeResult.AllCatalogHashes...)
+		// Each catalog hash gets the 'C' content-type suffix so SubmitPayload
+		// can propagate it to the ObjectPack C line, causing the receiver to
+		// store each catalog at data/XY/sha1C (CVMFS catalog content-type path).
+		for _, h := range mergeResult.AllCatalogHashes {
+			req.ObjectHashes = append(req.ObjectHashes, h+"C")
+		}
 		req.OldRootHash = mergeResult.OldRootHash
 		req.NewRootHashSuffixed = mergeResult.NewRootHashSuffixed
 	}
