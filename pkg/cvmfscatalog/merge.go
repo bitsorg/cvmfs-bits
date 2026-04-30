@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"cvmfs.io/prepub/pkg/cvmfsdirtab"
 	"cvmfs.io/prepub/pkg/cvmfshash"
@@ -198,7 +199,37 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		defer chain[i].cat.Close()
 	}
 
-	// ── Step 3.5: Plan split points from entries + dirtab ───────────────────
+	// ── Step 3.5: Rewrite entry paths from relative to absolute ─────────────
+	// The pipeline produces paths relative to the tar root, e.g.
+	// "usr/share/test-pkg/hello.txt". CVMFS requires absolute paths with the
+	// full lease prefix, e.g. "/test/smoke/usr/share/test-pkg/hello.txt".
+	// The tar root entry "." maps to targetAbsPath itself (or "" for a
+	// root-level lease that publishes directly into "/").
+	prefix := targetAbsPath
+	for i := range entries {
+		rel := entries[i].FullPath
+		switch {
+		case rel == "." || rel == "":
+			// Tar root entry → the lease directory itself.
+			entries[i].FullPath = prefix
+		case strings.HasPrefix(rel, "/"):
+			// Already absolute — pipeline has already prefixed this entry.
+			// Pass through unchanged to avoid double-prefixing (e.g. if the
+			// caller supplies paths like /cvmfs/repo/test/smoke/... we must
+			// not prepend prefix a second time).
+		case prefix != "":
+			entries[i].FullPath = prefix + "/" + rel
+		default:
+			entries[i].FullPath = "/" + rel
+		}
+		if entries[i].FullPath == "" || entries[i].FullPath == "/" {
+			entries[i].Name = ""
+		} else {
+			entries[i].Name = path.Base(entries[i].FullPath)
+		}
+	}
+
+	// ── Step 3.6: Plan split points from entries + dirtab ───────────────────
 	// splitPaths is the sorted list of absolute paths that should become new
 	// nested-catalog roots within this publish.  Splits must be strictly inside
 	// the LeasePath so we don't touch parts of the repo we don't own.
@@ -225,6 +256,33 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		nc := newCat
 		defer func() { nc.Close() }()
 		newCats[sp2] = &newCatNode{cat: newCat, path: sp}
+	}
+
+	// ── Step 3.9: Synthesize missing ancestor directories ────────────────────
+	// For a lease at "/test/smoke", the tar payload only contains entries at or
+	// below that path.  The root catalog needs a "/test" directory entry so that
+	// the CVMFS client can traverse into the subtree.  We insert any missing
+	// intermediate path components (everything between "/" and targetAbsPath,
+	// exclusive) into the root catalog using Upsert (idempotent on re-publish).
+	if targetAbsPath != "" {
+		ancestors := ancestorPaths(targetAbsPath)
+		if len(ancestors) > 1 {
+			now := time.Now().Unix()
+			for _, ancestor := range ancestors[:len(ancestors)-1] {
+				syntheticDir := Entry{
+					FullPath: ancestor,
+					Name:     path.Base(ancestor),
+					Mode:     fs.ModeDir | 0o755,
+					Size:     4096,
+					Mtime:    now,
+					UID:      0,
+					GID:      0,
+				}
+				if uErr := chain[0].cat.Upsert(syntheticDir); uErr != nil {
+					return nil, fmt.Errorf("synthesizing ancestor dir %q: %w", ancestor, uErr)
+				}
+			}
+		}
 	}
 
 	// ── Step 4: Route entries to the correct catalog ──────────────────────────
