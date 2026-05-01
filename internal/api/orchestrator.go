@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -223,6 +225,23 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		}
 	} else {
 		logger.Info("local publish mode — skipping pipeline, tar will be extracted during Commit")
+	}
+
+	// ── Phase 2.5: ensure ancestor directories exist (gateway mode) ──────────
+	// For a nested lease path like "test/smoke", the CVMFS receiver needs the
+	// parent directory "/test" to already exist in the writable catalog when it
+	// calls GraftNestedCatalog("/test/smoke").  WritableCatalogManager::FindCatalog
+	// calls LookupPath("/test") which panics if the entry is absent.
+	//
+	// Fix: before acquiring the main lease, do a preliminary root-level publish
+	// (LeasePath="") that adds synthetic directory entries for every intermediate
+	// path component.  After this commit the repo's root catalog contains "/test",
+	// so the main publish succeeds.
+	if pipelineResult != nil && o.Stratum0URL != "" && strings.Contains(j.Path, "/") {
+		if ensureErr := o.ensureAncestors(ctx, j); ensureErr != nil {
+			span.RecordError(ensureErr)
+			return o.abortJob(ctx, j, ensureErr)
+		}
 	}
 
 	// ── Phase 3: acquire lease / open transaction ─────────────────────────────
@@ -563,4 +582,132 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	}
 
 	return err
+}
+
+// ensureAncestors ensures that every intermediate directory component of
+// j.Path exists in the repository before the main publish.
+//
+// Background: For a lease path "test/smoke" the CVMFS receiver maps this to
+// the catalog-relative path "/test/smoke".  When grafting the nested catalog
+// it calls GraftNestedCatalog("test/smoke") which internally needs the parent
+// directory "/test" to already exist in the writable catalog.  On first
+// publish the repo is empty so that lookup panics.
+//
+// Fix: acquire a root-level lease, run a Merge that upserts synthetic
+// directory entries for each intermediate path component (e.g. "/test"),
+// and commit.  After this preliminary publish the repo's root catalog
+// contains "/test" and the main publish succeeds.
+//
+// This is only called when j.Path contains at least one "/" (depth > 1) and
+// Stratum0URL is configured (gateway mode).
+func (o *Orchestrator) ensureAncestors(ctx context.Context, j *job.Job) error {
+	logger := o.Obs.Logger.With("job_id", j.ID, "phase", "ensure_ancestors")
+
+	// Build the list of intermediate path components.
+	// For "test/smoke" → ["/test"]
+	// For "a/b/c"      → ["/a", "/a/b"]
+	parts := strings.Split(strings.Trim(j.Path, "/"), "/")
+	now := time.Now().Unix()
+	ancestors := make([]cvmfscatalog.Entry, 0, len(parts)-1)
+	for i := 1; i < len(parts); i++ {
+		absPath := "/" + strings.Join(parts[:i], "/")
+		ancestors = append(ancestors, cvmfscatalog.Entry{
+			FullPath: absPath,
+			// Name is set by Merge's path-rewriting step (path.Base(absPath)).
+			Mode:  fs.ModeDir | 0o755,
+			Size:  4096,
+			Mtime: now,
+			UID:   0,
+			GID:   0,
+		})
+	}
+	logger.Info("adding ancestor directories via root-level publish",
+		"path", j.Path, "ancestors", len(ancestors))
+
+	// Use a dedicated sub-directory so ancestor catalogs don't collide with
+	// the main merge catalogs written to JobDir later.
+	ancTempDir := filepath.Join(o.Spool.JobDir(j), "ancestors")
+	if mkErr := os.MkdirAll(ancTempDir, 0o750); mkErr != nil {
+		return fmt.Errorf("ensure_ancestors: creating temp dir: %w", mkErr)
+	}
+
+	// Acquire a root-level lease so the merge sees the latest repo manifest
+	// and no concurrent publisher can modify the root catalog under us.
+	logger.Info("acquiring root-level lease for ancestor publish")
+	ancToken, leaseErr := o.Lease.Acquire(ctx, j.Repo, "")
+	if leaseErr != nil {
+		return fmt.Errorf("ensure_ancestors: acquiring root lease: %w", leaseErr)
+	}
+
+	// Ensure the lease is released (aborted) on any error path, including
+	// context cancellation and a failed Commit.
+	//
+	// We use context.Background() for the Abort call so that a cancelled ctx
+	// does not prevent the DELETE /api/v1/leases/<token> request from being
+	// sent — failing to abort leaves the lease held until gateway expiry and
+	// blocks subsequent publishers on the same repo.
+	committed := false
+	defer func() {
+		if !committed {
+			if abortErr := o.Lease.Abort(context.Background(), ancToken); abortErr != nil {
+				logger.Warn("ensure_ancestors: failed to abort ancestor lease on error path",
+					"token", ancToken, "error", abortErr)
+			}
+		}
+	}()
+
+	// Merge the synthetic ancestor entries into the root catalog.
+	// LeasePath="" → all paths are reportable → AddDirectory is called for
+	// each ancestor by the receiver's CatalogMergeTool.
+	ancMerge, mergeErr := cvmfscatalog.Merge(ctx, cvmfscatalog.MergeConfig{
+		Stratum0URL: o.Stratum0URL,
+		RepoName:    j.Repo,
+		LeasePath:   "",
+		TempDir:     ancTempDir,
+	}, ancestors)
+	if mergeErr != nil {
+		return fmt.Errorf("ensure_ancestors: catalog merge: %w", mergeErr)
+	}
+
+	// Upload the resulting catalog(s) to the CAS.
+	for _, catHash := range ancMerge.AllCatalogHashes {
+		catFilePath := filepath.Join(ancTempDir, cvmfshash.ObjectPath(catHash)+"C")
+		f, openErr := os.Open(catFilePath)
+		if openErr != nil {
+			return fmt.Errorf("ensure_ancestors: opening catalog %s: %w", catHash, openErr)
+		}
+		fi, statErr := f.Stat()
+		if statErr != nil {
+			f.Close()
+			return fmt.Errorf("ensure_ancestors: stat catalog %s: %w", catHash, statErr)
+		}
+		putErr := o.CAS.Put(ctx, catHash+"C", f, fi.Size())
+		f.Close()
+		if putErr != nil {
+			return fmt.Errorf("ensure_ancestors: uploading catalog %s: %w", catHash, putErr)
+		}
+	}
+
+	// Commit the preliminary root-level publish.
+	ancReq := lease.CommitRequest{
+		Token:               ancToken,
+		ObjectStore:         o.CAS,
+		OldRootHash:         ancMerge.OldRootHash,
+		NewRootHashSuffixed: ancMerge.NewRootHashSuffixed,
+	}
+	for _, h := range ancMerge.AllCatalogHashes {
+		ancReq.ObjectHashes = append(ancReq.ObjectHashes, h+"C")
+	}
+
+	logger.Info("committing ancestor publish",
+		"old_root", ancMerge.OldRootHash,
+		"new_root", ancMerge.NewRootHashSuffixed)
+	if commitErr := o.Lease.Commit(ctx, ancReq); commitErr != nil {
+		// defer will abort the lease.
+		return fmt.Errorf("ensure_ancestors: commit failed: %w", commitErr)
+	}
+
+	committed = true // disarm the deferred abort
+	logger.Info("ancestor publish complete")
+	return nil
 }
