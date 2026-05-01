@@ -80,11 +80,19 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 	eg, egCtx := errgroup.WithContext(ctx)
 	sem := semaphore.NewWeighted(int64(workers))
 
+	// Fix #P1: capture sem.Acquire failure without returning early.
+	// If we returned here, already-launched eg.Go workers would still be
+	// running when our caller closes out (via defer close(compressOut)),
+	// causing a "send on closed channel" panic.  Breaking out of the loop
+	// and always reaching eg.Wait() ensures every worker exits before we
+	// return — and therefore before out is closed.
+	var semErr error
 	for entry := range in {
 		entry := entry // capture for closure
 		if err := sem.Acquire(egCtx, 1); err != nil {
 			span.RecordError(err)
-			return fmt.Errorf("compress semaphore: %w", err)
+			semErr = fmt.Errorf("compress semaphore: %w", err)
+			break
 		}
 
 		eg.Go(func() error {
@@ -115,12 +123,16 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 		})
 	}
 
-	// Wait for all in-flight workers to finish before returning.
+	// CRITICAL: always wait for every in-flight worker before returning.
+	// Our caller (pipeline.go stage 3a) does "defer close(out)" — if any
+	// worker goroutine is still running when we return, it will try to send
+	// on the now-closed channel and panic.  eg.Wait() provides the
+	// happens-before guarantee that out is safe to close after this call.
 	if err := eg.Wait(); err != nil {
 		span.RecordError(err)
 		return err
 	}
-	return nil
+	return semErr
 }
 
 func compressEntry(entry unpack.FileEntry, chunkSize int64) (Result, error) {

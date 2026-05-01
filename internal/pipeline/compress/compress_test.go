@@ -15,6 +15,54 @@ import (
 	"cvmfs.io/prepub/pkg/observe"
 )
 
+// TestRunContextCancelledNoPanic is a regression test for Fix #P1.
+//
+// Before the fix, cancelling the outer context while compress.Run was
+// dispatching work caused sem.Acquire to fail and Run to return *early*,
+// bypassing eg.Wait().  The caller's "defer close(out)" then fired while
+// already-launched workers were still trying to send to out, producing a
+// "send on closed channel" panic.
+//
+// After the fix, Run always reaches eg.Wait() so every worker has exited
+// before the function returns, making it safe for the caller to close out.
+func TestRunContextCancelledNoPanic(t *testing.T) {
+	// Build a large-ish input so that with 4 workers there are several
+	// entries in-flight when we cancel the context.
+	const nEntries = 64
+	in := make(chan unpack.FileEntry, nEntries)
+	for i := 0; i < nEntries; i++ {
+		in <- unpack.FileEntry{
+			Path: fmt.Sprintf("/file%d.txt", i),
+			Mode: fs.FileMode(0644),
+			Data: make([]byte, 512),
+		}
+	}
+	close(in)
+
+	out := make(chan Result, nEntries)
+
+	// Cancel the context immediately so that sem.Acquire will fail as soon
+	// as a slot is available — this is the trigger for the original panic.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	obs, shutdown, err := observe.New("test-compress-cancel")
+	if err != nil {
+		t.Fatalf("observe.New: %v", err)
+	}
+	defer shutdown()
+
+	cfg := Config{Workers: 4, ChunkSize: 0}
+
+	// This must not panic.  If the bug is present the test will panic with
+	// "send on closed channel" rather than reaching the assertion below.
+	_ = Run(ctx, in, out, cfg, obs) // error expected; we only care about no panic
+
+	// The caller is responsible for closing out after Run returns.
+	// This must be safe to call because Run guarantees all workers have exited.
+	close(out)
+}
+
 // compressZlib compresses data with zlib and returns the compressed bytes.
 func compressZlib(data []byte) []byte {
 	var buf bytes.Buffer
