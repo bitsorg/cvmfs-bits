@@ -578,8 +578,15 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 
 	o.Obs.Logger.Error("job failed", "job_id", j.ID, "error", err, "class", class)
 	j.Error = "job processing failed — see service logs for details"
-	j.State = job.StateFailed
-	_ = o.Spool.WriteManifest(j)
+	// NOTE: do NOT set j.State = StateFailed here.  WriteManifest uses j.State
+	// to compute the target directory (spool/<state>/<id>/).  If we set
+	// j.State = StateFailed prematurely, WriteManifest creates a new empty
+	// spool/failed/<id>/ directory while the real job directory is still in
+	// spool/<previous-state>/<id>/.  IsTerminal then returns true so
+	// Spool.Transition is skipped, leaving the job un-moved.  FindJob searches
+	// non-terminal directories first and finds the unrenamed directory with the
+	// stale "staging" (or earlier) manifest — so GET /api/v1/jobs/{id} never
+	// returns state="failed", and pollers hang until the overall deadline.
 
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cleanupCancel()
@@ -598,9 +605,14 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 		}
 	}
 
+	// Move the job directory to spool/failed/ (Transition renames it and sets
+	// j.State = StateFailed), then write the manifest so the error info and
+	// terminal state are visible to FindJob.  WriteManifest must come AFTER
+	// Transition so it writes to the correct spool/failed/<id>/ location.
 	if !job.IsTerminal(j.State) {
 		_ = o.Spool.Transition(cleanupCtx, j, job.StateFailed)
 	}
+	_ = o.Spool.WriteManifest(j)
 
 	if o.Notify != nil {
 		o.Notify.Publish(notify.Event{
