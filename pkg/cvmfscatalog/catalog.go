@@ -732,7 +732,7 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 
 	compressedBytes := buf.Bytes()
 
-	// Hash compressed bytes (SHA-256)
+	// Hash compressed bytes (SHA-1 — CVMFS CAS convention)
 	hash, _, err := cvmfshash.HashReader(bytes.NewReader(compressedBytes))
 	if err != nil {
 		return "", Statistics{}, fmt.Errorf("hashing: %w", err)

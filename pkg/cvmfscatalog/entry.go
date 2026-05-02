@@ -16,12 +16,25 @@ const (
 	HashRipeMD160 HashAlgo = 3
 )
 
-// Compression algorithm IDs
+// Compression algorithm IDs matching CVMFS zlib::Algorithms in compression.h.
+//
+// CVMFS stores the compression algorithm in catalog flag bits 11-13 as the
+// raw enum value (no offset adjustment, unlike hash algo which subtracts 1).
+//
+//	kZlibDefault  = 0  → bits 11-13 = 000  (zlib-compressed; the default)
+//	kNoCompression = 1  → bits 11-13 = 001  (stored verbatim, no decompression)
+//
+// WARNING: Do NOT swap these values.  CompZlib MUST be 0 so that zlib-
+// compressed files set bits 11-13 = 000 in the flags column, which the CVMFS
+// client interprets as kZlibDefault and correctly decompresses on read.
+// Assigning CompZlib = 1 (kNoCompression) causes the client to skip
+// decompression, then fail a size check (compressed size ≠ catalog size) and
+// quarantine the object, returning EIO on every subsequent read.
 type CompAlgo int
 
 const (
-	CompNone CompAlgo = 0
-	CompZlib CompAlgo = 1
+	CompZlib CompAlgo = 0 // kZlibDefault = 0  — compressed with zlib (CVMFS default)
+	CompNone CompAlgo = 1 // kNoCompression = 1 — stored verbatim, no compression
 )
 
 // Catalog entry flag bits (from cvmfs/catalog_sql.h)
