@@ -149,6 +149,22 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 	j.State = to
 	j.UpdatedAt = time.Now()
 
+	// Write the manifest into the new directory so the on-disk state is
+	// consistent with j.State and the spool directory name.  Without this,
+	// FindJob reads the old manifest (which has the pre-transition state) and
+	// returns a stale state to callers — e.g. GET /api/v1/jobs/{id} returns
+	// "leased" even after the job directory has been moved to published/.
+	// Pollers that check for "published" then hang until their deadline.
+	//
+	// This write is best-effort: a failure here means the directory was
+	// successfully renamed (the job is in the correct spool state) but the
+	// manifest carries a stale state field.  We log and continue rather than
+	// failing the transition itself.
+	if wErr := s.WriteManifest(j); wErr != nil {
+		s.obs.Logger.Warn("manifest write after transition failed — state field may be stale",
+			"from", string(entry.From), "to", string(to), "job_id", j.ID, "error", wErr)
+	}
+
 	// Record metric
 	s.obs.Metrics.SpoolTransitions.WithLabelValues(string(entry.From), string(entry.To)).Inc()
 
