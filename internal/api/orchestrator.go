@@ -95,6 +95,21 @@ type Orchestrator struct {
 	// Serialising within this section preserves concurrent pipeline throughput
 	// (compress / distribute) while ensuring each commit sees a fresh manifest.
 	commitMu sync.Map // map[string]*sync.Mutex — keyed by repo name
+
+	// ensuredAncestors caches the set of ancestor directory sets that have
+	// already been committed to the repository.  The key is the canonical
+	// ancestor string for a (repo, path) pair — see ancestorCacheKey.
+	//
+	// Once a set of ancestor directories has been committed (ensureAncestors
+	// returned nil), they are permanently in the catalog and do not need to be
+	// re-published for subsequent jobs with the same repo + path prefix.  This
+	// eliminates the redundant root-level lease + Merge + commit that fires for
+	// every job when the ancestor directories are already present.
+	//
+	// The cache is in-process only and is rebuilt from scratch on service
+	// restart.  A restart re-runs ensureAncestors on the first job for each
+	// repo+path — a rare and cheap operation.
+	ensuredAncestors sync.Map // map[string]struct{} — keyed by ancestorCacheKey(repo, path)
 }
 
 // repoMutex returns the per-repo mutex for repo, creating it on first call.
@@ -102,6 +117,23 @@ type Orchestrator struct {
 func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
 	v, _ := o.commitMu.LoadOrStore(repo, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+// ancestorCacheKey builds the cache key for the ensuredAncestors map.
+// The key encodes both the repo and the full ordered ancestor path set derived
+// from path so that different publish paths with disjoint ancestors are cached
+// independently.
+//
+// Example: repo="test.cvmfs.io", path="test/stress/1"
+//   ancestors: ["/test", "/test/stress"]
+//   key: "test.cvmfs.io\x00/test,/test/stress"
+func ancestorCacheKey(repo, path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	ancestors := make([]string, 0, len(parts)-1)
+	for i := 1; i < len(parts); i++ {
+		ancestors = append(ancestors, "/"+strings.Join(parts[:i], "/"))
+	}
+	return repo + "\x00" + strings.Join(ancestors, ",")
 }
 
 // registerJob records the cancel function for a running job so CancelJob can
@@ -181,6 +213,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		return o.abortJob(ctx, j, err)
 	}
 
+	// Record total-S0 start time: from the moment Run() is invoked (job was
+	// already in StateIncoming when the goroutine was scheduled).
+	jobStartTS := time.Now()
+
 	// ── Phase 1 + 2: pipeline + distribution (gateway mode only) ─────────────
 	var pipelineResult *pipeline.Result
 
@@ -196,6 +232,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		// now points to a non-existent directory.
 		j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
 		logger.Info("running pipeline", "tar", j.TarPath)
+		phaseStart := time.Now()
 		var err error
 		pipelineResult, err = pipeline.Run(ctx, j.TarPath, o.Pipeline)
 		if err != nil {
@@ -203,6 +240,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 			logger.Error("pipeline failed", "error", err)
 			return o.abortJob(ctx, j, err)
 		}
+		o.Obs.Metrics.JobPhaseDuration.WithLabelValues("pipeline").Observe(time.Since(phaseStart).Seconds())
 
 		j.NObjects = len(pipelineResult.ObjectHashes)
 		j.NBytesRaw = pipelineResult.NBytesRaw
@@ -282,9 +320,20 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	// path component.  After this commit the repo's root catalog contains "/test",
 	// so the main publish succeeds.
 	if pipelineResult != nil && o.Stratum0URL != "" && strings.Contains(j.Path, "/") {
-		if ensureErr := o.ensureAncestors(ctx, j); ensureErr != nil {
-			span.RecordError(ensureErr)
-			return o.abortJob(ctx, j, ensureErr)
+		cacheKey := ancestorCacheKey(j.Repo, j.Path)
+		if _, alreadyEnsured := o.ensuredAncestors.Load(cacheKey); alreadyEnsured {
+			logger.Info("skipping ensureAncestors — ancestor directories already in catalog",
+				"repo", j.Repo, "path", j.Path)
+		} else {
+			phaseStart := time.Now()
+			if ensureErr := o.ensureAncestors(ctx, j); ensureErr != nil {
+				span.RecordError(ensureErr)
+				return o.abortJob(ctx, j, ensureErr)
+			}
+			o.Obs.Metrics.JobPhaseDuration.WithLabelValues("ensure_ancestors").Observe(time.Since(phaseStart).Seconds())
+			// Cache the successful ancestor publish so subsequent jobs with the
+			// same repo + path prefix skip the redundant root-level commit.
+			o.ensuredAncestors.Store(cacheKey, struct{}{})
 		}
 	}
 
@@ -329,6 +378,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	var mergeResult *cvmfscatalog.MergeResult
 	if pipelineResult != nil && o.Stratum0URL != "" {
 		logger.Info("merging catalog", "repo", j.Repo, "path", j.Path)
+		mergePhasStart := time.Now()
 		mergeResult, err = cvmfscatalog.Merge(leaseCtx, cvmfscatalog.MergeConfig{
 			Stratum0URL:   o.Stratum0URL,
 			RepoName:      j.Repo,
@@ -388,6 +438,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 					"hash", catHash, "error", closeErr)
 			}
 		}
+		o.Obs.Metrics.JobPhaseDuration.WithLabelValues("catalog_merge").Observe(time.Since(mergePhasStart).Seconds())
 		logger.Info("catalog merge complete",
 			"old_root", mergeResult.OldRootHash,
 			"new_root", mergeResult.NewRootHash,
@@ -440,6 +491,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	leaseCancel()     // release leaseCtx resources early; Commit uses the parent ctx
 
 	logger.Info("committing")
+	commitPhaseStart := time.Now()
 	if commitErr := o.Lease.Commit(ctx, req); commitErr != nil {
 		if errors.Is(commitErr, lease.ErrCommittedNotRemounted) {
 			// The catalog IS in the repository — only the FUSE remount failed.
@@ -455,11 +507,20 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 			return o.abortJob(ctx, j, commitErr)
 		}
 	}
+	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("commit").Observe(time.Since(commitPhaseStart).Seconds())
+
+	// Store the new catalog root hash so callers can poll Stratum 1 for propagation.
+	if mergeResult != nil {
+		j.NewRootHash = mergeResult.NewRootHash
+	}
 
 	if err := o.transition(ctx, j, job.StatePublished); err != nil {
 		span.RecordError(err)
 		return err
 	}
+
+	// Record total S0 wall time (submission → StatePublished).
+	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("total_s0").Observe(time.Since(jobStartTS).Seconds())
 
 	// ── Provenance (non-fatal) ────────────────────────────────────────────────
 	if o.Provenance != nil && j.Provenance != nil {

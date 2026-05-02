@@ -132,6 +132,11 @@ type Job struct {
 	// TagDescription is a human-readable comment stored alongside TagName.
 	// Ignored when TagName is empty.
 	TagDescription string `json:"tag_description,omitempty"`
+	// NewRootHash is the plain-hex SHA-1 hash of the root catalog after a
+	// successful publish (e.g. "a3f5...").  Populated only in StatePublished.
+	// Pollers can compare this against the C= field of the Stratum 1
+	// .cvmfspublished manifest to determine when S1 replication is complete.
+	NewRootHash string `json:"new_root_hash,omitempty"`
 	// Provenance contains build identity and Rekor transparency log receipt.
 	Provenance *Provenance `json:"provenance,omitempty"`
 }

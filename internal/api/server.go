@@ -534,6 +534,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		NObjects         int       `json:"n_objects,omitempty"`
 		NBytesRaw        int64     `json:"n_bytes_raw,omitempty"`
 		NBytesCompressed int64     `json:"n_bytes_compressed,omitempty"`
+		NewRootHash      string    `json:"new_root_hash,omitempty"`
 		Error            string    `json:"error,omitempty"`
 		CreatedAt        time.Time `json:"created_at"`
 		UpdatedAt        time.Time `json:"updated_at"`
@@ -547,6 +548,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		NObjects:         j.NObjects,
 		NBytesRaw:        j.NBytesRaw,
 		NBytesCompressed: j.NBytesCompressed,
+		NewRootHash:      j.NewRootHash,
 		Error:            j.Error,
 		CreatedAt:        j.CreatedAt,
 		UpdatedAt:        j.UpdatedAt,

@@ -25,6 +25,15 @@ type Metrics struct {
 	ReceiverBytesReceived      prometheus.Counter
 	ReceiverBloomSize          prometheus.Gauge
 	ReceiverHeartbeatErrors    prometheus.Counter
+
+	// Per-phase job duration histograms.
+	// Label "phase" takes values:
+	//   pipeline         — tar unpack + compress + dedup + CAS upload
+	//   ensure_ancestors — root-level ancestor-directory pre-publish
+	//   catalog_merge    — SQLite catalog merge (download + merge + upload)
+	//   commit           — gateway SubmitPayload + Release round-trip
+	//   total_s0         — wall time from job submission to StatePublished
+	JobPhaseDuration *prometheus.HistogramVec
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -112,6 +121,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "cvmfs_receiver_heartbeat_errors_total",
 			Help: "Total coordination-service heartbeat errors.",
 		}),
+		JobPhaseDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "cvmfs_prepub_job_phase_seconds",
+			Help: "Wall-clock duration of each job processing phase.",
+			// Buckets cover 0.1 s → ~17 minutes; well-suited for gateway round-trips
+			// (sub-second) through full pipeline + distribution runs (minutes).
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15), // 0.1s … 1638s
+		}, []string{"phase"}),
 	}
 }
 
@@ -138,5 +154,6 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.ReceiverBytesReceived,
 		m.ReceiverBloomSize,
 		m.ReceiverHeartbeatErrors,
+		m.JobPhaseDuration,
 	)
 }
