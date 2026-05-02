@@ -61,8 +61,13 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 	}
 
 	// Write to a temporary file.
+	// Use 0666 (world-readable before umask) to match the standard CVMFS local
+	// uploader (upload_local.h: default_backend_file_mode_ = 0666, masked by the
+	// process umask).  With the typical container umask of 0022 this yields 0644,
+	// allowing Apache in the stratum0 container to serve the object over HTTP.
+	// Using 0600 (owner-only) causes 403 responses and CVMFS client EIO errors.
 	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
