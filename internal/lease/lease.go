@@ -88,9 +88,14 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 			Timeout:   30 * time.Second,
 			Transport: newTLSTransport(),
 		},
-		// No Timeout: let the context passed to Commit() control the deadline.
-		// This allows the cvmfs_receiver to take as long as it needs.
+		// commitClient has a generous but finite timeout so that a hanging
+		// cvmfs_receiver (observed in the testbed with concurrent commits)
+		// eventually surfaces as a job failure rather than blocking the job
+		// goroutine forever.  10 minutes is far beyond any legitimate receiver
+		// run (catalog merge + RSA sign typically takes < 30 s); this is purely
+		// a safety net against infinite hangs.
 		commitClient: &http.Client{
+			Timeout:   10 * time.Minute,
 			Transport: newTLSTransport(),
 		},
 	}

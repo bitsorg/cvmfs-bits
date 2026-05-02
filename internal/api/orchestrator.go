@@ -78,6 +78,30 @@ type Orchestrator struct {
 	// webhookWg tracks in-flight webhook delivery goroutines so Server.Shutdown
 	// can wait for them to finish before the process exits.
 	webhookWg sync.WaitGroup
+
+	// commitMu serialises the ensureAncestors + catalog-merge + commit phase
+	// per repository.  Only one job per repo may be in this critical section
+	// at a time.
+	//
+	// Background: both ensureAncestors and the main Merge download the current
+	// manifest and record its hash as old_root_hash.  If two jobs for the same
+	// repo run these steps concurrently, both see the same old_root_hash.  The
+	// first commit updates the manifest to a new hash; the second commit then
+	// presents a stale old_root_hash to the gateway, which spawns a second
+	// cvmfs_receiver that either conflicts with the first or returns an error.
+	// In the testbed the receiver is observed to block indefinitely in this
+	// case, causing the job to hang in StateCommitting forever.
+	//
+	// Serialising within this section preserves concurrent pipeline throughput
+	// (compress / distribute) while ensuring each commit sees a fresh manifest.
+	commitMu sync.Map // map[string]*sync.Mutex — keyed by repo name
+}
+
+// repoMutex returns the per-repo mutex for repo, creating it on first call.
+// The same *sync.Mutex is returned for every call with the same repo string.
+func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
+	v, _ := o.commitMu.LoadOrStore(repo, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // registerJob records the cancel function for a running job so CancelJob can
@@ -225,6 +249,26 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		}
 	} else {
 		logger.Info("local publish mode — skipping pipeline, tar will be extracted during Commit")
+	}
+
+	// ── Phase 2.5–4: per-repo serialisation ─────────────────────────────────
+	// Acquire a per-repo mutex before ensureAncestors so that only ONE job per
+	// repo is in the manifest-download → merge → commit critical section at a
+	// time.  This prevents two concurrent jobs from both downloading the same
+	// old manifest hash, producing diverging new catalogs, and then racing to
+	// commit — a situation where the second commit presents a stale
+	// old_root_hash to the gateway receiver, which in the testbed causes the
+	// receiver subprocess to block indefinitely (hang in StateCommitting).
+	//
+	// Pipeline stages (compress / distribute) run freely before this point, so
+	// the only serialised work is the gateway round-trips (ensureAncestors
+	// root-lease commit + main lease acquire + merge + commit), which are
+	// latency-bound by cvmfs_receiver anyway.
+	if o.Lease.NeedsPipeline() {
+		repoMu := o.repoMutex(j.Repo)
+		repoMu.Lock()
+		defer repoMu.Unlock()
+		logger.Info("acquired per-repo commit serialisation lock", "repo", j.Repo)
 	}
 
 	// ── Phase 2.5: ensure ancestor directories exist (gateway mode) ──────────
