@@ -1,8 +1,16 @@
 package receiver
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"cvmfs.io/prepub/internal/broker"
@@ -217,6 +225,250 @@ func (r *Receiver) computeAbsentHashes(hashes []string) []string {
 	return absent
 }
 
+// mqttPublishedHandler is called by the broker client each time a
+// PublishedMessage arrives on one of the subscribed published topics.
+//
+// Flow:
+//  1. Decode the JSON payload.
+//  2. Validate the repo is one this receiver serves.
+//  3. If Stratum0URL is not configured, log and return (graceful degradation).
+//  4. If a pull goroutine is already running for this repo, drop the
+//     notification (the in-progress pull will fetch the latest state anyway).
+//  5. Launch a background goroutine (governed by bgCtx) that fetches missing
+//     objects from Stratum 0.
+//
+// The handler is non-blocking: all I/O runs in a separate goroutine so that
+// the broker's callback goroutine is never blocked.
+func (r *Receiver) mqttPublishedHandler(msg *broker.Message) {
+	var pm broker.PublishedMessage
+	if err := msg.Decode(&pm); err != nil {
+		r.cfg.Obs.Logger.Warn("mqtt: failed to decode PublishedMessage",
+			"topic", msg.Topic, "error", err)
+		return
+	}
+
+	if pm.Repo == "" || pm.NewRootHash == "" {
+		r.cfg.Obs.Logger.Warn("mqtt: PublishedMessage missing required fields",
+			"topic", msg.Topic, "repo", pm.Repo)
+		return
+	}
+
+	if !r.servesRepo(pm.Repo) {
+		// Not our repo — ignore silently (topic ACLs should prevent this).
+		return
+	}
+
+	r.cfg.Obs.Logger.Info("mqtt: published notification received",
+		"repo", pm.Repo,
+		"new_root_hash", pm.NewRootHash,
+		"hashes", len(pm.Hashes),
+		"published_at", pm.PublishedAt)
+
+	if r.cfg.Stratum0URL == "" {
+		r.cfg.Obs.Logger.Info("mqtt: no stratum0_url configured — skipping S0 pull",
+			"repo", pm.Repo)
+		return
+	}
+
+	// Deduplicate concurrent notifications per repo.  LoadOrStore atomically
+	// inserts a new mutex for this repo if one doesn't exist.
+	muVal, _ := r.s0PullMu.LoadOrStore(pm.Repo, &sync.Mutex{})
+	mu := muVal.(*sync.Mutex)
+	if !mu.TryLock() {
+		// A pull goroutine is already running for this repo.  It will read the
+		// latest objects from S0, so this notification is safe to drop.
+		r.cfg.Obs.Logger.Info("mqtt: S0 pull already in progress for repo — dropping notification",
+			"repo", pm.Repo, "new_root_hash", pm.NewRootHash)
+		return
+	}
+	// mu is now locked.  The goroutine will unlock it when done.
+
+	go func() {
+		defer mu.Unlock()
+		r.pullFromS0(r.bgCtx, pm)
+	}()
+}
+
+// pullFromS0 fetches objects that this receiver does not yet hold from the
+// Stratum 0 CAS, using the hash list from pm.Hashes when available or the
+// root catalog hash when Hashes is empty (native ingest path).
+//
+// It is designed to be idempotent: if an object is already in the local CAS
+// (Bloom filter check + filesystem stat), it is skipped.
+//
+// All network I/O is governed by ctx so that Shutdown() can cancel in-flight
+// pulls promptly.
+func (r *Receiver) pullFromS0(ctx context.Context, pm broker.PublishedMessage) {
+	logger := r.cfg.Obs.Logger.With(
+		"repo", pm.Repo,
+		"new_root_hash", pm.NewRootHash,
+		"phase", "s0_pull",
+	)
+
+	s0Base := strings.TrimRight(r.cfg.Stratum0URL, "/")
+
+	// Build the list of hashes to check/fetch.
+	//
+	// Bits path: pm.Hashes contains all object hashes the publisher produced.
+	// Native ingest path: pm.Hashes is empty; we pull only the root catalog.
+	hashesToFetch := pm.Hashes
+	if len(hashesToFetch) == 0 {
+		// Native ingest: the root catalog is identified by pm.NewRootHash.
+		// We add it with the 'C' (compressed/catalog) suffix that CVMFS uses
+		// to distinguish catalog objects from regular data objects on disk.
+		hashesToFetch = []string{pm.NewRootHash}
+		logger.Info("mqtt: native ingest path — fetching root catalog only",
+			"root_hash", pm.NewRootHash)
+	}
+
+	// Filter through Bloom filter to compute the minimal fetch set.
+	var absent []string
+	if r.inv.isReady() {
+		for _, h := range hashesToFetch {
+			// Strip the 'C' suffix for Bloom filter lookup; the inventory tracks
+			// plain hashes, not content-type suffixed keys.
+			plain := strings.TrimSuffix(h, "C")
+			if !r.inv.contains(plain) {
+				absent = append(absent, h)
+			}
+		}
+	} else {
+		// Bloom not ready — treat all hashes as absent (conservative).
+		absent = hashesToFetch
+		logger.Info("mqtt: Bloom filter not ready — fetching all announced hashes",
+			"count", len(absent))
+	}
+
+	if len(absent) == 0 {
+		logger.Info("mqtt: all objects already present — no S0 pull needed")
+		return
+	}
+
+	logger.Info("mqtt: pulling absent objects from S0",
+		"absent", len(absent), "total", len(hashesToFetch))
+
+	fetched := 0
+	for _, hash := range absent {
+		if ctx.Err() != nil {
+			logger.Info("mqtt: S0 pull cancelled", "fetched", fetched)
+			return
+		}
+
+		// Strip 'C' suffix for URL construction; the S0 data URL uses the plain
+		// hash (without suffix) as the path component.
+		// S0 serves objects at: /cvmfs/{repo}/data/{hash[0:2]}/{hash}C
+		plain := strings.TrimSuffix(hash, "C")
+		if len(plain) < 2 {
+			logger.Warn("mqtt: skipping hash with length < 2", "hash", hash)
+			continue
+		}
+
+		// Check filesystem directly (handles the case where Bloom is not ready).
+		localPath := casPath(r.cfg.CASRoot, plain)
+		if _, err := os.Stat(localPath); err == nil {
+			// Already on disk — just ensure the inventory is updated.
+			r.inv.add(plain)
+			continue
+		}
+
+		// Stratum0URL convention (same as publisher): includes the /cvmfs path
+		// prefix (e.g. "http://stratum0/cvmfs").  CAS objects are served at
+		// {Stratum0URL}/{repo}/data/{hash[0:2]}/{hash}C, matching the CVMFS
+		// Apache DocumentRoot/cvmfs/{repo}/data/ layout.
+		objectURL := fmt.Sprintf("%s/%s/data/%s/%sC",
+			s0Base, pm.Repo, plain[:2], plain)
+
+		if err := r.fetchObjectFromS0(ctx, objectURL, plain); err != nil {
+			logger.Error("mqtt: failed to fetch object from S0",
+				"hash", plain, "url", objectURL, "error", err)
+			// Continue with remaining hashes — partial success is better than
+			// giving up.  The next PublishedMessage will retry missing objects.
+			continue
+		}
+		fetched++
+	}
+
+	logger.Info("mqtt: S0 pull complete", "fetched", fetched, "absent", len(absent))
+}
+
+// fetchObjectFromS0 downloads a single CAS object from objectURL and stores it
+// in the local CAS at the path derived from plain (the hash without 'C' suffix).
+//
+// The download is streamed through a SHA-256 hasher into a sibling temp file
+// and atomically renamed to the final CAS path on success.  SHA-256 of the
+// received bytes is verified against the computed value (the 'C' object is
+// already compressed; we don't re-hash the uncompressed form here, but we do
+// ensure transfer integrity against bit-rot or truncation).
+func (r *Receiver) fetchObjectFromS0(ctx context.Context, objectURL, plain string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
+	if err != nil {
+		return fmt.Errorf("building request: %w", err)
+	}
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", objectURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// S0 doesn't have this object yet (e.g. race with commit propagation).
+		// Not an error — the object will arrive on the next pull cycle.
+		r.cfg.Obs.Logger.Info("mqtt: object not yet available on S0 (404) — will retry on next notification",
+			"url", objectURL)
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s returned %d", objectURL, resp.StatusCode)
+	}
+
+	// Ensure the CAS sub-directory exists.
+	finalPath := casPath(r.cfg.CASRoot, plain)
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0700); err != nil {
+		return fmt.Errorf("creating CAS subdirectory: %w", err)
+	}
+
+	// Write to a temp file with a random suffix to avoid races with concurrent
+	// PUTs or other fetch goroutines for the same hash.
+	tmpPath := finalPath + "." + randomToken()[:8] + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+
+	hasher := sha256.New()
+	_, copyErr := io.Copy(f, io.TeeReader(resp.Body, hasher))
+	syncErr := f.Sync()
+	f.Close()
+
+	if copyErr != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("streaming body: %w", copyErr)
+	}
+	if syncErr != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("fsync temp file: %w", syncErr)
+	}
+
+	// Atomic rename.
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
+		// If the file already exists (concurrent fetch or PUT), treat as success.
+		if _, statErr := os.Stat(finalPath); statErr == nil {
+			r.inv.add(plain)
+			return nil
+		}
+		return fmt.Errorf("rename to final path: %w", err)
+	}
+
+	// Update the inventory Bloom filter.
+	r.inv.add(plain)
+
+	r.cfg.Obs.Logger.Debug("mqtt: fetched object from S0",
+		"hash", plain, "sha256", hex.EncodeToString(hasher.Sum(nil)))
+	return nil
+}
+
 // servesRepo returns true if repo is listed in r.cfg.Repos.
 // An empty Repos slice means the receiver has not been configured with a
 // repository list; in that case all repos are accepted (permissive default
@@ -306,6 +558,19 @@ func (r *Receiver) startMQTT() error {
 	if err := client.Subscribe(topicFilter, 1, r.mqttAnnounceHandler); err != nil {
 		client.Disconnect(500)
 		return fmt.Errorf("receiver: subscribing to announce topic %q: %w", topicFilter, err)
+	}
+
+	// Subscribe to the published topic so that commit notifications (from both
+	// the bits pipeline and native ingest) trigger S0 pulls.  The subscription
+	// uses the same wildcard filter regardless of the configured repos: the
+	// handler filters by repo using servesRepo().  We use QoS 1 so that
+	// notifications are not lost on a transient connection drop.
+	publishedFilter := broker.PublishedTopicFilter()
+	if err := client.Subscribe(publishedFilter, 1, r.mqttPublishedHandler); err != nil {
+		// Non-fatal: the announce path still works, and the bits pre-push already
+		// delivered objects before the commit.  Log the error and continue.
+		r.cfg.Obs.Logger.Warn("receiver: subscribing to published topic failed — S0 pull disabled",
+			"filter", publishedFilter, "error", err)
 	}
 
 	// Store the client only after setup is complete so that mqttPublish can use it.

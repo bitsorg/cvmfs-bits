@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
 	"cvmfs.io/prepub/internal/job"
@@ -60,6 +61,17 @@ type Orchestrator struct {
 	// Distribute contains configuration for Stratum 1 push distribution.
 	// nil disables distribution (typical for local mode).
 	Distribute *distribute.Config
+
+	// BrokerConfig is the MQTT broker configuration used for publishing commit
+	// notifications (PublishedMessage) after a successful catalog commit.  When
+	// non-nil, a short-lived client is created per commit to publish the message
+	// and then disconnected.  nil disables MQTT publish notifications.
+	//
+	// This is separate from Distribute.BrokerConfig: distribution uses the
+	// broker for the announce/ready exchange BEFORE the commit, while this
+	// config is for the post-commit "published" notification.  In typical
+	// deployments both configs reference the same broker.
+	BrokerConfig *broker.Config
 	// Pipeline contains configuration for the compression/dedup pipeline.
 	// Only used when Lease.NeedsPipeline() returns true.
 	Pipeline pipeline.Config
@@ -180,6 +192,68 @@ func (o *Orchestrator) transition(ctx context.Context, j *job.Job, to job.State)
 		})
 	}
 	return nil
+}
+
+// publishMQTTNotification creates a short-lived MQTT client, publishes a
+// PublishedMessage to the per-repo published topic, and disconnects.
+//
+// It is called in a goroutine after StatePublished so that a slow broker does
+// not block the job completion path.  Failures are logged but not propagated —
+// a missed notification means S1 receivers on the native ingest path won't
+// pull immediately, but they will pull on the next notification.
+//
+// A per-call client is used (rather than a persistent one) to avoid managing
+// lifecycle state in the Orchestrator: the client is connected, one message is
+// published, and it is disconnected — analogous to a single-use HTTP POST.
+// The overhead (one TCP handshake + one MQTT CONNECT) is negligible compared
+// to the catalog commit that just completed.
+func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
+	if o.BrokerConfig == nil || o.BrokerConfig.BrokerURL == "" {
+		return
+	}
+
+	// Derive a unique ClientID for this notification so that concurrent calls
+	// from different jobs do not collide.  Use the first 8 chars of the root
+	// hash for uniqueness; prefix with "pub-notify-" to distinguish from job
+	// distributor clients ("pub-<payloadID[:8]>").
+	suffix := newRootHash
+	if len(suffix) > 8 {
+		suffix = suffix[:8]
+	}
+	cfg := *o.BrokerConfig
+	if cfg.ClientID == "" {
+		cfg.ClientID = "cvmfs-prepub-notify-" + suffix
+	} else {
+		cfg.ClientID = cfg.ClientID + "-notify-" + suffix
+	}
+
+	client, err := broker.New(cfg)
+	if err != nil {
+		o.Obs.Logger.Warn("mqtt: failed to connect for publish notification",
+			"repo", repo, "error", err)
+		return
+	}
+	defer client.Disconnect(500)
+
+	// Hashes are intentionally omitted: for bits path S1 receivers already
+	// hold all pre-warmed objects; for native ingest the receiver pulls the
+	// root catalog using NewRootHash.  Omitting hashes keeps the message small.
+	msg := broker.PublishedMessage{
+		Repo:        repo,
+		NewRootHash: newRootHash,
+		PublishedAt: time.Now(),
+	}
+
+	topic := broker.PublishedTopic(repo)
+	if err := client.Publish(topic, 1, false, msg); err != nil {
+		o.Obs.Logger.Warn("mqtt: failed to publish commit notification",
+			"repo", repo, "new_root_hash", newRootHash, "error", err)
+		return
+	}
+
+	o.Obs.Logger.Info("mqtt: commit notification published",
+		"repo", repo,
+		"new_root_hash", newRootHash)
 }
 
 // Run executes the job through all pipeline stages.
@@ -521,6 +595,24 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 
 	// Record total S0 wall time (submission → StatePublished).
 	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("total_s0").Observe(time.Since(jobStartTS).Seconds())
+
+	// Publish a commit notification over MQTT so that Stratum 1 receivers can
+	// pull any new objects from S0 that were not pre-warmed via the bits
+	// pipeline (e.g. native ingest path publishing to the same repo).
+	//
+	// This is fire-and-forget: a failed publish does not fail the job.  The
+	// bits pipeline already pre-warmed all objects before the commit, so the
+	// notification is supplemental for S1 receivers on the native ingest path.
+	//
+	// Hashes are intentionally omitted from the notification: for the bits path
+	// S1 receivers already hold all pre-warmed objects, so there is nothing to
+	// fetch.  For the native ingest path S1 receivers use the NewRootHash to
+	// fetch just the root catalog from S0.  Including the full hash list would
+	// make the MQTT message proportionally large (63 bytes × N hashes) and
+	// could exceed the broker's message_size_limit for large payloads.
+	if o.BrokerConfig != nil && j.NewRootHash != "" {
+		go o.publishMQTTNotification(j.Repo, j.NewRootHash)
+	}
 
 	// ── Provenance (non-fatal) ────────────────────────────────────────────────
 	if o.Provenance != nil && j.Provenance != nil {

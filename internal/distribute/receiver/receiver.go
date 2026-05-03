@@ -107,6 +107,18 @@ type Config struct {
 	// the coordination service can build the routing table.
 	Repos []string
 
+	// Stratum0URL is the HTTP base URL of the Stratum 0 server from which new
+	// CAS objects are fetched when a PublishedMessage is received over MQTT.
+	// Must include the /cvmfs path prefix, matching the convention used by the
+	// publisher's Stratum0URL.
+	// Example: "http://stratum0.example.org/cvmfs"
+	// When empty, published-notification-triggered pulls are disabled: the
+	// receiver still subscribes to the published topic and logs notifications,
+	// but takes no action.  This is safe — objects pushed via the bits pipeline
+	// are already present before the commit; the pull is only needed for objects
+	// committed via the native ingest path.
+	Stratum0URL string
+
 	// BrokerURL is the MQTT broker address (e.g. "tls://broker.cern.ch:8883").
 	// When non-empty the receiver connects to the broker, publishes a retained
 	// presence message, and subscribes to announce topics for the configured
@@ -185,6 +197,19 @@ type Receiver struct {
 	bgCtx        context.Context     // cancelled by Shutdown to stop background goroutines
 	bgCancel     context.CancelFunc  // cancels bgCtx
 	shutdownOnce sync.Once           // ensures Shutdown can be safely called multiple times
+
+	// httpClient is used for outbound S0 fetch requests triggered by
+	// PublishedMessage notifications.  Initialised once in New() and shared
+	// across all fetch goroutines.
+	httpClient *http.Client
+
+	// s0PullMu is a per-repo map that prevents concurrent S0 pull goroutines
+	// for the same repository.  The value is a *sync.Mutex that the pull
+	// goroutine tries to TryLock; if it cannot, the notification is dropped
+	// (the in-progress pull will fetch the latest objects anyway).
+	//
+	// Key: repo name string.  Value: *sync.Mutex.
+	s0PullMu sync.Map
 }
 
 // New creates a Receiver from cfg but does not start any listeners.
@@ -216,6 +241,9 @@ func New(cfg Config) (*Receiver, error) {
 		stopClean: make(chan struct{}),
 		bgCtx:     bgCtx,
 		bgCancel:  bgCancel,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Minute, // generous for large CAS objects
+		},
 	}
 
 	// Control channel mux (HTTPS): announce, bloom filter snapshot, metrics.

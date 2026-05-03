@@ -1,5 +1,7 @@
 package broker
 
+import "time"
+
 // AnnounceMessage is published by a publisher to the announce topic for a
 // specific repository (see AnnounceTopic).  All receivers subscribed to that
 // topic will receive it and decide whether they can participate.
@@ -61,6 +63,41 @@ type ReadyMessage struct {
 	// insufficient disk space, unknown repo, session cap reached).  Publishers
 	// must not count receivers with a non-empty Error field towards quorum.
 	Error string `json:"error,omitempty"`
+}
+
+// PublishedMessage is published by a publisher to the published topic for a
+// specific repository (see PublishedTopic) immediately after a successful
+// catalog commit — whether via the bits pre-publish pipeline or the native
+// cvmfs_server ingest path.
+//
+// Receivers subscribed to this topic use it as a trigger to pull any new CAS
+// objects from the Stratum 0 that they do not yet hold, so that they are
+// synchronised with the canonical repository state after every commit.
+//
+// When Hashes is non-empty (bits path) the receiver can use it to compute the
+// delta against its local Bloom filter and fetch only the missing objects.
+// When Hashes is empty (native ingest path) the receiver falls back to pulling
+// the new root catalog from Stratum 0 and walking the catalog to discover
+// referenced objects — or simply acknowledges the notification and performs a
+// full snapshot on its next scheduled window.
+type PublishedMessage struct {
+	// Repo is the CVMFS repository name (e.g. "atlas.cern.ch").
+	Repo string `json:"repo"`
+
+	// NewRootHash is the plain-hex SHA-1 hash of the root catalog after the
+	// successful commit.  Receivers use this as a cache key to avoid redundant
+	// pulls when the same commit hash is broadcast multiple times.
+	NewRootHash string `json:"new_root_hash"`
+
+	// PublishedAt is the wall-clock time at which the commit completed on the
+	// publisher.  Included for audit / latency-measurement purposes.
+	PublishedAt time.Time `json:"published_at"`
+
+	// Hashes is the full list of CAS object hashes that were part of this
+	// publish.  Populated by the bits pipeline; empty for native ingest.
+	// Receivers that have a populated Bloom filter can subtract their local
+	// inventory from this list to compute the minimal fetch set.
+	Hashes []string `json:"hashes,omitempty"`
 }
 
 // PresenceMessage is published (retained) by a receiver on connect and also

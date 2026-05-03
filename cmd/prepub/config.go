@@ -110,6 +110,11 @@ type fileConfig struct {
 	// Equivalent to --repos (comma-separated on the CLI).
 	Repos    []string `yaml:"repos"`
 	CoordURL string   `yaml:"coord_url"`
+	// ReceiverStratum0URL is the Stratum 0 HTTP base URL used by the receiver
+	// to pull CAS objects when a PublishedMessage is received over MQTT.
+	// Example: "http://stratum0.example.org/cvmfs"
+	// Equivalent to --receiver-stratum0-url.
+	ReceiverStratum0URL string `yaml:"receiver_stratum0_url"`
 
 	// Shared Bloom filter (publisher).
 	BloomSnapshotDir    string       `yaml:"bloom_snapshot_dir"`
@@ -177,7 +182,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	controlAddr, dataAddr, dataHost, tlsCert, tlsKey *string,
 	sessionTTL *time.Duration,
 	diskHeadroom *float64,
-	nodeID, repos, coordURL *string,
+	nodeID, repos, coordURL, recvStratum0URL *string,
 	bloomSnapshotDir, bloomNodeID *string,
 	bloomMaxSnapshotAge *time.Duration,
 	bloomFilterCapacity *uint,
@@ -250,6 +255,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		*repos = strings.Join(fc.Repos, ",")
 	}
 	str("coord-url", coordURL, fc.CoordURL)
+	str("receiver-stratum0-url", recvStratum0URL, fc.ReceiverStratum0URL)
 
 	// Bloom filter (publisher).
 	str("bloom-snapshot-dir", bloomSnapshotDir, fc.BloomSnapshotDir)

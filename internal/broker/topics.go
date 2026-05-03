@@ -28,6 +28,12 @@
 //	    Publisher → all receivers.  Payload: AnnounceMessage (JSON).
 //	    QoS 1, retained=false.
 //
+//	cvmfs/repos/{repo}/published
+//	    Publisher → all receivers.  Payload: PublishedMessage (JSON).
+//	    QoS 1, retained=false.  Sent after every successful catalog commit
+//	    (bits pipeline and native ingest path alike).  Receivers use it as a
+//	    trigger to pull any new objects from Stratum 0.
+//
 //	cvmfs/receivers/{node_id}/presence
 //	    Receiver → all observers.  Payload: PresenceMessage (JSON).
 //	    QoS 1, retained=true.  LWT publishes the same topic with Online=false.
@@ -56,6 +62,7 @@ const (
 	topicReceivers  = "receivers"
 	topicPublishers = "publishers"
 	topicAnnounce   = "announce"
+	topicPublished  = "published"
 	topicPresence   = "presence"
 	topicReady      = "ready"
 )
@@ -94,6 +101,29 @@ func AnnounceTopic(repo string) string {
 //	cvmfs/repos/+/announce
 func AnnounceTopicFilter() string {
 	return fmt.Sprintf("%s/%s/+/%s", topicBase, topicRepos, topicAnnounce)
+}
+
+// PublishedTopic returns the topic on which a publisher broadcasts a commit
+// notification after a successful catalog publish (bits pipeline or native
+// ingest).  Receivers subscribed to this topic pull any new CAS objects from
+// Stratum 0.
+//
+//	cvmfs/repos/{repo}/published
+//
+// Panics if repo contains MQTT-reserved characters (/, +, #, NUL) or is empty.
+func PublishedTopic(repo string) string {
+	if err := validTopicSegment("repo", repo); err != nil {
+		panic(err)
+	}
+	return fmt.Sprintf("%s/%s/%s/%s", topicBase, topicRepos, repo, topicPublished)
+}
+
+// PublishedTopicFilter returns an MQTT subscription filter that matches
+// published notifications for all repositories.
+//
+//	cvmfs/repos/+/published
+func PublishedTopicFilter() string {
+	return fmt.Sprintf("%s/%s/+/%s", topicBase, topicRepos, topicPublished)
 }
 
 // PresenceTopic returns the retained topic on which a receiver publishes its

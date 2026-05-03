@@ -103,9 +103,14 @@ func main() {
 	// HepCDN coordination service — off by default.
 	// CoordURL enables registration, heartbeat, and topology-aware routing.
 	// The bearer token is read from PREPUB_COORD_TOKEN for security.
-	coordURL := flag.String("coord-url", "", "HepCDN coordination service base URL (e.g. https://coord.hepcdn.example.com) [receiver]")
-	nodeID   := flag.String("node-id", "", "Stable identifier for this receiver node; defaults to hostname [receiver]")
-	repos    := flag.String("repos", "", "Comma-separated list of CVMFS repositories served by this receiver (e.g. atlas.cern.ch,cms.cern.ch) [receiver]")
+	coordURL    := flag.String("coord-url", "", "HepCDN coordination service base URL (e.g. https://coord.hepcdn.example.com) [receiver]")
+	nodeID      := flag.String("node-id", "", "Stable identifier for this receiver node; defaults to hostname [receiver]")
+	repos       := flag.String("repos", "", "Comma-separated list of CVMFS repositories served by this receiver (e.g. atlas.cern.ch,cms.cern.ch) [receiver]")
+	// recvStratum0URL is the Stratum 0 base URL the receiver uses to pull CAS
+	// objects on published-notification.  Distinct from --stratum0-url (which
+	// is publisher-mode only) to avoid flag-name collisions in the shared flag
+	// set.  Using --receiver-stratum0-url makes the purpose explicit.
+	recvStratum0URL := flag.String("receiver-stratum0-url", "", "Stratum 0 HTTP base URL used by the receiver to pull objects on commit notification (e.g. http://stratum0/cvmfs) [receiver]")
 
 	// MQTT broker — shared by publisher and receiver modes.
 	// When set, receivers connect outbound to the broker and publish retained
@@ -142,7 +147,7 @@ func main() {
 			brokerURL, brokerClientCert, brokerClientKey, brokerCACert,
 			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
 			sessionTTL, diskHeadroom,
-			nodeID, repos, coordURL,
+			nodeID, repos, coordURL, recvStratum0URL,
 			bloomSnapshotDir, bloomNodeID,
 			bloomMaxSnapshotAge, bloomFilterCapacity, bloomFilterFPRate,
 			recvBloomCapacity, recvBloomFPRate,
@@ -174,7 +179,8 @@ func main() {
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
-			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert)
+			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
+			*recvStratum0URL)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
 		os.Exit(1)
@@ -394,12 +400,28 @@ func runPublisher(
 		}
 	}
 
+	// Build a broker config for post-commit publish notifications.
+	// Reuses the same broker credentials as the distribution path so that
+	// operators only need one set of MQTT credentials per node.
+	var publishBrokerCfg *broker.Config
+	if brokerURL != "" {
+		publishBrokerCfg = &broker.Config{
+			BrokerURL:  brokerURL,
+			ClientCert: brokerClientCert,
+			ClientKey:  brokerClientKey,
+			CACert:     brokerCACert,
+			// ClientID is left empty; publishMQTTNotification derives a unique
+			// per-notification suffix from the new root hash.
+		}
+	}
+
 	orch := &api.Orchestrator{
-		Spool:       sp,
-		CAS:         casBackend,
-		Lease:       leaseBackend,
-		CVMFSMount:  cvmfsMount,
-		Stratum0URL: stratum0URL,
+		Spool:        sp,
+		CAS:          casBackend,
+		Lease:        leaseBackend,
+		CVMFSMount:   cvmfsMount,
+		Stratum0URL:  stratum0URL,
+		BrokerConfig: publishBrokerCfg,
 		Pipeline: pipeline.Config{
 			Workers:      4,
 			UploadConc:   4,
@@ -496,6 +518,7 @@ func runReceiver(
 	bloomFPRate float64,
 	coordURL, nodeID, reposFlag string,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
+	stratum0URL string,
 ) {
 	// Load the HMAC shared secret from the environment.  In DevMode the
 	// receiver skips HMAC verification entirely, so the secret is not required.
@@ -563,6 +586,7 @@ func runReceiver(
 		CoordToken:       coordToken,
 		NodeID:           nodeID,
 		Repos:            repoList,
+		Stratum0URL:      stratum0URL,
 		BrokerURL:        brokerURL,
 		BrokerClientCert: brokerClientCert,
 		BrokerClientKey:  brokerClientKey,
