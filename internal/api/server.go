@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	// Critical #4: All job routes require a valid bearer token.
 	auth := s.router.PathPrefix("/api/v1/jobs").Subrouter()
 	auth.Use(s.requireAuth)
+	auth.HandleFunc("", s.listJobs).Methods("GET")
 	auth.HandleFunc("", s.submitJob).Methods("POST")
 	auth.HandleFunc("/{id}", s.getJob).Methods("GET")
 	auth.HandleFunc("/{id}/abort", s.abortJobHandler).Methods("POST")
@@ -183,6 +185,92 @@ func (s *Server) Shutdown(ctx context.Context) error {
 //	}
 //
 // Returns 202 Accepted with {"job_id": "<uuid>"}.  The caller should poll
+// listJobs handles GET /api/v1/jobs.
+// It scans every spool state directory and returns a JSON array of all jobs
+// (active and terminal), sorted by creation time newest-first.
+// Individual manifests that cannot be read are silently skipped so a single
+// corrupt entry does not break the list.
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	_, span := s.obs.Tracer.Start(r.Context(), "api.list_jobs")
+	defer span.End()
+
+	allStates := []job.State{
+		job.StateIncoming,
+		job.StateStaging,
+		job.StateUploading,
+		job.StateDistributing,
+		job.StateLeased,
+		job.StateCommitting,
+		job.StatePublished,
+		job.StateFailed,
+		job.StateAborted,
+	}
+
+	type jobEntry struct {
+		JobID            string    `json:"job_id"`
+		State            string    `json:"state"`
+		Repo             string    `json:"repo"`
+		Path             string    `json:"path,omitempty"`
+		TagName          string    `json:"tag_name,omitempty"`
+		NObjects         int       `json:"n_objects,omitempty"`
+		NBytesRaw        int64     `json:"n_bytes_raw,omitempty"`
+		NBytesCompressed int64     `json:"n_bytes_compressed,omitempty"`
+		NewRootHash      string    `json:"new_root_hash,omitempty"`
+		Error            string    `json:"error,omitempty"`
+		CreatedAt        time.Time `json:"created_at"`
+		UpdatedAt        time.Time `json:"updated_at"`
+	}
+
+	var jobs []jobEntry
+	for _, state := range allStates {
+		stateDir := filepath.Join(s.spoolRoot, string(state))
+		entries, err := os.ReadDir(stateDir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			span.RecordError(err)
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			dir := filepath.Join(stateDir, entry.Name())
+			j, err := s.sp.ReadManifest(dir)
+			if err != nil {
+				continue
+			}
+			jobs = append(jobs, jobEntry{
+				JobID:            j.ID,
+				State:            string(j.State),
+				Repo:             j.Repo,
+				Path:             j.Path,
+				TagName:          j.TagName,
+				NObjects:         j.NObjects,
+				NBytesRaw:        j.NBytesRaw,
+				NBytesCompressed: j.NBytesCompressed,
+				NewRootHash:      j.NewRootHash,
+				Error:            j.Error,
+				CreatedAt:        j.CreatedAt,
+				UpdatedAt:        j.UpdatedAt,
+			})
+		}
+	}
+
+	// Newest first.
+	sort.Slice(jobs, func(i, k int) bool {
+		return jobs[i].CreatedAt.After(jobs[k].CreatedAt)
+	})
+
+	if jobs == nil {
+		jobs = []jobEntry{} // return [] not null
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(jobs)
+}
+
 // GET /api/v1/jobs/{id} or subscribe to GET /api/v1/jobs/{id}/events.
 func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	_, span := s.obs.Tracer.Start(r.Context(), "api.submit_job")
