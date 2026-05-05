@@ -67,6 +67,14 @@ func main() {
 	s1Timeout         := flag.Duration("s1-timeout", 60*time.Second, "Per-object/batch timeout for Stratum 1 pushes [publisher]")
 	s1BloomTimeout    := flag.Duration("s1-bloom-timeout", 0, "Per-endpoint timeout for fetching inventory Bloom filter (0 = disable delta push) [publisher]")
 	s1MQTTTimeout     := flag.Duration("s1-mqtt-quorum-timeout", 30*time.Second, "Time to wait for receiver ready replies before proceeding (MQTT mode) [publisher]")
+	// Queue-driven distribution worker flags.
+	s1WorkerConcurrency  := flag.Int("s1-worker-concurrency", 0, "Concurrent transfer goroutines per Stratum 1 endpoint (0 = default 2) [publisher]")
+	s1AttemptTimeout     := flag.Duration("s1-attempt-timeout", 0, "Per-attempt timeout for a single endpoint distribution run (0 = default 90s) [publisher]")
+	s1InitialBackoff     := flag.Duration("s1-initial-backoff", 0, "Initial backoff after a failed distribution attempt (0 = default 5s) [publisher]")
+	s1MaxBackoff         := flag.Duration("s1-max-backoff", 0, "Maximum exponential backoff between retry attempts (0 = default 5m) [publisher]")
+	s1MaxAttempts        := flag.Int("s1-max-attempts", 0, "Max delivery attempts per item per endpoint; 0 = unlimited [publisher]")
+	s1QueueDepth         := flag.Int("s1-queue-depth", 0, "In-memory queue depth per Stratum 1 endpoint (0 = default 512) [publisher]")
+	s1QueueSpoolDir      := flag.String("s1-queue-spool-dir", "", "Directory for persistent per-endpoint distribution queues (default: {spool-root}/dist-queue) [publisher]")
 
 	// Shared Bloom filter — off by default.
 	bloomSnapshotDir    := flag.String("bloom-snapshot-dir", "", "Directory for shared Bloom filter snapshots (enables cross-node dedup; must be on a shared filesystem) [publisher]")
@@ -144,6 +152,9 @@ func main() {
 			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
 			stratum0URL,
 			s1Endpoints, s1Quorum, s1Timeout, s1BloomTimeout, s1MQTTTimeout,
+			s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth,
+			s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff,
+			s1QueueSpoolDir,
 			brokerURL, brokerClientCert, brokerClientKey, brokerCACert,
 			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
 			sessionTTL, diskHeadroom,
@@ -175,6 +186,8 @@ func main() {
 			*bloomSnapshotDir, *bloomNodeID, *bloomMaxSnapshotAge, *bloomFilterCapacity, *bloomFilterFPRate,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*s1Endpoints, *s1Quorum, *s1Timeout, *s1BloomTimeout, *s1MQTTTimeout,
+			*s1WorkerConcurrency, *s1MaxAttempts, *s1QueueDepth,
+			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
@@ -203,6 +216,9 @@ func runPublisher(
 	s1Endpoints string,
 	s1Quorum float64,
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout time.Duration,
+	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth int,
+	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff time.Duration,
+	s1QueueSpoolDir string,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
@@ -383,21 +399,45 @@ func runPublisher(
 				os.Exit(1)
 			}
 			distCfg = &distribute.Config{
-				Endpoints:         endpoints,
-				Quorum:            s1Quorum,
-				Timeout:           s1Timeout,
-				Obs:               obs,
-				DevMode:           devMode,
-				HMACSecret:        hmacSecret,
-				BloomQueryTimeout: s1BloomTimeout,
-				BrokerConfig:      brokerCfg,
-				MQTTQuorumTimeout: s1MQTTTimeout,
+				Endpoints:            endpoints,
+				Quorum:               s1Quorum,
+				Timeout:              s1Timeout,
+				Obs:                  obs,
+				DevMode:              devMode,
+				HMACSecret:           hmacSecret,
+				BloomQueryTimeout:    s1BloomTimeout,
+				BrokerConfig:         brokerCfg,
+				MQTTQuorumTimeout:    s1MQTTTimeout,
+				WorkerConcurrency:    s1WorkerConcurrency,
+				QueueDepth:           s1QueueDepth,
+				WorkerAttemptTimeout: s1AttemptTimeout,
+				WorkerInitialBackoff: s1InitialBackoff,
+				WorkerMaxBackoff:     s1MaxBackoff,
+				WorkerMaxAttempts:    s1MaxAttempts,
+				// Default spool dir: {spoolRoot}/dist-queue.
+				// Operators can override via --s1-queue-spool-dir or YAML config (queue_spool_dir).
+				QueueSpoolDir: func() string {
+					if s1QueueSpoolDir != "" {
+						return s1QueueSpoolDir
+					}
+					return spoolRoot + "/dist-queue"
+				}(),
 			}
 			obs.Logger.Info("Stratum 1 distribution configured",
 				"endpoints", len(endpoints),
 				"mqtt", brokerCfg != nil,
-				"quorum", s1Quorum)
+				"quorum", s1Quorum,
+				"worker_concurrency", distCfg.WorkerConcurrency,
+				"attempt_timeout", distCfg.WorkerAttemptTimeout)
 		}
+	}
+
+	// Create the queue-driven distribution manager when S1 endpoints are
+	// configured.  The manager is started after the orchestrator is wired up
+	// so that the server startup sequence is linear.
+	var distManager *distribute.Manager
+	if distCfg != nil && len(distCfg.Endpoints) > 0 {
+		distManager = distribute.NewManager(*distCfg, casBackend)
 	}
 
 	// Build a broker config for post-commit publish notifications.
@@ -430,10 +470,18 @@ func runPublisher(
 			Obs:          obs,
 			SharedFilter: sharedFilter,
 		},
-		Distribute: distCfg,
-		Notify:     notifyBus,
-		Provenance: provProvider,
-		Obs:        obs,
+		Distribute:  distCfg,
+		DistManager: distManager,
+		Notify:      notifyBus,
+		Provenance:  provProvider,
+		Obs:         obs,
+	}
+
+	// Start the distribution manager after the orchestrator is created so the
+	// manager's worker goroutines have access to the shared CAS backend.
+	if distManager != nil {
+		distManager.Start(context.Background())
+		obs.Logger.Info("distribution manager started", "endpoints", len(distCfg.Endpoints))
 	}
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot)

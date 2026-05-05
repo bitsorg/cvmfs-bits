@@ -659,8 +659,9 @@ func (b *blockingCAS) Exists(_ context.Context, _ string) (bool, error) { return
 func (b *blockingCAS) Put(_ context.Context, _ string, _ io.Reader, _ int64) error {
 	return nil
 }
-func (b *blockingCAS) Delete(_ context.Context, _ string) error { return nil }
-func (b *blockingCAS) List(_ context.Context) ([]string, error)  { return nil, nil }
+func (b *blockingCAS) Size(_ context.Context, _ string) (int64, error) { return 0, nil }
+func (b *blockingCAS) Delete(_ context.Context, _ string) error        { return nil }
+func (b *blockingCAS) List(_ context.Context) ([]string, error)        { return nil, nil }
 
 // TestPushBatch_GoroutineExitsOnContextCancel verifies that the streaming
 // goroutine inside pushBatch terminates promptly when the batch context is

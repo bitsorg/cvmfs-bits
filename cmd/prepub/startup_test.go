@@ -150,6 +150,9 @@ func (f *failCASForProbe) Exists(_ context.Context, _ string) (bool, error) {
 func (f *failCASForProbe) Get(_ context.Context, _ string) (io.ReadCloser, error) {
 	return nil, f.err
 }
+func (f *failCASForProbe) Size(_ context.Context, _ string) (int64, error) {
+	return 0, f.err
+}
 func (f *failCASForProbe) Delete(_ context.Context, _ string) error {
 	return f.err
 }

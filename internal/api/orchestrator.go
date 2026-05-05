@@ -62,6 +62,12 @@ type Orchestrator struct {
 	// nil disables distribution (typical for local mode).
 	Distribute *distribute.Config
 
+	// DistManager is the queue-driven distribution manager.  When non-nil it
+	// is used instead of the legacy fire-and-forget goroutine; each publish job
+	// enqueues a WorkItem and DistManager handles retries, backoff, and
+	// per-endpoint parallelism.  Typically created alongside Distribute.
+	DistManager *distribute.Manager
+
 	// BrokerConfig is the MQTT broker configuration used for publishing commit
 	// notifications (PublishedMessage) after a successful catalog commit.  When
 	// non-nil, a short-lived client is created per commit to publish the message
@@ -331,88 +337,59 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		}
 
 		// Pre-push to Stratum 1s before acquiring the lease to keep the lease
-		// window as short as possible.  Distribution runs in a background goroutine
-		// so it does not block the job from proceeding to the commit phase.
-		// With quorum:0 the publish succeeds regardless of distribution outcome;
-		// S1 receivers serve objects from the gateway CAS until pre-warming
-		// completes.  Distribution results are persisted to the job manifest
-		// asynchronously so the console can track per-endpoint timing.
-		shouldDistribute := o.Distribute != nil &&
-			(len(o.Distribute.Endpoints) > 0 ||
-				(o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != ""))
+		// window as short as possible.  The DistManager handles concurrency,
+		// retries, and backoff per endpoint in its own goroutine pools.
+		// The job proceeds immediately to the serialised commit section below.
+		shouldDistribute := o.DistManager != nil ||
+			(o.Distribute != nil &&
+				(len(o.Distribute.Endpoints) > 0 ||
+					(o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != "")))
 		if shouldDistribute {
-			logger.Info("launching background S1 pre-warming (non-blocking)",
-				"endpoints", len(o.Distribute.Endpoints),
-				"objects", len(pipelineResult.ObjectHashes),
-				"mqtt", o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != "")
+			logger.Info("enqueuing S1 pre-warming (non-blocking)",
+				"objects", len(pipelineResult.ObjectHashes))
 
 			if err := o.transition(ctx, j, job.StateDistributing); err != nil {
 				span.RecordError(err)
 				return o.abortJob(ctx, j, err)
 			}
 
-			// Record distribution start time and persist it so the console can
-			// show that distribution is in progress even before it finishes.
+			// Record start time and persist it so the console can show that
+			// distribution is in progress before it completes.
 			j.DistributingStartedAt = time.Now()
 			if err := o.Spool.WriteManifest(j); err != nil {
 				logger.Warn("best-effort manifest write failed (distributing_started_at)",
 					"job_id", j.ID, "error", err)
 			}
 
-			// Snapshot all fields the goroutine needs before any further state
-			// transitions rename the job directory and change j.State.
-			distJobID := j.ID
-			distHashes := append([]string(nil), pipelineResult.ObjectHashes...) // immutable copy
-			distCfg := *o.Distribute
-			distCfg.Repo = j.Repo
-			distCfg.TotalBytes = pipelineResult.NBytesComp
-			distStarted := j.DistributingStartedAt
-
-			// Background distribution goroutine.  Uses a detached context with a
-			// generous timeout so it can outlive the job goroutine.  A NopDistLog
-			// is used because distribution is best-effort; if the service restarts
-			// mid-distribution, idempotent PUT re-pushes are acceptable.
-			// Tracked in webhookWg so Server.Shutdown waits for completion.
-			o.webhookWg.Add(1)
-			go func() {
-				defer o.webhookWg.Done()
-
-				distCtx, distCancel := context.WithTimeout(context.Background(), 30*time.Minute)
-				defer distCancel()
-
-				confirmed, total, distErr := distribute.Distribute(
-					distCtx, distJobID, distHashes, o.CAS, distCfg, distribute.NopDistLog())
-
-				elapsed := time.Since(distStarted)
-				if distErr != nil {
-					o.Obs.Logger.Warn("background distribution: failed or quorum not reached",
-						"job_id", distJobID,
-						"confirmed", confirmed, "total", total,
-						"elapsed", elapsed, "error", distErr)
-				} else {
-					o.Obs.Logger.Info("background distribution: complete",
-						"job_id", distJobID,
-						"confirmed", confirmed, "total", total, "elapsed", elapsed)
+			if o.DistManager != nil {
+				// Queue-driven path: per-endpoint worker pools with retry/backoff.
+				distJobID := j.ID
+				item := distribute.WorkItem{
+					JobID:      j.ID,
+					Hashes:     append([]string(nil), pipelineResult.ObjectHashes...),
+					TotalBytes: pipelineResult.NBytesComp,
+					Repo:       j.Repo,
+					EnqueuedAt: j.DistributingStartedAt,
 				}
-
-				// Persist distribution results.  Re-read the manifest via FindJob
-				// because the job directory will have moved to published/ (or
-				// failed/) by the time this goroutine runs — using a stale path
-				// would silently write to a non-existent directory.
-				freshJ, readErr := o.Spool.FindJob(distJobID)
-				if readErr != nil {
-					o.Obs.Logger.Warn("background distribution: cannot reload manifest; results not persisted",
-						"job_id", distJobID, "error", readErr)
-					return
-				}
-				freshJ.DistributingEndedAt = time.Now()
-				freshJ.DistributionConfirmed = confirmed
-				freshJ.DistributionTotal = total
-				if writeErr := o.Spool.WriteManifest(freshJ); writeErr != nil {
-					o.Obs.Logger.Warn("background distribution: manifest update failed",
-						"job_id", distJobID, "error", writeErr)
-				}
-			}()
+				o.DistManager.Enqueue(item, func(jobID string, confirmed, total int) {
+					// Fired from a DistManager worker goroutine when all endpoints finish.
+					freshJ, readErr := o.Spool.FindJob(distJobID)
+					if readErr != nil {
+						o.Obs.Logger.Warn("dist-result: cannot reload manifest",
+							"job_id", distJobID, "error", readErr)
+						return
+					}
+					freshJ.DistributingEndedAt = time.Now()
+					freshJ.DistributionConfirmed = confirmed
+					freshJ.DistributionTotal = total
+					if writeErr := o.Spool.WriteManifest(freshJ); writeErr != nil {
+						o.Obs.Logger.Warn("dist-result: manifest update failed",
+							"job_id", distJobID, "error", writeErr)
+					}
+					o.Obs.Logger.Info("dist-result: all endpoints finished",
+						"job_id", distJobID, "confirmed", confirmed, "total", total)
+				})
+			}
 			// Job continues immediately to the serialised commit section below.
 		}
 	} else {

@@ -25,7 +25,8 @@ func (b *existsOnlyBackend) Put(_ context.Context, _ string, r io.Reader, _ int6
 func (b *existsOnlyBackend) Get(_ context.Context, _ string) (io.ReadCloser, error) {
 	return io.NopCloser(io.Reader(nil)), nil
 }
-func (b *existsOnlyBackend) Delete(_ context.Context, _ string) error { return nil }
+func (b *existsOnlyBackend) Size(_ context.Context, _ string) (int64, error) { return 0, nil }
+func (b *existsOnlyBackend) Delete(_ context.Context, _ string) error        { return nil }
 func (b *existsOnlyBackend) List(_ context.Context) ([]string, error) {
 	out := make([]string, 0, len(b.hashes))
 	for h := range b.hashes {

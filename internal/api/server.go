@@ -136,13 +136,17 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 // Shutdown gracefully stops the HTTP server and waits for all background job
-// goroutines and webhook deliveries to finish. The provided context caps the
-// total wait—if it expires before all jobs complete, Shutdown returns ctx.Err()
-// and the caller should force-exit.
+// goroutines, webhook deliveries, and distribution workers to finish.
+// The provided context caps the total wait — if it expires before all work
+// completes, Shutdown returns ctx.Err() and the caller should force-exit.
+// Distribution workers that are mid-backoff stop immediately; in-flight
+// transfers finish their current attempt.  Pending spool items are retried on
+// the next start.
 func (s *Server) Shutdown(ctx context.Context) error {
 	httpErr := s.httpServer.Shutdown(ctx)
 
-	// Wait for in-flight jobs and their webhook goroutines, but respect the deadline.
+	// Phase 1: wait for all job goroutines and webhook deliveries.
+	// After this, no new items will be enqueued in DistManager.
 	done := make(chan struct{})
 	go func() {
 		s.jobWg.Wait()
@@ -155,7 +159,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if httpErr == nil {
 			httpErr = ctx.Err()
 		}
+		return httpErr
 	}
+
+	// Phase 2: drain the distribution manager (all job goroutines have finished
+	// so all Enqueue calls have already been made).
+	if s.orch.DistManager != nil {
+		s.orch.DistManager.Drain(ctx)
+	}
+
 	return httpErr
 }
 

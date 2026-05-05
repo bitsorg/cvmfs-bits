@@ -61,6 +61,16 @@ func (c *CAS) Put(ctx context.Context, hash string, r io.Reader, size int64) err
 	return nil
 }
 
+func (c *CAS) Size(ctx context.Context, hash string) (int64, error) {
+	c.mu.RLock()
+	data, ok := c.objects[hash]
+	c.mu.RUnlock()
+	if !ok {
+		return 0, fmt.Errorf("object not found: %s", hash)
+	}
+	return int64(len(data)), nil
+}
+
 func (c *CAS) Get(ctx context.Context, hash string) (io.ReadCloser, error) {
 	ctx, span := c.obs.Tracer.Start(ctx, "fakecas.get")
 	defer span.End()

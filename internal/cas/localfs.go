@@ -41,6 +41,16 @@ func (lf *LocalFS) Exists(ctx context.Context, hash string) (bool, error) {
 	return false, err
 }
 
+// Size returns the on-disk size in bytes of the stored object.
+func (lf *LocalFS) Size(_ context.Context, hash string) (int64, error) {
+	path := filepath.Join(lf.Root, cvmfshash.ObjectPath(hash))
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
 // Put stores an object and verifies the written bytes match the expected hash.
 // The write is performed to a temp file, synced to disk, then atomically renamed
 // into place. After the rename, the file is re-read and hashed to verify integrity

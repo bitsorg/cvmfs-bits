@@ -33,9 +33,9 @@ func (f *flakyBackend) Get(ctx context.Context, hash string) (io.ReadCloser, err
 
 func (f *flakyBackend) Exists(ctx context.Context, hash string) (bool, error) { return true, nil }
 
-func (f *flakyBackend) Delete(ctx context.Context, hash string) error { return nil }
-
-func (f *flakyBackend) List(ctx context.Context) ([]string, error) { return nil, nil }
+func (f *flakyBackend) Size(ctx context.Context, hash string) (int64, error) { return 0, nil }
+func (f *flakyBackend) Delete(ctx context.Context, hash string) error        { return nil }
+func (f *flakyBackend) List(ctx context.Context) ([]string, error)           { return nil, nil }
 
 // TestUploadWithRetry_SucceedsAfterTransientFailure verifies that a transient
 // CAS error is retried and the upload eventually succeeds (Fix #7).

@@ -91,6 +91,15 @@ type fileConfig struct {
 		Timeout           yamlDuration `yaml:"timeout"`
 		BloomQueryTimeout yamlDuration `yaml:"bloom_query_timeout"`
 		MQTTQuorumTimeout yamlDuration `yaml:"mqtt_quorum_timeout"`
+
+		// Queue-driven worker settings (Manager).
+		WorkerConcurrency  int          `yaml:"worker_concurrency"`
+		QueueDepth         int          `yaml:"queue_depth"`
+		AttemptTimeout     yamlDuration `yaml:"attempt_timeout"`
+		InitialBackoff     yamlDuration `yaml:"initial_backoff"`
+		MaxBackoff         yamlDuration `yaml:"max_backoff"`
+		WorkerMaxAttempts  int          `yaml:"worker_max_attempts"`
+		QueueSpoolDir      string       `yaml:"queue_spool_dir"`
 	} `yaml:"distribution"`
 
 	// MQTT broker settings — used by both publisher and receiver.
@@ -178,6 +187,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	s1Endpoints *string,
 	s1Quorum *float64,
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout *time.Duration,
+	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth *int,
+	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff *time.Duration,
+	s1QueueSpoolDir *string,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert *string,
 	controlAddr, dataAddr, dataHost, tlsCert, tlsKey *string,
 	sessionTTL *time.Duration,
@@ -237,6 +249,20 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	dur("s1-timeout", s1Timeout, fc.Distribution.Timeout)
 	dur("s1-bloom-timeout", s1BloomTimeout, fc.Distribution.BloomQueryTimeout)
 	dur("s1-mqtt-quorum-timeout", s1MQTTTimeout, fc.Distribution.MQTTQuorumTimeout)
+	// Queue-driven worker settings.
+	if !has("s1-worker-concurrency") && fc.Distribution.WorkerConcurrency != 0 {
+		*s1WorkerConcurrency = fc.Distribution.WorkerConcurrency
+	}
+	if !has("s1-queue-depth") && fc.Distribution.QueueDepth != 0 {
+		*s1QueueDepth = fc.Distribution.QueueDepth
+	}
+	dur("s1-attempt-timeout", s1AttemptTimeout, fc.Distribution.AttemptTimeout)
+	dur("s1-initial-backoff", s1InitialBackoff, fc.Distribution.InitialBackoff)
+	dur("s1-max-backoff", s1MaxBackoff, fc.Distribution.MaxBackoff)
+	if !has("s1-max-attempts") && fc.Distribution.WorkerMaxAttempts != 0 {
+		*s1MaxAttempts = fc.Distribution.WorkerMaxAttempts
+	}
+	str("s1-queue-spool-dir", s1QueueSpoolDir, fc.Distribution.QueueSpoolDir)
 
 	// MQTT broker.
 	str("broker-url", brokerURL, fc.BrokerURL)

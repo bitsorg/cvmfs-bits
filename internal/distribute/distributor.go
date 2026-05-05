@@ -122,6 +122,84 @@ type Config struct {
 	// MQTTQuorumTimeout is how long to wait for ready replies from receivers
 	// before deciding quorum is not reachable.  Defaults to 30 s.
 	MQTTQuorumTimeout time.Duration
+
+	// ── Manager / worker settings ─────────────────────────────────────────────
+	// These fields are only used by Manager; they have no effect when calling
+	// Distribute directly.
+
+	// WorkerConcurrency is the number of concurrent transfer goroutines per
+	// endpoint.  Each goroutine independently pulls items from the shared
+	// endpoint queue, enabling parallel pushes to the same S1.
+	// Default (0): 2.
+	WorkerConcurrency int
+
+	// QueueDepth is the in-memory queue capacity per endpoint.  When the queue
+	// is full, Enqueue drops the item for that endpoint (logged as a warning).
+	// Default (0): 512.
+	QueueDepth int
+
+	// WorkerAttemptTimeout is the per-attempt deadline for one full
+	// distribution of a WorkItem to a single endpoint (announce + all object
+	// PUTs).  Short values fail fast and back off quickly.
+	// Default (0): 90 s.
+	WorkerAttemptTimeout time.Duration
+
+	// WorkerInitialBackoff is the first backoff duration after a failed attempt.
+	// Subsequent backoffs double up to WorkerMaxBackoff.
+	// Default (0): 5 s.
+	WorkerInitialBackoff time.Duration
+
+	// WorkerMaxBackoff caps the exponential backoff between retry attempts.
+	// Default (0): 5 min.
+	WorkerMaxBackoff time.Duration
+
+	// WorkerMaxAttempts is the maximum number of delivery attempts per item
+	// per endpoint.  0 means unlimited: the worker retries indefinitely until
+	// the item is delivered or the service shuts down.
+	WorkerMaxAttempts int
+
+	// QueueSpoolDir is the root directory for persistent per-endpoint queue
+	// files ({QueueSpoolDir}/{endpoint-hash}/{job-id}.json).  Items are written
+	// here before being placed in the in-memory channel, so they survive
+	// service restarts.  Empty string disables persistence.
+	QueueSpoolDir string
+}
+
+// ── Config accessor helpers (return sensible defaults for zero values) ────────
+
+func (c *Config) workerConcurrency() int {
+	if c.WorkerConcurrency > 0 {
+		return c.WorkerConcurrency
+	}
+	return 2
+}
+
+func (c *Config) queueDepth() int {
+	if c.QueueDepth > 0 {
+		return c.QueueDepth
+	}
+	return 512
+}
+
+func (c *Config) workerAttemptTimeout() time.Duration {
+	if c.WorkerAttemptTimeout > 0 {
+		return c.WorkerAttemptTimeout
+	}
+	return 90 * time.Second
+}
+
+func (c *Config) workerInitialBackoff() time.Duration {
+	if c.WorkerInitialBackoff > 0 {
+		return c.WorkerInitialBackoff
+	}
+	return 5 * time.Second
+}
+
+func (c *Config) workerMaxBackoff() time.Duration {
+	if c.WorkerMaxBackoff > 0 {
+		return c.WorkerMaxBackoff
+	}
+	return 5 * time.Minute
 }
 
 // ValidateEndpoints checks all configured endpoints and returns an error if

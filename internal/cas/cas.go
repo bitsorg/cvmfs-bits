@@ -21,6 +21,10 @@ type Backend interface {
 	// Returns an io.ReadCloser that must be closed by the caller.
 	Get(ctx context.Context, hash string) (io.ReadCloser, error)
 
+	// Size returns the stored size in bytes of the object with the given hash.
+	// Returns an error if the object does not exist.
+	Size(ctx context.Context, hash string) (int64, error)
+
 	// Delete removes data with the given hash.
 	Delete(ctx context.Context, hash string) error
 
