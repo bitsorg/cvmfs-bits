@@ -409,7 +409,17 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	// the only serialised work is the gateway round-trips (ensureAncestors
 	// root-lease commit + main lease acquire + merge + commit), which are
 	// latency-bound by cvmfs_receiver anyway.
+	//
+	// Transition to StateLeased BEFORE acquiring the mutex so that the console
+	// shows "leased" (waiting for / in the commit window) rather than
+	// "distributing" (S1 pre-warming done, stuck on mutex).  Multiple concurrent
+	// jobs for the same repo would otherwise all show as distributing while only
+	// one is actually making progress.
 	if o.Lease.NeedsPipeline() {
+		if err := o.transition(ctx, j, job.StateLeased); err != nil {
+			span.RecordError(err)
+			return o.abortJob(ctx, j, err)
+		}
 		repoMu := o.repoMutex(j.Repo)
 		repoMu.Lock()
 		defer repoMu.Unlock()
@@ -446,10 +456,14 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 
 	// ── Phase 3: acquire lease / open transaction ─────────────────────────────
 	logger.Info("acquiring lease", "repo", j.Repo, "path", j.Path)
-	j.LeasedAt = time.Now() // record start of lease-wait phase before network call
-	if err := o.transition(ctx, j, job.StateLeased); err != nil {
-		span.RecordError(err)
-		return o.abortJob(ctx, j, err)
+	j.LeasedAt = time.Now() // precise timestamp of gateway lease attempt
+	if !o.Lease.NeedsPipeline() {
+		// Local mode: job is still in StateIncoming (skipped all pipeline states).
+		// Transition to StateLeased here so the FSM is consistent before Commit.
+		if err := o.transition(ctx, j, job.StateLeased); err != nil {
+			span.RecordError(err)
+			return o.abortJob(ctx, j, err)
+		}
 	}
 
 	// j.Path == "" means a root-level repo lease; acquireLease handles that by
