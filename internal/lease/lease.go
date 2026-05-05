@@ -28,6 +28,14 @@ import (
 // to respond — at that point the lease has almost certainly expired.
 const maxConsecutiveHeartbeatFailures = 3
 
+// ErrRenewalNotSupported is returned by Renew when the gateway responds with
+// HTTP 405 Method Not Allowed, indicating it has no lease-renewal endpoint.
+// The real cvmfs_gateway does not implement PUT /api/v1/leases/<token>; the
+// lease stays alive for the gateway's max_lease_time without any renewal call.
+// Heartbeat treats this error as a permanent capability signal and stops
+// attempting renewal rather than counting it toward the abort threshold.
+var ErrRenewalNotSupported = errors.New("gateway does not support lease renewal (HTTP 405)")
+
 // Lease represents a granted publish lock on a repository path.
 // The lease is valid until ExpiresAt and is identified by a Token.
 type Lease struct {
@@ -322,6 +330,12 @@ func (c *Client) Renew(ctx context.Context, token string) error {
 	}
 	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusMethodNotAllowed {
+		// Gateway has no renewal endpoint; return the sentinel so Heartbeat
+		// can distinguish "not supported" from a real transient failure.
+		span.RecordError(ErrRenewalNotSupported)
+		return ErrRenewalNotSupported
+	}
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		err := fmt.Errorf("lease renewal failed: status %d: %s", resp.StatusCode, data)
@@ -401,6 +415,16 @@ func (c *Client) Heartbeat(ctx context.Context, token string, interval time.Dura
 				return
 			case <-ticker.C:
 				if err := c.Renew(ctx, token); err != nil {
+					if errors.Is(err, ErrRenewalNotSupported) {
+						// Gateway has no renewal endpoint (HTTP 405).  The lease
+						// stays alive for the gateway's own max_lease_time — stop
+						// the heartbeat gracefully without aborting the job.
+						c.obs.Logger.Info(
+							"lease heartbeat: gateway does not support renewal — heartbeat disabled; lease will expire after gateway max_lease_time",
+							"token", token,
+						)
+						return
+					}
 					c.obs.Logger.Error("lease heartbeat error", "token", token, "error", err)
 					c.obs.Metrics.LeaseHeartbeatErrors.Inc()
 					consecutive++
