@@ -139,6 +139,32 @@ type Job struct {
 	NewRootHash string `json:"new_root_hash,omitempty"`
 	// Provenance contains build identity and Rekor transparency log receipt.
 	Provenance *Provenance `json:"provenance,omitempty"`
+
+	// ── Per-stage timestamps (gateway/bits path only) ─────────────────────────
+	// All times are zero-value when the stage was not reached or not applicable.
+	// Callers can compute per-phase duration from successive timestamps.
+
+	// PipelineStartedAt is when the compression/dedup/CAS pipeline started.
+	PipelineStartedAt time.Time `json:"pipeline_started_at,omitempty"`
+	// PipelineEndedAt is when the compression/dedup/CAS pipeline completed.
+	PipelineEndedAt time.Time `json:"pipeline_ended_at,omitempty"`
+	// DistributingStartedAt is when background S1 pre-warming was launched.
+	// Distribution runs asynchronously — the job proceeds to StateLeased
+	// without waiting for it to complete.
+	DistributingStartedAt time.Time `json:"distributing_started_at,omitempty"`
+	// DistributingEndedAt is when background S1 pre-warming finished.
+	// May be after PublishedAt since distribution is fire-and-forget.
+	DistributingEndedAt time.Time `json:"distributing_ended_at,omitempty"`
+	// DistributionConfirmed is the number of S1 endpoints that confirmed all objects.
+	DistributionConfirmed int `json:"distribution_confirmed,omitempty"`
+	// DistributionTotal is the total number of S1 endpoints attempted.
+	DistributionTotal int `json:"distribution_total,omitempty"`
+	// LeasedAt is when the gateway lease was successfully acquired.
+	LeasedAt time.Time `json:"leased_at,omitempty"`
+	// CommittingAt is when the commit phase started (after catalog merge).
+	CommittingAt time.Time `json:"committing_at,omitempty"`
+	// PublishedAt is when the job reached StatePublished (S0 commit complete).
+	PublishedAt time.Time `json:"published_at,omitempty"`
 }
 
 // NewJob creates a new job with incoming state and the current timestamp.

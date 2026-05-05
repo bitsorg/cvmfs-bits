@@ -308,6 +308,13 @@ func OpenDistLog(path string) *DistLog {
 	return &DistLog{path: path}
 }
 
+// NopDistLog returns a DistLog that silently discards all records.
+// Use when distribution is best-effort and per-object crash-recovery tracking
+// is not required (e.g. background fire-and-forget distribution).
+func NopDistLog() *DistLog {
+	return &DistLog{} // path is zero-value (""); Record returns nil on empty path
+}
+
 // distLogEntry is the fixed struct written to the distribution log.
 // Using a named struct instead of map[string]string avoids a heap allocation
 // per Record call (the struct can be stack-allocated and its fields need no
@@ -321,7 +328,11 @@ type distLogEntry struct {
 // Record appends a distribution entry to the log (endpoint, hash, timestamp).
 // The file is opened on the first call and reused for subsequent calls.
 // Call Sync or Close to flush to disk.
+// Record is a no-op (returns nil) when d was created with NopDistLog.
 func (d *DistLog) Record(endpoint, hash string) error {
+	if d.path == "" {
+		return nil // NopDistLog — records are discarded
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 

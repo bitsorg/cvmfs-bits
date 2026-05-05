@@ -307,6 +307,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
 		logger.Info("running pipeline", "tar", j.TarPath)
 		phaseStart := time.Now()
+		j.PipelineStartedAt = phaseStart
 		var err error
 		pipelineResult, err = pipeline.Run(ctx, j.TarPath, o.Pipeline)
 		if err != nil {
@@ -314,6 +315,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 			logger.Error("pipeline failed", "error", err)
 			return o.abortJob(ctx, j, err)
 		}
+		j.PipelineEndedAt = time.Now()
 		o.Obs.Metrics.JobPhaseDuration.WithLabelValues("pipeline").Observe(time.Since(phaseStart).Seconds())
 
 		j.NObjects = len(pipelineResult.ObjectHashes)
@@ -329,13 +331,19 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		}
 
 		// Pre-push to Stratum 1s before acquiring the lease to keep the lease
-		// window as short as possible.
+		// window as short as possible.  Distribution runs in a background goroutine
+		// so it does not block the job from proceeding to the commit phase.
+		// With quorum:0 the publish succeeds regardless of distribution outcome;
+		// S1 receivers serve objects from the gateway CAS until pre-warming
+		// completes.  Distribution results are persisted to the job manifest
+		// asynchronously so the console can track per-endpoint timing.
 		shouldDistribute := o.Distribute != nil &&
 			(len(o.Distribute.Endpoints) > 0 ||
 				(o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != ""))
 		if shouldDistribute {
-			logger.Info("pre-pushing to Stratum 1s before lease acquire",
+			logger.Info("launching background S1 pre-warming (non-blocking)",
 				"endpoints", len(o.Distribute.Endpoints),
+				"objects", len(pipelineResult.ObjectHashes),
 				"mqtt", o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != "")
 
 			if err := o.transition(ctx, j, job.StateDistributing); err != nil {
@@ -343,21 +351,69 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 				return o.abortJob(ctx, j, err)
 			}
 
-			distLog := distribute.OpenDistLog(o.Spool.JobDir(j) + "/dist.log")
-			defer distLog.Close()
+			// Record distribution start time and persist it so the console can
+			// show that distribution is in progress even before it finishes.
+			j.DistributingStartedAt = time.Now()
+			if err := o.Spool.WriteManifest(j); err != nil {
+				logger.Warn("best-effort manifest write failed (distributing_started_at)",
+					"job_id", j.ID, "error", err)
+			}
 
+			// Snapshot all fields the goroutine needs before any further state
+			// transitions rename the job directory and change j.State.
+			distJobID := j.ID
+			distHashes := append([]string(nil), pipelineResult.ObjectHashes...) // immutable copy
 			distCfg := *o.Distribute
 			distCfg.Repo = j.Repo
 			distCfg.TotalBytes = pipelineResult.NBytesComp
+			distStarted := j.DistributingStartedAt
 
-			confirmed, total, distErr := distribute.Distribute(
-				ctx, j.ID, pipelineResult.ObjectHashes, o.CAS, distCfg, distLog)
-			if distErr != nil {
-				logger.Warn("distribution failed or quorum not reached",
-					"error", distErr, "confirmed", confirmed, "total", total)
-				// Continue — gateway serves clients from CAS directly if S1s are
-				// incomplete; quorum enforcement is a policy decision.
-			}
+			// Background distribution goroutine.  Uses a detached context with a
+			// generous timeout so it can outlive the job goroutine.  A NopDistLog
+			// is used because distribution is best-effort; if the service restarts
+			// mid-distribution, idempotent PUT re-pushes are acceptable.
+			// Tracked in webhookWg so Server.Shutdown waits for completion.
+			o.webhookWg.Add(1)
+			go func() {
+				defer o.webhookWg.Done()
+
+				distCtx, distCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+				defer distCancel()
+
+				confirmed, total, distErr := distribute.Distribute(
+					distCtx, distJobID, distHashes, o.CAS, distCfg, distribute.NopDistLog())
+
+				elapsed := time.Since(distStarted)
+				if distErr != nil {
+					o.Obs.Logger.Warn("background distribution: failed or quorum not reached",
+						"job_id", distJobID,
+						"confirmed", confirmed, "total", total,
+						"elapsed", elapsed, "error", distErr)
+				} else {
+					o.Obs.Logger.Info("background distribution: complete",
+						"job_id", distJobID,
+						"confirmed", confirmed, "total", total, "elapsed", elapsed)
+				}
+
+				// Persist distribution results.  Re-read the manifest via FindJob
+				// because the job directory will have moved to published/ (or
+				// failed/) by the time this goroutine runs — using a stale path
+				// would silently write to a non-existent directory.
+				freshJ, readErr := o.Spool.FindJob(distJobID)
+				if readErr != nil {
+					o.Obs.Logger.Warn("background distribution: cannot reload manifest; results not persisted",
+						"job_id", distJobID, "error", readErr)
+					return
+				}
+				freshJ.DistributingEndedAt = time.Now()
+				freshJ.DistributionConfirmed = confirmed
+				freshJ.DistributionTotal = total
+				if writeErr := o.Spool.WriteManifest(freshJ); writeErr != nil {
+					o.Obs.Logger.Warn("background distribution: manifest update failed",
+						"job_id", distJobID, "error", writeErr)
+				}
+			}()
+			// Job continues immediately to the serialised commit section below.
 		}
 	} else {
 		logger.Info("local publish mode — skipping pipeline, tar will be extracted during Commit")
@@ -413,6 +469,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 
 	// ── Phase 3: acquire lease / open transaction ─────────────────────────────
 	logger.Info("acquiring lease", "repo", j.Repo, "path", j.Path)
+	j.LeasedAt = time.Now() // record start of lease-wait phase before network call
 	if err := o.transition(ctx, j, job.StateLeased); err != nil {
 		span.RecordError(err)
 		return o.abortJob(ctx, j, err)
@@ -523,6 +580,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	}
 
 	// ── Phase 4: commit ───────────────────────────────────────────────────────
+	j.CommittingAt = time.Now() // record commit-phase start before transition
 	if err := o.transition(leaseCtx, j, job.StateCommitting); err != nil {
 		span.RecordError(err)
 		cancelHeartbeat()
@@ -588,6 +646,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		j.NewRootHash = mergeResult.NewRootHash
 	}
 
+	// Set PublishedAt before the transition so Spool.Transition's internal
+	// WriteManifest persists it in the same atomic rename operation.
+	j.PublishedAt = time.Now()
 	if err := o.transition(ctx, j, job.StatePublished); err != nil {
 		span.RecordError(err)
 		return err
