@@ -52,36 +52,75 @@ func PutWithRetry(ctx context.Context, casBackend cas.Backend, hash string, data
 	return fmt.Errorf("upload failed after %d attempts: %w", maxUploadAttempts, lastErr)
 }
 
+// UploadLog records which objects have been written to CAS for the current job.
+// The file is opened lazily on the first Record call and kept open for the
+// lifetime of the job, avoiding the overhead of an open+fsync+close per object
+// (same pattern as distribute.DistLog).  Call Close to flush and release the fd.
 type UploadLog struct {
 	path string
 	mu   sync.Mutex
+	// f is the open file handle; nil until the first Record call.
+	f *os.File
 }
 
 func OpenUploadLog(path string) *UploadLog {
 	return &UploadLog{path: path}
 }
 
+// Record appends a hash entry to the upload log.
+// The file is opened once on the first call and reused for all subsequent
+// calls, eliminating the open+fsync+close overhead that previously dominated
+// upload-log I/O for large publishes.
 func (l *UploadLog) Record(hash string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Fix: 0600 so other local users cannot read upload logs that may reveal
-	// object hashes or internal CAS layout.
-	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return fmt.Errorf("opening upload log: %w", err)
+	if l.f == nil {
+		// Fix: 0600 so other local users cannot read upload logs that may reveal
+		// object hashes or internal CAS layout.
+		f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("opening upload log: %w", err)
+		}
+		l.f = f
 	}
-	defer f.Close()
 
 	data, err := json.Marshal(map[string]string{"hash": hash, "time": time.Now().Format(time.RFC3339)})
 	if err != nil {
 		return fmt.Errorf("marshaling upload log entry: %w", err)
 	}
-	if _, err := f.Write(append(data, '\n')); err != nil {
+	if _, err := l.f.Write(append(data, '\n')); err != nil {
 		return fmt.Errorf("writing to upload log: %w", err)
 	}
+	return nil
+}
 
-	return f.Sync()
+// Sync flushes the upload log to disk without closing it.
+// Call this periodically or after a batch of uploads to ensure durability.
+func (l *UploadLog) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f != nil {
+		return l.f.Sync()
+	}
+	return nil
+}
+
+// Close syncs and closes the underlying file.
+// Safe to call on a log that has never been written to.
+func (l *UploadLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f == nil {
+		return nil
+	}
+	syncErr := l.f.Sync()
+	closeErr := l.f.Close()
+	l.f = nil
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // ReadHashes returns the deduplicated list of object hashes recorded in the

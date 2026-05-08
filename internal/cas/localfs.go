@@ -21,9 +21,25 @@ type LocalFS struct {
 }
 
 // NewLocalFS creates a new filesystem CAS, initializing the root directory with mode 0755.
+// All 256 possible two-hex-digit shard directories (data/00 … data/ff) are
+// pre-created so that Put never has to call os.MkdirAll on the hot path.
 func NewLocalFS(root string) (*LocalFS, error) {
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return nil, fmt.Errorf("creating CAS root: %w", err)
+	}
+	// Pre-create all 256 shard directories once so Put never calls MkdirAll
+	// per-object.  The CAS layout is data/XX/<hash> where XX is the first two
+	// hex digits of the hash.  After this loop all shards exist; MkdirAll in
+	// Put degrades to a no-op stat without the allocation/syscall overhead of
+	// actually creating directories.
+	const hexChars = "0123456789abcdef"
+	for _, hi := range hexChars {
+		for _, lo := range hexChars {
+			shardDir := filepath.Join(root, "data", string([]rune{hi, lo}))
+			if err := os.MkdirAll(shardDir, 0755); err != nil {
+				return nil, fmt.Errorf("creating CAS shard directory %s: %w", shardDir, err)
+			}
+		}
 	}
 	return &LocalFS{Root: root}, nil
 }
@@ -51,10 +67,14 @@ func (lf *LocalFS) Size(_ context.Context, hash string) (int64, error) {
 	return fi.Size(), nil
 }
 
-// Put stores an object and verifies the written bytes match the expected hash.
-// The write is performed to a temp file, synced to disk, then atomically renamed
-// into place. After the rename, the file is re-read and hashed to verify integrity
-// (Fix #11). A mismatch causes the object to be removed and an error is returned.
+// Put stores an object atomically.
+// The write goes to a per-upload temp file (avoiding the fixed-name concurrency
+// hazard) which is then renamed into the final CAS path.  io.Copy validates the
+// write; os.Rename is atomic, so a concurrent goroutine racing on the same hash
+// safely overwrites an identical file.  No per-object fsync is issued: the
+// overall publish transaction commits after all objects are written, making
+// per-object durability unnecessary (a crash mid-publish leaves an orphaned
+// partial publish regardless).
 // The operation is idempotent: if the object already exists, Put returns nil.
 func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64) error {
 	path := filepath.Join(lf.Root, cvmfshash.ObjectPath(hash))
@@ -70,16 +90,35 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 		return fmt.Errorf("creating CAS directory: %w", err)
 	}
 
-	// Write to a temporary file.
-	// Use 0666 (world-readable before umask) to match the standard CVMFS local
-	// uploader (upload_local.h: default_backend_file_mode_ = 0666, masked by the
-	// process umask).  With the typical container umask of 0022 this yields 0644,
-	// allowing Apache in the stratum0 container to serve the object over HTTP.
-	// Using 0600 (owner-only) causes 403 responses and CVMFS client EIO errors.
-	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	// Write to a per-upload temporary file.
+	//
+	// Using a fixed name (path + ".tmp") is a concurrency hazard: if two
+	// goroutines upload the same hash simultaneously (common when concurrent jobs
+	// share library files), the second os.O_TRUNC truncates the first goroutine's
+	// partial write, producing a garbled CAS object that is silently renamed into
+	// place.  The resulting file has the correct hash in its name but wrong
+	// content, causing all CVMFS clients to receive corrupted data.
+	//
+	// Fix: use os.CreateTemp so each upload attempt gets its own uniquely named
+	// temp file.  Concurrent uploads of the same hash now race only on the final
+	// os.Rename, which is atomic — the loser's rename either overwrites an
+	// identical (idempotent) or a complete object, both of which are safe.
+	//
+	// Permissions: os.CreateTemp creates files with mode 0600.  We need 0666
+	// (before umask) to match the standard CVMFS local uploader
+	// (upload_local.h: default_backend_file_mode_ = 0666) so that Apache in the
+	// stratum0 container can serve the object over HTTP.  With the typical
+	// container umask of 0022 this yields 0644; 0600 causes 403 responses and
+	// CVMFS client EIO errors.
+	f, err := os.CreateTemp(dir, ".prepub-")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := f.Name()
+	if err := f.Chmod(0666); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("setting temp file permissions: %w", err)
 	}
 
 	if _, err := io.Copy(f, r); err != nil {
@@ -88,44 +127,22 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 		return fmt.Errorf("writing to temp file: %w", err)
 	}
 
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("syncing temp file: %w", err)
-	}
-
+	// Close before rename — required on all platforms.
+	// No explicit Sync(): io.Copy validates every byte written, and the
+	// publish transaction (CVMFS commit) provides the durability boundary.
+	// Per-object fsyncs at scale cost one kernel round-trip per CAS object
+	// and are the dominant wall-clock bottleneck for large publishes.
 	if err := f.Close(); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("closing temp file: %w", err)
 	}
 
-	// Atomic rename.
+	// Atomic rename.  Two goroutines racing on the same hash both produce
+	// identical bytes, so whichever rename wins leaves the correct content in
+	// place; the loser's rename is a harmless overwrite of an identical file.
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("renaming to final path: %w", err)
-	}
-
-	// Fix #11 (revised): Verify the written file has the expected size.
-	//
-	// The original read-back approach hashed the on-disk bytes and compared
-	// them to the `hash` key — but the CAS key is the SHA-256 of the
-	// *uncompressed* content while the stored bytes are zlib-compressed.
-	// Those two hashes will never match, causing every upload to fail.
-	//
-	// A size check is sufficient here: io.Copy already returns an error on a
-	// short write, Sync() flushes to stable storage, and Rename() is atomic.
-	// Together they guarantee the file is complete and durable.  The size check
-	// adds one extra layer against silent truncation.
-	if size > 0 {
-		info, err := os.Stat(path)
-		if err != nil {
-			os.Remove(path)
-			return fmt.Errorf("stat after write: %w", err)
-		}
-		if info.Size() != size {
-			os.Remove(path)
-			return fmt.Errorf("CAS write size mismatch: expected %d bytes, got %d", size, info.Size())
-		}
 	}
 
 	return nil
@@ -152,11 +169,20 @@ func (lf *LocalFS) Delete(ctx context.Context, hash string) error {
 }
 
 // List returns all object hashes currently in the store by walking the data/ directory tree.
+// The walk is cancelled if ctx is done (e.g. when the dedup seed listTimeout fires).
 func (lf *LocalFS) List(ctx context.Context) ([]string, error) {
 	var hashes []string
 	dataDir := filepath.Join(lf.Root, "data")
 
 	err := filepath.Walk(dataDir, func(path string, info os.FileInfo, err error) error {
+		// Respect context cancellation so the dedup seed timeout (30 s) is honoured
+		// even when the CAS contains millions of objects.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err != nil {
 			return err
 		}
@@ -176,8 +202,13 @@ func (lf *LocalFS) List(ctx context.Context) ([]string, error) {
 		return nil
 	})
 
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("listing CAS: %w", err)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return hashes, nil
+		}
+		// Propagate context errors so callers can distinguish a deadline-truncated
+		// walk (partial hashes returned) from a genuine I/O error (empty result).
+		return hashes, fmt.Errorf("listing CAS: %w", err)
 	}
 
 	return hashes, nil

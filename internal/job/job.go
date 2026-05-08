@@ -100,6 +100,13 @@ type Job struct {
 	PackageName string
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string
+	// TarName is the original base filename of the submitted tar (e.g.
+	// "payload-abc123.tar").  Populated at submission time; used by the
+	// console tooltip to identify which source file produced this job.
+	TarName string `json:"tar_name,omitempty"`
+	// TarSize is the size of the submitted tar in bytes.
+	// Populated at submission time; used by the console tooltip.
+	TarSize int64 `json:"tar_size,omitempty"`
 	// TarSHA256 is the hex-encoded SHA-256 digest of the tar file, recorded at
 	// submission time.  Non-empty when the caller provided a checksum (required
 	// for tar_path / JSON submissions; optional for multipart uploads).
@@ -113,13 +120,22 @@ type Job struct {
 	// LeaseToken is the gateway lease identifier while held; empty otherwise.
 	LeaseToken string
 	// NObjects is the number of objects in the published catalog (set after pipeline).
+	// This includes both newly uploaded objects and dedup hits from prior jobs.
 	NObjects int
+	// NNewObjects is the number of objects that were freshly uploaded to CAS in
+	// this pipeline run (dedup hits excluded).  Used by the S1 distribution
+	// backlog display so the object count matches what is actually being pushed.
+	NNewObjects int
 	// NBytesRaw is the total uncompressed content bytes.
 	NBytesRaw int64
 	// NBytesCompressed is the total compressed content bytes (dedup-hits not counted).
 	NBytesCompressed int64
 	// Error is the failure reason; set on abort or failure.
 	Error string `json:"error,omitempty"`
+	// FailedAtState is the FSM state the job was in when it failed (e.g.
+	// "leased", "committing").  Empty for non-failed jobs.  Used by the
+	// console to highlight the correct pipeline step in the miniPipeline view.
+	FailedAtState string `json:"failed_at_state,omitempty"`
 	// RecoveryCount is the number of times this job has been reset for recovery.
 	RecoveryCount int `json:"recovery_count,omitempty"`
 	// WebhookURL is an optional URL to POST when the job reaches a terminal state.

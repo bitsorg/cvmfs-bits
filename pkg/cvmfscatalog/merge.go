@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -24,7 +23,13 @@ type MergeConfig struct {
 	RepoName    string
 	LeasePath   string      // e.g. "atlas/24.0" (no leading/trailing slash)
 	TempDir     string
-	HTTPClient  *http.Client // nil = http.DefaultClient
+	HTTPClient  *http.Client // nil = http.DefaultClient; ignored when Source is set
+	// Source provides access to the Stratum 0 CAS (manifests, catalogs, objects).
+	// When non-nil, Source takes precedence over Stratum0URL for all catalog I/O,
+	// eliminating HTTP round-trips when the data is locally accessible (e.g. the
+	// Stratum 0 data directory is mounted on the same host).
+	// When nil and Stratum0URL is non-empty, an HTTPSource is constructed automatically.
+	Source CatalogSource
 	// DirtabContent is the raw text of the .cvmfsdirtab file found in the
 	// current tar payload.  When non-empty it takes precedence over any
 	// .cvmfsdirtab already present in the repository.  When nil/empty, Merge
@@ -89,34 +94,35 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		cfg.HTTPClient = http.DefaultClient
 	}
 
-	// ── Step 1: Fetch the current manifest ──────────────────────────────────
-	// A 404 on .cvmfspublished means the repository has never been published
-	// (first publish ever).  We treat this identically to "start from empty".
-	manifestURL := cfg.Stratum0URL + "/" + cfg.RepoName + "/.cvmfspublished"
-	resp, err := cfg.HTTPClient.Get(manifestURL)
-	if err != nil {
-		return nil, fmt.Errorf("fetching manifest: %w", err)
-	}
-	defer resp.Body.Close()
+	// Resolve the catalog source: prefer cfg.Source; fall back to HTTPSource.
+	src := sourceFromConfig(cfg)
 
-	// emptyRoot is set when there is no existing catalog to merge into.
+	// err is used throughout the function for catalog open/create operations.
+	var err error
+
+	// ── Step 1: Fetch the current manifest ──────────────────────────────────
+	// A missing manifest (404 / file-not-found) means the repository has never
+	// been published.  We treat this identically to "start from empty".
 	emptyRoot := false
 	var manifest *Manifest
 
-	if resp.StatusCode == http.StatusNotFound {
-		// First publish: no manifest yet — start from an empty root catalog.
-		emptyRoot = true
-	} else if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("manifest http %d: %s", resp.StatusCode, manifestURL)
+	if src != nil {
+		manifestData, err := src.Manifest(ctx, cfg.RepoName)
+		if err != nil {
+			return nil, fmt.Errorf("fetching manifest: %w", err)
+		}
+		if manifestData == nil {
+			// First publish: no manifest yet.
+			emptyRoot = true
+		} else {
+			manifest, err = ParseManifest(manifestData)
+			if err != nil {
+				return nil, fmt.Errorf("parsing manifest: %w", err)
+			}
+		}
 	} else {
-		manifestData, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("reading manifest: %w", err)
-		}
-		manifest, err = ParseManifest(manifestData)
-		if err != nil {
-			return nil, fmt.Errorf("parsing manifest: %w", err)
-		}
+		// No source and no Stratum0URL — treat as first publish (empty root).
+		emptyRoot = true
 	}
 
 	result := &MergeResult{}
@@ -146,8 +152,12 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 	rootDBPath := filepath.Join(cfg.TempDir, "root.db")
 	var rootCat *Catalog
 	if !emptyRoot && manifest != nil {
-		dlErr := DownloadCatalog(ctx, cfg.HTTPClient, cfg.Stratum0URL, cfg.RepoName,
-			manifest.RootHash, rootDBPath)
+		var dlErr error
+		if src != nil {
+			dlErr = src.Catalog(ctx, cfg.RepoName, manifest.RootHash, rootDBPath)
+		} else {
+			dlErr = ErrCatalogNotFound
+		}
 		if dlErr != nil && !errors.Is(dlErr, ErrCatalogNotFound) {
 			return nil, fmt.Errorf("downloading root catalog: %w", dlErr)
 		}
@@ -173,8 +183,8 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 	// existing .cvmfsdirtab (fetched from CAS).  A fetch failure is non-fatal:
 	// we proceed with whatever we have.
 	dirtabContent := cfg.DirtabContent
-	if len(dirtabContent) == 0 && cfg.Stratum0URL != "" {
-		fetched, fetchErr := fetchExistingDirtab(ctx, cfg, rootCat)
+	if len(dirtabContent) == 0 && src != nil {
+		fetched, fetchErr := fetchExistingDirtab(ctx, src, cfg.RepoName, rootCat)
 		if fetchErr == nil {
 			dirtabContent = fetched
 		}
@@ -189,7 +199,7 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 
 	// ── Step 3: Walk nested catalogs to find the target ──────────────────────
 	targetAbsPath := normalizeLeasePathForNested(cfg.LeasePath)
-	chain, err := buildCatalogChain(ctx, cfg, rootCat, targetAbsPath)
+	chain, err := buildCatalogChain(ctx, src, cfg.RepoName, cfg.TempDir, rootCat, targetAbsPath)
 	if err != nil {
 		rootCat.Close()
 		return nil, fmt.Errorf("walking nested catalogs: %w", err)
@@ -313,7 +323,19 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 	// new child catalog.  All other entries go to the leaf of the existing chain.
 	// The .cvmfscatalog file itself goes into the child catalog that owns the
 	// subtree it lives in (i.e. the directory that was split).
+	//
+	// Performance: entries are grouped per target catalog and written via
+	// BatchUpsert (single SQLite transaction per catalog) instead of one
+	// transaction per entry.  For a publish with N new files this reduces N
+	// separate BEGIN/COMMIT round-trips to one per target catalog, eliminating
+	// the O(N × per-commit-overhead) cost that makes leased-state latency
+	// proportional to payload size.  Deletion entries are handled individually
+	// (they are rare and Remove already uses per-entry transactions).
 	leafCat := chain[len(chain)-1].cat
+
+	// batchMap accumulates upsert entries keyed by catalog pointer.
+	batchMap := make(map[*Catalog][]Entry)
+
 	for _, entry := range entries {
 		owner := findOwner(splitPaths, entry.FullPath)
 		var targetCat *Catalog
@@ -324,6 +346,14 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 		}
 
 		if isDeletion(entry) {
+			// Flush any pending upserts for this catalog before the deletion so
+			// that a re-add followed immediately by a delete is handled correctly.
+			if pending := batchMap[targetCat]; len(pending) > 0 {
+				if batchErr := targetCat.BatchUpsert(pending); batchErr != nil {
+					return nil, fmt.Errorf("batch upsert before deletion: %w", batchErr)
+				}
+				delete(batchMap, targetCat)
+			}
 			rmErr := targetCat.Remove(entry.FullPath)
 			if rmErr == nil {
 				continue
@@ -334,8 +364,13 @@ func Merge(ctx context.Context, cfg MergeConfig, entries []Entry) (*MergeResult,
 			}
 			return nil, fmt.Errorf("removing entry %q: %w", entry.FullPath, rmErr)
 		}
-		if uErr := targetCat.Upsert(entry); uErr != nil {
-			return nil, fmt.Errorf("upserting entry %q: %w", entry.FullPath, uErr)
+		batchMap[targetCat] = append(batchMap[targetCat], entry)
+	}
+
+	// Flush remaining upsert batches.
+	for targetCat, pending := range batchMap {
+		if batchErr := targetCat.BatchUpsert(pending); batchErr != nil {
+			return nil, fmt.Errorf("batch upsert: %w", batchErr)
 		}
 	}
 
@@ -527,11 +562,11 @@ func findOwner(splitPaths []string, entryPath string) string {
 }
 
 // fetchExistingDirtab looks up the .cvmfsdirtab file in the root catalog and,
-// if present, downloads and decompresses it from the stratum0 CAS.
+// if present, fetches and decompresses it via src.
 // Returns (nil, nil) when the file does not exist in the catalog.
 // Fetch / decompress errors are returned so the caller can decide whether to
 // treat them as fatal or non-fatal.
-func fetchExistingDirtab(ctx context.Context, cfg MergeConfig, rootCat *Catalog) ([]byte, error) {
+func fetchExistingDirtab(ctx context.Context, src CatalogSource, repoName string, rootCat *Catalog) ([]byte, error) {
 	hashHex, algo, found, err := rootCat.LookupFileHash("/.cvmfsdirtab")
 	if err != nil {
 		return nil, fmt.Errorf("looking up /.cvmfsdirtab in root catalog: %w", err)
@@ -539,13 +574,9 @@ func fetchExistingDirtab(ctx context.Context, cfg MergeConfig, rootCat *Catalog)
 	if !found {
 		return nil, nil
 	}
-	client := cfg.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	data, err := DownloadObject(ctx, client, cfg.Stratum0URL, cfg.RepoName, hashHex, algo)
+	data, err := src.Object(ctx, repoName, hashHex, algo)
 	if err != nil {
-		return nil, fmt.Errorf("downloading existing .cvmfsdirtab: %w", err)
+		return nil, fmt.Errorf("fetching existing .cvmfsdirtab: %w", err)
 	}
 	return data, nil
 }
@@ -572,18 +603,24 @@ func safePathID(absPath string) string {
 // element is the deepest catalog that covers targetAbsPath.
 //
 // For a targetAbsPath of "/atlas/24.0" the function checks whether "/atlas"
-// is a nested mount point in the root catalog.  If so it downloads that
-// catalog and checks whether "/atlas/24.0" is a nested mount point within it,
+// is a nested mount point in the root catalog.  If so it fetches that catalog
+// via src and checks whether "/atlas/24.0" is a nested mount point within it,
 // and so on.  The first ancestor path that is NOT a mount point ends the walk;
 // the catalog opened at that point is the target.
 //
 // Fix H1: any nested catalog opened before an error is returned is closed
 // before this function returns, preventing DB handle leaks.  rootCat is NOT
 // closed here — it is owned by the caller (Merge).
-func buildCatalogChain(ctx context.Context, cfg MergeConfig,
+//
+// src may be nil when there is no Stratum 0 configured; in that case a first
+// publish is assumed and the chain contains only the empty root catalog.
+func buildCatalogChain(ctx context.Context, src CatalogSource, repoName, tempDir string,
 	rootCat *Catalog, targetAbsPath string) ([]catalogChainNode, error) {
 
 	chain := []catalogChainNode{{cat: rootCat, path: ""}}
+	if src == nil {
+		return chain, nil // no remote source — chain is just the empty root
+	}
 	current := rootCat
 
 	// closeOpened closes all nested catalogs (index 1+) opened so far.
@@ -605,13 +642,12 @@ func buildCatalogChain(ctx context.Context, cfg MergeConfig,
 			break
 		}
 
-		// Download the nested catalog.  Use the hash as the filename so that
+		// Fetch the nested catalog.  Use the hash as the filename so that
 		// multiple levels with the same path component never collide.
-		nestedDBPath := filepath.Join(cfg.TempDir, "nested_"+hashHex+".db")
-		if dlErr := DownloadCatalog(ctx, cfg.HTTPClient, cfg.Stratum0URL, cfg.RepoName,
-			hashHex, nestedDBPath); dlErr != nil {
+		nestedDBPath := filepath.Join(tempDir, "nested_"+hashHex+".db")
+		if dlErr := src.Catalog(ctx, repoName, hashHex, nestedDBPath); dlErr != nil {
 			closeOpened()
-			return nil, fmt.Errorf("downloading nested catalog at %q (hash %s): %w",
+			return nil, fmt.Errorf("fetching nested catalog at %q (hash %s): %w",
 				ancestor, hashHex, dlErr)
 		}
 		nestedCat, openErr := Open(nestedDBPath)

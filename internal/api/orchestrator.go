@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,6 +46,11 @@ type Orchestrator struct {
 	// Lease is the publish transaction backend.  Use lease.NewClient for
 	// gateway mode or lease.NewLocalBackend for single-host mode.
 	Lease lease.Backend
+	// JobTimeout is the maximum wall-clock duration a single job may run
+	// before its context is cancelled and the job is failed.  A value of
+	// zero disables the per-job timeout (backward-compatible default).
+	// Recommended starting value: 30m for gateway mode, 60m for large repos.
+	JobTimeout time.Duration
 	// CVMFSMount is the filesystem root where CVMFS repositories are mounted
 	// (e.g. "/cvmfs").  Only used in local publish mode; ignored by the
 	// gateway backend.
@@ -58,6 +62,11 @@ type Orchestrator struct {
 	// If empty, the catalog merge step is skipped and the commit will use an
 	// empty old_root_hash (only safe for the initial publish of a new repository).
 	Stratum0URL string
+	// CatalogSource is reserved for future use.  It is not currently used by
+	// the orchestrator (Merge is no longer called; BuildSubtree handles all
+	// catalog construction without accessing the existing repository catalog).
+	// Kept for API stability so callers that configure it do not break.
+	CatalogSource cvmfscatalog.CatalogSource
 	// Distribute contains configuration for Stratum 1 push distribution.
 	// nil disables distribution (typical for local mode).
 	Distribute *distribute.Config
@@ -79,8 +88,28 @@ type Orchestrator struct {
 	// deployments both configs reference the same broker.
 	BrokerConfig *broker.Config
 	// Pipeline contains configuration for the compression/dedup pipeline.
-	// Only used when Lease.NeedsPipeline() returns true.
+	// Only used when Lease.NeedsPipeline() returns true and SwissKnife is nil.
 	Pipeline pipeline.Config
+
+	// SwissKnife holds the cvmfs_swissknife configuration set at startup.
+	// When non-nil and swissknifeLive is true, Run() delegates the entire
+	// publish pipeline to cvmfs_swissknife ingest instead of the Go pipeline.
+	//
+	// Access SwissKnifeEnabled() / SetSwissKnifeEnabled() for the live toggle;
+	// read SwissKnife directly only for configuration display.
+	//
+	// When active:
+	//   • CAS is not required (swissknife manages its own object store).
+	//   • Stratum 1 pre-warming (DistManager) is skipped — no per-object
+	//     CAS records are available.
+	//   • The per-job pipeline metrics (pipeline_duration, objects_new, …)
+	//     are not populated; only swissknife_ingest_duration and total_s0 emit.
+	SwissKnife *cvmfscatalog.SwissKnifeConfig
+
+	// swissknifeMu protects swissknifeLive for concurrent reads from Run()
+	// and writes from SetSwissKnifeEnabled().
+	swissknifeMu   sync.RWMutex
+	swissknifeLive bool // true iff SwissKnife != nil and currently enabled
 	// Notify is the event bus for job state changes. nil disables event publishing.
 	Notify *notify.Bus
 	// Provenance records build identity and Rekor receipts. nil disables provenance recording.
@@ -97,37 +126,34 @@ type Orchestrator struct {
 	// can wait for them to finish before the process exits.
 	webhookWg sync.WaitGroup
 
-	// commitMu serialises the ensureAncestors + catalog-merge + commit phase
-	// per repository.  Only one job per repo may be in this critical section
-	// at a time.
+	// GatewayQueue replaces the exponential-backoff retry loop in Lease.Acquire
+	// with a short-interval (1 s) poll that also wakes up immediately when an
+	// in-process job releases its lease via NotifyRelease.  Only used when the
+	// backend is a *lease.Client (gateway mode); nil in local mode.
+	GatewayQueue *GatewayQueue
+
+	// commitMu serialises the manifest-fetch + commit phase per repository.
+	// Only one job per repo may be in this critical section at a time.
 	//
-	// Background: both ensureAncestors and the main Merge download the current
-	// manifest and record its hash as old_root_hash.  If two jobs for the same
-	// repo run these steps concurrently, both see the same old_root_hash.  The
-	// first commit updates the manifest to a new hash; the second commit then
-	// presents a stale old_root_hash to the gateway, which spawns a second
-	// cvmfs_receiver that either conflicts with the first or returns an error.
-	// In the testbed the receiver is observed to block indefinitely in this
-	// case, causing the job to hang in StateCommitting forever.
+	// Background: two concurrent jobs publishing to different sub-paths of the
+	// same repo both call FetchManifestRootHash to obtain old_root_hash.  If
+	// they run concurrently, both see the same hash.  The first commit updates
+	// the manifest; the second commit then presents a stale old_root_hash to
+	// the gateway, which causes cvmfs_receiver to block indefinitely (observed
+	// in the testbed, resulting in StateCommitting hangs).
 	//
-	// Serialising within this section preserves concurrent pipeline throughput
-	// (compress / distribute) while ensuring each commit sees a fresh manifest.
+	// The subtree catalog build (Phase 2.6) runs before the mutex so multiple
+	// jobs build their catalogs in parallel while one holds the lock.
 	commitMu sync.Map // map[string]*sync.Mutex — keyed by repo name
 
-	// ensuredAncestors caches the set of ancestor directory sets that have
-	// already been committed to the repository.  The key is the canonical
-	// ancestor string for a (repo, path) pair — see ancestorCacheKey.
-	//
-	// Once a set of ancestor directories has been committed (ensureAncestors
-	// returned nil), they are permanently in the catalog and do not need to be
-	// re-published for subsequent jobs with the same repo + path prefix.  This
-	// eliminates the redundant root-level lease + Merge + commit that fires for
-	// every job when the ancestor directories are already present.
-	//
-	// The cache is in-process only and is rebuilt from scratch on service
-	// restart.  A restart re-runs ensureAncestors on the first job for each
-	// repo+path — a rare and cheap operation.
-	ensuredAncestors sync.Map // map[string]struct{} — keyed by ancestorCacheKey(repo, path)
+	// prefetchResults maps job ID to a buffered channel that receives the
+	// Phase-0 (collect+sort) result started by StartPrefetch.  The channel
+	// has capacity 1 so the goroutine never blocks after writing.
+	// Run() drains the channel with a context-aware receive; if the prefetch
+	// goroutine hasn't finished yet, Run() waits for it (still faster than
+	// a full re-read because at worst both overlap briefly).  On prefetch
+	// failure the channel receives nil and Run() falls back to pipeline.Run().
+	prefetchResults sync.Map // map[string]chan *pipeline.PrefetchResult
 }
 
 // repoMutex returns the per-repo mutex for repo, creating it on first call.
@@ -137,21 +163,106 @@ func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-// ancestorCacheKey builds the cache key for the ensuredAncestors map.
-// The key encodes both the repo and the full ordered ancestor path set derived
-// from path so that different publish paths with disjoint ancestors are cached
-// independently.
-//
-// Example: repo="test.cvmfs.io", path="test/stress/1"
-//   ancestors: ["/test", "/test/stress"]
-//   key: "test.cvmfs.io\x00/test,/test/stress"
-func ancestorCacheKey(repo, path string) string {
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	ancestors := make([]string, 0, len(parts)-1)
-	for i := 1; i < len(parts); i++ {
-		ancestors = append(ancestors, "/"+strings.Join(parts[:i], "/"))
+// SwissKnifeEnabled reports whether the cvmfs_swissknife ingest path is
+// currently active.  It is safe to call from multiple goroutines.
+func (o *Orchestrator) SwissKnifeEnabled() bool {
+	o.swissknifeMu.RLock()
+	defer o.swissknifeMu.RUnlock()
+	return o.swissknifeLive
+}
+
+// SetSwissKnifeEnabled enables or disables the cvmfs_swissknife ingest path
+// at runtime without restarting the service.  Returns false (no-op) when
+// SwissKnife config was not provided at startup (enabling has no effect
+// without a config).  Safe to call from multiple goroutines.
+func (o *Orchestrator) SetSwissKnifeEnabled(enabled bool) bool {
+	if o.SwissKnife == nil {
+		return false // no config — cannot enable
 	}
-	return repo + "\x00" + strings.Join(ancestors, ",")
+	o.swissknifeMu.Lock()
+	o.swissknifeLive = enabled
+	o.swissknifeMu.Unlock()
+	return true
+}
+
+// InitSwissKnife sets the live flag from the SwissKnife config pointer.
+// Call once from main after assigning orch.SwissKnife; the Web UI may
+// subsequently toggle the flag via SetSwissKnifeEnabled without restart.
+func (o *Orchestrator) InitSwissKnife() {
+	o.swissknifeMu.Lock()
+	o.swissknifeLive = o.SwissKnife != nil
+	o.swissknifeMu.Unlock()
+}
+
+// StartPrefetch starts a background goroutine that performs Phase 0 of the
+// pipeline (collect+validate+sort all tar entries into memory) BEFORE the
+// concurrency slot is acquired.  This means the blocking tar scan overlaps
+// with earlier jobs' compress/upload work instead of serialising with it.
+//
+// Call immediately after a job is accepted (before jobSem.Acquire).  Run()
+// will pick up the result via the prefetchResults map and skip Phase 0.
+//
+// If the pipeline is not needed (local mode) or if the tar is unavailable,
+// the call is a no-op and Run() will fall back to pipeline.Run() as usual.
+//
+// Race-safety: the tar file lives at j.TarPath (inside incoming/<jobID>/).
+// When the concurrency slot is eventually acquired, the orchestrator renames
+// incoming/<jobID>/ → staging/<jobID>/, making the original path invalid.
+// To avoid a TOCTOU race where the goroutine tries to open the file after
+// the rename, we open the file descriptor HERE (synchronously, on the caller's
+// goroutine) before launching the background goroutine.  An open fd holds a
+// kernel inode reference that survives directory renames, so the goroutine
+// can read all content through the fd even after the rename completes.
+func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
+	if !o.Lease.NeedsPipeline() {
+		return // local mode: no pipeline, no prefetch
+	}
+	if j.TarPath == "" {
+		return
+	}
+
+	// Open the file synchronously to obtain a stable inode reference before
+	// any directory rename can occur.
+	f, err := os.Open(j.TarPath)
+	if err != nil {
+		o.Obs.Logger.Warn("prefetch: cannot open tar — will fall back to pipeline.Run()",
+			"job_id", j.ID, "path", j.TarPath, "error", err)
+		return // no channel stored → takePrefetch returns nil → fallback
+	}
+
+	ch := make(chan *pipeline.PrefetchResult, 1)
+	o.prefetchResults.Store(j.ID, ch)
+
+	go func() {
+		defer f.Close()
+		result, err := pipeline.PrefetchFromReader(ctx, f, o.Obs)
+		if err != nil {
+			o.Obs.Logger.Warn("prefetch failed — Run() will fall back to pipeline.Run()",
+				"job_id", j.ID, "error", err)
+			ch <- nil // nil signals failure
+			return
+		}
+		ch <- result
+		o.Obs.Logger.Info("prefetch ready",
+			"job_id", j.ID, "entries", len(result.SortedEntries))
+	}()
+}
+
+// takePrefetch retrieves and removes the prefetch result for jobID.
+// It blocks until the prefetch goroutine finishes or ctx is cancelled.
+// Returns nil when no prefetch was started, the prefetch failed, or ctx fired.
+func (o *Orchestrator) takePrefetch(ctx context.Context, jobID string) *pipeline.PrefetchResult {
+	v, ok := o.prefetchResults.LoadAndDelete(jobID)
+	if !ok {
+		return nil
+	}
+	ch := v.(chan *pipeline.PrefetchResult)
+	select {
+	case r := <-ch:
+		return r // may be nil if prefetch failed
+	case <-ctx.Done():
+		return nil
+	}
 }
 
 // registerJob records the cancel function for a running job so CancelJob can
@@ -279,16 +390,24 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 // The lease window in gateway mode covers only SubmitPayload + Release,
 // reducing contention on the same sub-path to O(seconds) rather than
 // O(pipeline duration).
-func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
+// Run executes the job through all pipeline stages.
+// onStagingComplete, when non-nil, is called exactly once after all CPU/network-
+// intensive pipeline work is done but BEFORE the goroutine blocks on the per-repo
+// commit serialisation mutex.  The server uses this hook to release the concurrency
+// semaphore slot early so a new job can start its own staging phase while this job
+// waits for the mutex and executes the commit POST.  For local mode (no pipeline),
+// it is called immediately before the Commit call.  Passing nil is safe (Recover
+// uses nil since it runs outside the server semaphore).
+func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete func()) error {
 	ctx, span := o.Obs.Tracer.Start(ctx, "orchestrator.run")
 	defer span.End()
 
 	logger := o.Obs.Logger.With("job_id", j.ID)
 
-	// Invariant: gateway mode requires a non-nil CAS backend.  Catch
-	// misconfiguration before touching the spool or network.
-	if o.Lease.NeedsPipeline() && o.CAS == nil {
-		err := fmt.Errorf("misconfiguration: gateway mode requires a non-nil CAS backend")
+	// Invariant: gateway mode requires a non-nil CAS backend — UNLESS the
+	// SwissKnife path is active, which manages its own object store.
+	if o.Lease.NeedsPipeline() && o.CAS == nil && !o.SwissKnifeEnabled() {
+		err := fmt.Errorf("misconfiguration: gateway mode requires a non-nil CAS backend (or --swissknife)")
 		span.RecordError(err)
 		return o.abortJob(ctx, j, err)
 	}
@@ -296,6 +415,19 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	// Record total-S0 start time: from the moment Run() is invoked (job was
 	// already in StateIncoming when the goroutine was scheduled).
 	jobStartTS := time.Now()
+
+	// ── SwissKnife fast path ───────────────────────────────────────────────────
+	// When the operator has configured cvmfs_swissknife as the publish tool,
+	// bypass the Go pipeline (dedup, compress, CAS, catalog, commit) entirely.
+	// The binary handles all processing in optimised C++ code; our job lifecycle
+	// machinery (state transitions, provenance, MQTT, webhook) still runs.
+	//
+	// This path is taken when --swissknife is set (o.SwissKnife != nil) and the
+	// backend is gateway mode (NeedsPipeline).  Local-mode jobs (NeedsPipeline
+	// == false) use the existing Commit path regardless of SwissKnife config.
+	if o.SwissKnifeEnabled() && o.Lease.NeedsPipeline() {
+		return o.runWithSwissKnife(ctx, j, onStagingComplete, jobStartTS)
+	}
 
 	// ── Phase 1 + 2: pipeline + distribution (gateway mode only) ─────────────
 	var pipelineResult *pipeline.Result
@@ -315,18 +447,45 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		phaseStart := time.Now()
 		j.PipelineStartedAt = phaseStart
 		var err error
-		pipelineResult, err = pipeline.Run(ctx, j.TarPath, o.Pipeline)
+		// Use a per-job pipeline config so that upload.log and any other
+		// SpoolDir-relative files are written to the job's own directory rather
+		// than the shared spool root.  Without this, every concurrent job appends
+		// to the same spoolRoot/upload.log, making crash-recovery impossible
+		// (the log cannot be associated with a specific job).
+		jobPipelineCfg := o.Pipeline
+		jobPipelineCfg.SpoolDir = o.Spool.JobDir(j)
+
+		// Use the prefetch result (Phase 0 done before the concurrency slot was
+		// acquired) if it is available and succeeded.  This saves the O(tar-scan)
+		// blocking gate — compress workers start immediately rather than waiting
+		// for the full tar to be read from disk.
+		if prefetch := o.takePrefetch(ctx, j.ID); prefetch != nil {
+			logger.Info("using prefetched tar entries (phase 0 already done)",
+				"entries", len(prefetch.SortedEntries))
+			pipelineResult, err = pipeline.RunFromPrefetch(ctx, prefetch, jobPipelineCfg)
+		} else {
+			pipelineResult, err = pipeline.Run(ctx, j.TarPath, jobPipelineCfg)
+		}
 		if err != nil {
 			span.RecordError(err)
 			logger.Error("pipeline failed", "error", err)
 			return o.abortJob(ctx, j, err)
 		}
 		j.PipelineEndedAt = time.Now()
-		o.Obs.Metrics.JobPhaseDuration.WithLabelValues("pipeline").Observe(time.Since(phaseStart).Seconds())
+		pipelineDuration := time.Since(phaseStart)
+		o.Obs.Metrics.JobPhaseDuration.WithLabelValues("pipeline").Observe(pipelineDuration.Seconds())
 
 		j.NObjects = len(pipelineResult.ObjectHashes)
+		j.NNewObjects = len(pipelineResult.NewObjectHashes)
 		j.NBytesRaw = pipelineResult.NBytesRaw
 		j.NBytesCompressed = pipelineResult.NBytesComp
+		logger.Info("pipeline complete",
+			"duration", pipelineDuration.Round(time.Millisecond),
+			"objects_total", j.NObjects,
+			"objects_new", j.NNewObjects,
+			"bytes_raw", j.NBytesRaw,
+			"bytes_compressed", j.NBytesCompressed,
+		)
 		if err := o.Spool.WriteManifest(j); err != nil {
 			logger.Warn("best-effort manifest write failed", "job_id", j.ID, "error", err)
 		}
@@ -346,7 +505,8 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 					(o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != "")))
 		if shouldDistribute {
 			logger.Info("enqueuing S1 pre-warming (non-blocking)",
-				"objects", len(pipelineResult.ObjectHashes))
+				"objects", len(pipelineResult.ObjectHashes),
+				"new_objects", len(pipelineResult.NewObjectHashes))
 
 			if err := o.transition(ctx, j, job.StateDistributing); err != nil {
 				span.RecordError(err)
@@ -365,8 +525,25 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 				// Queue-driven path: per-endpoint worker pools with retry/backoff.
 				distJobID := j.ID
 				item := distribute.WorkItem{
-					JobID:      j.ID,
-					Hashes:     append([]string(nil), pipelineResult.ObjectHashes...),
+					JobID: j.ID,
+					// Use NewObjectHashes (freshly uploaded objects only) rather
+					// than the full ObjectHashes set.
+					//
+					// ObjectHashes includes every dedup hit — objects that were
+					// already in CAS from previous jobs and were already pushed to
+					// S1 when those jobs ran.  Re-pushing them here means the
+					// DistManager reads the entire accumulated CAS for every job
+					// that shares objects with the first big publish (e.g. a 1.3 GB
+					// Python installation that later jobs all link against).  With
+					// 32 packages and 99% dedup rates this reads 1.3 GB from CAS
+					// for each small subsequent job, explaining the "CAS scanning"
+					// slowdown observed after the first large job.
+					//
+					// NewObjectHashes contains only objects that did not exist in
+					// CAS before this pipeline run — these are the only ones S1
+					// has not yet seen.  Dedup-hit objects were already present on
+					// S1 from the jobs that originally uploaded them.
+					Hashes:     append([]string(nil), pipelineResult.NewObjectHashes...),
 					TotalBytes: pipelineResult.NBytesComp,
 					Repo:       j.Repo,
 					EnqueuedAt: j.DistributingStartedAt,
@@ -382,9 +559,18 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 					freshJ.DistributingEndedAt = time.Now()
 					freshJ.DistributionConfirmed = confirmed
 					freshJ.DistributionTotal = total
-					if writeErr := o.Spool.WriteManifest(freshJ); writeErr != nil {
-						o.Obs.Logger.Warn("dist-result: manifest update failed",
-							"job_id", distJobID, "error", writeErr)
+					// Ghost-directory guard: only write if the job directory still
+					// exists at the path derived from freshJ.State.  A narrow race
+					// between FindJob (which read state="leased") and this write can
+					// occur when abortJob concurrently renames leased/<id> →
+					// failed/<id>.  Without the guard, WriteManifest (which calls
+					// MkdirAll) would recreate spool/leased/<id>/, producing a ghost
+					// entry that listJobs returns and Scan recovers on restart.
+					if _, statErr := os.Stat(o.Spool.JobDir(freshJ)); statErr == nil {
+						if writeErr := o.Spool.WriteManifest(freshJ); writeErr != nil {
+							o.Obs.Logger.Warn("dist-result: manifest update failed",
+								"job_id", distJobID, "error", writeErr)
+						}
 					}
 					o.Obs.Logger.Info("dist-result: all endpoints finished",
 						"job_id", distJobID, "confirmed", confirmed, "total", total)
@@ -394,179 +580,370 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		}
 	} else {
 		logger.Info("local publish mode — skipping pipeline, tar will be extracted during Commit")
+		// Local mode has no CPU-intensive staging phase.  Release the concurrency
+		// slot immediately so the next queued job can start.
+		if onStagingComplete != nil {
+			onStagingComplete()
+		}
 	}
 
+	// ── Lease-management variables (used across Phases 2.7, 3, 3.5, 4) ────────
+	// Declared at this scope so they can be set by whichever phase acquires
+	// the lease (Phase 2.7 for subtree+gateway, Phase 3 for all other cases).
+	//
+	// Defaults are no-ops so the deferred cleanup is safe even when no lease
+	// was acquired (e.g. local mode or early error return).
+	var (
+		token           string
+		leaseCtx        context.Context    = ctx
+		leaseCancel     context.CancelFunc = func() {}
+		cancelHeartbeat func()             = func() {}
+		// preMutexLease is true when the gateway lease AND SubmitPayload were
+		// both completed BEFORE the per-repo serialisation mutex.  When true:
+		//   • Phase 3 skips lease acquisition (already done)
+		//   • Phase 4 calls CommitFinalizeOnly instead of full Commit
+		preMutexLease bool
+		// err is used across Phases 3.5 and 4 for catalog and commit operations.
+		err error
+	)
+	defer func() { cancelHeartbeat(); leaseCancel() }()
+
 	// ── Phase 2.5–4: per-repo serialisation ─────────────────────────────────
-	// Acquire a per-repo mutex before ensureAncestors so that only ONE job per
-	// repo is in the manifest-download → merge → commit critical section at a
-	// time.  This prevents two concurrent jobs from both downloading the same
-	// old manifest hash, producing diverging new catalogs, and then racing to
-	// commit — a situation where the second commit presents a stale
+	// Acquire a per-repo mutex so that only ONE job per repo is in the
+	// manifest-fetch → commit POST critical section at a time.
+	// This prevents two concurrent jobs (publishing to different sub-paths of
+	// the same repo) from both reading the same old manifest hash and racing
+	// to commit — a situation where the second commit presents a stale
 	// old_root_hash to the gateway receiver, which in the testbed causes the
-	// receiver subprocess to block indefinitely (hang in StateCommitting).
+	// receiver subprocess to block indefinitely.
 	//
-	// Pipeline stages (compress / distribute) run freely before this point, so
-	// the only serialised work is the gateway round-trips (ensureAncestors
-	// root-lease commit + main lease acquire + merge + commit), which are
-	// latency-bound by cvmfs_receiver anyway.
+	// Phase 2.6 (subtree catalog build) runs BEFORE the mutex — parallel across
+	// all active jobs.  Phase 2.7 (lease acquisition + catalog upload to the
+	// gateway) also runs BEFORE the mutex for subtree+gateway jobs, so that
+	// job N+1's catalog upload overlaps with job N's commit POST.  The only
+	// serialised work remaining inside the mutex is:
+	//   • lightweight manifest GET (old_root_hash, ~500 bytes)
+	//   • commit POST (cvmfs_receiver graft, the dominant latency term)
 	//
-	// Transition to StateLeased BEFORE acquiring the mutex so that the console
-	// shows "leased" (waiting for / in the commit window) rather than
-	// "distributing" (S1 pre-warming done, stuck on mutex).  Multiple concurrent
-	// jobs for the same repo would otherwise all show as distributing while only
-	// one is actually making progress.
+	// Transition to StateLeased BEFORE the subtree build and the mutex acquire
+	// so that the console shows "leased" (in or approaching the commit window)
+	// rather than "distributing" (pre-warming done, stuck on build/mutex).
+	//
+	// These variables are declared here (outside all if blocks) so that:
+	//   • Phase 3.5 (inside the mutex) can read them after BuildSubtree completes.
+	//   • Phase 4 (commit) can read all three regardless of which code path ran.
+	var subtreeResult *cvmfscatalog.SubtreeResult
+	var oldRootHash string
 	if o.Lease.NeedsPipeline() {
 		if err := o.transition(ctx, j, job.StateLeased); err != nil {
 			span.RecordError(err)
 			return o.abortJob(ctx, j, err)
 		}
-		repoMu := o.repoMutex(j.Repo)
-		repoMu.Lock()
-		defer repoMu.Unlock()
-		logger.Info("acquired per-repo commit serialisation lock", "repo", j.Repo)
-	}
 
-	// ── Phase 2.5: ensure ancestor directories exist (gateway mode) ──────────
-	// For a nested lease path like "test/smoke", the CVMFS receiver needs the
-	// parent directory "/test" to already exist in the writable catalog when it
-	// calls GraftNestedCatalog("/test/smoke").  WritableCatalogManager::FindCatalog
-	// calls LookupPath("/test") which panics if the entry is absent.
-	//
-	// Fix: before acquiring the main lease, do a preliminary root-level publish
-	// (LeasePath="") that adds synthetic directory entries for every intermediate
-	// path component.  After this commit the repo's root catalog contains "/test",
-	// so the main publish succeeds.
-	if pipelineResult != nil && o.Stratum0URL != "" && strings.Contains(j.Path, "/") {
-		cacheKey := ancestorCacheKey(j.Repo, j.Path)
-		if _, alreadyEnsured := o.ensuredAncestors.Load(cacheKey); alreadyEnsured {
-			logger.Info("skipping ensureAncestors — ancestor directories already in catalog",
-				"repo", j.Repo, "path", j.Path)
-		} else {
-			phaseStart := time.Now()
-			if ensureErr := o.ensureAncestors(ctx, j); ensureErr != nil {
-				span.RecordError(ensureErr)
-				return o.abortJob(ctx, j, ensureErr)
+		// ── Phase 2.6 / 2.7: catalog work before the per-repo mutex ─────────────
+		//
+		// All heavy catalog I/O runs here — outside the repoMu critical section —
+		// so that jobs for the same repo can overlap their catalog work with each
+		// other's commit POST (cvmfs_receiver).
+		//
+		// Phase 2.6 builds a subtree catalog (BuildSubtree) for path-scoped
+		// publishes (j.Path != "").  The gateway receiver grafts this subtree
+		// into the existing repository at LeasePath during the commit step; it
+		// never needs to see the full repository catalog.
+		//
+		// Root-level publishes (j.Path == "") are NOT handled here.  The
+		// gateway handles root-level leases without a catalog submission from
+		// the publisher — only the commit POST is required.
+		//
+		// Phase 2.7 (gateway mode, GatewayQueue != nil) acquires the lease and
+		// uploads the catalog BEFORE the per-repo mutex so that catalog upload
+		// overlaps with the previous job's commit POST.  The mutex only guards
+		// the lightweight manifest GET + commit POST (O(milliseconds)).
+		if pipelineResult != nil && o.Stratum0URL != "" && j.Path != "" {
+			// ── Phase 2.6: build subtree catalog ──────────────────────────────
+			subtreePhaseStart := time.Now()
+			logger.Info("building subtree catalog", "repo", j.Repo, "path", j.Path)
+
+			var buildErr error
+			subtreeResult, buildErr = cvmfscatalog.BuildSubtree(ctx, cvmfscatalog.SubtreeConfig{
+				LeasePath:     j.Path,
+				TempDir:       o.Spool.JobDir(j),
+				DirtabContent: pipelineResult.DirtabContent,
+			}, pipelineResult.CatalogEntries)
+			if buildErr != nil {
+				span.RecordError(buildErr)
+				return o.abortJob(ctx, j, fmt.Errorf("subtree catalog build: %w", buildErr))
 			}
-			o.Obs.Metrics.JobPhaseDuration.WithLabelValues("ensure_ancestors").Observe(time.Since(phaseStart).Seconds())
-			// Cache the successful ancestor publish so subsequent jobs with the
-			// same repo + path prefix skip the redundant root-level commit.
-			o.ensuredAncestors.Store(cacheKey, struct{}{})
+
+			// Upload the subtree catalog file(s) to the local CAS so that
+			// SubmitPayload (inside the mutex) can stream them to the gateway.
+			for _, catHash := range subtreeResult.AllCatalogHashes {
+				catFilePath := filepath.Join(o.Spool.JobDir(j),
+					cvmfshash.ObjectPath(catHash)+"C")
+				f, openErr := os.Open(catFilePath)
+				if openErr != nil {
+					return o.abortJob(ctx, j,
+						fmt.Errorf("opening subtree catalog %s: %w", catHash, openErr))
+				}
+				fi, statErr := f.Stat()
+				if statErr != nil {
+					f.Close()
+					return o.abortJob(ctx, j,
+						fmt.Errorf("stat subtree catalog %s: %w", catHash, statErr))
+				}
+				putErr := o.CAS.Put(ctx, catHash+"C", f, fi.Size())
+				closeErr := f.Close()
+				if putErr != nil {
+					return o.abortJob(ctx, j,
+						fmt.Errorf("uploading subtree catalog %s to CAS: %w", catHash, putErr))
+				}
+				if closeErr != nil {
+					logger.Warn("subtree catalog file close error (CAS upload already complete)",
+						"hash", catHash, "error", closeErr)
+				}
+			}
+
+			o.Obs.Metrics.JobPhaseDuration.WithLabelValues("subtree_build").Observe(
+				time.Since(subtreePhaseStart).Seconds())
+			logger.Info("subtree catalog ready",
+				"catalogs", len(subtreeResult.AllCatalogHashes),
+				"root_hash", subtreeResult.CatalogHash)
+
+			// ── Phase 2.7: pre-acquire lease + submit subtree catalog ──────────
+			// Acquire the gateway lease and upload the catalog BEFORE the mutex so
+			// this work overlaps with the previous job's commit POST.
+			//
+			// Different-path jobs hold non-overlapping leases simultaneously →
+			// lease acquisition and catalog upload run fully in parallel.
+			//
+			// Same-path jobs: GatewayQueue.Acquire blocks on path_busy until the
+			// current holder commits.  The upload then runs, and by the time the
+			// mutex is free the catalog is already on the gateway.
+			if o.GatewayQueue != nil {
+				preMutexLease = true
+
+				// Release the pipeline concurrency slot before gateway I/O.
+				// BuildSubtree (Phase 2.6) has just completed — all CPU-intensive
+				// compress+catalog work is done.  The remaining work (lease acquire,
+				// payload upload) is pure network I/O that does not consume pipeline
+				// CPU budget.  Releasing early lets the next queued job start its
+				// own compress pipeline immediately rather than waiting for the full
+				// lease-acquire + SubmitPayload duration.
+				// onStagingComplete is sync.Once-guarded by the server; the safety-net
+				// call below (after the mutex wait setup) is a no-op if fired here first.
+				if onStagingComplete != nil {
+					onStagingComplete()
+				}
+
+				logger.Info("acquiring gateway lease (pre-commit-lock)",
+					"repo", j.Repo, "path", j.Path)
+				leaseAcquireStart := time.Now()
+				var leaseErr error
+				token, leaseErr = o.GatewayQueue.Acquire(ctx, j.Repo, j.Path, 0)
+				if leaseErr != nil {
+					span.RecordError(leaseErr)
+					return o.abortJob(ctx, j, fmt.Errorf("pre-mutex lease acquire: %w", leaseErr))
+				}
+				logger.Info("gateway lease acquired (pre-commit-lock)",
+					"duration", time.Since(leaseAcquireStart).Round(time.Millisecond))
+
+				j.LeasedAt = time.Now()
+				j.LeaseToken = token
+				if writeErr := o.Spool.WriteManifest(j); writeErr != nil {
+					logger.Warn("best-effort manifest write failed (pre-mutex lease token)",
+						"job_id", j.ID, "error", writeErr)
+				}
+
+				// Start heartbeat — monitoring-only (gateway HTTP 405 on renewal).
+				leaseCtx, leaseCancel = context.WithCancel(ctx)
+				cancelHeartbeat = o.Lease.Heartbeat(ctx, token, 10*time.Second, leaseCancel)
+
+				// Upload the subtree catalog(s) to the gateway before the mutex.
+				// Split catalogs first, subtree root last — gateway referential integrity.
+				// Type-assertion to *lease.Client is safe: GatewayQueue != nil implies
+				// gateway mode.
+				lc := o.Lease.(*lease.Client)
+				var preCatalogHash string
+				var preObjectHashes []string
+				nn := len(subtreeResult.AllCatalogHashes)
+				for i, h := range subtreeResult.AllCatalogHashes {
+					if i < nn-1 {
+						preObjectHashes = append(preObjectHashes, h+"C")
+					} else {
+						preCatalogHash = h + "C"
+					}
+				}
+
+				submitStart := time.Now()
+				logger.Info("uploading subtree catalog(s) to gateway (pre-commit-lock)",
+					"repo", j.Repo, "catalogs", len(subtreeResult.AllCatalogHashes))
+				if submitErr := lc.SubmitPayload(leaseCtx, token, preCatalogHash, preObjectHashes, o.CAS); submitErr != nil {
+					span.RecordError(submitErr)
+					return o.abortJob(ctx, j, fmt.Errorf("pre-mutex submit payload: %w", submitErr))
+				}
+				o.Obs.Metrics.JobPhaseDuration.WithLabelValues("submit_payload").Observe(
+					time.Since(submitStart).Seconds())
+				logger.Info("subtree catalog(s) uploaded to gateway",
+					"duration", time.Since(submitStart).Round(time.Millisecond),
+					"catalogs", len(subtreeResult.AllCatalogHashes))
+			}
+
 		}
+
+		// ── Release pipeline concurrency slot (gateway mode) ──────────────────
+		// All CPU-intensive work is complete: compress workers finished (pipeline),
+		// subtree catalog was built (Phase 2.6), and catalog was submitted to the
+		// gateway (Phase 2.7).  What remains is:
+		//   • a context-aware mutex wait (no CPU)
+		//   • a manifest GET (~500 bytes, network only)
+		//   • a commit POST to cvmfs_receiver (network / gateway I/O, no compress)
+		//
+		// Releasing the slot here lets the next queued job start its own
+		// compress pipeline immediately, overlapping with this job's commit wait.
+		// Without this early release, every waiting job in StateIncoming was
+		// blocked behind the mutex + commit POST duration even though those phases
+		// consume no pipeline-level CPU.
+		if onStagingComplete != nil {
+			onStagingComplete()
+		}
+
+		// Fix: replace the non-interruptible Lock() with a context-aware acquire.
+		//
+		// sync.Mutex.Lock() cannot be interrupted by context cancellation.  When
+		// a job's JobTimeout fires (or the operator cancels a job via CancelJob),
+		// the goroutine would block here forever even though its context is done,
+		// keeping the job stuck in StateLeased indefinitely and preventing future
+		// jobs for the same repo from ever acquiring the mutex (livelock).
+		//
+		// Pattern: spawn a goroutine that calls the blocking Lock() and closes
+		// a channel when it succeeds.  The select below races that channel against
+		// ctx.Done().  If the context fires first, a cleanup goroutine waits for
+		// the channel (the blocking Lock will eventually return once the current
+		// lock-holder finishes) and immediately unlocks so the mutex is not
+		// permanently abandoned.
+		repoMu := o.repoMutex(j.Repo)
+		lockCh := make(chan struct{})
+		go func() {
+			repoMu.Lock()
+			close(lockCh)
+		}()
+
+		lockWaitStart := time.Now()
+		select {
+		case <-lockCh:
+			defer repoMu.Unlock()
+			if waited := time.Since(lockWaitStart); waited > 5*time.Second {
+				logger.Warn("waited for per-repo commit serialisation lock",
+					"repo", j.Repo, "waited", waited.Round(time.Millisecond))
+			}
+		case <-leaseCtx.Done():
+			// The pre-acquired lease expired (or heartbeat fired onExpire) while
+			// we were queued waiting for the mutex.  Hand the mutex goroutine off
+			// to a cleanup goroutine so future jobs are not permanently blocked.
+			go func() { <-lockCh; repoMu.Unlock() }()
+			leaseErr := fmt.Errorf(
+				"gateway lease expired while waiting for commit lock (waited %s): %w",
+				time.Since(lockWaitStart).Round(time.Millisecond), leaseCtx.Err())
+			span.RecordError(leaseErr)
+			return o.abortJob(ctx, j, leaseErr)
+		case <-ctx.Done():
+			// Our goroutine will eventually acquire the lock; hand it off to a
+			// cleanup goroutine that immediately releases it so future jobs
+			// for this repo are not permanently blocked.
+			go func() { <-lockCh; repoMu.Unlock() }()
+			ctxErr := fmt.Errorf("cancelled waiting for commit serialisation lock (waited %s): %w",
+				time.Since(lockWaitStart).Round(time.Millisecond), ctx.Err())
+			span.RecordError(ctxErr)
+			return o.abortJob(ctx, j, ctxErr)
+		}
+		lockWaitTotal := time.Since(lockWaitStart)
+		logger.Info("acquired per-repo commit serialisation lock",
+			"repo", j.Repo,
+			"waited", lockWaitTotal.Round(time.Millisecond),
+		)
 	}
 
 	// ── Phase 3: acquire lease / open transaction ─────────────────────────────
-	logger.Info("acquiring lease", "repo", j.Repo, "path", j.Path)
-	j.LeasedAt = time.Now() // precise timestamp of gateway lease attempt
+	// For subtree publishes in gateway mode (preMutexLease == true), the lease
+	// was already acquired and the heartbeat already started in Phase 2.7.
+	// Skip acquisition here to avoid a redundant gateway round-trip.
 	if !o.Lease.NeedsPipeline() {
-		// Local mode: job is still in StateIncoming (skipped all pipeline states).
+		// Local mode: job skipped all pipeline states and is still StateIncoming.
 		// Transition to StateLeased here so the FSM is consistent before Commit.
+		j.LeasedAt = time.Now()
 		if err := o.transition(ctx, j, job.StateLeased); err != nil {
 			span.RecordError(err)
 			return o.abortJob(ctx, j, err)
 		}
 	}
 
-	// j.Path == "" means a root-level repo lease; acquireLease handles that by
-	// constructing the path as "repo/" which is what the gateway expects.
-	token, err := o.Lease.Acquire(ctx, j.Repo, j.Path)
-	if err != nil {
-		span.RecordError(err)
-		logger.Error("failed to acquire lease", "error", err)
-		return o.abortJob(ctx, j, err)
-	}
-
-	j.LeaseToken = token
-	if err := o.Spool.WriteManifest(j); err != nil {
-		logger.Warn("best-effort manifest write failed (lease token)", "job_id", j.ID, "error", err)
-	}
-
-	// leaseCtx lets the heartbeat abort the publish if consecutive renewals
-	// fail (gateway mode only; the no-op heartbeat never calls onExpire in
-	// local mode).
-	leaseCtx, leaseCancel := context.WithCancel(ctx)
-	defer leaseCancel()
-
-	cancelHeartbeat := o.Lease.Heartbeat(ctx, token, 10*time.Second, leaseCancel)
-	defer cancelHeartbeat()
-
-	// ── Phase 3.5: catalog merge (gateway mode only) ──────────────────────────
-	// Merge happens AFTER lease acquisition so that the manifest/catalog we
-	// download reflects the version we are merging onto — no other publisher
-	// can commit to the same path while we hold the lease.
-	//
-	// The merge: fetches the current root manifest → downloads the root SQLite
-	// catalog → applies the new entries → finalises (compress+hash) → writes
-	// compressed catalog(s) to the spool job directory → uploads them to CAS.
-	var mergeResult *cvmfscatalog.MergeResult
-	if pipelineResult != nil && o.Stratum0URL != "" {
-		logger.Info("merging catalog", "repo", j.Repo, "path", j.Path)
-		mergePhasStart := time.Now()
-		mergeResult, err = cvmfscatalog.Merge(leaseCtx, cvmfscatalog.MergeConfig{
-			Stratum0URL:   o.Stratum0URL,
-			RepoName:      j.Repo,
-			LeasePath:     j.Path,
-			TempDir:       o.Spool.JobDir(j),
-			DirtabContent: pipelineResult.DirtabContent,
-		}, pipelineResult.CatalogEntries)
-		if err != nil {
-			span.RecordError(err)
-			logger.Error("catalog merge failed", "error", err)
-			cancelHeartbeat()
-			leaseCancel()
-			return o.abortJob(ctx, j, fmt.Errorf("catalog merge: %w", err))
-		}
-
-		// Upload the merged catalog file(s) to the CAS so SubmitPayload can
-		// stream them to the gateway.  Finalize() wrote each catalog to
-		// TempDir/data/XY/hashC (CVMFS on-disk format).
+	if !preMutexLease {
+		// Fallback/local path: lease was not pre-acquired in Phase 2.7
+		// (either GatewayQueue is nil, or NeedsPipeline is false).
+		// Acquire here inside the per-repo mutex so that FetchManifestRootHash
+		// (Phase 3.5) sees the fully committed manifest from the previous job.
 		//
-		// The CAS key includes the 'C' content-type suffix ("sha1C", 41 chars)
-		// so that SubmitPayload can propagate the suffix into the ObjectPack C
-		// line.  The receiver's LocalUploader then stores the object at
-		// data/XY/sha1C, and CommitProcessor can find it there when it fetches
-		// the new root catalog from stratum0.
-		for _, catHash := range mergeResult.AllCatalogHashes {
-			// Path written by cvmfscatalog.Finalize: data/XY/hash + "C"
-			catFilePath := filepath.Join(o.Spool.JobDir(j),
-				cvmfshash.ObjectPath(catHash)+"C")
-			f, openErr := os.Open(catFilePath)
-			if openErr != nil {
-				cancelHeartbeat()
-				leaseCancel()
-				return o.abortJob(ctx, j,
-					fmt.Errorf("opening merged catalog %s: %w", catHash, openErr))
-			}
-			fi, statErr := f.Stat()
-			if statErr != nil {
-				f.Close()
-				cancelHeartbeat()
-				leaseCancel()
-				return o.abortJob(ctx, j,
-					fmt.Errorf("stat merged catalog %s: %w", catHash, statErr))
-			}
-			// Use "sha1C" (with 'C' suffix) as the CAS key so that
-			// ObjectPath("sha1C") resolves to data/XY/sha1C — the same path
-			// where Finalize wrote the compressed catalog file.
-			putErr := o.CAS.Put(leaseCtx, catHash+"C", f, fi.Size())
-			closeErr := f.Close()
-			if putErr != nil {
-				cancelHeartbeat()
-				leaseCancel()
-				return o.abortJob(ctx, j,
-					fmt.Errorf("uploading merged catalog %s: %w", catHash, putErr))
-			}
-			if closeErr != nil {
-				logger.Warn("merged catalog file close error (upload already complete)",
-					"hash", catHash, "error", closeErr)
-			}
+		// j.Path == "" means a root-level repo lease; the gateway expects
+		// the path as "repo/" which Acquire handles internally.
+		logger.Info("acquiring lease", "repo", j.Repo, "path", j.Path)
+		j.LeasedAt = time.Now()
+		var leaseErr error
+		if o.GatewayQueue != nil {
+			token, leaseErr = o.GatewayQueue.Acquire(ctx, j.Repo, j.Path, 0)
+		} else {
+			token, leaseErr = o.Lease.Acquire(ctx, j.Repo, j.Path)
 		}
-		o.Obs.Metrics.JobPhaseDuration.WithLabelValues("catalog_merge").Observe(time.Since(mergePhasStart).Seconds())
-		logger.Info("catalog merge complete",
-			"old_root", mergeResult.OldRootHash,
-			"new_root", mergeResult.NewRootHash,
-			"catalogs", len(mergeResult.AllCatalogHashes))
+		if leaseErr != nil {
+			span.RecordError(leaseErr)
+			logger.Error("failed to acquire lease", "error", leaseErr)
+			return o.abortJob(ctx, j, leaseErr)
+		}
+
+		j.LeaseToken = token
+		if writeErr := o.Spool.WriteManifest(j); writeErr != nil {
+			logger.Warn("best-effort manifest write failed (lease token)", "job_id", j.ID, "error", writeErr)
+		}
+
+		// leaseCtx lets the heartbeat abort the publish if consecutive renewals
+		// fail (gateway mode only; the no-op heartbeat never calls onExpire in
+		// local mode).
+		leaseCtx, leaseCancel = context.WithCancel(ctx)
+		cancelHeartbeat = o.Lease.Heartbeat(ctx, token, 10*time.Second, leaseCancel)
+	} else {
+		logger.Info("using pre-acquired gateway lease (Phase 2.7)",
+			"repo", j.Repo, "path", j.Path)
+	}
+
+	// ── Phase 3.5: fetch manifest for old_root_hash (subtree publishes only) ──
+	// The subtree catalog was built and uploaded to local CAS in Phase 2.6.
+	// Only a lightweight manifest GET (~500 bytes) is needed here to obtain
+	// old_root_hash for the commit POST.
+	//
+	// old_root_hash is safe to read here because the per-repo mutex ensures no
+	// other job for this repo can commit between this fetch and our commit POST.
+	//
+	// For root-level publishes (j.Path == "") subtreeResult is nil; skip the
+	// manifest fetch and leave oldRootHash empty (commit with empty old_root_hash).
+	if pipelineResult != nil && o.Stratum0URL != "" {
+		if subtreeResult != nil {
+			logger.Info("fetching manifest for old_root_hash", "repo", j.Repo)
+			manifestPhaseStart := time.Now()
+			oldRootHash, err = cvmfscatalog.FetchManifestRootHash(leaseCtx, nil, o.Stratum0URL, j.Repo)
+			if err != nil {
+				span.RecordError(err)
+				logger.Error("manifest fetch failed", "error", err)
+				cancelHeartbeat()
+				leaseCancel()
+				return o.abortJob(ctx, j, fmt.Errorf("fetching manifest root hash: %w", err))
+			}
+			o.Obs.Metrics.JobPhaseDuration.WithLabelValues("manifest_fetch").Observe(
+				time.Since(manifestPhaseStart).Seconds())
+			logger.Info("manifest fetched",
+				"old_root", oldRootHash,
+				"new_root", subtreeResult.CatalogHash)
+		}
 	} else if pipelineResult != nil && o.Stratum0URL == "" {
-		logger.Warn("Stratum0URL not configured — skipping catalog merge; " +
+		logger.Warn("Stratum0URL not configured — skipping catalog step; " +
 			"commit will use empty old_root_hash (only correct for initial publish)")
 	}
 
@@ -592,22 +969,34 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 		TagName:        j.TagName,
 		TagDescription: j.TagDescription,
 	}
-	if pipelineResult != nil {
-		// File object hashes (catalog hashes added below from merge result).
-		req.ObjectHashes = pipelineResult.ObjectHashes
-		req.ObjectStore = o.CAS
-	}
-	if mergeResult != nil {
-		// Catalog hashes go into ObjectHashes so SubmitPayload uploads them.
-		// The root catalog goes last (Merge returns leaf-first, root-last).
-		// Each catalog hash gets the 'C' content-type suffix so SubmitPayload
-		// can propagate it to the ObjectPack C line, causing the receiver to
-		// store each catalog at data/XY/sha1C (CVMFS catalog content-type path).
-		for _, h := range mergeResult.AllCatalogHashes {
-			req.ObjectHashes = append(req.ObjectHashes, h+"C")
+	if preMutexLease {
+		// Catalog already uploaded to the gateway in Phase 2.7 (BuildSubtree).
+		// Only supply the hashes needed for the commit POST — do NOT populate
+		// ObjectStore/ObjectHashes/CatalogHash (already uploaded; re-uploading
+		// wastes time inside the critical section).
+		req.OldRootHash = oldRootHash
+		req.NewRootHashSuffixed = subtreeResult.CatalogHashSuffixed
+		// ObjectStore, ObjectHashes, CatalogHash intentionally left empty.
+	} else {
+		// Fallback path (local mode or no GatewayQueue): SubmitPayload will be
+		// called inside Commit() below.
+		if pipelineResult != nil {
+			req.ObjectStore = o.CAS
 		}
-		req.OldRootHash = mergeResult.OldRootHash
-		req.NewRootHashSuffixed = mergeResult.NewRootHashSuffixed
+		if subtreeResult != nil {
+			// BuildSubtree catalog without pre-acquired lease (GatewayQueue nil).
+			// Build catalog hashes for Commit to upload.
+			n := len(subtreeResult.AllCatalogHashes)
+			for i, h := range subtreeResult.AllCatalogHashes {
+				if i < n-1 {
+					req.ObjectHashes = append(req.ObjectHashes, h+"C")
+				} else {
+					req.CatalogHash = h + "C"
+				}
+			}
+			req.OldRootHash = oldRootHash
+			req.NewRootHashSuffixed = subtreeResult.CatalogHashSuffixed
+		}
 	}
 
 	cancelHeartbeat() // stop renewal before committing (idempotent; defer fires again at return)
@@ -615,7 +1004,18 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 
 	logger.Info("committing")
 	commitPhaseStart := time.Now()
-	if commitErr := o.Lease.Commit(ctx, req); commitErr != nil {
+
+	var commitErr error
+	if preMutexLease {
+		// Catalog already uploaded in Phase 2.7.  Only the commit POST remains.
+		// Type-assertion is safe: preMutexLease is only set when o.GatewayQueue != nil.
+		lc := o.Lease.(*lease.Client)
+		commitErr = lc.CommitFinalizeOnly(ctx, req)
+	} else {
+		commitErr = o.Lease.Commit(ctx, req)
+	}
+
+	if commitErr != nil {
 		if errors.Is(commitErr, lease.ErrCommittedNotRemounted) {
 			// The catalog IS in the repository — only the FUSE remount failed.
 			// Log a warning and continue to StatePublished; the operator must
@@ -632,9 +1032,28 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	}
 	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("commit").Observe(time.Since(commitPhaseStart).Seconds())
 
+	// Notify the gateway queue that this repo's lease has been released so any
+	// goroutine waiting in GatewayQueue.Acquire wakes up immediately instead of
+	// waiting for the next poll interval.
+	if o.GatewayQueue != nil {
+		o.GatewayQueue.NotifyRelease(j.Repo)
+	}
+
 	// Store the new catalog root hash so callers can poll Stratum 1 for propagation.
-	if mergeResult != nil {
-		j.NewRootHash = mergeResult.NewRootHash
+	//
+	// cvmfs_receiver produces the final merged root hash during the graft; we
+	// don't know it ahead of time.  Fetch the updated manifest post-commit to
+	// record it in j.NewRootHash.  This is a small HTTP GET (~500 bytes) and
+	// the manifest is immediately updated after a successful commit.
+	if subtreeResult != nil && o.Stratum0URL != "" {
+		if newRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, j.Repo); fetchErr != nil {
+			logger.Warn("could not fetch new root hash from manifest post-commit",
+				"error", fetchErr)
+		} else {
+			// FetchManifestRootHash returns hash+"C"; strip the suffix for
+			// j.NewRootHash which is always plain hex (no content-type suffix).
+			j.NewRootHash = strings.TrimSuffix(newRoot, "C")
+		}
 	}
 
 	// Set PublishedAt before the transition so Spool.Transition's internal
@@ -670,9 +1089,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	if o.Provenance != nil && j.Provenance != nil {
 		var catalogHash string
 		var objectHashes []string
-		if mergeResult != nil {
-			catalogHash = mergeResult.NewRootHash // root catalog hash (plain hex)
-			objectHashes = append(objectHashes, mergeResult.AllCatalogHashes...)
+		if subtreeResult != nil {
+			catalogHash = subtreeResult.CatalogHash // subtree root catalog hash (plain hex)
+			objectHashes = append(objectHashes, subtreeResult.AllCatalogHashes...)
 		}
 		if pipelineResult != nil {
 			objectHashes = append(pipelineResult.ObjectHashes, objectHashes...)
@@ -731,6 +1150,154 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job) error {
 	return nil
 }
 
+// runWithSwissKnife is the alternative job-execution path that delegates the
+// entire publish pipeline to cvmfs_swissknife ingest.  Called by Run() when
+// o.SwissKnife is non-nil and the backend is gateway mode.
+//
+// The method replicates the post-publish steps of the Go path (provenance,
+// MQTT notification, webhook) so operators who switch to swissknife continue
+// to get the same observability and lifecycle events.  The Go pipeline, catalog
+// build, and gateway commit steps are replaced by the single subprocess call.
+func (o *Orchestrator) runWithSwissKnife(
+	ctx context.Context,
+	j *job.Job,
+	onStagingComplete func(),
+	jobStartTS time.Time,
+) error {
+	ctx, span := o.Obs.Tracer.Start(ctx, "orchestrator.swissknife")
+	defer span.End()
+	logger := o.Obs.Logger.With("job_id", j.ID)
+
+	if err := o.transition(ctx, j, job.StateStaging); err != nil {
+		span.RecordError(err)
+		return o.abortJob(ctx, j, err)
+	}
+
+	// TarPath becomes valid at the staging location after the rename above.
+	j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
+	j.PipelineStartedAt = time.Now()
+
+	logger.Info("cvmfs_swissknife ingest starting",
+		"repo", j.Repo,
+		"path", j.Path,
+		"tar", j.TarPath,
+		"binary", o.SwissKnife.Binary,
+		"gateway", o.SwissKnife.GatewayURL,
+	)
+
+	// Release the pipeline concurrency slot now.
+	//
+	// cvmfs_swissknife manages its own internal thread pool (-q) and is not
+	// subject to the Go compress-worker budget.  Releasing the slot early lets
+	// the next queued job start its own staging phase while swissknife runs,
+	// preserving the concurrency benefit introduced by the dynamic semaphore.
+	if onStagingComplete != nil {
+		onStagingComplete()
+	}
+
+	ingestStart := time.Now()
+	if err := cvmfscatalog.SwissKnifeIngest(
+		ctx, *o.SwissKnife,
+		o.Stratum0URL, j.TarPath, j.Repo, j.Path,
+		func(line string) { logger.Info("swissknife: " + line) },
+	); err != nil {
+		span.RecordError(err)
+		logger.Error("cvmfs_swissknife ingest failed", "error", err)
+		return o.abortJob(ctx, j, fmt.Errorf("cvmfs_swissknife ingest: %w", err))
+	}
+
+	ingestDur := time.Since(ingestStart)
+	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("swissknife_ingest").Observe(ingestDur.Seconds())
+	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("total_s0").Observe(time.Since(jobStartTS).Seconds())
+	j.PipelineEndedAt = time.Now()
+
+	logger.Info("cvmfs_swissknife ingest complete",
+		"duration", ingestDur.Round(time.Millisecond))
+
+	// Wake any in-process goroutine waiting for this repo's lease so the next
+	// job does not wait for the next poll interval.
+	if o.GatewayQueue != nil {
+		o.GatewayQueue.NotifyRelease(j.Repo)
+	}
+
+	// Fetch the new root hash from the manifest produced by swissknife.
+	// This is a lightweight GET (~500 bytes); swissknife has already committed
+	// by the time Run returns, so the manifest reflects the new state.
+	if o.Stratum0URL != "" {
+		if newRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(
+			ctx, nil, o.Stratum0URL, j.Repo,
+		); fetchErr != nil {
+			logger.Warn("swissknife: could not fetch new root hash post-commit",
+				"error", fetchErr)
+		} else {
+			j.NewRootHash = strings.TrimSuffix(newRoot, "C")
+		}
+	}
+
+	j.PublishedAt = time.Now()
+	if err := o.transition(ctx, j, job.StatePublished); err != nil {
+		span.RecordError(err)
+		return err
+	}
+
+	// MQTT post-commit notification (fire-and-forget).
+	if o.BrokerConfig != nil && j.NewRootHash != "" {
+		go o.publishMQTTNotification(j.Repo, j.NewRootHash)
+	}
+
+	// Provenance — swissknife does not produce per-object hashes, so
+	// CatalogHash and ObjectHashes are empty.  The identity fields
+	// (GitSHA, Actor, etc.) are still recorded for audit purposes.
+	if o.Provenance != nil && j.Provenance != nil {
+		rec := &provenance.Record{
+			JobID:       j.ID,
+			Repo:        j.Repo,
+			Path:        j.Path,
+			GitRepo:     j.Provenance.GitRepo,
+			GitSHA:      j.Provenance.GitSHA,
+			GitRef:      j.Provenance.GitRef,
+			Actor:       j.Provenance.Actor,
+			PipelineID:  j.Provenance.PipelineID,
+			BuildSystem: j.Provenance.BuildSystem,
+			OIDCIssuer:  j.Provenance.OIDCIssuer,
+			OIDCSubject: j.Provenance.OIDCSubject,
+			Verified:    j.Provenance.Verified,
+		}
+		if submitErr := o.Provenance.Submit(ctx, rec); submitErr != nil {
+			logger.Warn("provenance: Rekor submission failed (continuing)", "error", submitErr)
+		} else if rec.Submitted() {
+			j.Provenance.RekorServer = rec.RekorServer
+			j.Provenance.RekorUUID = rec.RekorUUID
+			j.Provenance.RekorLogIndex = rec.RekorLogIndex
+			j.Provenance.RekorIntegratedTime = rec.RekorIntegratedTime
+			j.Provenance.RekorSET = rec.RekorSET
+			if err := o.Spool.WriteManifest(j); err != nil {
+				logger.Warn("best-effort manifest write failed (rekor receipt)",
+					"job_id", j.ID, "error", err)
+			}
+		}
+	}
+
+	// Webhook delivery (async, non-fatal).
+	if o.Notify != nil && j.WebhookURL != "" {
+		webhookCtx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		o.webhookWg.Add(1)
+		go func() {
+			defer o.webhookWg.Done()
+			defer wcancel()
+			notify.DeliverWebhook(webhookCtx, j.WebhookURL, notify.Event{
+				JobID: j.ID,
+				State: job.StatePublished,
+				Time:  time.Now(),
+			}, o.Obs)
+		}()
+	}
+
+	o.Obs.Metrics.JobsCompleted.Inc()
+	logger.Info("swissknife job completed successfully")
+	return nil
+}
+
 // Recover attempts to re-process a job found in a non-terminal state at
 // service startup.  Stale transactions are aborted before the job is reset.
 // After MaxRecoveries attempts, jobs are moved to StateFailed.
@@ -766,7 +1333,9 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job) error {
 	}
 
 	logger.Info("job reset to incoming — restarting")
-	return o.Run(ctx, j)
+	// Recover runs outside the server semaphore (it is called at startup, not
+	// from a job goroutine).  Pass nil so Run skips the early-release hook.
+	return o.Run(ctx, j, nil)
 }
 
 // abortJob records the failure, writes the manifest, and transitions the job
@@ -783,6 +1352,12 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 
 	o.Obs.Logger.Error("job failed", "job_id", j.ID, "error", err, "class", class)
 	j.Error = "job processing failed — see service logs for details"
+	// Record which FSM state the job was in when it failed.  This is used by
+	// the console miniPipeline view to highlight the correct pipeline step.
+	// Must be captured BEFORE the Transition call below changes j.State.
+	if !job.IsTerminal(j.State) && j.FailedAtState == "" {
+		j.FailedAtState = string(j.State)
+	}
 	// NOTE: do NOT set j.State = StateFailed here.  WriteManifest uses j.State
 	// to compute the target directory (spool/<state>/<id>/).  If we set
 	// j.State = StateFailed prematurely, WriteManifest creates a new empty
@@ -807,6 +1382,11 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 				"error", abortErr,
 				"hint", "DELETE "+j.LeaseToken+" via gateway API or wait for lease expiry",
 			)
+		}
+		// Notify the gateway queue even when Abort failed: the queue will poll
+		// the gateway every 1 s anyway, and notifying on error is harmless.
+		if o.GatewayQueue != nil {
+			o.GatewayQueue.NotifyRelease(j.Repo)
 		}
 	}
 
@@ -843,132 +1423,4 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	}
 
 	return err
-}
-
-// ensureAncestors ensures that every intermediate directory component of
-// j.Path exists in the repository before the main publish.
-//
-// Background: For a lease path "test/smoke" the CVMFS receiver maps this to
-// the catalog-relative path "/test/smoke".  When grafting the nested catalog
-// it calls GraftNestedCatalog("test/smoke") which internally needs the parent
-// directory "/test" to already exist in the writable catalog.  On first
-// publish the repo is empty so that lookup panics.
-//
-// Fix: acquire a root-level lease, run a Merge that upserts synthetic
-// directory entries for each intermediate path component (e.g. "/test"),
-// and commit.  After this preliminary publish the repo's root catalog
-// contains "/test" and the main publish succeeds.
-//
-// This is only called when j.Path contains at least one "/" (depth > 1) and
-// Stratum0URL is configured (gateway mode).
-func (o *Orchestrator) ensureAncestors(ctx context.Context, j *job.Job) error {
-	logger := o.Obs.Logger.With("job_id", j.ID, "phase", "ensure_ancestors")
-
-	// Build the list of intermediate path components.
-	// For "test/smoke" → ["/test"]
-	// For "a/b/c"      → ["/a", "/a/b"]
-	parts := strings.Split(strings.Trim(j.Path, "/"), "/")
-	now := time.Now().Unix()
-	ancestors := make([]cvmfscatalog.Entry, 0, len(parts)-1)
-	for i := 1; i < len(parts); i++ {
-		absPath := "/" + strings.Join(parts[:i], "/")
-		ancestors = append(ancestors, cvmfscatalog.Entry{
-			FullPath: absPath,
-			// Name is set by Merge's path-rewriting step (path.Base(absPath)).
-			Mode:  fs.ModeDir | 0o755,
-			Size:  4096,
-			Mtime: now,
-			UID:   0,
-			GID:   0,
-		})
-	}
-	logger.Info("adding ancestor directories via root-level publish",
-		"path", j.Path, "ancestors", len(ancestors))
-
-	// Use a dedicated sub-directory so ancestor catalogs don't collide with
-	// the main merge catalogs written to JobDir later.
-	ancTempDir := filepath.Join(o.Spool.JobDir(j), "ancestors")
-	if mkErr := os.MkdirAll(ancTempDir, 0o750); mkErr != nil {
-		return fmt.Errorf("ensure_ancestors: creating temp dir: %w", mkErr)
-	}
-
-	// Acquire a root-level lease so the merge sees the latest repo manifest
-	// and no concurrent publisher can modify the root catalog under us.
-	logger.Info("acquiring root-level lease for ancestor publish")
-	ancToken, leaseErr := o.Lease.Acquire(ctx, j.Repo, "")
-	if leaseErr != nil {
-		return fmt.Errorf("ensure_ancestors: acquiring root lease: %w", leaseErr)
-	}
-
-	// Ensure the lease is released (aborted) on any error path, including
-	// context cancellation and a failed Commit.
-	//
-	// We use context.Background() for the Abort call so that a cancelled ctx
-	// does not prevent the DELETE /api/v1/leases/<token> request from being
-	// sent — failing to abort leaves the lease held until gateway expiry and
-	// blocks subsequent publishers on the same repo.
-	committed := false
-	defer func() {
-		if !committed {
-			if abortErr := o.Lease.Abort(context.Background(), ancToken); abortErr != nil {
-				logger.Warn("ensure_ancestors: failed to abort ancestor lease on error path",
-					"token", ancToken, "error", abortErr)
-			}
-		}
-	}()
-
-	// Merge the synthetic ancestor entries into the root catalog.
-	// LeasePath="" → all paths are reportable → AddDirectory is called for
-	// each ancestor by the receiver's CatalogMergeTool.
-	ancMerge, mergeErr := cvmfscatalog.Merge(ctx, cvmfscatalog.MergeConfig{
-		Stratum0URL: o.Stratum0URL,
-		RepoName:    j.Repo,
-		LeasePath:   "",
-		TempDir:     ancTempDir,
-	}, ancestors)
-	if mergeErr != nil {
-		return fmt.Errorf("ensure_ancestors: catalog merge: %w", mergeErr)
-	}
-
-	// Upload the resulting catalog(s) to the CAS.
-	for _, catHash := range ancMerge.AllCatalogHashes {
-		catFilePath := filepath.Join(ancTempDir, cvmfshash.ObjectPath(catHash)+"C")
-		f, openErr := os.Open(catFilePath)
-		if openErr != nil {
-			return fmt.Errorf("ensure_ancestors: opening catalog %s: %w", catHash, openErr)
-		}
-		fi, statErr := f.Stat()
-		if statErr != nil {
-			f.Close()
-			return fmt.Errorf("ensure_ancestors: stat catalog %s: %w", catHash, statErr)
-		}
-		putErr := o.CAS.Put(ctx, catHash+"C", f, fi.Size())
-		f.Close()
-		if putErr != nil {
-			return fmt.Errorf("ensure_ancestors: uploading catalog %s: %w", catHash, putErr)
-		}
-	}
-
-	// Commit the preliminary root-level publish.
-	ancReq := lease.CommitRequest{
-		Token:               ancToken,
-		ObjectStore:         o.CAS,
-		OldRootHash:         ancMerge.OldRootHash,
-		NewRootHashSuffixed: ancMerge.NewRootHashSuffixed,
-	}
-	for _, h := range ancMerge.AllCatalogHashes {
-		ancReq.ObjectHashes = append(ancReq.ObjectHashes, h+"C")
-	}
-
-	logger.Info("committing ancestor publish",
-		"old_root", ancMerge.OldRootHash,
-		"new_root", ancMerge.NewRootHashSuffixed)
-	if commitErr := o.Lease.Commit(ctx, ancReq); commitErr != nil {
-		// defer will abort the lease.
-		return fmt.Errorf("ensure_ancestors: commit failed: %w", commitErr)
-	}
-
-	committed = true // disarm the deferred abort
-	logger.Info("ancestor publish complete")
-	return nil
 }

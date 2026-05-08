@@ -64,9 +64,15 @@ func TestRunContextCancelledNoPanic(t *testing.T) {
 }
 
 // compressZlib compresses data with zlib and returns the compressed bytes.
+// compressZlib compresses data at the given zlib level.
+// Pass zlib.DefaultCompression (-1) to match compressEntry(entry, chunkSize, 0).
 func compressZlib(data []byte) []byte {
+	return compressZlibLevel(data, zlib.DefaultCompression)
+}
+
+func compressZlibLevel(data []byte, level int) []byte {
 	var buf bytes.Buffer
-	w, _ := zlib.NewWriterLevel(&buf, zlib.BestCompression)
+	w, _ := zlib.NewWriterLevel(&buf, level)
 	w.Write(data) //nolint:errcheck
 	w.Close()     //nolint:errcheck
 	return buf.Bytes()
@@ -89,7 +95,7 @@ func TestCompressSmallFileNotChunked(t *testing.T) {
 		Data:    data,
 	}
 
-	result, err := compressEntry(entry, 4*1024*1024) // 4 MB chunk size
+	result, err := compressEntry(entry, 4*1024*1024, 0) // 4 MB chunk size
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -116,7 +122,7 @@ func TestCompressZeroChunkSizeNoChunking(t *testing.T) {
 		Data:    data,
 	}
 
-	result, err := compressEntry(entry, 0) // 0 = no chunking
+	result, err := compressEntry(entry, 0, 0) // 0 = no chunking
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -144,7 +150,7 @@ func TestCompressChunked(t *testing.T) {
 	}
 
 	chunkSize := int64(4 * 1024 * 1024) // 4 MB
-	result, err := compressEntry(entry, chunkSize)
+	result, err := compressEntry(entry, chunkSize, 0)
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -201,7 +207,7 @@ func TestCompressBulkHashMatchesFullContent(t *testing.T) {
 		Data:    data,
 	}
 
-	result, err := compressEntry(entry, 0) // No chunking
+	result, err := compressEntry(entry, 0, 0) // No chunking
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -231,7 +237,7 @@ func TestCompressChunkHashesCorrect(t *testing.T) {
 
 	// 6 bytes per chunk
 	chunkSize := int64(6)
-	result, err := compressEntry(entry, chunkSize)
+	result, err := compressEntry(entry, chunkSize, 0)
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -262,7 +268,7 @@ func TestCompressDirectory(t *testing.T) {
 		ModTime: time.Now(),
 	}
 
-	result, err := compressEntry(entry, 1024)
+	result, err := compressEntry(entry, 1024, 0)
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -284,7 +290,7 @@ func TestCompressSymlink(t *testing.T) {
 		LinkTarget: "/target",
 	}
 
-	result, err := compressEntry(entry, 1024)
+	result, err := compressEntry(entry, 1024, 0)
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -374,7 +380,7 @@ func TestCompressEntryChunkedGuardNonPositiveChunkSize(t *testing.T) {
 	}
 
 	for _, badSize := range []int64{0, -1, -1024} {
-		_, err := compressEntryChunked(entry, badSize)
+		_, err := compressEntryChunked(entry, badSize, 0)
 		if err == nil {
 			t.Errorf("chunkSize=%d: expected error, got nil", badSize)
 		}
@@ -395,7 +401,7 @@ func TestCompressZeroChunkSizeFallsBackToWhole(t *testing.T) {
 		Data:    data,
 	}
 
-	result, err := compressEntry(entry, 0) // chunkSize=0 means no chunking
+	result, err := compressEntry(entry, 0, 0) // chunkSize=0 means no chunking
 	if err != nil {
 		t.Fatalf("compressEntry(chunkSize=0) failed: %v", err)
 	}
@@ -428,7 +434,7 @@ func TestChunkCompressedSizeMatchesLen(t *testing.T) {
 		Data:    data,
 	}
 
-	result, err := compressEntry(entry, chunkSize)
+	result, err := compressEntry(entry, chunkSize, 0)
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}
@@ -471,7 +477,7 @@ func TestChunkBufferReuse(t *testing.T) {
 		Data:    data,
 	}
 
-	result, err := compressEntry(entry, chunkSize)
+	result, err := compressEntry(entry, chunkSize, 0)
 	if err != nil {
 		t.Fatalf("compressEntry failed: %v", err)
 	}

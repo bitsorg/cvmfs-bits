@@ -36,6 +36,10 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
+
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 // buildCvmfsPackHeader constructs the CVMFS object pack text header for a
@@ -196,42 +200,87 @@ func (c *Client) submitOneObject(ctx context.Context, basePayloadURL, token, has
 	return nil
 }
 
+// defaultSubmitConc is the number of object uploads that SubmitPayload runs in
+// parallel within a single lease.  The gateway accepts concurrent payload POSTs
+// per lease; serialising them (the old behaviour) left the gateway idle between
+// each round-trip, making large publishes wall-clock bound by N×RTT.
+//
+// The catalog is always uploaded last (after the semaphore drains) to satisfy
+// the gateway's referential-integrity requirement: the receiver must have all
+// chunk objects before it processes the root catalog.
+const defaultSubmitConc = 8
+
 // SubmitPayload uploads all staged CAS objects (file chunks + catalog) to the
 // gateway using the binary framing protocol required by cvmfs_gateway.
 //
-// Objects are uploaded in the order given (objectHashes first, then
-// catalogHash last so the gateway sees the catalog only after all its
-// referenced chunks are present).
+// File-chunk objects are uploaded concurrently (up to defaultSubmitConc in
+// parallel) to overlap network round-trips.  The catalog is always sent last,
+// after all chunk uploads have completed, so the gateway's referential-
+// integrity check never sees a catalog that references missing chunks.
 func (c *Client) SubmitPayload(ctx context.Context, token, catalogHash string, objectHashes []string, store ObjectReader) error {
 	ctx, span := c.obs.Tracer.Start(ctx, "lease.submit_payload")
 	defer span.End()
 
 	payloadURL := fmt.Sprintf("%s/api/v1/payloads", c.BaseURL)
 
-	// Upload file-chunk objects first, catalog last.
-	allHashes := append(append([]string(nil), objectHashes...), catalogHash)
-
-	for _, hash := range allHashes {
-		if hash == "" {
-			continue
-		}
-
-		// Read compressed object bytes from the local CAS.
+	// submitOne reads the object from CAS and POSTs it to the gateway.
+	submitOne := func(ctx context.Context, hash string) error {
 		rc, err := store.Get(ctx, hash)
 		if err != nil {
-			span.RecordError(err)
 			return fmt.Errorf("reading object %s from CAS: %w", hash, err)
 		}
 		objBytes, readErr := io.ReadAll(rc)
 		rc.Close()
 		if readErr != nil {
-			span.RecordError(readErr)
 			return fmt.Errorf("reading object %s bytes: %w", hash, readErr)
 		}
+		return c.submitOneObject(ctx, payloadURL, token, hash, objBytes)
+	}
 
-		if err := c.submitOneObject(ctx, payloadURL, token, hash, objBytes); err != nil {
+	// Upload file-chunk objects concurrently.  The semaphore bounds memory
+	// usage: at most defaultSubmitConc objects (each up to ChunkSize bytes)
+	// are held in memory simultaneously.
+	eg, egCtx := errgroup.WithContext(ctx)
+	sem := semaphore.NewWeighted(defaultSubmitConc)
+	var firstErrOnce sync.Once
+	var firstErr error
+
+	for _, hash := range objectHashes {
+		if hash == "" {
+			continue
+		}
+		hash := hash
+		if err := sem.Acquire(egCtx, 1); err != nil {
+			// Context cancelled — stop queuing new work.
+			firstErrOnce.Do(func() { firstErr = err })
+			break
+		}
+		eg.Go(func() error {
+			defer sem.Release(1)
+			if err := submitOne(egCtx, hash); err != nil {
+				span.RecordError(err)
+				return fmt.Errorf("object %s: %w", hash, err)
+			}
+			return nil
+		})
+	}
+
+	// Wait for all chunk uploads before proceeding to the catalog.
+	if err := eg.Wait(); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	if firstErr != nil {
+		span.RecordError(firstErr)
+		return firstErr
+	}
+
+	// Upload the catalog last — referential integrity requires all chunks
+	// to be present before the receiver processes the catalog.
+	if catalogHash != "" {
+		if err := submitOne(ctx, catalogHash); err != nil {
 			span.RecordError(err)
-			return fmt.Errorf("object %s: %w", hash, err)
+			return fmt.Errorf("catalog object %s: %w", catalogHash, err)
 		}
 	}
 

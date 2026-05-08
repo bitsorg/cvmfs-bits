@@ -250,7 +250,7 @@ func TestSubmitJob_InvalidTagName_JSON(t *testing.T) {
 	}
 	nb := notify.NewBus()
 	orch := &Orchestrator{Spool: sp, Notify: nb, Obs: obs, Lease: &noopBackend{}}
-	srv := New(obs, "", orch, sp, nb, spoolDir, stagingDir)
+	srv := New(obs, "", orch, sp, nb, spoolDir, stagingDir, 0 /*minConcurrentJobs: disabled*/, 0 /*maxConcurrentJobs: numCPU*/)
 
 	// Write a dummy tar to the staging dir and compute its SHA-256.
 	tarContent := []byte("dummy tar content for JSON tag rejection test")

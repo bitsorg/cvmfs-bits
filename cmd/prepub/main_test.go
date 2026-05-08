@@ -163,6 +163,8 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	casType := "localfs"
 	casRoot := "/var/lib/cas"
 	stratum0URL := ""
+	repoName := ""
+	jobTimeout := time.Duration(0)
 	s1Endpoints := ""
 	s1Quorum := 1.0
 	s1Timeout := 60 * time.Second
@@ -186,6 +188,9 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	repos := ""
 	coordURL := ""
 	recvStratum0URL := ""
+	minConcurrentJobs := 0
+	maxConcurrentJobs := 0
+	bloomFilter := false
 	bloomSnapshotDir := ""
 	bloomNodeID := ""
 	bloomMaxSnapshotAge := time.Duration(0)
@@ -197,11 +202,17 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	rekorServer := ""
 	rekorSigningKey := ""
 	oidcIssuers := ""
+	swissknife := false
+	swissknifeBinary := ""
+	swisskniferepokeys := ""
+	swissknifeConcurrency := 0
+	swissknifExtraArgs := ""
 
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
-		&stratum0URL,
+		&stratum0URL, &repoName,
+		&jobTimeout, &minConcurrentJobs, &maxConcurrentJobs,
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency, &s1MaxAttempts, &s1QueueDepth,
 		&s1AttemptTimeout, &s1InitialBackoff, &s1MaxBackoff,
@@ -210,10 +221,11 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
 		&nodeID, &repos, &coordURL, &recvStratum0URL,
-		&bloomSnapshotDir, &bloomNodeID,
+		&bloomFilter, &bloomSnapshotDir, &bloomNodeID,
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
+		&swissknife, &swissknifeBinary, &swisskniferepokeys, &swissknifeConcurrency, &swissknifExtraArgs,
 	)
 
 	if spoolRoot != "/from/config" {
@@ -246,6 +258,8 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	casType := "localfs"
 	casRoot := "/var/lib/cas"
 	stratum0URL := ""
+	repoName2 := ""
+	jobTimeout2 := time.Duration(0)
 	s1Endpoints := ""
 	s1Quorum := 1.0
 	s1Timeout := 60 * time.Second
@@ -259,6 +273,9 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	sessionTTL := time.Hour
 	diskHeadroom := 1.2
 	nodeID, repos, coordURL, recvStratum0URL := "", "", "", ""
+	minConcurrentJobs2 := 0
+	maxConcurrentJobs2 := 0
+	bloomFilter2 := false
 	bloomSnapshotDir, bloomNodeID := "", ""
 	bloomMaxSnapshotAge := time.Duration(0)
 	bloomFilterCapacity := uint(0)
@@ -267,11 +284,17 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
+	swissknife2 := false
+	swissknifeBinary2 := ""
+	swisskniferepokeys2 := ""
+	swissknifeConcurrency2 := 0
+	swissknifExtraArgs2 := ""
 
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
-		&stratum0URL,
+		&stratum0URL, &repoName2,
+		&jobTimeout2, &minConcurrentJobs2, &maxConcurrentJobs2,
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency2, &s1MaxAttempts2, &s1QueueDepth2,
 		&s1AttemptTimeout2, &s1InitialBackoff2, &s1MaxBackoff2,
@@ -280,10 +303,11 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
 		&nodeID, &repos, &coordURL, &recvStratum0URL,
-		&bloomSnapshotDir, &bloomNodeID,
+		&bloomFilter2, &bloomSnapshotDir, &bloomNodeID,
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
+		&swissknife2, &swissknifeBinary2, &swisskniferepokeys2, &swissknifeConcurrency2, &swissknifExtraArgs2,
 	)
 
 	// spool-root was explicitly set on CLI — config value must not override it.
@@ -303,6 +327,8 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	devMode := false
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot := "/sp", "", ":8080", "gateway", "https://gw", "/cvmfs", "localfs", "/cas"
 	stratum0URL := ""
+	repoName3 := ""
+	jobTimeout3 := time.Duration(0)
 	s1Quorum := 1.0
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout := 60*time.Second, time.Duration(0), 30*time.Second
 	s1WorkerConcurrency3, s1MaxAttempts3, s1QueueDepth3 := 0, 0, 0
@@ -313,6 +339,9 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	sessionTTL := time.Hour
 	diskHeadroom := 1.2
 	nodeID, repos, coordURL, recvStratum0URL3 := "", "", "", ""
+	minConcurrentJobs3 := 0
+	maxConcurrentJobs3 := 0
+	bloomFilter3 := false
 	bloomSnapshotDir, bloomNodeID := "", ""
 	bloomMaxSnapshotAge := time.Duration(0)
 	bloomFilterCapacity := uint(0)
@@ -321,11 +350,17 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
+	swissknife3 := false
+	swissknifeBinary3 := ""
+	swisskniferepokeys3 := ""
+	swissknifeConcurrency3 := 0
+	swissknifExtraArgs3 := ""
 
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
-		&stratum0URL,
+		&stratum0URL, &repoName3,
+		&jobTimeout3, &minConcurrentJobs3, &maxConcurrentJobs3,
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency3, &s1MaxAttempts3, &s1QueueDepth3,
 		&s1AttemptTimeout3, &s1InitialBackoff3, &s1MaxBackoff3,
@@ -334,10 +369,11 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
 		&nodeID, &repos, &coordURL, &recvStratum0URL3,
-		&bloomSnapshotDir, &bloomNodeID,
+		&bloomFilter3, &bloomSnapshotDir, &bloomNodeID,
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
+		&swissknife3, &swissknifeBinary3, &swisskniferepokeys3, &swissknifeConcurrency3, &swissknifExtraArgs3,
 	)
 
 	// Endpoints slice should be joined with comma.

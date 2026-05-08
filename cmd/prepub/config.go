@@ -60,13 +60,46 @@ type fileConfig struct {
 	SpoolRoot   string `yaml:"spool_root"`
 	StagingRoot string `yaml:"staging_root"`
 	PublishMode string `yaml:"publish_mode"`
-	CVMFSMount  string `yaml:"cvmfs_mount"`
+	// JobTimeout is the maximum wall-clock time a single job may run before it
+	// is cancelled.  Zero (default) means no timeout.
+	JobTimeout yamlDuration `yaml:"job_timeout"`
+	// MinConcurrentJobs is the guaranteed floor for the dynamic concurrency
+	// limit.  The effective slot count is max(MinConcurrentJobs, numCPU - load1min).
+	// 0 (default) falls back to the CLI flag default (4).
+	MinConcurrentJobs int `yaml:"min_concurrent_jobs"`
+	// MaxConcurrentJobs is the ceiling for the dynamic concurrency limit.
+	// 0 (default) means runtime.NumCPU().
+	MaxConcurrentJobs int    `yaml:"max_concurrent_jobs"`
+	CVMFSMount        string `yaml:"cvmfs_mount"`
+
+	// SwissKnife groups configuration for the cvmfs_swissknife ingest
+	// alternative publish path.  Leave the block absent (or set enabled: false)
+	// to use the default Go pipeline.
+	SwissKnife struct {
+		// Enabled activates the swissknife ingest path (--swissknife flag).
+		Enabled bool `yaml:"enabled"`
+		// Binary overrides the path to the cvmfs_swissknife executable.
+		Binary string `yaml:"binary"`
+		// RepoKeysDir is the repository public-key directory (-k flag).
+		RepoKeysDir string `yaml:"repo_keys_dir"`
+		// Concurrency sets the swissknife upload thread count (-q flag).
+		// 0 means use the swissknife default.
+		Concurrency int `yaml:"concurrency"`
+		// ExtraArgs are space-separated additional flags appended verbatim.
+		ExtraArgs string `yaml:"extra_args"`
+	} `yaml:"swissknife"`
 	// Stratum0URL is the base URL of the Stratum 0 CVMFS server
 	// (e.g. "http://stratum0/cvmfs").  Required in gateway mode so the
 	// orchestrator can fetch the existing root catalog for merging.
 	// Without this the catalog merge step is skipped (only valid for the
 	// very first publish of an empty repository).
 	Stratum0URL string `yaml:"stratum0_url"`
+	// RepoName is the CVMFS repository name for catalog-based dedup seeding at
+	// startup (e.g. "atlas.cern.ch").  When set alongside stratum0_url, the
+	// Bloom filter is seeded by walking the CVMFS catalog tree rather than
+	// scanning the CAS filesystem — much faster for large repositories.
+	// Leave empty to fall back to the CAS walk (safe, just slower).
+	RepoName string `yaml:"repo_name"`
 
 	Server struct {
 		Listen  string `yaml:"listen"`
@@ -93,13 +126,13 @@ type fileConfig struct {
 		MQTTQuorumTimeout yamlDuration `yaml:"mqtt_quorum_timeout"`
 
 		// Queue-driven worker settings (Manager).
-		WorkerConcurrency  int          `yaml:"worker_concurrency"`
-		QueueDepth         int          `yaml:"queue_depth"`
-		AttemptTimeout     yamlDuration `yaml:"attempt_timeout"`
-		InitialBackoff     yamlDuration `yaml:"initial_backoff"`
-		MaxBackoff         yamlDuration `yaml:"max_backoff"`
-		WorkerMaxAttempts  int          `yaml:"worker_max_attempts"`
-		QueueSpoolDir      string       `yaml:"queue_spool_dir"`
+		WorkerConcurrency int          `yaml:"worker_concurrency"`
+		QueueDepth        int          `yaml:"queue_depth"`
+		AttemptTimeout    yamlDuration `yaml:"attempt_timeout"`
+		InitialBackoff    yamlDuration `yaml:"initial_backoff"`
+		MaxBackoff        yamlDuration `yaml:"max_backoff"`
+		WorkerMaxAttempts int          `yaml:"worker_max_attempts"`
+		QueueSpoolDir     string       `yaml:"queue_spool_dir"`
 	} `yaml:"distribution"`
 
 	// MQTT broker settings — used by both publisher and receiver.
@@ -125,7 +158,10 @@ type fileConfig struct {
 	// Equivalent to --receiver-stratum0-url.
 	ReceiverStratum0URL string `yaml:"receiver_stratum0_url"`
 
-	// Shared Bloom filter (publisher).
+	// Bloom filter dedup (publisher).
+	// BloomFilter enables the in-process Bloom filter for dedup checking.
+	// Setting bloom_snapshot_dir also implies bloom_filter = true.
+	BloomFilter         bool         `yaml:"bloom_filter"`
 	BloomSnapshotDir    string       `yaml:"bloom_snapshot_dir"`
 	BloomNodeID         string       `yaml:"bloom_node_id"`
 	BloomMaxSnapshotAge yamlDuration `yaml:"bloom_max_snapshot_age"`
@@ -183,7 +219,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	mode, logLevel *string,
 	devMode *bool,
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot *string,
-	stratum0URL *string,
+	stratum0URL, repoName *string,
+	jobTimeout *time.Duration,
+	minConcurrentJobs, maxConcurrentJobs *int,
 	s1Endpoints *string,
 	s1Quorum *float64,
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout *time.Duration,
@@ -195,6 +233,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	sessionTTL *time.Duration,
 	diskHeadroom *float64,
 	nodeID, repos, coordURL, recvStratum0URL *string,
+	bloomFilter *bool,
 	bloomSnapshotDir, bloomNodeID *string,
 	bloomMaxSnapshotAge *time.Duration,
 	bloomFilterCapacity *uint,
@@ -203,6 +242,10 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	recvBloomFPRate *float64,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
+	swissknife *bool,
+	swissknifeBinary, swisskniferepokeys *string,
+	swissknifeConcurrency *int,
+	swissknifExtraArgs *string,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -234,8 +277,25 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("gateway-url", gatewayURL, fc.Gateway.URL)
 	str("cvmfs-mount", cvmfsMount, fc.CVMFSMount)
 	str("stratum0-url", stratum0URL, fc.Stratum0URL)
+	str("repo-name", repoName, fc.RepoName)
 	str("cas-type", casType, fc.CAS.Type)
 	str("cas-root", casRoot, fc.CAS.Root)
+	dur("job-timeout", jobTimeout, fc.JobTimeout)
+	if !has("min-concurrent-jobs") && fc.MinConcurrentJobs != 0 {
+		*minConcurrentJobs = fc.MinConcurrentJobs
+	}
+	if !has("max-concurrent-jobs") && fc.MaxConcurrentJobs != 0 {
+		*maxConcurrentJobs = fc.MaxConcurrentJobs
+	}
+	if !has("swissknife") && fc.SwissKnife.Enabled {
+		*swissknife = true
+	}
+	str("swissknife-binary", swissknifeBinary, fc.SwissKnife.Binary)
+	str("swissknife-repo-keys", swisskniferepokeys, fc.SwissKnife.RepoKeysDir)
+	if !has("swissknife-concurrency") && fc.SwissKnife.Concurrency != 0 {
+		*swissknifeConcurrency = fc.SwissKnife.Concurrency
+	}
+	str("swissknife-extra-args", swissknifExtraArgs, fc.SwissKnife.ExtraArgs)
 
 	// server.tls_cert / tls_key apply to both publisher and receiver.
 	str("tls-cert", tlsCert, fc.Server.TLSCert)
@@ -284,6 +344,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("receiver-stratum0-url", recvStratum0URL, fc.ReceiverStratum0URL)
 
 	// Bloom filter (publisher).
+	if !has("bloom-filter") && fc.BloomFilter {
+		*bloomFilter = true
+	}
 	str("bloom-snapshot-dir", bloomSnapshotDir, fc.BloomSnapshotDir)
 	str("bloom-node-id", bloomNodeID, fc.BloomNodeID)
 	dur("bloom-max-snapshot-age", bloomMaxSnapshotAge, fc.BloomMaxSnapshotAge)

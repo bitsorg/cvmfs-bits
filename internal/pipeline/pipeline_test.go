@@ -164,3 +164,128 @@ func TestPipelineChunkedFileMetaIsCorrect(t *testing.T) {
 		}
 	}
 }
+
+// ── Prefetch tests ────────────────────────────────────────────────────────────
+
+// TestPrefetchSortsLargestFirst verifies that PrefetchFromReader returns entries
+// sorted by descending size (largest first), matching the invariant that
+// RunFromReader uses for compress worker scheduling.
+func TestPrefetchSortsLargestFirst(t *testing.T) {
+	obs := newTestObs(t)
+	tarData := buildTar([]struct{ name, content string }{
+		{"small.txt", "x"},
+		{"large.txt", "a very large content string here"},
+		{"medium.txt", "medium content"},
+	})
+
+	prefetch, err := PrefetchFromReader(context.Background(), bytes.NewReader(tarData), obs)
+	if err != nil {
+		t.Fatalf("PrefetchFromReader: %v", err)
+	}
+	if len(prefetch.SortedEntries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(prefetch.SortedEntries))
+	}
+	// Verify descending size order.
+	for i := 1; i < len(prefetch.SortedEntries); i++ {
+		if prefetch.SortedEntries[i].Size > prefetch.SortedEntries[i-1].Size {
+			t.Errorf("entry[%d].Size=%d > entry[%d].Size=%d — not sorted largest-first",
+				i, prefetch.SortedEntries[i].Size, i-1, prefetch.SortedEntries[i-1].Size)
+		}
+	}
+}
+
+// TestPrefetchRejectsDuplicates verifies that PrefetchFromReader rejects a tar
+// with duplicate paths, matching RunFromReader's behaviour.
+func TestPrefetchRejectsDuplicates(t *testing.T) {
+	obs := newTestObs(t)
+	tarData := buildTar([]struct{ name, content string }{
+		{"dup.txt", "first"},
+		{"dup.txt", "second"},
+	})
+	_, err := PrefetchFromReader(context.Background(), bytes.NewReader(tarData), obs)
+	if err == nil {
+		t.Fatal("expected error for duplicate path in tar, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error %q should mention 'duplicate'", err.Error())
+	}
+}
+
+// TestRunFromPrefetchProducesSameResultAsRunFromReader verifies that
+// RunFromPrefetch(Prefetch(tar)) and RunFromReader(tar) produce identical
+// results (same NFiles, same ObjectHashes set).
+func TestRunFromPrefetchProducesSameResultAsRunFromReader(t *testing.T) {
+	obs := newTestObs(t)
+
+	tarData := buildTar([]struct{ name, content string }{
+		{"a.txt", "content a"},
+		{"b.txt", "content b longer"},
+		{"c.txt", "c"},
+	})
+
+	makeCfg := func(spoolDir string) Config {
+		return Config{
+			Workers:  1,
+			CAS:      fakecas.New(obs),
+			SpoolDir: spoolDir,
+			Obs:      obs,
+		}
+	}
+
+	// Run via RunFromReader (baseline).
+	baseResult, err := RunFromReader(
+		context.Background(),
+		bytes.NewReader(tarData),
+		makeCfg(t.TempDir()),
+	)
+	if err != nil {
+		t.Fatalf("RunFromReader: %v", err)
+	}
+
+	// Run via Prefetch + RunFromPrefetch.
+	prefetch, err := PrefetchFromReader(
+		context.Background(),
+		bytes.NewReader(tarData),
+		obs,
+	)
+	if err != nil {
+		t.Fatalf("PrefetchFromReader: %v", err)
+	}
+	prefetchResult, err := RunFromPrefetch(
+		context.Background(),
+		prefetch,
+		makeCfg(t.TempDir()),
+	)
+	if err != nil {
+		t.Fatalf("RunFromPrefetch: %v", err)
+	}
+
+	// Both paths must produce the same file count.
+	if prefetchResult.NFiles != baseResult.NFiles {
+		t.Errorf("NFiles: prefetch=%d base=%d", prefetchResult.NFiles, baseResult.NFiles)
+	}
+	// Both paths must produce the same number of objects.
+	if len(prefetchResult.ObjectHashes) != len(baseResult.ObjectHashes) {
+		t.Errorf("ObjectHashes len: prefetch=%d base=%d",
+			len(prefetchResult.ObjectHashes), len(baseResult.ObjectHashes))
+	}
+	// Both paths must produce the same raw byte count.
+	if prefetchResult.NBytesRaw != baseResult.NBytesRaw {
+		t.Errorf("NBytesRaw: prefetch=%d base=%d", prefetchResult.NBytesRaw, baseResult.NBytesRaw)
+	}
+}
+
+// TestPrefetchNilObsDoesNotPanic verifies that passing nil obs to
+// PrefetchFromReader does not panic (the obs nil-guard is exercised).
+func TestPrefetchNilObsDoesNotPanic(t *testing.T) {
+	tarData := buildTar([]struct{ name, content string }{
+		{"f.txt", "data"},
+	})
+	prefetch, err := PrefetchFromReader(context.Background(), bytes.NewReader(tarData), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(prefetch.SortedEntries) != 1 {
+		t.Errorf("expected 1 entry, got %d", len(prefetch.SortedEntries))
+	}
+}

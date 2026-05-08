@@ -37,7 +37,7 @@ func TestCluster(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Run(ctx, j); err != nil {
+	if err := orch.Run(ctx, j, nil); err != nil {
 		t.Logf("orchestrator result: %v", err)
 		// For now, don't fail on error - the mock components may not be fully functional
 	}
@@ -70,7 +70,7 @@ func TestPipelineStagesInstrumented(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Run(ctx, j); err != nil {
+	if err := orch.Run(ctx, j, nil); err != nil {
 		t.Logf("orchestrator result: %v", err)
 	}
 

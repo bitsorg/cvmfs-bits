@@ -94,6 +94,61 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	return m, nil
 }
 
+// FetchManifestRootHash performs a lightweight GET of the .cvmfspublished
+// manifest for the given repository and returns the current root catalog hash
+// with the CVMFS catalog content-type suffix 'C' appended (e.g. "abc123...C",
+// 41 chars for SHA-1).
+//
+// Returns ("", nil) when the repository has never been published (HTTP 404).
+// This is used by the orchestrator to obtain old_root_hash after acquiring a
+// gateway lease but before committing, without downloading the full root
+// catalog SQLite (which Merge requires but BuildSubtree does not).
+//
+// The HTTP request is made with the provided context so that job cancellation
+// and per-lease heartbeat timeouts propagate correctly.  client may be nil,
+// in which case http.DefaultClient is used.
+func FetchManifestRootHash(ctx context.Context, client *http.Client, stratum0URL, repo string) (string, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	manifestURL := stratum0URL + "/" + repo + "/.cvmfspublished"
+	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("creating manifest request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetching manifest: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil // first publish — no existing manifest
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("manifest http %d: %s", resp.StatusCode, manifestURL)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading manifest: %w", err)
+	}
+
+	manifest, err := ParseManifest(data)
+	if err != nil {
+		return "", fmt.Errorf("parsing manifest: %w", err)
+	}
+
+	if manifest.RootHash == "" {
+		return "", nil
+	}
+	// Append 'C' (CVMFS catalog content-type suffix) so the receiver's
+	// LoadCatalogByHash assertion (assert kSuffixCatalog == effective_hash.suffix)
+	// is satisfied.  ParseManifest already strips any algorithm suffix ("-", "~"),
+	// leaving a plain hex hash.
+	return manifest.RootHash + "C", nil
+}
+
 // DownloadObject fetches and decompresses a regular content object (NOT a
 // catalog) from a stratum0 HTTP CAS.  hashHex is the plain hex hash without
 // any suffix; algo is the hash algorithm used to construct the URL suffix

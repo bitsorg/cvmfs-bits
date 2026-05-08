@@ -59,6 +59,12 @@ type Server struct {
 	// jobWg tracks all background job goroutines so Shutdown can wait for them
 	// to reach a terminal state before the process exits.
 	jobWg sync.WaitGroup
+	// dynaSem limits the number of concurrently active jobs and adjusts its
+	// effective slot count dynamically with the system load (non-nil when
+	// minConcurrentJobs > 0 was passed to New).  Jobs wait in StateIncoming
+	// until a slot opens; the per-job timeout starts AFTER the slot is
+	// acquired, so queue-wait time does not count against the deadline.
+	dynaSem *DynamicSemaphore
 }
 
 // New creates a new API server.
@@ -66,7 +72,12 @@ type Server struct {
 // Pass an empty string to disable authentication (development only).
 // stagingRoot, when non-empty, enables the JSON tar_path submission mode and
 // restricts acceptable tar_path values to files within that directory tree.
-func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.Spool, nb *notify.Bus, spoolRoot, stagingRoot string) *Server {
+// minConcurrentJobs is the guaranteed floor for the dynamic concurrency limit
+// (effective slots = max(minConcurrentJobs, numCPU - load1min)).  Pass 0 to
+// disable the limit (all submitted jobs start immediately — legacy behaviour).
+// maxConcurrentJobs caps the dynamic limit at an explicit ceiling; 0 means
+// runtime.NumCPU().
+func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.Spool, nb *notify.Bus, spoolRoot, stagingRoot string, minConcurrentJobs, maxConcurrentJobs int) *Server {
 	router := mux.NewRouter()
 	s := &Server{
 		router:      router,
@@ -81,10 +92,26 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 			Handler: router,
 		},
 	}
+	if minConcurrentJobs > 0 {
+		s.dynaSem = NewDynamicSemaphore(minConcurrentJobs, maxConcurrentJobs, obs.Logger)
+		obs.Logger.Info("server: dynamic job concurrency enabled",
+			"min_slots", minConcurrentJobs,
+			"max_slots", s.dynaSem.maxSlots,
+			"note", "effective limit = max(min_slots, max_slots - load1min); timeout starts after slot acquisition")
+	}
 
 	// Unauthenticated routes.
 	s.router.Handle("/api/v1/metrics", promhttp.Handler())
 	s.router.HandleFunc("/api/v1/health", s.health).Methods("GET")
+	s.router.HandleFunc("/api/v1/config", s.getConfig).Methods("GET")
+
+	// Console — unauthenticated (read-only, no secrets exposed).
+	s.router.HandleFunc("/", s.consoleHandler).Methods("GET")
+	s.router.HandleFunc("/jobs", s.consoleHandler).Methods("GET")
+	s.router.HandleFunc("/jobs/{id}", s.jobDetailHandler).Methods("GET")
+
+	// PATCH /api/v1/config requires auth (it mutates server state).
+	s.router.Handle("/api/v1/config", s.requireAuth(http.HandlerFunc(s.patchConfig))).Methods("PATCH")
 
 	// Critical #4: All job routes require a valid bearer token.
 	auth := s.router.PathPrefix("/api/v1/jobs").Subrouter()
@@ -94,6 +121,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	auth.HandleFunc("/{id}", s.getJob).Methods("GET")
 	auth.HandleFunc("/{id}/abort", s.abortJobHandler).Methods("POST")
 	auth.HandleFunc("/{id}/events", s.jobEvents).Methods("GET")
+	auth.HandleFunc("/{id}/log", s.jobLogHandler).Methods("GET")
 
 	return s
 }
@@ -143,6 +171,12 @@ func (s *Server) ListenAndServe(addr string) error {
 // transfers finish their current attempt.  Pending spool items are retried on
 // the next start.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Stop the dynamic semaphore load-poller first so it doesn't interfere
+	// with the graceful drain below.
+	if s.dynaSem != nil {
+		s.dynaSem.Stop()
+	}
+
 	httpErr := s.httpServer.Shutdown(ctx)
 
 	// Phase 1: wait for all job goroutines and webhook deliveries.
@@ -219,18 +253,34 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type jobEntry struct {
-		JobID            string    `json:"job_id"`
-		State            string    `json:"state"`
-		Repo             string    `json:"repo"`
-		Path             string    `json:"path,omitempty"`
-		TagName          string    `json:"tag_name,omitempty"`
-		NObjects         int       `json:"n_objects,omitempty"`
-		NBytesRaw        int64     `json:"n_bytes_raw,omitempty"`
-		NBytesCompressed int64     `json:"n_bytes_compressed,omitempty"`
-		NewRootHash      string    `json:"new_root_hash,omitempty"`
-		Error            string    `json:"error,omitempty"`
-		CreatedAt        time.Time `json:"created_at"`
-		UpdatedAt        time.Time `json:"updated_at"`
+		JobID    string `json:"job_id"`
+		State    string `json:"state"`
+		Repo     string `json:"repo"`
+		Path     string `json:"path,omitempty"`
+		TagName  string `json:"tag_name,omitempty"`
+		TarName  string `json:"tar_name,omitempty"`
+		TarSize  int64  `json:"tar_size,omitempty"`
+		NObjects int    `json:"n_objects,omitempty"`
+		// NNewObjects is the count of objects freshly uploaded in this pipeline
+		// run (dedup hits excluded).  Used by the S1 distribution backlog so
+		// the object count matches what is actually being pushed to S1.
+		NNewObjects      int    `json:"n_new_objects,omitempty"`
+		NBytesRaw        int64  `json:"n_bytes_raw,omitempty"`
+		NBytesCompressed int64  `json:"n_bytes_compressed,omitempty"`
+		NewRootHash      string `json:"new_root_hash,omitempty"`
+		Error            string `json:"error,omitempty"`
+		// FailedAtState is the FSM state the job was in when it failed
+		// (e.g. "leased", "committing").  Empty for non-failed jobs.
+		FailedAtState string    `json:"failed_at_state,omitempty"`
+		CreatedAt     time.Time `json:"created_at"`
+		UpdatedAt     time.Time `json:"updated_at"`
+		// Distribution timestamps and counters for S1 backlog display in the console.
+		// DistributingStartedAt / DistributingEndedAt use omitempty so zero-value
+		// time.Time values are omitted; the JS checks for field presence.
+		DistributingStartedAt time.Time `json:"distributing_started_at,omitempty"`
+		DistributingEndedAt   time.Time `json:"distributing_ended_at,omitempty"`
+		DistributionConfirmed int       `json:"distribution_confirmed,omitempty"`
+		DistributionTotal     int       `json:"distribution_total,omitempty"`
 	}
 
 	var jobs []jobEntry
@@ -254,18 +304,26 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			jobs = append(jobs, jobEntry{
-				JobID:            j.ID,
-				State:            string(j.State),
-				Repo:             j.Repo,
-				Path:             j.Path,
-				TagName:          j.TagName,
-				NObjects:         j.NObjects,
-				NBytesRaw:        j.NBytesRaw,
-				NBytesCompressed: j.NBytesCompressed,
-				NewRootHash:      j.NewRootHash,
-				Error:            j.Error,
-				CreatedAt:        j.CreatedAt,
-				UpdatedAt:        j.UpdatedAt,
+				JobID:                 j.ID,
+				State:                 string(j.State),
+				Repo:                  j.Repo,
+				Path:                  j.Path,
+				TagName:               j.TagName,
+				TarName:               j.TarName,
+				TarSize:               j.TarSize,
+				NObjects:              j.NObjects,
+				NNewObjects:           j.NNewObjects,
+				NBytesRaw:             j.NBytesRaw,
+				NBytesCompressed:      j.NBytesCompressed,
+				NewRootHash:           j.NewRootHash,
+				Error:                 j.Error,
+				FailedAtState:         j.FailedAtState,
+				CreatedAt:             j.CreatedAt,
+				UpdatedAt:             j.UpdatedAt,
+				DistributingStartedAt: j.DistributingStartedAt,
+				DistributingEndedAt:   j.DistributingEndedAt,
+				DistributionConfirmed: j.DistributionConfirmed,
+				DistributionTotal:     j.DistributionTotal,
 			})
 		}
 	}
@@ -291,10 +349,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
 
 	var (
-		repo, subPath, webhookURL  string
-		tagName, tagDescription    string
-		spoolTarPath               string // final path inside the spool
-		submittedSHA256            string // caller-supplied; may be empty
+		repo, subPath, webhookURL string
+		tagName, tagDescription   string
+		spoolTarPath              string // final path inside the spool
+		submittedSHA256           string // caller-supplied; may be empty
 	)
 
 	jobID := uuid.New().String()
@@ -464,6 +522,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.TagName = tagName
 	j.TagDescription = tagDescription
 
+	// Record the original filename and size for the console tooltip.
+	// Use Stat on the spool copy since the original may have been moved.
+	j.TarName = filepath.Base(spoolTarPath)
+	if fi, statErr := os.Stat(spoolTarPath); statErr == nil {
+		j.TarSize = fi.Size()
+	}
+
 	// Extract provenance metadata — from OIDC token (verified) or plain headers.
 	if s.orch.Provenance != nil {
 		if rec := s.orch.Provenance.ExtractFromRequest(r); rec != nil {
@@ -489,17 +554,95 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Launch orchestrator in the background — the caller gets job_id immediately.
-	// The cancel func is registered so abortJobHandler can interrupt the job,
-	// and jobWg ensures Shutdown waits for all in-flight jobs to finish.
-	runCtx, cancel := context.WithCancel(context.Background())
-	s.orch.registerJob(jobID, cancel)
+	//
+	// Concurrency-limited path (jobSem != nil):
+	//   The goroutine first waits in StateIncoming for a semaphore slot.
+	//   Only after acquiring the slot does it create the execution context
+	//   (with JobTimeout if set).  This means queue-wait time is NOT counted
+	//   against the per-job timeout, so large batches do not time out simply
+	//   because they had to wait behind earlier jobs.
+	//
+	// Unlimited path (jobSem == nil):
+	//   All jobs start immediately with no queuing.  The timeout (if any)
+	//   starts at goroutine launch, identical to the previous behaviour.
+	//
+	// Either way, a cancel function is registered immediately so that
+	// abortJobHandler can interrupt the job at any point — including while
+	// it is waiting for a concurrency slot.
+	abortCtx, abortCancel := context.WithCancel(context.Background())
+	s.orch.registerJob(jobID, abortCancel)
+
+	// Read-ahead Phase 0: start the tar scan NOW, before waiting for the
+	// concurrency slot.  The tar is already on disk in the spool; scanning it
+	// costs only I/O and memory, not a pipeline slot.  For queued jobs the
+	// scan overlaps with earlier jobs' compress/upload work so that when the
+	// slot opens the compress workers start immediately with sorted entries
+	// already in memory rather than waiting for another full tar read.
+	s.orch.StartPrefetch(abortCtx, j)
+
 	s.jobWg.Add(1)
 	go func() {
 		defer s.jobWg.Done()
 		defer s.orch.unregisterJob(jobID)
-		defer cancel()
-		if err := s.orch.Run(runCtx, j); err != nil {
-			s.obs.Logger.Error("background job failed", "job_id", jobID, "error", err)
+		defer abortCancel()
+
+		// ── Wait for a concurrency slot (if the limit is configured) ──────────
+		// The semaphore limits concurrent pipeline (compress/upload) workers.
+		// The slot is released EARLY — before the per-repo commit mutex — by the
+		// onStagingComplete hook passed to Run().  This lets the next queued job
+		// start its own compress pipeline while this job does its gateway commit.
+		// The defer below is a safety net: if Run() returns without ever calling
+		// the hook (e.g. early error during staging, local mode) the slot is
+		// still released exactly once via sync.Once.
+		var semOnce sync.Once
+		releaseSem := func() {
+			semOnce.Do(func() {
+				if s.dynaSem != nil {
+					s.dynaSem.Release()
+					s.obs.Logger.Info("released concurrency slot (pipeline complete)",
+						"job_id", jobID)
+				}
+			})
+		}
+
+		if s.dynaSem != nil {
+			s.obs.Logger.Info("job queued — waiting for concurrency slot",
+				"job_id", jobID, "repo", j.Repo)
+			// Use abortCtx so that a manual abort unblocks the wait
+			// immediately rather than holding the slot indefinitely.
+			if err := s.dynaSem.Acquire(abortCtx); err != nil {
+				// abortCancel fired (operator abort or server shutdown) while
+				// the job was queued; mark it as aborted without running.
+				s.obs.Logger.Info("job aborted while waiting for slot",
+					"job_id", jobID, "error", err)
+				_ = s.orch.abortJob(context.Background(), j,
+					fmt.Errorf("aborted while waiting for concurrency slot: %w", err))
+				return
+			}
+			s.obs.Logger.Info("job acquired concurrency slot", "job_id", jobID)
+		}
+		defer releaseSem() // safety net — no-op if hook already fired
+
+		// ── Build the execution context (timeout starts here, not at submit) ──
+		var runCtx context.Context
+		var runCancel context.CancelFunc
+		if s.orch.JobTimeout > 0 {
+			runCtx, runCancel = context.WithTimeout(abortCtx, s.orch.JobTimeout)
+		} else {
+			runCtx, runCancel = context.WithCancel(abortCtx)
+		}
+		defer runCancel()
+
+		// Re-register with the timeout-aware cancel so abortJobHandler also
+		// cancels the execution context (not just the abort context).
+		s.orch.registerJob(jobID, runCancel)
+
+		if err := s.orch.Run(runCtx, j, releaseSem); err != nil {
+			if s.orch.JobTimeout > 0 && runCtx.Err() != nil {
+				s.obs.Logger.Error("background job timed out", "job_id", jobID, "timeout", s.orch.JobTimeout, "error", err)
+			} else {
+				s.obs.Logger.Error("background job failed", "job_id", jobID, "error", err)
+			}
 		}
 	}()
 
@@ -767,6 +910,462 @@ func (s *Server) jobEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// jobLogHandler handles GET /api/v1/jobs/{id}/log.
+// Returns a JSON object with the job manifest and its full FSM journal.
+// Requires the standard bearer token (authenticated route).
+func (s *Server) jobLogHandler(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	j, err := s.sp.FindJob(id)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, `{"error":"job not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	entries, _ := s.sp.ReadJobJournal(id) // best-effort; nil on error
+
+	type transition struct {
+		Time time.Time `json:"time"`
+		From string    `json:"from"`
+		To   string    `json:"to"`
+		Note string    `json:"note,omitempty"`
+	}
+	var transitions []transition
+	for _, e := range entries {
+		transitions = append(transitions, transition{
+			Time: e.T,
+			From: string(e.From),
+			To:   string(e.To),
+			Note: e.Note,
+		})
+	}
+	if transitions == nil {
+		transitions = []transition{}
+	}
+
+	resp := map[string]any{
+		"job":         j,
+		"transitions": transitions,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// consoleHandler serves the self-contained Publish Jobs web console.
+// It is unauthenticated (read-only; no secrets exposed) so operators can
+// check job status in a browser without copying tokens.
+func (s *Server) consoleHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, consoleHTML)
+}
+
+// jobDetailHandler serves the per-job log page at GET /jobs/{id}.
+// It is the same self-contained SPA shell as the console — the JS reads
+// the job ID from the URL and fetches /api/v1/jobs/{id}/log directly.
+func (s *Server) jobDetailHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, consoleHTML)
+}
+
+// consoleHTML is the self-contained single-page console application.
+// It renders both the job list (when at /jobs) and the per-job detail
+// page (when at /jobs/{id}).  No external dependencies — all CSS and JS
+// are inline.
+//
+// Features:
+//   - Auto-refreshes the job list every 5 s via polling.
+//   - Job ID shown as a link to /jobs/{id} with a tooltip displaying the
+//     original tar filename and size.
+//   - Detail page shows full FSM transition history with elapsed times,
+//     flags stuck states (> 2 min in a non-terminal state), and surfaces
+//     the error message when the job failed.
+const consoleHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CVMFS Publish Jobs</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;font-size:14px;background:#f5f7fa;color:#1a1a2e}
+header{background:#1a1a2e;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:12px}
+header h1{font-size:18px;font-weight:600}
+header a{color:#7ec8e3;text-decoration:none;font-size:13px}
+.container{max-width:1400px;margin:0 auto;padding:16px}
+.table-wrap{border-radius:8px;overflow:visible;box-shadow:0 1px 4px rgba(0,0,0,.08);background:#fff;border-radius:8px}
+table{width:100%;border-collapse:collapse;background:transparent}
+th{background:#f0f4f8;text-align:left;padding:10px 12px;font-weight:600;
+  border-bottom:2px solid #dde3ea;white-space:nowrap}
+thead tr th:first-child{border-radius:8px 0 0 0}
+thead tr th:last-child{border-radius:0 8px 0 0}
+tr:last-child td:first-child{border-radius:0 0 0 8px}
+tr:last-child td:last-child{border-radius:0 0 8px 0}
+td{padding:9px 12px;border-bottom:1px solid #edf0f3;vertical-align:top;word-break:break-all}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#f8fafc}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap}
+.s-incoming{background:#e8eaf6;color:#3949ab}
+.s-staging{background:#e3f2fd;color:#1565c0}
+.s-uploading{background:#e8f5e9;color:#2e7d32}
+.s-distributing{background:#fff8e1;color:#f57f17}
+.s-leased{background:#fce4ec;color:#c62828}
+.s-committing{background:#f3e5f5;color:#6a1b9a}
+.s-published{background:#e8f5e9;color:#1b5e20}
+.s-failed{background:#ffebee;color:#b71c1c}
+.s-aborted{background:#fafafa;color:#616161}
+.job-link{color:#1565c0;text-decoration:underline;font-family:monospace;font-size:12px}
+.job-link:hover{color:#003c8f}
+.tip{position:relative;display:inline-block}
+.tip .tiptext{visibility:hidden;background:#333;color:#fff;border-radius:4px;
+  padding:5px 8px;position:absolute;z-index:9999;bottom:125%;left:50%;
+  transform:translateX(-50%);white-space:nowrap;font-size:11px;pointer-events:none;
+  opacity:0;transition:opacity .15s}
+.tip:hover .tiptext{visibility:visible;opacity:1}
+.mono{font-family:monospace;font-size:12px}
+.err{color:#b71c1c;font-size:12px;max-width:300px}
+.stuck{color:#f57f17;font-weight:600}
+#refresh-info{font-size:12px;color:#888;margin-bottom:8px}
+/* detail page */
+.card{background:#fff;border-radius:8px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:16px}
+.card h2{font-size:16px;margin-bottom:12px;color:#1a1a2e}
+.kv{display:grid;grid-template-columns:160px 1fr;gap:6px 12px;font-size:13px}
+.kv dt{color:#666;font-weight:500}
+.kv dd{word-break:break-all}
+.timeline{list-style:none;position:relative;padding-left:24px}
+.timeline::before{content:'';position:absolute;left:8px;top:0;bottom:0;
+  width:2px;background:#dde3ea}
+.timeline li{position:relative;padding:6px 0 6px 16px;font-size:13px}
+.timeline li::before{content:'';position:absolute;left:-8px;top:12px;
+  width:10px;height:10px;border-radius:50%;background:#7ec8e3;border:2px solid #fff;
+  box-shadow:0 0 0 2px #7ec8e3}
+.timeline li.ok::before{background:#4caf50}
+.timeline li.fail::before{background:#ef5350}
+.timeline li.warn::before{background:#ff9800}
+.elapsed{color:#888;font-size:11px;margin-left:8px}
+.back{display:inline-block;margin-bottom:12px;color:#1565c0;text-decoration:none;font-size:13px}
+.back:hover{text-decoration:underline}
+.stuck-banner{background:#fff3e0;border:1px solid #ff9800;border-radius:6px;
+  padding:10px 14px;margin-bottom:12px;font-size:13px;color:#e65100}
+</style>
+</head>
+<body>
+<header>
+  <h1>CVMFS Publish Jobs</h1>
+  <a href="/jobs">All Jobs</a>
+</header>
+<div class="container" id="app">Loading…</div>
+<script>
+const POLL_MS = 5000;
+const STATE_ORDER = ['incoming','staging','uploading','distributing','leased','committing','published','failed','aborted'];
+const TERMINAL = new Set(['published','failed','aborted']);
+const NON_TERMINAL_WARN_MS = 2 * 60 * 1000; // flag if stuck > 2 min
+
+function fmtBytes(b){
+  if(!b) return '—';
+  if(b<1024) return b+' B';
+  if(b<1048576) return (b/1024).toFixed(1)+' KB';
+  if(b<1073741824) return (b/1048576).toFixed(1)+' MB';
+  return (b/1073741824).toFixed(2)+' GB';
+}
+function fmtDuration(ms){
+  if(ms<0) ms=0;
+  const s=Math.floor(ms/1000), m=Math.floor(s/60), h=Math.floor(m/60);
+  if(h>0) return h+'h '+( m%60)+'m';
+  if(m>0) return m+'m '+(s%60)+'s';
+  return s+'s';
+}
+function fmtTime(iso){
+  if(!iso) return '—';
+  const d=new Date(iso);
+  return d.toLocaleString(undefined,{month:'short',day:'2-digit',
+    hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function ago(iso){
+  if(!iso) return '—';
+  return fmtDuration(Date.now()-new Date(iso).getTime())+' ago';
+}
+function badgeClass(state){
+  return 's-'+state.replace(/[^a-z]/g,'');
+}
+function stateLabel(state){
+  const map={incoming:'Incoming',staging:'Staging',uploading:'Uploading',
+    distributing:'Distributing',leased:'Leased',committing:'Committing',
+    published:'Published',failed:'Failed',aborted:'Aborted'};
+  return map[state]||state;
+}
+function jobShortID(id){ return id.substring(0,8); }
+
+// ── List page ──────────────────────────────────────────────────────────────
+function renderList(jobs, lastRefresh){
+  const now=Date.now();
+  let rows='';
+  for(const j of jobs){
+    const stateAge=now-new Date(j.updated_at).getTime();
+    const isStuck=!TERMINAL.has(j.state)&&stateAge>NON_TERMINAL_WARN_MS;
+    const shortID=jobShortID(j.job_id);
+    const tipLines=['<span style="font-size:11px;color:#999">'+escHtml(j.job_id)+'</span>'];
+    if(j.tar_name) tipLines.push(escHtml(j.tar_name)+(j.tar_size?' &nbsp;'+fmtBytes(j.tar_size):''));
+    if(isStuck) tipLines.push('<b style="color:#e65100">⚠ Stuck '+fmtDuration(stateAge)+'</b>');
+    const tipText='<span class="tiptext">'+tipLines.join('<br>')+'</span>';
+    const idCell='<span class="tip"><a class="job-link" href="/jobs/'+encodeURIComponent(j.job_id)+'">'+shortID+'</a>'+tipText+'</span>';
+    const stateCell='<span class="badge '+badgeClass(j.state)+(isStuck?' stuck':'')+'">'
+      +stateLabel(j.state)+(isStuck?' ⚠':'')+' </span>';
+    const repoCell=escHtml(j.repo)+(j.path?'<br><span style="color:#666;font-size:11px">'+escHtml(j.path)+'</span>':'');
+    const statsCell=j.n_objects?('<span class="mono">'+j.n_objects+'</span> obj<br>'
+      +'<span class="mono">'+fmtBytes(j.n_bytes_raw)+'</span>'):'—';
+    const errCell=j.error?'<span class="err" title="'+escHtml(j.error)+'">'+escHtml(j.error.substring(0,80))+(j.error.length>80?'…':'')+'</span>':'';
+    rows+='<tr>'
+      +'<td>'+idCell+'</td>'
+      +'<td>'+stateCell+'</td>'
+      +'<td>'+repoCell+'</td>'
+      +'<td>'+statsCell+'</td>'
+      +'<td>'+fmtBytes(j.n_bytes_compressed)+'</td>'
+      +'<td class="mono">'+ago(j.created_at)+'</td>'
+      +'<td class="mono">'+ago(j.updated_at)+'</td>'
+      +'<td>'+errCell+'</td>'
+      +'</tr>';
+  }
+  const infoLine='<div id="refresh-info">'+jobs.length+' jobs &nbsp;·&nbsp; last refreshed '+
+    new Date(lastRefresh).toLocaleTimeString()+' &nbsp;·&nbsp; auto-refreshes every 5 s</div>';
+  return infoLine+'<div class="table-wrap"><table><thead><tr>'
+    +'<th>Job ID</th><th>State</th><th>Repo / Path</th>'
+    +'<th>Objects / Raw</th><th>Compressed</th>'
+    +'<th>Submitted</th><th>Updated</th><th>Error</th>'
+    +'</tr></thead><tbody>'+rows+'</tbody></table></div>';
+}
+
+// ── Detail page ────────────────────────────────────────────────────────────
+function renderDetail(data){
+  const j=data.job;
+  const transitions=data.transitions||[];
+  const now=Date.now();
+  const stateAge=now-new Date(j.UpdatedAt||j.updated_at).getTime();
+  const state=j.State||j.state;
+  const isStuck=!TERMINAL.has(state)&&stateAge>NON_TERMINAL_WARN_MS;
+
+  let stuckBanner='';
+  if(isStuck){
+    stuckBanner='<div class="stuck-banner">⚠ Job has been in <b>'+stateLabel(state)+'</b> for '
+      +fmtDuration(stateAge)+'. It may be stuck.<br>'
+      +(state==='leased'?'Possible cause: waiting for per-repo serialisation lock (another job is committing).'
+       :state==='committing'?'Possible cause: cvmfs_receiver is processing the catalog graft (30–150 s normal).'
+       :state==='staging'?'Possible cause: large tar or slow CAS — pipeline is compressing/uploading.'
+       :state==='distributing'?'Possible cause: waiting for Stratum 1 quorum confirmation.'
+       :'Check service logs for details.')
+      +'</div>';
+  }
+
+  // Build kv pairs from manifest
+  const kvs=[
+    ['State', '<span class="badge '+badgeClass(state)+'">'+stateLabel(state)+'</span>'],
+    ['Job ID', '<span class="mono">'+escHtml(j.ID||j.job_id)+'</span>'],
+    ['Repo', escHtml(j.Repo||j.repo||'—')],
+    ['Path', escHtml(j.Path||j.path||'(root)')],
+    ['Tar file', escHtml(j.TarName||j.tar_name||'—')],
+    ['Tar size', fmtBytes(j.TarSize||j.tar_size)],
+    ['Objects (total)', (j.NObjects||j.n_objects||0).toString()],
+    ['Objects (new)', (j.NNewObjects||j.n_new_objects||0).toString()],
+    ['Raw size', fmtBytes(j.NBytesRaw||j.n_bytes_raw)],
+    ['Compressed', fmtBytes(j.NBytesCompressed||j.n_bytes_compressed)],
+    ['Tag', escHtml(j.TagName||j.tag_name||'—')],
+    ['New root hash', j.NewRootHash||j.new_root_hash?'<span class="mono">'+(j.NewRootHash||j.new_root_hash)+'</span>':'—'],
+    ['Created', fmtTime(j.CreatedAt||j.created_at)+' ('+ago(j.CreatedAt||j.created_at)+')'],
+    ['Updated', fmtTime(j.UpdatedAt||j.updated_at)+' ('+ago(j.UpdatedAt||j.updated_at)+')'],
+  ];
+  if(j.Error||j.error){
+    kvs.push(['Error', '<span style="color:#b71c1c">'+escHtml(j.Error||j.error)+'</span>']);
+  }
+  if(j.FailedAtState||j.failed_at_state){
+    kvs.push(['Failed at state', '<span class="badge s-failed">'+escHtml(j.FailedAtState||j.failed_at_state)+'</span>']);
+  }
+
+  let kvHtml='<dl class="kv">';
+  for(const[k,v] of kvs) kvHtml+='<dt>'+escHtml(k)+'</dt><dd>'+v+'</dd>';
+  kvHtml+='</dl>';
+
+  // Timeline
+  let prevTime=null;
+  let tlHtml='<ul class="timeline">';
+  for(const t of transitions){
+    const isTerminal=TERMINAL.has(t.to);
+    const cls=t.to==='published'?'ok':t.to==='failed'||t.to==='aborted'?'fail':'';
+    const elapsed=prevTime?'<span class="elapsed">+'+fmtDuration(new Date(t.time).getTime()-new Date(prevTime).getTime())+'</span>':'';
+    tlHtml+='<li class="'+cls+'"><b>'+escHtml(stateLabel(t.from))+'</b> → <b>'
+      +escHtml(stateLabel(t.to))+'</b>&nbsp; '
+      +'<span style="color:#888;font-size:11px">'+fmtTime(t.time)+'</span>'
+      +elapsed
+      +(t.note?'<br><span style="color:#666;font-size:12px">'+escHtml(t.note)+'</span>':'')
+      +'</li>';
+    prevTime=t.time;
+  }
+  // Add "currently in" entry if job is still active
+  if(!TERMINAL.has(state)&&transitions.length>0){
+    const elapsed=prevTime?'<span class="elapsed stuck">still here, '+fmtDuration(now-new Date(prevTime).getTime())+'</span>':'';
+    tlHtml+='<li class="warn"><b>'+escHtml(stateLabel(state))+'</b> (current) '+elapsed+'</li>';
+  }
+  if(transitions.length===0){
+    tlHtml+='<li>No state transitions recorded yet.</li>';
+  }
+  tlHtml+='</ul>';
+
+  return '<a class="back" href="/jobs">← All Jobs</a>'
+    +stuckBanner
+    +'<div class="card"><h2>Job Detail</h2>'+kvHtml+'</div>'
+    +'<div class="card"><h2>State Transitions</h2>'+tlHtml+'</div>';
+}
+
+// ── Router ─────────────────────────────────────────────────────────────────
+function escHtml(s){
+  if(!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+const path=window.location.pathname;
+const app=document.getElementById('app');
+const jobDetailMatch=path.match(/^\/jobs\/([^\/]+)$/);
+
+if(jobDetailMatch){
+  // ── Detail view ──────────────────────────────────────────────────────────
+  const jobID=jobDetailMatch[1];
+  document.title='Job '+jobID.substring(0,8)+' — CVMFS';
+  let token='';
+  try{ token=localStorage.getItem('prepub_token')||''; }catch(_){}
+
+  async function loadDetail(){
+    try{
+      const headers=token?{Authorization:'Bearer '+token}:{};
+      const r=await fetch('/api/v1/jobs/'+jobID+'/log',{headers});
+      if(r.status===401){
+        app.innerHTML='<div class="card"><h2>Authentication required</h2>'
+          +'<p style="margin-top:8px">Enter your API token to view job details:</p>'
+          +'<input id="tok" type="password" placeholder="Bearer token" style="margin:8px 0;padding:6px;width:300px;border:1px solid #ccc;border-radius:4px">'
+          +'<button onclick="saveToken()" style="padding:6px 12px;margin-left:6px;cursor:pointer">Save</button></div>';
+        return;
+      }
+      const data=await r.json();
+      app.innerHTML=renderDetail(data);
+    }catch(e){
+      app.innerHTML='<div class="card"><p style="color:red">Error: '+escHtml(e.message)+'</p></div>';
+    }
+  }
+  window.saveToken=function(){
+    const t=document.getElementById('tok').value.trim();
+    try{localStorage.setItem('prepub_token',t);}catch(_){}
+    token=t;
+    loadDetail();
+  };
+  loadDetail();
+  // Refresh detail every 5 s if job is not terminal
+  setInterval(async()=>{
+    try{
+      const headers=token?{Authorization:'Bearer '+token}:{};
+      const r=await fetch('/api/v1/jobs/'+jobID+'/log',{headers});
+      if(!r.ok) return;
+      const data=await r.json();
+      const state=data.job&&(data.job.State||data.job.state);
+      if(state&&!TERMINAL.has(state)) app.innerHTML=renderDetail(data);
+    }catch(_){}
+  }, POLL_MS);
+
+} else {
+  // ── List view ─────────────────────────────────────────────────────────────
+  document.title='CVMFS Publish Jobs';
+  let listToken='';
+  try{ listToken=localStorage.getItem('prepub_token')||''; }catch(_){}
+
+  function showListAuthForm(){
+    app.innerHTML='<div class="card"><h2>Authentication required</h2>'
+      +'<p style="margin-top:8px">Enter your API token to view publish jobs:</p>'
+      +'<input id="ltok" type="password" placeholder="Bearer token" style="margin:8px 0;padding:6px;width:300px;border:1px solid #ccc;border-radius:4px">'
+      +'<button onclick="saveListToken()" style="padding:6px 12px;margin-left:6px;cursor:pointer">Save</button></div>';
+  }
+  window.saveListToken=function(){
+    const t=document.getElementById('ltok').value.trim();
+    try{localStorage.setItem('prepub_token',t);}catch(_){}
+    listToken=t;
+    loadList();
+  };
+
+  async function loadList(){
+    try{
+      const headers=listToken?{Authorization:'Bearer '+listToken}:{};
+      const r=await fetch('/api/v1/jobs?_='+Date.now(),{headers});
+      if(r.status===401){ showListAuthForm(); return; }
+      if(!r.ok){ app.innerHTML='<p>Failed to load jobs ('+r.status+')</p>'; return; }
+      const jobs=await r.json();
+      app.innerHTML=renderList(jobs,Date.now());
+    }catch(e){
+      app.innerHTML='<p style="color:red">Error: '+escHtml(e.message)+'</p>';
+    }
+  }
+  loadList();
+  setInterval(loadList, POLL_MS);
+}
+</script>
+</body>
+</html>`
+
+// configResponse is the JSON shape returned by GET /api/v1/config and
+// PATCH /api/v1/config.
+type configResponse struct {
+	// SwissKnifeEnabled reports whether the cvmfs_swissknife ingest path is
+	// currently active.  Toggle it at runtime via PATCH /api/v1/config.
+	SwissKnifeEnabled bool `json:"swissknife_enabled"`
+	// SwissKnifeConfigured is true when --swissknife was passed at startup
+	// (i.e. the binary and key-dir are known).  When false, enabling via the
+	// API has no effect and the toggle is disabled in the UI.
+	SwissKnifeConfigured bool `json:"swissknife_configured"`
+	// SwissKnifeBinary is the path to the cvmfs_swissknife executable.
+	// Empty when SwissKnifeConfigured is false.
+	SwissKnifeBinary string `json:"swissknife_binary,omitempty"`
+}
+
+// getConfig handles GET /api/v1/config.
+// Returns the current runtime configuration.  Unauthenticated (read-only).
+func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
+	resp := configResponse{
+		SwissKnifeEnabled:    s.orch.SwissKnifeEnabled(),
+		SwissKnifeConfigured: s.orch.SwissKnife != nil,
+	}
+	if s.orch.SwissKnife != nil {
+		resp.SwissKnifeBinary = s.orch.SwissKnife.Binary
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// patchConfig handles PATCH /api/v1/config.
+// Accepts {"swissknife_enabled": true|false} and toggles the ingest path
+// at runtime without a service restart.  Requires bearer token auth.
+func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SwissKnifeEnabled *bool `json:"swissknife_enabled"`
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if err != nil || json.Unmarshal(body, &req) != nil {
+		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.SwissKnifeEnabled != nil {
+		if ok := s.orch.SetSwissKnifeEnabled(*req.SwissKnifeEnabled); !ok {
+			http.Error(w, `{"error":"swissknife was not configured at startup; cannot enable at runtime"}`, http.StatusConflict)
+			return
+		}
+		s.obs.Logger.Info("swissknife ingest path toggled via API",
+			"enabled", *req.SwissKnifeEnabled,
+			"remote_addr", r.RemoteAddr,
+		)
+	}
+	// Return updated state.
+	s.getConfig(w, r)
 }
 
 // health returns a liveness probe response.

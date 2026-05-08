@@ -171,7 +171,11 @@ func (c *Config) workerConcurrency() int {
 	if c.WorkerConcurrency > 0 {
 		return c.WorkerConcurrency
 	}
-	return 2
+	// Default raised from 2→8: distribution is pure network I/O; 2 goroutines
+	// per endpoint left most of the available bandwidth idle on any non-trivial
+	// publish.  8 concurrent goroutines overlap round-trips without overwhelming
+	// typical S1 receivers.
+	return 8
 }
 
 func (c *Config) queueDepth() int {
@@ -185,7 +189,12 @@ func (c *Config) workerAttemptTimeout() time.Duration {
 	if c.WorkerAttemptTimeout > 0 {
 		return c.WorkerAttemptTimeout
 	}
-	return 90 * time.Second
+	// Default raised from 90s→5min: a single distribution attempt covers the
+	// full announce + all object PUTs for one WorkItem.  With 8 concurrent
+	// workers and up to thousands of objects per job, 90 s was too short for
+	// large publishes and caused spurious retries.  5 min gives breathing room
+	// while still failing fast on genuinely hung endpoints.
+	return 5 * time.Minute
 }
 
 func (c *Config) workerInitialBackoff() time.Duration {

@@ -90,7 +90,7 @@ func TestMerge(t *testing.T) {
 		}
 
 		// CAS path for root catalog
-		if r.URL.Path == "/testrepo/data/"+oldHash[:2]+"/"+oldHash+"C" {
+		if r.URL.Path == "/testrepo/data/"+oldHash[:2]+"/"+oldHash[2:]+"C" {
 			w.Write(compressedRootCatalog)
 			return
 		}
@@ -282,7 +282,7 @@ func TestMergeNestedCatalog(t *testing.T) {
 	compressedNested := compressCatalog(t, nestedDBPath)
 
 	// stat the CAS file to get the exact compressed size Finalize wrote
-	nestedCASFilePath := filepath.Join(casTempDir, "data", nestedHash[:2], nestedHash+"C")
+	nestedCASFilePath := filepath.Join(casTempDir, "data", nestedHash[:2], nestedHash[2:]+"C")
 	nestedFI, err := os.Stat(nestedCASFilePath)
 	if err != nil {
 		t.Fatalf("stat nested CAS file: %v", err)
@@ -321,9 +321,9 @@ func TestMergeNestedCatalog(t *testing.T) {
 		switch r.URL.Path {
 		case "/testrepo/.cvmfspublished":
 			w.Write(manifest)
-		case "/testrepo/data/" + rootHash[:2] + "/" + rootHash + "C":
+		case "/testrepo/data/" + rootHash[:2] + "/" + rootHash[2:] + "C":
 			w.Write(compressedRoot)
-		case "/testrepo/data/" + nestedHash[:2] + "/" + nestedHash + "C":
+		case "/testrepo/data/" + nestedHash[:2] + "/" + nestedHash[2:] + "C":
 			w.Write(compressedNested)
 		default:
 			http.Error(w, "not found: "+r.URL.Path, http.StatusNotFound)
@@ -408,7 +408,7 @@ func TestMergeNestedCatalogChain(t *testing.T) {
 		t.Fatalf("Finalize /a/b catalog: %v", err)
 	}
 	compressedAB := compressCatalog(t, abDBPath)
-	abFI, err := os.Stat(filepath.Join(casTempDir, "data", abHash[:2], abHash+"C"))
+	abFI, err := os.Stat(filepath.Join(casTempDir, "data", abHash[:2], abHash[2:]+"C"))
 	if err != nil {
 		t.Fatalf("stat /a/b CAS file: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestMergeNestedCatalogChain(t *testing.T) {
 		t.Fatalf("Finalize /a catalog: %v", err)
 	}
 	compressedA := compressCatalog(t, aDBPath)
-	aFI, err := os.Stat(filepath.Join(casTempDir, "data", aHash[:2], aHash+"C"))
+	aFI, err := os.Stat(filepath.Join(casTempDir, "data", aHash[:2], aHash[2:]+"C"))
 	if err != nil {
 		t.Fatalf("stat /a CAS file: %v", err)
 	}
@@ -470,11 +470,11 @@ func TestMergeNestedCatalogChain(t *testing.T) {
 		switch r.URL.Path {
 		case "/testrepo/.cvmfspublished":
 			w.Write(manifest)
-		case "/testrepo/data/" + rootHash[:2] + "/" + rootHash + "C":
+		case "/testrepo/data/" + rootHash[:2] + "/" + rootHash[2:] + "C":
 			w.Write(compressedRoot)
-		case "/testrepo/data/" + aHash[:2] + "/" + aHash + "C":
+		case "/testrepo/data/" + aHash[:2] + "/" + aHash[2:] + "C":
 			w.Write(compressedA)
-		case "/testrepo/data/" + abHash[:2] + "/" + abHash + "C":
+		case "/testrepo/data/" + abHash[:2] + "/" + abHash[2:] + "C":
 			w.Write(compressedAB)
 		default:
 			http.Error(w, "not found: "+r.URL.Path, http.StatusNotFound)
@@ -699,7 +699,7 @@ func TestMergeClosesChainOnNestedDownloadError(t *testing.T) {
 		LinkCount: 1,
 	})
 	// Stat the nested CAS file so AddNestedMount gets a real size.
-	nestedCASPath := filepath.Join(casTempDir, "data", nestedHash[:2], nestedHash+"C")
+	nestedCASPath := filepath.Join(casTempDir, "data", nestedHash[:2], nestedHash[2:]+"C")
 	fi, err := os.Stat(nestedCASPath)
 	if err != nil {
 		t.Fatalf("stat nested CAS file: %v", err)
@@ -719,7 +719,7 @@ func TestMergeClosesChainOnNestedDownloadError(t *testing.T) {
 		switch r.URL.Path {
 		case "/testrepo/.cvmfspublished":
 			w.Write(manifest)
-		case "/testrepo/data/" + rootHash[:2] + "/" + rootHash + "C":
+		case "/testrepo/data/" + rootHash[:2] + "/" + rootHash[2:] + "C":
 			w.Write(compressedRoot)
 		default:
 			// Nested catalog download will hit here and get 404.

@@ -58,6 +58,11 @@ type Client struct {
 	KeyID string
 	// Secret is the HMAC secret key for signing requests.
 	Secret string
+	// RetryMax is the upper bound on total path_busy retry time.
+	// Zero means use defaultLeaseRetryMax (12 min).
+	// Set via --lease-retry-max; should be > the gateway's max_lease_time so
+	// that a single Acquire call can outlast a stale lease from a crashed job.
+	RetryMax time.Duration
 	// obs provides logging and metrics.
 	obs *observe.Provider
 	// client is the HTTP client with TLS 1.2+ enforced, used for all operations
@@ -70,6 +75,20 @@ type Client struct {
 	// entropy-starved containers.
 	commitClient *http.Client
 }
+
+// retryMax returns the effective path_busy retry window, applying the default
+// when the caller has not set a custom RetryMax.
+func (c *Client) retryMax() time.Duration {
+	if c.RetryMax > 0 {
+		return c.RetryMax
+	}
+	return defaultLeaseRetryMax
+}
+
+// EffectiveRetryMax returns the retry window that will actually be used by
+// Acquire — either the configured RetryMax or the package default.
+// Useful for logging at startup.
+func (c *Client) EffectiveRetryMax() time.Duration { return c.retryMax() }
 
 // newTLSTransport returns an http.Transport with TLS 1.2+ enforced.
 func newTLSTransport() *http.Transport {
@@ -109,17 +128,33 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 	}
 }
 
-// errPathBusy is a sentinel returned by acquireLease when the gateway responds
-// with status "path_busy" (another publisher holds the lease).  It is
-// intentionally unexported; Acquire handles it internally with retry logic.
-var errPathBusy = errors.New("path_busy: another publisher holds the lease")
+// ErrPathBusy is returned by TryAcquireOnce when the gateway responds with
+// status "path_busy" (another publisher holds the lease).  Callers that want
+// to implement their own retry / queueing logic (e.g. GatewayQueue) should
+// check for this error to distinguish a transient contention from a hard failure.
+var ErrPathBusy = errors.New("path_busy: another publisher holds the lease")
+
+// errPathBusy is the unexported alias kept for backward-compatibility inside
+// this package (Acquire still uses errors.Is(err, errPathBusy)).
+var errPathBusy = ErrPathBusy
 
 // leaseRetryConfig controls the backoff behaviour for path_busy retries.
 const (
-	// leaseRetryMax is the upper bound on total retry time.  The real CERN
-	// gateway max_lease_time is 7200 s (2 hours), so we don't try to outlast
-	// a hung lease — we just wait long enough for a normally-finishing publisher.
-	leaseRetryMax = 5 * time.Minute
+	// defaultLeaseRetryMax is the upper bound on total retry time when the
+	// caller has not configured a custom value.
+	//
+	// 12 minutes was chosen to outlast the default gateway max_lease_time of
+	// 600 s (10 min) that ships with the testbed and many production deployments.
+	// When a job crashes without releasing its lease, the next job's Acquire
+	// retries for up to defaultLeaseRetryMax; if that window exceeds the stale
+	// lease's TTL the next attempt within the same retry loop succeeds rather
+	// than failing and waiting for the lease to expire on its own.
+	//
+	// Operators running a gateway with max_lease_time > 12 min should set
+	// --lease-retry-max accordingly.  The real CERN gateway default is 7200 s
+	// (2 hours); there it is intentional to let the retry window be shorter so
+	// a broken publisher does not block others indefinitely.
+	defaultLeaseRetryMax = 12 * time.Minute
 	// leaseRetryBase is the initial delay between retries.
 	leaseRetryBase = 5 * time.Second
 	// leaseRetryMaxDelay caps the per-attempt sleep so we don't wait too long
@@ -136,7 +171,8 @@ const (
 // eventually expires) and legitimate concurrent publishers (who will release
 // the lease when they finish).
 func (c *Client) Acquire(ctx context.Context, repo, path string) (string, error) {
-	deadline := time.Now().Add(leaseRetryMax)
+	retryMax := c.retryMax()
+	deadline := time.Now().Add(retryMax)
 	delay := leaseRetryBase
 	attempt := 0
 
@@ -154,7 +190,7 @@ func (c *Client) Acquire(ctx context.Context, repo, path string) (string, error)
 		// path_busy: check whether we still have time left to retry.
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return "", fmt.Errorf("lease acquisition: path still busy after %s (%d attempts)", leaseRetryMax, attempt)
+			return "", fmt.Errorf("lease acquisition: path still busy after %s (%d attempts)", retryMax, attempt)
 		}
 
 		sleep := delay
@@ -182,6 +218,19 @@ func (c *Client) Acquire(ctx context.Context, repo, path string) (string, error)
 			delay = leaseRetryMaxDelay
 		}
 	}
+}
+
+// TryAcquireOnce makes a single attempt to acquire the lease without retrying.
+// Returns the token on success, ErrPathBusy if the path is currently locked by
+// another publisher, or another error for hard failures (auth, network, etc.).
+// Callers that want queue-based or custom retry semantics should use this
+// instead of Acquire.
+func (c *Client) TryAcquireOnce(ctx context.Context, repo, path string) (string, error) {
+	l, err := c.acquireLease(ctx, repo, path)
+	if err != nil {
+		return "", err
+	}
+	return l.Token, nil
 }
 
 // acquireLease is the internal form of Acquire that returns the full *Lease
@@ -535,6 +584,78 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		// Non-fatal: commit likely succeeded if status was 200.
+		c.obs.Logger.Info("lease commit: could not decode response body", "error", err)
+		return nil
+	}
+	if result.Status != "ok" {
+		err := fmt.Errorf("gateway commit status %q: %s", result.Status, result.Reason)
+		span.RecordError(err)
+		return err
+	}
+	return nil
+}
+
+// CommitFinalizeOnly performs only step 2 of Commit — the gateway commit POST —
+// assuming all catalog objects have already been uploaded via SubmitPayload.
+//
+// Use this when SubmitPayload was called BEFORE the per-repo commit serialisation
+// mutex to allow concurrent catalog uploads to overlap with the previous job's
+// commit POST.  The caller is responsible for having called SubmitPayload with
+// the correct token, catalogHash, and objectHashes beforehand.
+//
+// The req fields used here are: Token, OldRootHash, NewRootHashSuffixed,
+// CatalogHash (fallback if NewRootHashSuffixed is empty), TagName, TagDescription.
+// ObjectHashes, CatalogHash (for upload), and ObjectStore are ignored.
+func (c *Client) CommitFinalizeOnly(ctx context.Context, req CommitRequest) error {
+	ctx, span := c.obs.Tracer.Start(ctx, "lease.commit_finalize_only")
+	defer span.End()
+
+	commitURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(req.Token))
+
+	newHash := req.NewRootHashSuffixed
+	if newHash == "" {
+		newHash = req.CatalogHash
+	}
+
+	commitBody, err := json.Marshal(map[string]interface{}{
+		"old_root_hash":   req.OldRootHash,
+		"new_root_hash":   newHash,
+		"tag_name":        req.TagName,
+		"tag_description": req.TagDescription,
+	})
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("marshalling commit body: %w", err)
+	}
+
+	postReq, err := http.NewRequestWithContext(ctx, "POST", commitURL, bytes.NewReader(commitBody))
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("creating commit request: %w", err)
+	}
+	postReq.Header.Set("Content-Type", "application/json")
+	postReq.ContentLength = int64(len(commitBody))
+	c.signWithToken(postReq, req.Token)
+
+	resp, err := c.commitClient.Do(postReq)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("committing lease: %w", err)
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		err := fmt.Errorf("gateway commit failed: status %d: %s", resp.StatusCode, data)
+		span.RecordError(err)
+		return err
+	}
+
+	var result struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		c.obs.Logger.Info("lease commit: could not decode response body", "error", err)
 		return nil
 	}

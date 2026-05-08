@@ -263,7 +263,7 @@ func TestFinalize(t *testing.T) {
 	}
 
 	// Verify CAS file exists
-	casPath := filepath.Join(destDir, "data", hash[:2], hash+"C")
+	casPath := filepath.Join(destDir, "data", hash[:2], hash[2:]+"C")
 	if _, err := os.Stat(casPath); err != nil {
 		t.Errorf("CAS file not found at %s: %v", casPath, err)
 	}
@@ -954,12 +954,12 @@ func TestNestedCatalogsUniqueConstraint(t *testing.T) {
 	}
 	defer cat.Close()
 
-	p1, p2 := MD5Path("/nested")
+	_, _ = MD5Path("/nested") // kept for reference; schema uses path TEXT PRIMARY KEY
 
 	insert := func() error {
 		_, err := cat.db.Exec(
-			"INSERT INTO nested_catalogs (md5path_1, md5path_2, sha1, size) VALUES (?, ?, NULL, 0)",
-			p1, p2)
+			"INSERT INTO nested_catalogs (path, sha1, size) VALUES (?, NULL, 0)",
+			"/nested")
 		return err
 	}
 

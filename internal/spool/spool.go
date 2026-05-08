@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"cvmfs.io/prepub/internal/job"
@@ -407,6 +408,50 @@ func (s *Spool) FindJob(id string) (*job.Job, error) {
 		}
 	}
 	return nil, fmt.Errorf("job %q: %w", id, os.ErrNotExist)
+}
+
+// ReadJobJournal returns all journal entries for a specific job ID, ordered
+// by timestamp.  It scans every state directory's journal.jsonl and filters
+// by job_id, so the full FSM history is reconstructed even after the job
+// directory has been renamed across multiple state transitions.
+//
+// Returns nil (not an error) when no journal entries exist yet (e.g. job was
+// just submitted and has not transitioned yet).
+func (s *Spool) ReadJobJournal(jobID string) ([]Entry, error) {
+	allStates := []job.State{
+		job.StateIncoming,
+		job.StateStaging,
+		job.StateUploading,
+		job.StateDistributing,
+		job.StateLeased,
+		job.StateCommitting,
+		job.StatePublished,
+		job.StateFailed,
+		job.StateAborted,
+	}
+
+	var entries []Entry
+	for _, state := range allStates {
+		stateDir := filepath.Join(s.Root, string(state))
+		j := OpenJournal(stateDir)
+		all, err := j.Read()
+		if err != nil {
+			// Corrupt journal in this state directory — skip it; log but don't fail.
+			continue
+		}
+		for _, e := range all {
+			if e.JobID == jobID {
+				entries = append(entries, e)
+			}
+		}
+	}
+
+	// Sort by time ascending so the caller sees a chronological history.
+	sort.Slice(entries, func(i, k int) bool {
+		return entries[i].T.Before(entries[k].T)
+	})
+
+	return entries, nil
 }
 
 // isErrExist reports whether err (or any wrapped error) indicates that a file

@@ -148,7 +148,7 @@ func TestOrchestrator_AbortOnceOnCommitError(t *testing.T) {
 	j := newIncomingJob(t, sp)
 
 	ctx := context.Background()
-	_ = o.Run(ctx, j)
+	_ = o.Run(ctx, j, nil)
 
 	abortCount := atomic.LoadInt32(&backend.abortCalls)
 	if abortCount != 1 {
@@ -166,7 +166,7 @@ func TestOrchestrator_NoAbortWhenAcquireFails(t *testing.T) {
 	o, sp := minimalOrch(t, backend)
 	j := newIncomingJob(t, sp)
 
-	_ = o.Run(context.Background(), j)
+	_ = o.Run(context.Background(), j, nil)
 
 	if got := atomic.LoadInt32(&backend.abortCalls); got != 0 {
 		t.Errorf("Abort called %d times after Acquire failure; want 0", got)
@@ -184,7 +184,7 @@ func TestOrchestrator_AbortCalledOnCommitError(t *testing.T) {
 	o, sp := minimalOrch(t, backend)
 	j := newIncomingJob(t, sp)
 
-	_ = o.Run(context.Background(), j)
+	_ = o.Run(context.Background(), j, nil)
 
 	if got := atomic.LoadInt32(&backend.abortCalls); got != 1 {
 		t.Errorf("Abort called %d times after commit error; want 1", got)
@@ -203,7 +203,7 @@ func TestOrchestrator_NoAbortOnErrCommittedNotRemounted(t *testing.T) {
 	o, sp := minimalOrch(t, backend)
 	j := newIncomingJob(t, sp)
 
-	err := o.Run(context.Background(), j)
+	err := o.Run(context.Background(), j, nil)
 	// ErrCommittedNotRemounted should NOT propagate as a job failure.
 	if err != nil {
 		t.Errorf("Run returned error %v; want nil (committed-not-remounted is treated as published)", err)
@@ -228,7 +228,7 @@ func TestOrchestrator_NilCASGuard_GatewayMode(t *testing.T) {
 	o, sp := minimalOrch(t, backend)
 	j := newIncomingJob(t, sp)
 
-	err := o.Run(context.Background(), j)
+	err := o.Run(context.Background(), j, nil)
 	if err == nil {
 		t.Fatal("expected error for nil CAS in gateway mode, got nil")
 	}
@@ -254,7 +254,7 @@ func TestOrchestrator_NilCAS_LocalMode(t *testing.T) {
 
 	j := newIncomingJob(t, sp)
 	// We expect Run to reach StatePublished without panicking.
-	err := o.Run(context.Background(), j)
+	err := o.Run(context.Background(), j, nil)
 	if err != nil {
 		t.Errorf("unexpected error in local mode with nil CAS: %v", err)
 	}

@@ -40,80 +40,154 @@ import (
 	"cvmfs.io/prepub/internal/pipeline/dedup"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
+	"cvmfs.io/prepub/pkg/cvmfscatalog"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────
-	mode     := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
+	mode := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
-	devMode  := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
-	config   := flag.String("config", "", "Config file path (reserved for future use)")
+	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
+	config := flag.String("config", "", "Config file path (reserved for future use)")
 
 	// ── Publisher-mode flags ───────────────────────────────────────────────────
-	spoolRoot    := flag.String("spool-root", "/var/spool/cvmfs-prepub", "Spool root directory [publisher]")
-	stagingRoot  := flag.String("staging-root", "", "Directory from which tar_path references (JSON submissions) are allowed; empty disables JSON/tar_path mode [publisher]")
-	listen       := flag.String("listen", ":8080", "HTTP listen address for the API server [publisher]")
-	publishMode  := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
-	gatewayURL   := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
-	cvmfsMount   := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
-	stratum0URL  := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
-	casType      := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
-	casRoot      := flag.String("cas-root", "/var/lib/cvmfs-prepub/cas", "CAS root directory [publisher|receiver]")
+	spoolRoot := flag.String("spool-root", "/var/spool/cvmfs-prepub", "Spool root directory [publisher]")
+	stagingRoot := flag.String("staging-root", "", "Directory from which tar_path references (JSON submissions) are allowed; empty disables JSON/tar_path mode [publisher]")
+	listen := flag.String("listen", ":8080", "HTTP listen address for the API server [publisher]")
+	publishMode := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
+	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
+	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
+	stratum0URL := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
+	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
+	casRoot := flag.String("cas-root", "/var/lib/cvmfs-prepub/cas", "CAS root directory [publisher|receiver]")
+
+	// Per-job wall-clock timeout (publisher) — prevents any phase from hanging
+	// indefinitely.  0 (default) disables the timeout for backward compatibility.
+	// When --max-concurrent-jobs is also set, the timeout starts AFTER the job
+	// acquires a concurrency slot, so queue-wait time does not count against it.
+	jobTimeout := flag.Duration("job-timeout", 0, "Maximum wall-clock time a single publish job may run before it is cancelled and failed; 0 disables the timeout [publisher]")
+
+	// Server-side job concurrency limiter.  Limits how many jobs can run the
+	// pipeline + critical section simultaneously, preventing CPU
+	// over-subscription when many jobs are submitted at once.  Jobs that
+	// cannot start immediately queue in StateIncoming.
+	//
+	// Recommended value: match the number of parallel uploads from the client
+	// (e.g. 4 when using --concurrency 4 in upload-filelist.sh).  With N
+	// concurrent jobs, at most N compress worker pools run at once, so zlib
+	// workers are used efficiently rather than competing for CPU.
+	//
+	// 0 (default) disables the limit — all submitted jobs start immediately,
+	// which is the legacy behaviour.
+	// Dynamic concurrency:
+	//   --min-concurrent-jobs  — floor for the slot count (default 4).
+	//                            Set to 0 to disable the limit entirely (legacy behaviour).
+	//   --max-concurrent-jobs  — ceiling for the slot count (default 0 = runtime.NumCPU()).
+	//
+	// Effective slots = max(min, numCPU - load1min), clamped to [min, max].
+	// As load drops, waiting jobs are released without any delay.
+	minConcurrentJobs := flag.Int("min-concurrent-jobs", 4, "Minimum (guaranteed) number of concurrent jobs regardless of load; 0 = disable dynamic limiting [publisher]")
+	maxConcurrentJobs := flag.Int("max-concurrent-jobs", 0, "Maximum concurrent jobs ceiling (0 = runtime.NumCPU()); effective slots adapt between min and max based on 1-min load average [publisher]")
+
+	// Lease path_busy retry window — how long Acquire() will keep retrying when
+	// the gateway reports another publisher holds the lease.  Should be set to
+	// a value slightly greater than the gateway's max_lease_time so that a
+	// single Acquire call can outlast a stale lease left by a crashed job.
+	// Default is 12 min (outlasts the common 600 s testbed TTL).
+	leaseRetryMax := flag.Duration("lease-retry-max", 0, "Maximum time to retry lease acquisition when path_busy; 0 = 12 min default (should exceed gateway max_lease_time) [publisher]")
+
+	// Pipeline performance tuning.
+	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
+	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
+
+	// ── cvmfs_swissknife ingest alternative pipeline ───────────────────────────
+	//
+	// When --swissknife is set, the Go pipeline (dedup + compress + CAS write +
+	// BuildSubtree + gateway HTTP commit) is replaced by a single call to
+	// cvmfs_swissknife ingest.  The binary handles all processing in optimised
+	// C++ code.  Trade-offs: Stratum 1 pre-warming and Go-side Bloom-filter
+	// dedup are disabled; per-object provenance hashes are not recorded.
+	//
+	// Benchmark first with --swissknife on a representative publish before
+	// committing to this path in production.  Keep the Go path as a fallback.
+	swissknife := flag.Bool("swissknife", false, "Use cvmfs_swissknife ingest instead of Go pipeline; replaces dedup+compress+catalog+commit with a single C++ call [publisher]")
+	swissknifeBinary := flag.String("swissknife-binary", "cvmfs_swissknife", "Path to the cvmfs_swissknife executable (default: resolved via PATH) [publisher]")
+	swisskniferepokeys := flag.String("swissknife-repo-keys", "/etc/cvmfs/keys", "Directory containing repository public-key files (required by cvmfs_swissknife -k) [publisher]")
+	swissknifeConcurrency := flag.Int("swissknife-concurrency", 0, "Number of internal cvmfs_swissknife upload threads (-q); 0 = use swissknife default [publisher]")
+	swissknifExtraArgs := flag.String("swissknife-extra-args", "", "Space-separated extra flags appended to cvmfs_swissknife ingest (e.g. '-e' for dedup, '-x' for delete-absent) [publisher]")
+
+	// Optional: repository name for catalog-based dedup seeding at startup.
+	// When set alongside --stratum0-url, the Bloom filter is seeded by walking
+	// the CVMFS catalog tree (much faster than scanning the CAS filesystem for
+	// large repositories).  If not set, falls back to the CAS walk.
+	// In single-repo deployments set this to the same value as the repo field
+	// in job submissions (e.g. "atlas.cern.ch").
+	repoName := flag.String("repo-name", "", "CVMFS repository name for catalog-based dedup seeding at startup (e.g. atlas.cern.ch); leave empty to use CAS walk [publisher]")
 
 	// ── Stratum 1 distribution flags (publisher) ─────────────────────────────
-	s1Endpoints       := flag.String("s1-endpoints", "", "Comma-separated Stratum 1 HTTPS URLs to pre-warm (e.g. https://s1a.cern.ch,https://s1b.cern.ch) [publisher]")
-	s1Quorum          := flag.Float64("s1-quorum", 1.0, "Fraction of Stratum 1 endpoints that must confirm receipt for the publish to proceed (0.5 = majority, 1.0 = all) [publisher]")
-	s1Timeout         := flag.Duration("s1-timeout", 60*time.Second, "Per-object/batch timeout for Stratum 1 pushes [publisher]")
-	s1BloomTimeout    := flag.Duration("s1-bloom-timeout", 0, "Per-endpoint timeout for fetching inventory Bloom filter (0 = disable delta push) [publisher]")
-	s1MQTTTimeout     := flag.Duration("s1-mqtt-quorum-timeout", 30*time.Second, "Time to wait for receiver ready replies before proceeding (MQTT mode) [publisher]")
+	s1Endpoints := flag.String("s1-endpoints", "", "Comma-separated Stratum 1 HTTPS URLs to pre-warm (e.g. https://s1a.cern.ch,https://s1b.cern.ch) [publisher]")
+	s1Quorum := flag.Float64("s1-quorum", 1.0, "Fraction of Stratum 1 endpoints that must confirm receipt for the publish to proceed (0.5 = majority, 1.0 = all) [publisher]")
+	s1Timeout := flag.Duration("s1-timeout", 60*time.Second, "Per-object/batch timeout for Stratum 1 pushes [publisher]")
+	s1BloomTimeout := flag.Duration("s1-bloom-timeout", 0, "Per-endpoint timeout for fetching inventory Bloom filter (0 = disable delta push) [publisher]")
+	s1MQTTTimeout := flag.Duration("s1-mqtt-quorum-timeout", 30*time.Second, "Time to wait for receiver ready replies before proceeding (MQTT mode) [publisher]")
 	// Queue-driven distribution worker flags.
-	s1WorkerConcurrency  := flag.Int("s1-worker-concurrency", 0, "Concurrent transfer goroutines per Stratum 1 endpoint (0 = default 2) [publisher]")
-	s1AttemptTimeout     := flag.Duration("s1-attempt-timeout", 0, "Per-attempt timeout for a single endpoint distribution run (0 = default 90s) [publisher]")
-	s1InitialBackoff     := flag.Duration("s1-initial-backoff", 0, "Initial backoff after a failed distribution attempt (0 = default 5s) [publisher]")
-	s1MaxBackoff         := flag.Duration("s1-max-backoff", 0, "Maximum exponential backoff between retry attempts (0 = default 5m) [publisher]")
-	s1MaxAttempts        := flag.Int("s1-max-attempts", 0, "Max delivery attempts per item per endpoint; 0 = unlimited [publisher]")
-	s1QueueDepth         := flag.Int("s1-queue-depth", 0, "In-memory queue depth per Stratum 1 endpoint (0 = default 512) [publisher]")
-	s1QueueSpoolDir      := flag.String("s1-queue-spool-dir", "", "Directory for persistent per-endpoint distribution queues (default: {spool-root}/dist-queue) [publisher]")
+	s1WorkerConcurrency := flag.Int("s1-worker-concurrency", 0, "Concurrent transfer goroutines per Stratum 1 endpoint (0 = default 2) [publisher]")
+	s1AttemptTimeout := flag.Duration("s1-attempt-timeout", 0, "Per-attempt timeout for a single endpoint distribution run (0 = default 90s) [publisher]")
+	s1InitialBackoff := flag.Duration("s1-initial-backoff", 0, "Initial backoff after a failed distribution attempt (0 = default 5s) [publisher]")
+	s1MaxBackoff := flag.Duration("s1-max-backoff", 0, "Maximum exponential backoff between retry attempts (0 = default 5m) [publisher]")
+	s1MaxAttempts := flag.Int("s1-max-attempts", 0, "Max delivery attempts per item per endpoint; 0 = unlimited [publisher]")
+	s1QueueDepth := flag.Int("s1-queue-depth", 0, "In-memory queue depth per Stratum 1 endpoint (0 = default 512) [publisher]")
+	s1QueueSpoolDir := flag.String("s1-queue-spool-dir", "", "Directory for persistent per-endpoint distribution queues (default: {spool-root}/dist-queue) [publisher]")
 
-	// Shared Bloom filter — off by default.
-	bloomSnapshotDir    := flag.String("bloom-snapshot-dir", "", "Directory for shared Bloom filter snapshots (enables cross-node dedup; must be on a shared filesystem) [publisher]")
-	bloomNodeID         := flag.String("bloom-node-id", "", "Unique node ID for this build node (defaults to hostname) [publisher]")
+	// Bloom filter dedup — off by default.
+	//
+	// By default the pipeline calls CAS.Exists (stat/HEAD) once per object to
+	// detect duplicates before uploading.  For local-disk or S3 CAS this is
+	// fast and requires no startup walk.
+	//
+	// Enable --bloom-filter when CAS.Exists is expensive (high-latency network
+	// CAS) to replace per-object calls with a pre-seeded in-memory index.
+	// --bloom-snapshot-dir additionally enables cross-node snapshot sharing so
+	// all build nodes merge each other's filter state at startup.
+	bloomFilter := flag.Bool("bloom-filter", false, "Enable in-process Bloom filter for dedup; use when CAS.Exists (stat/HEAD) is expensive (e.g. high-latency network CAS) [publisher]")
+	bloomSnapshotDir := flag.String("bloom-snapshot-dir", "", "Directory for shared Bloom filter snapshots (enables cross-node dedup; must be on a shared filesystem; implies --bloom-filter) [publisher]")
+	bloomNodeID := flag.String("bloom-node-id", "", "Unique node ID for this build node (defaults to hostname) [publisher]")
 	bloomMaxSnapshotAge := flag.Duration("bloom-max-snapshot-age", 0, "Maximum age of peer Bloom snapshots to merge (default 24h) [publisher]")
-	bloomFilterCapacity := flag.Uint("bloom-filter-capacity", 0, "Bloom filter capacity — must match across all nodes (default 1 000 000) [publisher]")
-	bloomFilterFPRate   := flag.Float64("bloom-filter-fp-rate", 0, "Bloom filter false-positive rate — must match across all nodes (default 0.01) [publisher]")
+	bloomFilterCapacity := flag.Uint("bloom-filter-capacity", 0, "Bloom filter capacity — must match across all nodes (default 10 000 000); auto-sized to catalog count when not using shared snapshots [publisher]")
+	bloomFilterFPRate := flag.Float64("bloom-filter-fp-rate", 0, "Bloom filter false-positive rate — must match across all nodes (default 0.01) [publisher]")
 
 	// Provenance & Rekor transparency log — off by default.
 	provenanceEnabled := flag.Bool("provenance", false, "Enable provenance recording and Rekor transparency log submission [publisher]")
-	rekorServer       := flag.String("rekor-server", provenance.DefaultRekorServer, "Rekor transparency log URL [publisher]")
-	rekorSigningKey   := flag.String("rekor-signing-key", "", "Path to Ed25519 private key (PEM/PKCS#8) for signing Rekor entries; auto-generated if absent [publisher]")
-	oidcIssuers       := flag.String("oidc-issuers", "", "Comma-separated list of allowed OIDC issuer URLs for CI token validation [publisher]")
+	rekorServer := flag.String("rekor-server", provenance.DefaultRekorServer, "Rekor transparency log URL [publisher]")
+	rekorSigningKey := flag.String("rekor-signing-key", "", "Path to Ed25519 private key (PEM/PKCS#8) for signing Rekor entries; auto-generated if absent [publisher]")
+	oidcIssuers := flag.String("oidc-issuers", "", "Comma-separated list of allowed OIDC issuer URLs for CI token validation [publisher]")
 
 	// ── Receiver-mode flags ────────────────────────────────────────────────────
 	//
 	// The CAS root for the receiver is shared with --cas-root above so that a
 	// node running both modes (unusual but possible in a test setup) uses the
 	// same directory by default.  Override with --cas-root as needed.
-	controlAddr  := flag.String("control-addr", ":9100", "HTTPS listen address for announce requests [receiver]")
-	dataAddr     := flag.String("data-addr", ":9101", "Plain-HTTP listen address for object PUTs [receiver]")
-	dataHost     := flag.String("data-host", "", "Publicly reachable hostname or IP returned to senders as the data endpoint [receiver]")
-	tlsCert      := flag.String("tls-cert", "", "Path to TLS certificate for the control channel [receiver]")
-	tlsKey       := flag.String("tls-key", "", "Path to TLS private key for the control channel [receiver]")
-	sessionTTL   := flag.Duration("session-ttl", time.Hour, "How long announce sessions remain valid [receiver]")
+	controlAddr := flag.String("control-addr", ":9100", "HTTPS listen address for announce requests [receiver]")
+	dataAddr := flag.String("data-addr", ":9101", "Plain-HTTP listen address for object PUTs [receiver]")
+	dataHost := flag.String("data-host", "", "Publicly reachable hostname or IP returned to senders as the data endpoint [receiver]")
+	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate for the control channel [receiver]")
+	tlsKey := flag.String("tls-key", "", "Path to TLS private key for the control channel [receiver]")
+	sessionTTL := flag.Duration("session-ttl", time.Hour, "How long announce sessions remain valid [receiver]")
 	diskHeadroom := flag.Float64("disk-headroom", 1.2, "Multiplier applied to announced payload size when checking available disk space [receiver]")
 
 	// Receiver inventory Bloom filter — controls the in-memory filter that
 	// tracks which CAS objects are present locally.  Values must be consistent
 	// across all receivers that the distributor will compare filters between.
 	recvBloomCapacity := flag.Uint("bloom-capacity", 0, "Inventory Bloom filter capacity (default 5 000 000) [receiver]")
-	recvBloomFPRate   := flag.Float64("bloom-fp-rate", 0, "Inventory Bloom filter false-positive rate (default 0.001) [receiver]")
+	recvBloomFPRate := flag.Float64("bloom-fp-rate", 0, "Inventory Bloom filter false-positive rate (default 0.001) [receiver]")
 
 	// HepCDN coordination service — off by default.
 	// CoordURL enables registration, heartbeat, and topology-aware routing.
 	// The bearer token is read from PREPUB_COORD_TOKEN for security.
-	coordURL    := flag.String("coord-url", "", "HepCDN coordination service base URL (e.g. https://coord.hepcdn.example.com) [receiver]")
-	nodeID      := flag.String("node-id", "", "Stable identifier for this receiver node; defaults to hostname [receiver]")
-	repos       := flag.String("repos", "", "Comma-separated list of CVMFS repositories served by this receiver (e.g. atlas.cern.ch,cms.cern.ch) [receiver]")
+	coordURL := flag.String("coord-url", "", "HepCDN coordination service base URL (e.g. https://coord.hepcdn.example.com) [receiver]")
+	nodeID := flag.String("node-id", "", "Stable identifier for this receiver node; defaults to hostname [receiver]")
+	repos := flag.String("repos", "", "Comma-separated list of CVMFS repositories served by this receiver (e.g. atlas.cern.ch,cms.cern.ch) [receiver]")
 	// recvStratum0URL is the Stratum 0 base URL the receiver uses to pull CAS
 	// objects on published-notification.  Distinct from --stratum0-url (which
 	// is publisher-mode only) to avoid flag-name collisions in the shared flag
@@ -126,10 +200,10 @@ func main() {
 	// The broker URL uses Paho format: "tls://broker.cern.ch:8883" (production)
 	// or "tcp://localhost:1883" (development).  mTLS cert/key are required in
 	// production; --broker-ca-cert overrides the system CA pool.
-	brokerURL        := flag.String("broker-url", "", "MQTT broker URL (e.g. tls://broker.cern.ch:8883); empty disables MQTT [publisher+receiver]")
+	brokerURL := flag.String("broker-url", "", "MQTT broker URL (e.g. tls://broker.cern.ch:8883); empty disables MQTT [publisher+receiver]")
 	brokerClientCert := flag.String("broker-client-cert", "", "Path to PEM client certificate for MQTT mTLS [publisher+receiver]")
-	brokerClientKey  := flag.String("broker-client-key", "", "Path to PEM client private key for MQTT mTLS [publisher+receiver]")
-	brokerCACert     := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker; empty uses system pool [publisher+receiver]")
+	brokerClientKey := flag.String("broker-client-key", "", "Path to PEM client private key for MQTT mTLS [publisher+receiver]")
+	brokerCACert := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker; empty uses system pool [publisher+receiver]")
 
 	flag.Parse()
 
@@ -150,7 +224,8 @@ func main() {
 		applyFileConfig(fc, explicit,
 			mode, logLevel, devMode,
 			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
-			stratum0URL,
+			stratum0URL, repoName,
+			jobTimeout, minConcurrentJobs, maxConcurrentJobs,
 			s1Endpoints, s1Quorum, s1Timeout, s1BloomTimeout, s1MQTTTimeout,
 			s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth,
 			s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff,
@@ -159,10 +234,11 @@ func main() {
 			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
 			sessionTTL, diskHeadroom,
 			nodeID, repos, coordURL, recvStratum0URL,
-			bloomSnapshotDir, bloomNodeID,
+			bloomFilter, bloomSnapshotDir, bloomNodeID,
 			bloomMaxSnapshotAge, bloomFilterCapacity, bloomFilterFPRate,
 			recvBloomCapacity, recvBloomFPRate,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
+			swissknife, swissknifeBinary, swisskniferepokeys, swissknifeConcurrency, swissknifExtraArgs,
 		)
 	}
 
@@ -182,9 +258,12 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *cvmfsMount, *stratum0URL, *casType, *casRoot,
-			*bloomSnapshotDir, *bloomNodeID, *bloomMaxSnapshotAge, *bloomFilterCapacity, *bloomFilterFPRate,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
+			*bloomFilter, *bloomSnapshotDir, *bloomNodeID, *bloomMaxSnapshotAge, *bloomFilterCapacity, *bloomFilterFPRate,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
+			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
+			*pipelineUploadConc, *pipelineCompressLevel,
+			*swissknife, *swissknifeBinary, *swisskniferepokeys, *swissknifeConcurrency, *swissknifExtraArgs,
 			*s1Endpoints, *s1Quorum, *s1Timeout, *s1BloomTimeout, *s1MQTTTimeout,
 			*s1WorkerConcurrency, *s1MaxAttempts, *s1QueueDepth,
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
@@ -206,13 +285,21 @@ func main() {
 func runPublisher(
 	obs *observe.Provider,
 	devMode bool,
-	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, stratum0URL, casType, casRoot string,
+	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, stratum0URL, repoName, casType, casRoot string,
+	bloomFilterEnabled bool,
 	bloomSnapshotDir, bloomNodeID string,
 	bloomMaxSnapshotAge time.Duration,
 	bloomFilterCapacity uint,
 	bloomFilterFPRate float64,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
+	jobTimeout, leaseRetryMax time.Duration,
+	minConcurrentJobs, maxConcurrentJobs int,
+	pipelineUploadConc, pipelineCompressLevel int,
+	swissknife bool,
+	swissknifeBinary, swisskniferepokeys string,
+	swissknifeConcurrency int,
+	swissknifExtraArgs string,
 	s1Endpoints string,
 	s1Quorum float64,
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout time.Duration,
@@ -247,6 +334,7 @@ func runPublisher(
 
 	var casBackend cas.Backend
 	var leaseBackend lease.Backend
+	var gatewayQueue *api.GatewayQueue // non-nil only in gateway mode
 
 	switch publishMode {
 	case "gateway":
@@ -297,9 +385,16 @@ func runPublisher(
 			os.Exit(1)
 		}
 
-		leaseBackend = lease.NewClient(gatewayURL, gatewayKeyID, gatewaySecret, obs)
+		lc := lease.NewClient(gatewayURL, gatewayKeyID, gatewaySecret, obs)
+		if leaseRetryMax > 0 {
+			lc.RetryMax = leaseRetryMax
+		}
+		leaseBackend = lc
+		gatewayQueue = api.NewGatewayQueue(lc, obs)
 		obs.Logger.Info("gateway credentials", "key_id", gatewayKeyID)
-		obs.Logger.Info("publish backend: gateway", "url", gatewayURL)
+		obs.Logger.Info("publish backend: gateway", "url", gatewayURL,
+			"lease_retry_max", lc.EffectiveRetryMax(),
+			"poll_interval", "1s")
 
 	case "local":
 		// No gateway, no CAS — cvmfs_server handles everything.
@@ -360,15 +455,78 @@ func runPublisher(
 		}
 	}
 	provCfg := provenance.Config{
-		Enabled:       provenanceEnabled,
-		RekorServer:   rekorServer,
+		Enabled:        provenanceEnabled,
+		RekorServer:    rekorServer,
 		SigningKeyPath: rekorSigningKey,
-		OIDCIssuers:   oidcIssuerList,
+		OIDCIssuers:    oidcIssuerList,
 	}
 	provProvider, err := provenance.New(provCfg, spoolRoot, obs)
 	if err != nil {
 		obs.Logger.Error("failed to initialise provenance provider", "error", err)
 		os.Exit(1)
+	}
+
+	// ── Shared dedup Bloom filter (optional, gateway mode only) ─────────────
+	//
+	// Default dedup path: the pipeline calls cfg.CAS.Exists once per object
+	// (a stat or S3 HEAD request) before each Put.  For local-disk or S3 CAS
+	// this is fast and requires no startup walk and no memory overhead.
+	//
+	// Enable --bloom-filter (or --bloom-snapshot-dir, which implies it) when
+	// CAS.Exists is expensive — e.g. a high-latency network CAS where each
+	// HEAD request takes tens of milliseconds.  The Bloom filter replaces most
+	// CAS.Exists calls with an in-memory lookup seeded at startup.
+	//
+	// Seed path: walk the CVMFS catalog tree via Stratum 0 (when --stratum0-url
+	// and --repo-name are set) — 10–100× faster than a CAS filesystem walk for
+	// large repositories.  Falls back to a CAS walk when either flag is absent
+	// or Stratum 0 is temporarily unreachable.
+	//
+	// Add() is called after each successful CAS upload so the filter stays
+	// current without any per-job walk.
+	useBloom := bloomFilterEnabled || sharedFilter.Enabled // --bloom-snapshot-dir implies --bloom-filter
+	var sharedDedup *dedup.Checker
+	if casBackend != nil && useBloom {
+		seedMethod := "CAS filesystem walk"
+		if stratum0URL != "" && repoName != "" {
+			seedMethod = "CVMFS catalog tree walk (stratum0)"
+		} else if stratum0URL != "" {
+			seedMethod = "CAS filesystem walk (--repo-name not set; catalog walk unavailable)"
+		}
+		obs.Logger.Info("initializing shared dedup Bloom filter", "method", seedMethod)
+
+		// Ensure the temp directory for catalog SQLite downloads exists.
+		// walkCatalogTree writes one file per catalog hash here; each is removed
+		// immediately after the catalog is processed.
+		dedupTmpDir := spoolRoot + "/dedup-tmp"
+		if mkErr := os.MkdirAll(dedupTmpDir, 0o750); mkErr != nil {
+			obs.Logger.Error("failed to create dedup temp directory", "dir", dedupTmpDir, "error", mkErr)
+			os.Exit(1)
+		}
+
+		// Use a generous timeout: the catalog walk downloads and queries many
+		// SQLite files over HTTP for large repositories.  5 minutes handles repos
+		// with thousands of nested catalogs.  NewFromCatalog's internal CAS-walk
+		// fallback applies its own 30-second timeout if catalog seeding is skipped.
+		dedupInitCtx, dedupInitCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		var dedupInitErr error
+		sharedDedup, dedupInitErr = dedup.NewFromCatalog(
+			dedupInitCtx,
+			stratum0URL, // empty string → CAS walk fallback inside NewFromCatalog
+			repoName,    // empty string → CAS walk fallback inside NewFromCatalog
+			dedupTmpDir, // temp dir for catalog SQLite files; cleaned up per-catalog
+			casBackend,
+			sharedFilter,
+			obs,
+		)
+		dedupInitCancel()
+		if dedupInitErr != nil {
+			obs.Logger.Error("failed to initialize shared dedup Bloom filter at startup", "error", dedupInitErr)
+			os.Exit(1)
+		}
+		obs.Logger.Info("shared dedup Bloom filter ready — all jobs will use this checker")
+	} else if casBackend != nil {
+		obs.Logger.Info("dedup: using direct CAS.Exists per object (Bloom filter disabled; enable with --bloom-filter for high-latency CAS)")
 	}
 
 	// Build the orchestrator.
@@ -459,22 +617,60 @@ func runPublisher(
 		Spool:        sp,
 		CAS:          casBackend,
 		Lease:        leaseBackend,
+		GatewayQueue: gatewayQueue,
 		CVMFSMount:   cvmfsMount,
 		Stratum0URL:  stratum0URL,
+		JobTimeout:   jobTimeout,
 		BrokerConfig: publishBrokerCfg,
 		Pipeline: pipeline.Config{
-			Workers:      4,
-			UploadConc:   4,
-			CAS:          casBackend,
-			SpoolDir:     spoolRoot,
-			Obs:          obs,
-			SharedFilter: sharedFilter,
+			Workers:       4,
+			UploadConc:    pipelineUploadConc,
+			CompressLevel: pipelineCompressLevel,
+			CAS:           casBackend,
+			SpoolDir:      spoolRoot,
+			Obs:           obs,
+			SharedFilter:  sharedFilter,
+			DedupChecker:  sharedDedup, // shared across all jobs — no per-job CAS walk
 		},
 		Distribute:  distCfg,
 		DistManager: distManager,
 		Notify:      notifyBus,
 		Provenance:  provProvider,
 		Obs:         obs,
+	}
+
+	// Wire cvmfs_swissknife ingest if requested.
+	//
+	// When enabled, the Go pipeline (dedup + compress + CAS + catalog + commit)
+	// is replaced by a single cvmfs_swissknife ingest call.  CAS is not used
+	// by the swissknife path so casBackend may be nil when --swissknife is the
+	// only active publish mode; in mixed deployments CAS is still created for
+	// the Go path and swissknife simply ignores it.
+	if swissknife {
+		var extraArgs []string
+		for _, a := range strings.Fields(swissknifExtraArgs) {
+			extraArgs = append(extraArgs, a)
+		}
+		orch.SwissKnife = &cvmfscatalog.SwissKnifeConfig{
+			Binary:      swissknifeBinary,
+			GatewayURL:  gatewayURL,
+			RepoKeysDir: swisskniferepokeys,
+			Concurrency: swissknifeConcurrency,
+			ExtraArgs:   extraArgs,
+		}
+		obs.Logger.Info("cvmfs_swissknife ingest path enabled",
+			"binary", swissknifeBinary,
+			"repo_keys", swisskniferepokeys,
+			"gateway", gatewayURL,
+			"note", "Go pipeline (dedup/CAS/catalog) is bypassed; Stratum 1 pre-warming disabled",
+		)
+	}
+	// Initialise the atomic live flag from the config pointer set above.
+	// Must be called after orch.SwissKnife is assigned so the flag reflects
+	// the startup value; the Web UI can toggle it at runtime via PATCH /api/v1/config.
+	orch.InitSwissKnife()
+	if jobTimeout > 0 {
+		obs.Logger.Info("per-job timeout enabled", "job_timeout", jobTimeout)
 	}
 
 	// Start the distribution manager after the orchestrator is created so the
@@ -484,7 +680,7 @@ func runPublisher(
 		obs.Logger.Info("distribution manager started", "endpoints", len(distCfg.Endpoints))
 	}
 
-	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot)
+	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
 
 	// Crash-recovery: re-run jobs that were interrupted by a previous crash.
 	recoverCtx, cancelRecover := context.WithCancel(context.Background())

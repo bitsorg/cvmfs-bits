@@ -111,8 +111,8 @@ func TestDownloadCatalog(t *testing.T) {
 
 	// Create an httptest server that serves the compressed catalog
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Expected path: /testrepo/data/34/3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01C
-		if r.URL.Path == "/testrepo/data/34/3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01C" {
+		// Expected path: /testrepo/data/34/56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01C
+		if r.URL.Path == "/testrepo/data/34/56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01C" {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Write(compressedData)
 			return

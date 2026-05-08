@@ -69,11 +69,21 @@ type SharedFilterConfig struct {
 }
 
 // filterCapacity returns the configured capacity with a safe default.
+//
+// The default was raised from 1 000 000 to 10 000 000 to provide meaningful
+// headroom for large repositories and for the shared checker that accumulates
+// entries via Add() over a service run.  A saturated filter drives FPR to
+// ~100 %, causing every dedup.Check() to fall through to a cas.Exists() stat
+// call — including for brand-new objects — which slows jobs as the CAS grows.
+//
+// At 1 % FPR a 10M-capacity filter costs ~12 MB of heap; this is a reasonable
+// one-time allocation for a long-running service.  Operators can lower or raise
+// the value via --bloom-filter-capacity.
 func (c SharedFilterConfig) filterCapacity() uint {
 	if c.Capacity > 0 {
 		return c.Capacity
 	}
-	return 1_000_000
+	return 10_000_000
 }
 
 // filterFPRate returns the configured false-positive rate with a safe default.
