@@ -183,6 +183,27 @@ func (e *Entry) Hardlinks() int64 {
 	return int64(e.HardlinkGroup)<<32 | int64(lc)
 }
 
+// HashSuffix returns the CVMFS algorithm suffix string for a given HashAlgo.
+//
+//	SHA-1      → ""   (no suffix — the default and most common case)
+//	SHA-256    → "-"
+//	RipeMD-160 → "~"
+//
+// The suffix is appended to the hex hash when constructing CAS object paths
+// and catalog content-type identifiers (e.g. "abc123...C" for catalogs).
+func HashSuffix(algo HashAlgo) string {
+	switch algo {
+	case HashSha1:
+		return ""
+	case HashSha256:
+		return "-"
+	case HashRipeMD160:
+		return "~"
+	default:
+		return ""
+	}
+}
+
 // HashAlgoFromFlags extracts the hash algorithm from a flags value.
 func HashAlgoFromFlags(flags int) HashAlgo {
 	return HashAlgo(((flags>>FlagPosHash)&7) + 1)

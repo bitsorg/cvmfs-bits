@@ -103,15 +103,11 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	// Unauthenticated routes.
 	s.router.Handle("/api/v1/metrics", promhttp.Handler())
 	s.router.HandleFunc("/api/v1/health", s.health).Methods("GET")
-	s.router.HandleFunc("/api/v1/config", s.getConfig).Methods("GET")
 
 	// Console — unauthenticated (read-only, no secrets exposed).
 	s.router.HandleFunc("/", s.consoleHandler).Methods("GET")
 	s.router.HandleFunc("/jobs", s.consoleHandler).Methods("GET")
 	s.router.HandleFunc("/jobs/{id}", s.jobDetailHandler).Methods("GET")
-
-	// PATCH /api/v1/config requires auth (it mutates server state).
-	s.router.Handle("/api/v1/config", s.requireAuth(http.HandlerFunc(s.patchConfig))).Methods("PATCH")
 
 	// Critical #4: All job routes require a valid bearer token.
 	auth := s.router.PathPrefix("/api/v1/jobs").Subrouter()
@@ -1312,61 +1308,6 @@ if(jobDetailMatch){
 </script>
 </body>
 </html>`
-
-// configResponse is the JSON shape returned by GET /api/v1/config and
-// PATCH /api/v1/config.
-type configResponse struct {
-	// SwissKnifeEnabled reports whether the cvmfs_swissknife ingest path is
-	// currently active.  Toggle it at runtime via PATCH /api/v1/config.
-	SwissKnifeEnabled bool `json:"swissknife_enabled"`
-	// SwissKnifeConfigured is true when --swissknife was passed at startup
-	// (i.e. the binary and key-dir are known).  When false, enabling via the
-	// API has no effect and the toggle is disabled in the UI.
-	SwissKnifeConfigured bool `json:"swissknife_configured"`
-	// SwissKnifeBinary is the path to the cvmfs_swissknife executable.
-	// Empty when SwissKnifeConfigured is false.
-	SwissKnifeBinary string `json:"swissknife_binary,omitempty"`
-}
-
-// getConfig handles GET /api/v1/config.
-// Returns the current runtime configuration.  Unauthenticated (read-only).
-func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
-	resp := configResponse{
-		SwissKnifeEnabled:    s.orch.SwissKnifeEnabled(),
-		SwissKnifeConfigured: s.orch.SwissKnife != nil,
-	}
-	if s.orch.SwissKnife != nil {
-		resp.SwissKnifeBinary = s.orch.SwissKnife.Binary
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// patchConfig handles PATCH /api/v1/config.
-// Accepts {"swissknife_enabled": true|false} and toggles the ingest path
-// at runtime without a service restart.  Requires bearer token auth.
-func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SwissKnifeEnabled *bool `json:"swissknife_enabled"`
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
-	if err != nil || json.Unmarshal(body, &req) != nil {
-		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
-		return
-	}
-	if req.SwissKnifeEnabled != nil {
-		if ok := s.orch.SetSwissKnifeEnabled(*req.SwissKnifeEnabled); !ok {
-			http.Error(w, `{"error":"swissknife was not configured at startup; cannot enable at runtime"}`, http.StatusConflict)
-			return
-		}
-		s.obs.Logger.Info("swissknife ingest path toggled via API",
-			"enabled", *req.SwissKnifeEnabled,
-			"remote_addr", r.RemoteAddr,
-		)
-	}
-	// Return updated state.
-	s.getConfig(w, r)
-}
 
 // health returns a liveness probe response.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

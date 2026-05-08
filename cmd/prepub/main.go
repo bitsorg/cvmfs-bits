@@ -40,7 +40,6 @@ import (
 	"cvmfs.io/prepub/internal/pipeline/dedup"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
-	"cvmfs.io/prepub/pkg/cvmfscatalog"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
@@ -100,22 +99,6 @@ func main() {
 	// Pipeline performance tuning.
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
-
-	// ── cvmfs_swissknife ingest alternative pipeline ───────────────────────────
-	//
-	// When --swissknife is set, the Go pipeline (dedup + compress + CAS write +
-	// BuildSubtree + gateway HTTP commit) is replaced by a single call to
-	// cvmfs_swissknife ingest.  The binary handles all processing in optimised
-	// C++ code.  Trade-offs: Stratum 1 pre-warming and Go-side Bloom-filter
-	// dedup are disabled; per-object provenance hashes are not recorded.
-	//
-	// Benchmark first with --swissknife on a representative publish before
-	// committing to this path in production.  Keep the Go path as a fallback.
-	swissknife := flag.Bool("swissknife", false, "Use cvmfs_swissknife ingest instead of Go pipeline; replaces dedup+compress+catalog+commit with a single C++ call [publisher]")
-	swissknifeBinary := flag.String("swissknife-binary", "cvmfs_swissknife", "Path to the cvmfs_swissknife executable (default: resolved via PATH) [publisher]")
-	swisskniferepokeys := flag.String("swissknife-repo-keys", "/etc/cvmfs/keys", "Directory containing repository public-key files (required by cvmfs_swissknife -k) [publisher]")
-	swissknifeConcurrency := flag.Int("swissknife-concurrency", 0, "Number of internal cvmfs_swissknife upload threads (-q); 0 = use swissknife default [publisher]")
-	swissknifExtraArgs := flag.String("swissknife-extra-args", "", "Space-separated extra flags appended to cvmfs_swissknife ingest (e.g. '-e' for dedup, '-x' for delete-absent) [publisher]")
 
 	// Optional: repository name for catalog-based dedup seeding at startup.
 	// When set alongside --stratum0-url, the Bloom filter is seeded by walking
@@ -238,7 +221,6 @@ func main() {
 			bloomMaxSnapshotAge, bloomFilterCapacity, bloomFilterFPRate,
 			recvBloomCapacity, recvBloomFPRate,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
-			swissknife, swissknifeBinary, swisskniferepokeys, swissknifeConcurrency, swissknifExtraArgs,
 		)
 	}
 
@@ -263,7 +245,6 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
-			*swissknife, *swissknifeBinary, *swisskniferepokeys, *swissknifeConcurrency, *swissknifExtraArgs,
 			*s1Endpoints, *s1Quorum, *s1Timeout, *s1BloomTimeout, *s1MQTTTimeout,
 			*s1WorkerConcurrency, *s1MaxAttempts, *s1QueueDepth,
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
@@ -296,10 +277,6 @@ func runPublisher(
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineUploadConc, pipelineCompressLevel int,
-	swissknife bool,
-	swissknifeBinary, swisskniferepokeys string,
-	swissknifeConcurrency int,
-	swissknifExtraArgs string,
 	s1Endpoints string,
 	s1Quorum float64,
 	s1Timeout, s1BloomTimeout, s1MQTTTimeout time.Duration,
@@ -639,36 +616,6 @@ func runPublisher(
 		Obs:         obs,
 	}
 
-	// Wire cvmfs_swissknife ingest if requested.
-	//
-	// When enabled, the Go pipeline (dedup + compress + CAS + catalog + commit)
-	// is replaced by a single cvmfs_swissknife ingest call.  CAS is not used
-	// by the swissknife path so casBackend may be nil when --swissknife is the
-	// only active publish mode; in mixed deployments CAS is still created for
-	// the Go path and swissknife simply ignores it.
-	if swissknife {
-		var extraArgs []string
-		for _, a := range strings.Fields(swissknifExtraArgs) {
-			extraArgs = append(extraArgs, a)
-		}
-		orch.SwissKnife = &cvmfscatalog.SwissKnifeConfig{
-			Binary:      swissknifeBinary,
-			GatewayURL:  gatewayURL,
-			RepoKeysDir: swisskniferepokeys,
-			Concurrency: swissknifeConcurrency,
-			ExtraArgs:   extraArgs,
-		}
-		obs.Logger.Info("cvmfs_swissknife ingest path enabled",
-			"binary", swissknifeBinary,
-			"repo_keys", swisskniferepokeys,
-			"gateway", gatewayURL,
-			"note", "Go pipeline (dedup/CAS/catalog) is bypassed; Stratum 1 pre-warming disabled",
-		)
-	}
-	// Initialise the atomic live flag from the config pointer set above.
-	// Must be called after orch.SwissKnife is assigned so the flag reflects
-	// the startup value; the Web UI can toggle it at runtime via PATCH /api/v1/config.
-	orch.InitSwissKnife()
 	if jobTimeout > 0 {
 		obs.Logger.Info("per-job timeout enabled", "job_timeout", jobTimeout)
 	}

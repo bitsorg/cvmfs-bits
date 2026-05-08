@@ -62,11 +62,6 @@ type Orchestrator struct {
 	// If empty, the catalog merge step is skipped and the commit will use an
 	// empty old_root_hash (only safe for the initial publish of a new repository).
 	Stratum0URL string
-	// CatalogSource is reserved for future use.  It is not currently used by
-	// the orchestrator (Merge is no longer called; BuildSubtree handles all
-	// catalog construction without accessing the existing repository catalog).
-	// Kept for API stability so callers that configure it do not break.
-	CatalogSource cvmfscatalog.CatalogSource
 	// Distribute contains configuration for Stratum 1 push distribution.
 	// nil disables distribution (typical for local mode).
 	Distribute *distribute.Config
@@ -88,28 +83,9 @@ type Orchestrator struct {
 	// deployments both configs reference the same broker.
 	BrokerConfig *broker.Config
 	// Pipeline contains configuration for the compression/dedup pipeline.
-	// Only used when Lease.NeedsPipeline() returns true and SwissKnife is nil.
+	// Only used when Lease.NeedsPipeline() returns true (gateway mode).
 	Pipeline pipeline.Config
 
-	// SwissKnife holds the cvmfs_swissknife configuration set at startup.
-	// When non-nil and swissknifeLive is true, Run() delegates the entire
-	// publish pipeline to cvmfs_swissknife ingest instead of the Go pipeline.
-	//
-	// Access SwissKnifeEnabled() / SetSwissKnifeEnabled() for the live toggle;
-	// read SwissKnife directly only for configuration display.
-	//
-	// When active:
-	//   • CAS is not required (swissknife manages its own object store).
-	//   • Stratum 1 pre-warming (DistManager) is skipped — no per-object
-	//     CAS records are available.
-	//   • The per-job pipeline metrics (pipeline_duration, objects_new, …)
-	//     are not populated; only swissknife_ingest_duration and total_s0 emit.
-	SwissKnife *cvmfscatalog.SwissKnifeConfig
-
-	// swissknifeMu protects swissknifeLive for concurrent reads from Run()
-	// and writes from SetSwissKnifeEnabled().
-	swissknifeMu   sync.RWMutex
-	swissknifeLive bool // true iff SwissKnife != nil and currently enabled
 	// Notify is the event bus for job state changes. nil disables event publishing.
 	Notify *notify.Bus
 	// Provenance records build identity and Rekor receipts. nil disables provenance recording.
@@ -161,37 +137,6 @@ type Orchestrator struct {
 func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
 	v, _ := o.commitMu.LoadOrStore(repo, &sync.Mutex{})
 	return v.(*sync.Mutex)
-}
-
-// SwissKnifeEnabled reports whether the cvmfs_swissknife ingest path is
-// currently active.  It is safe to call from multiple goroutines.
-func (o *Orchestrator) SwissKnifeEnabled() bool {
-	o.swissknifeMu.RLock()
-	defer o.swissknifeMu.RUnlock()
-	return o.swissknifeLive
-}
-
-// SetSwissKnifeEnabled enables or disables the cvmfs_swissknife ingest path
-// at runtime without restarting the service.  Returns false (no-op) when
-// SwissKnife config was not provided at startup (enabling has no effect
-// without a config).  Safe to call from multiple goroutines.
-func (o *Orchestrator) SetSwissKnifeEnabled(enabled bool) bool {
-	if o.SwissKnife == nil {
-		return false // no config — cannot enable
-	}
-	o.swissknifeMu.Lock()
-	o.swissknifeLive = enabled
-	o.swissknifeMu.Unlock()
-	return true
-}
-
-// InitSwissKnife sets the live flag from the SwissKnife config pointer.
-// Call once from main after assigning orch.SwissKnife; the Web UI may
-// subsequently toggle the flag via SetSwissKnifeEnabled without restart.
-func (o *Orchestrator) InitSwissKnife() {
-	o.swissknifeMu.Lock()
-	o.swissknifeLive = o.SwissKnife != nil
-	o.swissknifeMu.Unlock()
 }
 
 // StartPrefetch starts a background goroutine that performs Phase 0 of the
@@ -404,10 +349,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 
 	logger := o.Obs.Logger.With("job_id", j.ID)
 
-	// Invariant: gateway mode requires a non-nil CAS backend — UNLESS the
-	// SwissKnife path is active, which manages its own object store.
-	if o.Lease.NeedsPipeline() && o.CAS == nil && !o.SwissKnifeEnabled() {
-		err := fmt.Errorf("misconfiguration: gateway mode requires a non-nil CAS backend (or --swissknife)")
+	// Invariant: gateway mode requires a non-nil CAS backend.
+	if o.Lease.NeedsPipeline() && o.CAS == nil {
+		err := fmt.Errorf("misconfiguration: gateway mode requires a non-nil CAS backend")
 		span.RecordError(err)
 		return o.abortJob(ctx, j, err)
 	}
@@ -415,19 +359,6 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// Record total-S0 start time: from the moment Run() is invoked (job was
 	// already in StateIncoming when the goroutine was scheduled).
 	jobStartTS := time.Now()
-
-	// ── SwissKnife fast path ───────────────────────────────────────────────────
-	// When the operator has configured cvmfs_swissknife as the publish tool,
-	// bypass the Go pipeline (dedup, compress, CAS, catalog, commit) entirely.
-	// The binary handles all processing in optimised C++ code; our job lifecycle
-	// machinery (state transitions, provenance, MQTT, webhook) still runs.
-	//
-	// This path is taken when --swissknife is set (o.SwissKnife != nil) and the
-	// backend is gateway mode (NeedsPipeline).  Local-mode jobs (NeedsPipeline
-	// == false) use the existing Commit path regardless of SwissKnife config.
-	if o.SwissKnifeEnabled() && o.Lease.NeedsPipeline() {
-		return o.runWithSwissKnife(ctx, j, onStagingComplete, jobStartTS)
-	}
 
 	// ── Phase 1 + 2: pipeline + distribution (gateway mode only) ─────────────
 	var pipelineResult *pipeline.Result
@@ -1147,154 +1078,6 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		"bytes_raw", j.NBytesRaw,
 		"bytes_compressed", j.NBytesCompressed,
 	)
-	return nil
-}
-
-// runWithSwissKnife is the alternative job-execution path that delegates the
-// entire publish pipeline to cvmfs_swissknife ingest.  Called by Run() when
-// o.SwissKnife is non-nil and the backend is gateway mode.
-//
-// The method replicates the post-publish steps of the Go path (provenance,
-// MQTT notification, webhook) so operators who switch to swissknife continue
-// to get the same observability and lifecycle events.  The Go pipeline, catalog
-// build, and gateway commit steps are replaced by the single subprocess call.
-func (o *Orchestrator) runWithSwissKnife(
-	ctx context.Context,
-	j *job.Job,
-	onStagingComplete func(),
-	jobStartTS time.Time,
-) error {
-	ctx, span := o.Obs.Tracer.Start(ctx, "orchestrator.swissknife")
-	defer span.End()
-	logger := o.Obs.Logger.With("job_id", j.ID)
-
-	if err := o.transition(ctx, j, job.StateStaging); err != nil {
-		span.RecordError(err)
-		return o.abortJob(ctx, j, err)
-	}
-
-	// TarPath becomes valid at the staging location after the rename above.
-	j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
-	j.PipelineStartedAt = time.Now()
-
-	logger.Info("cvmfs_swissknife ingest starting",
-		"repo", j.Repo,
-		"path", j.Path,
-		"tar", j.TarPath,
-		"binary", o.SwissKnife.Binary,
-		"gateway", o.SwissKnife.GatewayURL,
-	)
-
-	// Release the pipeline concurrency slot now.
-	//
-	// cvmfs_swissknife manages its own internal thread pool (-q) and is not
-	// subject to the Go compress-worker budget.  Releasing the slot early lets
-	// the next queued job start its own staging phase while swissknife runs,
-	// preserving the concurrency benefit introduced by the dynamic semaphore.
-	if onStagingComplete != nil {
-		onStagingComplete()
-	}
-
-	ingestStart := time.Now()
-	if err := cvmfscatalog.SwissKnifeIngest(
-		ctx, *o.SwissKnife,
-		o.Stratum0URL, j.TarPath, j.Repo, j.Path,
-		func(line string) { logger.Info("swissknife: " + line) },
-	); err != nil {
-		span.RecordError(err)
-		logger.Error("cvmfs_swissknife ingest failed", "error", err)
-		return o.abortJob(ctx, j, fmt.Errorf("cvmfs_swissknife ingest: %w", err))
-	}
-
-	ingestDur := time.Since(ingestStart)
-	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("swissknife_ingest").Observe(ingestDur.Seconds())
-	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("total_s0").Observe(time.Since(jobStartTS).Seconds())
-	j.PipelineEndedAt = time.Now()
-
-	logger.Info("cvmfs_swissknife ingest complete",
-		"duration", ingestDur.Round(time.Millisecond))
-
-	// Wake any in-process goroutine waiting for this repo's lease so the next
-	// job does not wait for the next poll interval.
-	if o.GatewayQueue != nil {
-		o.GatewayQueue.NotifyRelease(j.Repo)
-	}
-
-	// Fetch the new root hash from the manifest produced by swissknife.
-	// This is a lightweight GET (~500 bytes); swissknife has already committed
-	// by the time Run returns, so the manifest reflects the new state.
-	if o.Stratum0URL != "" {
-		if newRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(
-			ctx, nil, o.Stratum0URL, j.Repo,
-		); fetchErr != nil {
-			logger.Warn("swissknife: could not fetch new root hash post-commit",
-				"error", fetchErr)
-		} else {
-			j.NewRootHash = strings.TrimSuffix(newRoot, "C")
-		}
-	}
-
-	j.PublishedAt = time.Now()
-	if err := o.transition(ctx, j, job.StatePublished); err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	// MQTT post-commit notification (fire-and-forget).
-	if o.BrokerConfig != nil && j.NewRootHash != "" {
-		go o.publishMQTTNotification(j.Repo, j.NewRootHash)
-	}
-
-	// Provenance — swissknife does not produce per-object hashes, so
-	// CatalogHash and ObjectHashes are empty.  The identity fields
-	// (GitSHA, Actor, etc.) are still recorded for audit purposes.
-	if o.Provenance != nil && j.Provenance != nil {
-		rec := &provenance.Record{
-			JobID:       j.ID,
-			Repo:        j.Repo,
-			Path:        j.Path,
-			GitRepo:     j.Provenance.GitRepo,
-			GitSHA:      j.Provenance.GitSHA,
-			GitRef:      j.Provenance.GitRef,
-			Actor:       j.Provenance.Actor,
-			PipelineID:  j.Provenance.PipelineID,
-			BuildSystem: j.Provenance.BuildSystem,
-			OIDCIssuer:  j.Provenance.OIDCIssuer,
-			OIDCSubject: j.Provenance.OIDCSubject,
-			Verified:    j.Provenance.Verified,
-		}
-		if submitErr := o.Provenance.Submit(ctx, rec); submitErr != nil {
-			logger.Warn("provenance: Rekor submission failed (continuing)", "error", submitErr)
-		} else if rec.Submitted() {
-			j.Provenance.RekorServer = rec.RekorServer
-			j.Provenance.RekorUUID = rec.RekorUUID
-			j.Provenance.RekorLogIndex = rec.RekorLogIndex
-			j.Provenance.RekorIntegratedTime = rec.RekorIntegratedTime
-			j.Provenance.RekorSET = rec.RekorSET
-			if err := o.Spool.WriteManifest(j); err != nil {
-				logger.Warn("best-effort manifest write failed (rekor receipt)",
-					"job_id", j.ID, "error", err)
-			}
-		}
-	}
-
-	// Webhook delivery (async, non-fatal).
-	if o.Notify != nil && j.WebhookURL != "" {
-		webhookCtx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		o.webhookWg.Add(1)
-		go func() {
-			defer o.webhookWg.Done()
-			defer wcancel()
-			notify.DeliverWebhook(webhookCtx, j.WebhookURL, notify.Event{
-				JobID: j.ID,
-				State: job.StatePublished,
-				Time:  time.Now(),
-			}, o.Obs)
-		}()
-	}
-
-	o.Obs.Metrics.JobsCompleted.Inc()
-	logger.Info("swissknife job completed successfully")
 	return nil
 }
 

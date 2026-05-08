@@ -74,13 +74,13 @@ type Config struct {
 // Result is returned after a successful pipeline run.
 type Result struct {
 	// CatalogEntries are the CVMFS catalog entries collected from the tar.
-	// These are passed to cvmfscatalog.Merge() after the gateway lease is acquired.
-	// The catalog is NOT finalised here — merging with the existing repository
-	// catalog happens in the orchestrator after lease acquisition.
+	// These are passed to cvmfscatalog.BuildSubtree() in the orchestrator after
+	// the gateway lease is acquired.  The catalog is NOT finalised here — the
+	// subtree build happens in the orchestrator after lease acquisition.
 	CatalogEntries []cvmfscatalog.Entry
 	// ObjectHashes are the SHA-1 hashes (of zlib-compressed content) for ALL
 	// CAS objects in this publish (file chunks only, NOT including catalog — the
-	// catalog hashes come from cvmfscatalog.Merge).  This includes both newly
+	// catalog hashes come from cvmfscatalog.BuildSubtree).  This includes both newly
 	// uploaded objects and objects that were already in the CAS (dedup hits).
 	//
 	// This is the complete set of objects that Stratum 1 replicas need to have.
@@ -100,7 +100,7 @@ type Result struct {
 	// sent to the gateway in a previous commit and are still present there.
 	NewObjectHashes []string
 	// DirtabContent is the raw content of the .cvmfsdirtab file if one was
-	// present in the tar payload.  It is passed to cvmfscatalog.MergeConfig so
+	// present in the tar payload.  It is passed to cvmfscatalog.SubtreeConfig so
 	// that catalog-split rules from the new publish take effect immediately.
 	// Nil when no .cvmfsdirtab was found in the tar.
 	DirtabContent []byte

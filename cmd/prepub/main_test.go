@@ -202,12 +202,6 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	rekorServer := ""
 	rekorSigningKey := ""
 	oidcIssuers := ""
-	swissknife := false
-	swissknifeBinary := ""
-	swisskniferepokeys := ""
-	swissknifeConcurrency := 0
-	swissknifExtraArgs := ""
-
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
@@ -225,7 +219,6 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
-		&swissknife, &swissknifeBinary, &swisskniferepokeys, &swissknifeConcurrency, &swissknifExtraArgs,
 	)
 
 	if spoolRoot != "/from/config" {
@@ -284,12 +277,6 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
-	swissknife2 := false
-	swissknifeBinary2 := ""
-	swisskniferepokeys2 := ""
-	swissknifeConcurrency2 := 0
-	swissknifExtraArgs2 := ""
-
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
@@ -307,7 +294,6 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
-		&swissknife2, &swissknifeBinary2, &swisskniferepokeys2, &swissknifeConcurrency2, &swissknifExtraArgs2,
 	)
 
 	// spool-root was explicitly set on CLI — config value must not override it.
@@ -350,12 +336,6 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
-	swissknife3 := false
-	swissknifeBinary3 := ""
-	swisskniferepokeys3 := ""
-	swissknifeConcurrency3 := 0
-	swissknifExtraArgs3 := ""
-
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
@@ -373,7 +353,6 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
-		&swissknife3, &swissknifeBinary3, &swisskniferepokeys3, &swissknifeConcurrency3, &swissknifExtraArgs3,
 	)
 
 	// Endpoints slice should be joined with comma.

@@ -72,22 +72,6 @@ type fileConfig struct {
 	MaxConcurrentJobs int    `yaml:"max_concurrent_jobs"`
 	CVMFSMount        string `yaml:"cvmfs_mount"`
 
-	// SwissKnife groups configuration for the cvmfs_swissknife ingest
-	// alternative publish path.  Leave the block absent (or set enabled: false)
-	// to use the default Go pipeline.
-	SwissKnife struct {
-		// Enabled activates the swissknife ingest path (--swissknife flag).
-		Enabled bool `yaml:"enabled"`
-		// Binary overrides the path to the cvmfs_swissknife executable.
-		Binary string `yaml:"binary"`
-		// RepoKeysDir is the repository public-key directory (-k flag).
-		RepoKeysDir string `yaml:"repo_keys_dir"`
-		// Concurrency sets the swissknife upload thread count (-q flag).
-		// 0 means use the swissknife default.
-		Concurrency int `yaml:"concurrency"`
-		// ExtraArgs are space-separated additional flags appended verbatim.
-		ExtraArgs string `yaml:"extra_args"`
-	} `yaml:"swissknife"`
 	// Stratum0URL is the base URL of the Stratum 0 CVMFS server
 	// (e.g. "http://stratum0/cvmfs").  Required in gateway mode so the
 	// orchestrator can fetch the existing root catalog for merging.
@@ -242,10 +226,6 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	recvBloomFPRate *float64,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
-	swissknife *bool,
-	swissknifeBinary, swisskniferepokeys *string,
-	swissknifeConcurrency *int,
-	swissknifExtraArgs *string,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -287,15 +267,6 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	if !has("max-concurrent-jobs") && fc.MaxConcurrentJobs != 0 {
 		*maxConcurrentJobs = fc.MaxConcurrentJobs
 	}
-	if !has("swissknife") && fc.SwissKnife.Enabled {
-		*swissknife = true
-	}
-	str("swissknife-binary", swissknifeBinary, fc.SwissKnife.Binary)
-	str("swissknife-repo-keys", swisskniferepokeys, fc.SwissKnife.RepoKeysDir)
-	if !has("swissknife-concurrency") && fc.SwissKnife.Concurrency != 0 {
-		*swissknifeConcurrency = fc.SwissKnife.Concurrency
-	}
-	str("swissknife-extra-args", swissknifExtraArgs, fc.SwissKnife.ExtraArgs)
 
 	// server.tls_cert / tls_key apply to both publisher and receiver.
 	str("tls-cert", tlsCert, fc.Server.TLSCert)

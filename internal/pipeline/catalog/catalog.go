@@ -76,13 +76,13 @@ func (b *Builder) Add(ctx context.Context, e unpack.FileEntry, hash string) erro
 	return nil
 }
 
-// Entries returns the collected entries for use by Merge.
+// Entries returns the collected entries for use by BuildSubtree.
 func (b *Builder) Entries() []*cvmfscatalog.Entry {
 	return b.entries
 }
 
 // Finalize is deprecated and returns an error.
-// Use Merge in pkg/cvmfscatalog instead.
+// Use BuildSubtree in pkg/cvmfscatalog instead.
 func (b *Builder) Finalize(ctx context.Context) (compPath string, dbHash string, err error) {
-	return "", "", fmt.Errorf("catalog.Builder.Finalize is deprecated; use pkg/cvmfscatalog.Merge instead")
+	return "", "", fmt.Errorf("catalog.Builder.Finalize is deprecated; use cvmfscatalog.BuildSubtree instead")
 }
