@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"cvmfs.io/prepub/pkg/observe"
 )
 
@@ -131,6 +133,60 @@ func TestSaveSnapshot_FileMode(t *testing.T) {
 	perm := info.Mode().Perm()
 	if perm != 0640 {
 		t.Errorf("snapshot has mode %04o, want 0640", perm)
+	}
+}
+
+// TestCheck_BloomFalsePositive_CounterIncrements is a regression test for the
+// BloomFalsePositives metric (Fix #bloom-fp-observability).
+//
+// A Bloom false positive occurs when the filter says "present" but CAS.Exists
+// returns false.  Before the fix there was no counter for this; a rising FP rate
+// would be invisible until CAS round-trip latency spiked.
+//
+// To engineer a false positive we bypass the seeding path: we call checker.Add()
+// to register a hash in the filter, then present a CAS backend that returns false
+// for that same hash — simulating the filter lying about the object being present.
+func TestCheck_BloomFalsePositive_CounterIncrements(t *testing.T) {
+	obs, shutdown, err := observe.New("test-fp")
+	if err != nil {
+		t.Fatalf("observe.New: %v", err)
+	}
+	defer shutdown()
+
+	// CAS backend is empty — Exists always returns false.
+	backend := &existsOnlyBackend{hashes: map[string]struct{}{}}
+	ctx := context.Background()
+
+	checker, err := New(ctx, backend, obs)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if obs.Metrics.BloomFalsePositives == nil {
+		t.Fatal("BloomFalsePositives metric is nil — was it registered in observe.New?")
+	}
+
+	// Read the baseline counter value before the test action.
+	before := testutil.ToFloat64(obs.Metrics.BloomFalsePositives)
+
+	// Directly inject "ghosthash" into the filter without adding it to CAS.
+	// This is exactly what a filter false positive looks like at runtime.
+	checker.Add("ghosthash")
+
+	// Check should return false (CAS doesn't have it) and should count the FP.
+	isDup, err := checker.Check(ctx, "ghosthash")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if isDup {
+		t.Error("expected isDup=false: CAS backend does not contain 'ghosthash'")
+	}
+
+	// The counter must have incremented by exactly one.
+	after := testutil.ToFloat64(obs.Metrics.BloomFalsePositives)
+	if after-before != 1 {
+		t.Errorf("BloomFalsePositives: expected +1 increment, got +%.0f (before=%.0f after=%.0f)",
+			after-before, before, after)
 	}
 }
 

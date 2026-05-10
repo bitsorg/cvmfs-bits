@@ -7,6 +7,23 @@ import (
 	"io"
 )
 
+// NativeExistsChecker is an optional interface that CAS backends implement
+// when their Exists() call is inherently cheap — for example a single
+// os.Stat for a local-disk store, or a single S3 HEAD request — so that
+// adding a Bloom-filter pre-check would increase overhead rather than
+// reduce it.
+//
+// When a Backend implements this interface the pipeline and the service
+// startup suppress Bloom-filter construction and use, regardless of any
+// --bloom-filter / --bloom-snapshot-dir flags, and fall back to calling
+// Exists() directly for every candidate object.
+type NativeExistsChecker interface {
+	Backend
+	// ExistsIsNative reports true when Exists() is cheap enough that a
+	// Bloom-filter pre-check is counterproductive.
+	ExistsIsNative() bool
+}
+
 // Backend is the interface for content-addressable storage.
 // All implementations must be thread-safe.
 type Backend interface {

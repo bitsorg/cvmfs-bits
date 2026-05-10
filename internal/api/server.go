@@ -24,6 +24,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/job"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/spool"
@@ -383,6 +384,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"repo field is required"}`, http.StatusBadRequest)
 			return
 		}
+		// Reject repo names that would produce structurally broken MQTT topics
+		// (/, +, #, NUL).  Validated here so downstream topic constructors
+		// (which panic on invalid input) never receive bad data.
+		if err := broker.ValidateRepo(req.Repo); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 		if req.TarPath == "" {
 			http.Error(w, `{"error":"tar_path field is required"}`, http.StatusBadRequest)
 			return
@@ -445,6 +453,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		repo = r.FormValue("repo")
 		if repo == "" {
 			http.Error(w, `{"error":"repo field is required"}`, http.StatusBadRequest)
+			return
+		}
+		if err := broker.ValidateRepo(repo); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
 		}
 		subPath = r.FormValue("path")
@@ -606,7 +618,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				"job_id", jobID, "repo", j.Repo)
 			// Use abortCtx so that a manual abort unblocks the wait
 			// immediately rather than holding the slot indefinitely.
-			if err := s.dynaSem.Acquire(abortCtx); err != nil {
+			if err := s.dynaSem.Acquire(abortCtx, j.TarSize); err != nil {
 				// abortCancel fired (operator abort or server shutdown) while
 				// the job was queued; mark it as aborted without running.
 				s.obs.Logger.Info("job aborted while waiting for slot",

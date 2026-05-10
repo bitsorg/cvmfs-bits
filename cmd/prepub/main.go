@@ -462,6 +462,17 @@ func runPublisher(
 	// Add() is called after each successful CAS upload so the filter stays
 	// current without any per-job walk.
 	useBloom := bloomFilterEnabled || sharedFilter.Enabled // --bloom-snapshot-dir implies --bloom-filter
+	// If the CAS backend can check existence natively (e.g. local os.Stat or a
+	// direct S3 HEAD), the Bloom filter adds overhead — an in-memory lookup plus
+	// an RWMutex acquire — on top of an already-cheap CAS.Exists call.  Suppress
+	// it unconditionally for such backends and warn if the operator explicitly
+	// requested it, so the flag does not silently become a no-op.
+	if nec, ok := casBackend.(cas.NativeExistsChecker); ok && nec.ExistsIsNative() {
+		if useBloom {
+			obs.Logger.Warn("--bloom-filter / --bloom-snapshot-dir ignored: CAS backend supports native existence checks (os.Stat / S3 HEAD); using direct CAS.Exists instead")
+		}
+		useBloom = false
+	}
 	var sharedDedup *dedup.Checker
 	if casBackend != nil && useBloom {
 		seedMethod := "CAS filesystem walk"
@@ -503,7 +514,11 @@ func runPublisher(
 		}
 		obs.Logger.Info("shared dedup Bloom filter ready — all jobs will use this checker")
 	} else if casBackend != nil {
-		obs.Logger.Info("dedup: using direct CAS.Exists per object (Bloom filter disabled; enable with --bloom-filter for high-latency CAS)")
+		if nec, ok := casBackend.(cas.NativeExistsChecker); ok && nec.ExistsIsNative() {
+			obs.Logger.Info("dedup: using direct CAS.Exists per object (CAS backend has native existence check; Bloom filter not needed)")
+		} else {
+			obs.Logger.Info("dedup: using direct CAS.Exists per object (Bloom filter disabled; enable with --bloom-filter for high-latency CAS)")
+		}
 	}
 
 	// Build the orchestrator.

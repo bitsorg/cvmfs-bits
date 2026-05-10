@@ -75,11 +75,10 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 	oldDir := s.JobDir(j)
 	newDir := filepath.Join(s.stateDir(to), j.ID)
 
-	// Write journal entry before moving
+	// Write journal entry before moving.
+	// oldDir is always Root/<state>/<jobID>, so filepath.Dir gives Root/<state>.
+	// The guard "if jdir == s.Root" could never be true and has been removed.
 	jdir := filepath.Dir(oldDir)
-	if jdir == s.Root {
-		jdir = s.stateDir(j.State)
-	}
 	journal := OpenJournal(jdir)
 	entry := Entry{
 		T:     time.Now(),
@@ -244,7 +243,10 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 	}
 
 	// Sync the temp file before renaming so the data is durable on crash.
-	f, err := os.Open(tmpPath)
+	// Must use O_RDWR, not os.Open (which gives a read-only fd): fsync(2) on a
+	// read-only fd is not guaranteed to succeed on all kernels/filesystems and
+	// returns EBADF on some.  A writable fd always works.
+	f, err := os.OpenFile(tmpPath, os.O_RDWR, 0)
 	if err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("opening manifest temp for sync: %w", err)
@@ -452,6 +454,55 @@ func (s *Spool) ReadJobJournal(jobID string) ([]Entry, error) {
 	})
 
 	return entries, nil
+}
+
+// IncomingBySize returns all jobs currently in the incoming state, sorted by
+// TarSize descending (largest first).
+//
+// This is the preferred way to enumerate jobs at startup or recovery so that
+// large jobs enter the pipeline first and overlap with smaller ones, reducing
+// overall makespan.  Jobs with TarSize == 0 (e.g. written before this field
+// was introduced) sort last and are otherwise treated normally.
+func (s *Spool) IncomingBySize(ctx context.Context) ([]*job.Job, error) {
+	_, span := s.obs.Tracer.Start(ctx, "spool.incoming_by_size")
+	defer span.End()
+
+	incomingDir := s.stateDir(job.StateIncoming)
+	entries, err := os.ReadDir(incomingDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		span.RecordError(err)
+		return nil, fmt.Errorf("reading incoming directory: %w", err)
+	}
+
+	var jobs []*job.Job
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		jobDir := filepath.Join(incomingDir, entry.Name())
+		j, err := s.ReadManifest(jobDir)
+		if err != nil {
+			span.RecordError(err)
+			return nil, fmt.Errorf("reading manifest for job %s: %w", entry.Name(), err)
+		}
+		jobs = append(jobs, j)
+	}
+
+	// Sort largest TarSize first so long-running jobs start early and overlap
+	// with shorter ones.  Ties are broken by submission time (CreatedAt) so
+	// older jobs are preferred among equal-size jobs, giving FIFO within each
+	// size bucket.
+	sort.Slice(jobs, func(i, k int) bool {
+		if jobs[i].TarSize != jobs[k].TarSize {
+			return jobs[i].TarSize > jobs[k].TarSize // descending size
+		}
+		return jobs[i].CreatedAt.Before(jobs[k].CreatedAt) // ascending age (older first)
+	})
+
+	return jobs, nil
 }
 
 // isErrExist reports whether err (or any wrapped error) indicates that a file

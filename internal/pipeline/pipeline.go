@@ -505,7 +505,7 @@ func runFromSortedEntries(
 		_, cspan := cfg.Obs.Tracer.Start(egCtx, "pipeline.catalog_build")
 		defer cspan.End()
 		for entry := range catalogChan {
-			if err := builder.Add(egCtx, entry, ""); err != nil {
+			if err := builder.Add(egCtx, entry); err != nil {
 				cspan.RecordError(err)
 				return fmt.Errorf("catalog add %s: %w", entry.Path, err)
 			}
@@ -521,15 +521,30 @@ func runFromSortedEntries(
 	//   hash before uploading.  For local-disk CAS or S3 this is a single
 	//   stat/HEAD request per object — fast enough that no pre-seeded index is
 	//   needed.  There is no startup walk, no memory overhead, and no risk of
-	//   filter saturation.
+	//   filter saturation.  This mode is also automatically chosen when the CAS
+	//   backend implements cas.NativeExistsChecker even if a DedupChecker is
+	//   configured (see below).
 	//
 	//   Bloom-filter mode (DedupChecker != nil): use a pre-seeded Bloom filter
 	//   for a fast in-memory negative test, confirming positives with CAS.Exists.
 	//   Enable this when CAS.Exists is expensive (e.g. high-latency network CAS
 	//   where each HEAD request takes tens of milliseconds) by passing a shared
 	//   *dedup.Checker seeded at service startup via --bloom-filter or
-	//   --bloom-snapshot-dir.
+	//   --bloom-snapshot-dir.  Backends that implement cas.NativeExistsChecker
+	//   always use the direct path regardless of this setting.
 	dedupChecker := cfg.DedupChecker // nil → direct CAS.Exists path
+	// If the CAS backend supports native existence checks, discard any
+	// configured Bloom filter: the filter adds an in-memory lookup plus RWMutex
+	// overhead on top of an already-cheap CAS.Exists call (os.Stat or S3 HEAD).
+	// This is a safety net; the startup code in main.go already sets DedupChecker
+	// to nil for such backends, but a manually constructed Config could still
+	// carry both.
+	if dedupChecker != nil {
+		if nec, ok := cfg.CAS.(cas.NativeExistsChecker); ok && nec.ExistsIsNative() {
+			cfg.Obs.Logger.DebugContext(ctx, "pipeline: discarding Bloom filter — CAS backend has native exists check (stat/HEAD)")
+			dedupChecker = nil
+		}
+	}
 	if dedupChecker != nil {
 		cfg.Obs.Logger.DebugContext(ctx, "pipeline: Bloom-filter dedup active")
 	} else {

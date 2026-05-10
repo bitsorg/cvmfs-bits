@@ -20,9 +20,9 @@ import (
 )
 
 // ErrNotFound is returned by Remove when the specified path does not exist
-// in the catalog.  Callers that treat deletion as idempotent (e.g. Merge)
-// can check for this sentinel and continue rather than fail (Fix N4).
-var ErrNotFound = errors.New("catalog: entry not found")
+// in the catalog.  Callers that treat deletion as idempotent can check for
+// this sentinel and continue rather than fail.
+var ErrNotFound = errors.New("entry not found")
 
 // cvmfsStatCounters is the canonical list of counter names that cvmfs_receiver's
 // SqlGetCounter queries via: SELECT value FROM statistics WHERE counter = :counter
@@ -46,25 +46,41 @@ type Catalog struct {
 	delta      Statistics // accumulated changes to flush in Finalize
 	// closeOnce ensures that Close() is safe to call from multiple goroutines
 	// simultaneously — only the first call actually closes the underlying DB.
-	closeOnce sync.Once // Fix N5
+	closeOnce sync.Once
 }
 
 // Statistics holds all counter columns from the statistics table.
+// Fields mirror the (counter TEXT PRIMARY KEY, value INTEGER) rows that
+// cvmfs_receiver reads via SqlGetCounter.
 type Statistics struct {
+	// Type counts (matching cvmfs/catalog_counters.h self_* / subtree_*)
 	SelfRegular     int64
 	SelfSymlink     int64
 	SelfDir         int64
 	SelfNested      int64
+	SelfSpecial     int64
+	SelfExternal    int64
+	SelfXattr       int64
+	// Chunked-file counters (task #12)
+	SelfChunked    int64 // files that use the chunked-upload path
+	SelfChunks     int64 // total number of chunk records across all chunked files
+	// Size counters (bytes, uncompressed)
+	SelfFileSize         int64 // sum of non-chunked regular file sizes
+	SelfChunkedSize      int64 // sum of chunked file sizes
+	SelfExternalFileSize int64 // sum of external file sizes
+
 	SubtreeRegular  int64
 	SubtreeSymlink  int64
 	SubtreeDir      int64
 	SubtreeNested   int64
-	SelfXattr       int64
-	SubtreeXattr    int64
-	SelfExternal    int64
-	SubtreeExternal int64
-	SelfSpecial     int64
 	SubtreeSpecial  int64
+	SubtreeExternal int64
+	SubtreeXattr    int64
+	SubtreeChunked    int64
+	SubtreeChunks     int64
+	SubtreeFileSize         int64
+	SubtreeChunkedSize      int64
+	SubtreeExternalFileSize int64
 }
 
 // Create creates a new CVMFS catalog database at dbPath with the given rootPrefix.
@@ -90,13 +106,14 @@ func Create(dbPath, rootPrefix string) (*Catalog, error) {
 
 	// Create all required tables for CVMFS schema 2.5.
 	//
-	// Fix N3/L3: UNIQUE constraints are expressed as explicit named indexes
-	// (rather than inline column constraints) so that the same
-	// CREATE UNIQUE INDEX IF NOT EXISTS statements can be issued in Open()
-	// to enforce the constraints on catalogs created by older code.
+	// UNIQUE constraints are expressed as explicit named indexes rather than
+	// inline column constraints so that the same CREATE UNIQUE INDEX IF NOT
+	// EXISTS statements can be re-issued by Open() to retrofit the constraint
+	// onto catalogs created by older code.
 	//
-	// Fix N6: nested_catalogs also gets a UNIQUE constraint so that calling
-	// AddNestedMount twice for the same path is rejected at the DB level.
+	// nested_catalogs uses a UNIQUE constraint so that calling AddNestedMount
+	// twice for the same path is rejected at the DB level rather than silently
+	// producing duplicate rows.
 	schema := `
 CREATE TABLE IF NOT EXISTS catalog (
 	md5path_1 INTEGER,
@@ -162,7 +179,7 @@ CREATE TABLE IF NOT EXISTS properties (
 		return nil, fmt.Errorf("creating schema: %w", err)
 	}
 
-	// Fix N3/L3/N6: enforce uniqueness via named indexes.
+	// Enforce uniqueness with explicit named indexes (idempotent).
 	// Using CREATE UNIQUE INDEX IF NOT EXISTS (rather than inline UNIQUE in the
 	// CREATE TABLE) means Open() can issue the same statements to retrofit the
 	// constraint onto catalogs created by older code — without risk of error.
@@ -239,8 +256,8 @@ CREATE TABLE IF NOT EXISTS properties (
 	}
 
 	if err := c.upsertEntry(rootEntry); err != nil {
-		// Fix N8: use c.Close() so the closeOnce gate is respected and the
-		// idempotent Close path is consistent with the rest of the package.
+		// Use c.Close() so the closeOnce gate is respected and the idempotent
+		// Close path is consistent with the rest of the package.
 		c.Close() //nolint:errcheck // best-effort cleanup on creation failure
 		return nil, fmt.Errorf("inserting root entry: %w", err)
 	}
@@ -256,11 +273,10 @@ func Open(dbPath string) (*Catalog, error) {
 	}
 
 	// Enable WAL + NORMAL synchronous for the same reasons as Create().
-	// Catalogs downloaded from Stratum 0 are opened read-modify-write during
-	// Merge; WAL mode dramatically reduces per-Upsert latency for large catalogs.
+	// WAL mode dramatically reduces per-Upsert latency for large catalogs.
 	// If the pragma fails (e.g. read-only filesystem or a locked WAL from a
 	// previous crash) we fall back silently — WAL is a performance improvement,
-	// not a correctness requirement for the Merge path.
+	// not a correctness requirement.
 	_, _ = db.Exec(`PRAGMA journal_mode=WAL`)   //nolint:errcheck // non-fatal
 	_, _ = db.Exec(`PRAGMA synchronous=NORMAL`) //nolint:errcheck // non-fatal
 
@@ -276,11 +292,10 @@ func Open(dbPath string) (*Catalog, error) {
 	}
 	// err == sql.ErrNoRows → root catalog, rootPrefix stays ""
 
-	// Attempt to re-apply unique indexes (Fix N3).  This is a no-op for catalogs
-	// that already have the indexes (IF NOT EXISTS).  For native CVMFS catalogs
-	// that lack md5path_1/md5path_2 columns the call will fail — we silently
-	// ignore that error because those catalogs are opened read-only for chain
-	// traversal and do not need write-path uniqueness guards.
+	// Re-apply unique indexes — a no-op for catalogs that already have them
+	// (IF NOT EXISTS).  For native CVMFS catalogs that lack md5path_1/md5path_2
+	// columns the call will fail — we silently ignore that error because those
+	// catalogs are opened read-only and do not need write-path uniqueness guards.
 	_ = applyUniqueIndexes(db)
 
 	return &Catalog{
@@ -321,47 +336,93 @@ func applyUniqueIndexes(db *sql.DB) error {
 	return nil
 }
 
-// trackAdd increments the appropriate self-count based on entry flags.
-// FlagXattr is orthogonal to the file-type counters and is tracked separately.
-func (c *Catalog) trackAdd(flags int) {
+// entryTrackInfo holds the fields needed to update in-memory statistics counters
+// when an entry is added or removed.  It is computed from the Entry struct (for
+// new entries) or from the catalog DB (when replacing or removing an existing
+// entry) and passed to trackAdd / trackRemove.
+type entryTrackInfo struct {
+	flags      int   // entry flags; FlagXattr is set when the xattr BLOB is non-NULL
+	size       int64 // uncompressed entry size in bytes
+	chunkCount int   // number of chunk records (0 for non-chunked files)
+}
+
+// trackAdd increments the appropriate self-counters for a newly inserted entry.
+//
+// Type dispatch order (checked before falling to the default):
+//  1. FlagDir   → directory
+//  2. FlagLink  → symlink
+//  3. FlagFileSpecial → device / named pipe / socket
+//  4. FlagFileExternal → external (catalogued without stored content)
+//  5. FlagFileChunk → chunked regular file
+//  6. default → plain regular file
+//
+// FlagXattr is orthogonal to the type bits and always updates SelfXattr.
+func (c *Catalog) trackAdd(info entryTrackInfo) {
 	switch {
-	case flags&FlagDir != 0:
+	case info.flags&FlagDir != 0:
 		c.delta.SelfDir++
-	case flags&FlagLink != 0:
+	case info.flags&FlagLink != 0:
 		c.delta.SelfSymlink++
-	default:
+	case info.flags&FlagFileSpecial != 0:
+		c.delta.SelfSpecial++
+	case info.flags&FlagFileExternal != 0:
 		c.delta.SelfRegular++
+		c.delta.SelfExternal++
+		c.delta.SelfExternalFileSize += info.size
+	case info.flags&FlagFileChunk != 0:
+		c.delta.SelfRegular++
+		c.delta.SelfChunked++
+		c.delta.SelfChunks += int64(info.chunkCount)
+		c.delta.SelfChunkedSize += info.size
+	default: // plain regular file
+		c.delta.SelfRegular++
+		c.delta.SelfFileSize += info.size
 	}
-	if flags&FlagXattr != 0 {
+	if info.flags&FlagXattr != 0 {
 		c.delta.SelfXattr++
 	}
 }
 
-// trackRemove decrements the appropriate self-count based on entry flags.
-// FlagXattr is orthogonal to the file-type counters and is tracked separately.
-func (c *Catalog) trackRemove(flags int) {
+// trackRemove mirrors trackAdd but decrements all counters.
+func (c *Catalog) trackRemove(info entryTrackInfo) {
 	switch {
-	case flags&FlagDir != 0:
+	case info.flags&FlagDir != 0:
 		c.delta.SelfDir--
-	case flags&FlagLink != 0:
+	case info.flags&FlagLink != 0:
 		c.delta.SelfSymlink--
+	case info.flags&FlagFileSpecial != 0:
+		c.delta.SelfSpecial--
+	case info.flags&FlagFileExternal != 0:
+		c.delta.SelfRegular--
+		c.delta.SelfExternal--
+		c.delta.SelfExternalFileSize -= info.size
+	case info.flags&FlagFileChunk != 0:
+		c.delta.SelfRegular--
+		c.delta.SelfChunked--
+		c.delta.SelfChunks -= int64(info.chunkCount)
+		c.delta.SelfChunkedSize -= info.size
 	default:
 		c.delta.SelfRegular--
+		c.delta.SelfFileSize -= info.size
 	}
-	if flags&FlagXattr != 0 {
+	if info.flags&FlagXattr != 0 {
 		c.delta.SelfXattr--
 	}
 }
 
-// upsertEntry inserts or replaces a single entry in the catalog table.
+// upsertOneInTx inserts or replaces a single entry within an existing
+// transaction.  It is the shared inner implementation used by both upsertEntry
+// and BatchUpsert (task #9 — eliminate duplication).
 //
-// Fix C3: all catalog and chunk mutations are wrapped in a single transaction
-// so that a crash between the DELETE and INSERT cannot leave the catalog in an
-// inconsistent state.
+// Returns:
+//   - hasExisting: whether a pre-existing row was found and deleted.
+//   - oldInfo: entryTrackInfo for the replaced row (only valid when hasExisting).
+//   - newInfo: entryTrackInfo for the newly inserted row.
 //
-// Fix C1: the statistics delta is updated only after the transaction commits
-// successfully, so a rollback never leaves the in-memory delta permanently wrong.
-func (c *Catalog) upsertEntry(e Entry) error {
+// The caller must invoke trackRemove(oldInfo) and trackAdd(newInfo) AFTER the
+// enclosing transaction commits — updating the delta post-commit means a
+// rollback never leaves the in-memory statistics in a permanently wrong state.
+func upsertOneInTx(tx *sql.Tx, e Entry) (hasExisting bool, oldInfo, newInfo entryTrackInfo, err error) {
 	p1, p2 := MD5Path(e.FullPath)
 	parentP1, parentP2 := int64(0), int64(0)
 	if e.FullPath != "" {
@@ -379,40 +440,35 @@ func (c *Catalog) upsertEntry(e Entry) error {
 	internalFlags := e.Flags()
 	dbFlags := internalFlags &^ FlagXattr
 	hardlinks := e.Hardlinks()
-
-	tx, err := c.db.Begin()
-	if err != nil {
-		return fmt.Errorf("beginning transaction for %s: %w", e.FullPath, err)
-	}
-	defer tx.Rollback() // no-op after Commit
+	xattrBlob := cvmfsxattr.Marshal(e.Xattr)
 
 	// Check for an existing entry so we can replace it atomically.
-	// Read both the stored flags and whether the xattr BLOB is non-NULL so
-	// that trackRemove can correctly decrement SelfXattr (FlagXattr is never
-	// stored in the DB flags column; we reconstruct it from the BLOB).
+	// Also read size and count chunks for entryTrackInfo (task #12).
 	var existingFlags int
 	var existingXattrPresent bool
-	hasExisting := false
+	var existingSize int64
 	if scanErr := tx.QueryRow(
-		"SELECT flags, (xattr IS NOT NULL) FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-	).Scan(&existingFlags, &existingXattrPresent); scanErr == nil {
+		"SELECT flags, (xattr IS NOT NULL), size FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?",
+		p1, p2,
+	).Scan(&existingFlags, &existingXattrPresent, &existingSize); scanErr == nil {
 		hasExisting = true
 		if existingXattrPresent {
 			existingFlags |= FlagXattr
 		}
+		var existingChunks int
+		_ = tx.QueryRow(
+			"SELECT COUNT(*) FROM chunks WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+		).Scan(&existingChunks)
+		oldInfo = entryTrackInfo{flags: existingFlags, size: existingSize, chunkCount: existingChunks}
+
 		if _, delErr := tx.Exec(
 			"DELETE FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
 		); delErr != nil {
-			return fmt.Errorf("removing old entry %s: %w", e.FullPath, delErr)
+			return false, entryTrackInfo{}, entryTrackInfo{}, fmt.Errorf("removing old entry %s: %w", e.FullPath, delErr)
 		}
 	}
 
-	// Serialize xattr map to the CVMFS binary TLV BLOB.
-	// cvmfsxattr.Marshal returns nil for an empty map, keeping the column NULL
-	// for entries with no extended attributes.
-	xattrBlob := cvmfsxattr.Marshal(e.Xattr)
-
-	// Insert the new row using dbFlags (FlagXattr masked out).
+	// Insert the new catalog row using dbFlags (FlagXattr masked out).
 	if _, insErr := tx.Exec(`
 		INSERT INTO catalog (
 			md5path_1, md5path_2, parent_1, parent_2, hardlinks, hash, size, mode,
@@ -422,35 +478,55 @@ func (c *Catalog) upsertEntry(e Entry) error {
 		UnixMode(e.Mode), e.Mtime, e.MtimeNs, dbFlags, e.Name,
 		e.Symlink, e.UID, e.GID, xattrBlob,
 	); insErr != nil {
-		return fmt.Errorf("inserting entry %s: %w", e.FullPath, insErr)
+		return false, entryTrackInfo{}, entryTrackInfo{}, fmt.Errorf("inserting entry %s: %w", e.FullPath, insErr)
 	}
 
 	// Replace chunk rows atomically within the same transaction.
 	if _, delErr := tx.Exec(
 		"DELETE FROM chunks WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
 	); delErr != nil {
-		return fmt.Errorf("clearing old chunks for %s: %w", e.FullPath, delErr)
+		return false, entryTrackInfo{}, entryTrackInfo{}, fmt.Errorf("clearing old chunks for %s: %w", e.FullPath, delErr)
 	}
 	for _, ch := range e.Chunks {
 		if _, insErr := tx.Exec(
 			"INSERT INTO chunks (md5path_1, md5path_2, offset, size, hash) VALUES (?, ?, ?, ?, ?)",
 			p1, p2, ch.Offset, ch.Size, ch.Hash,
 		); insErr != nil {
-			return fmt.Errorf("inserting chunk at offset %d for %s: %w", ch.Offset, e.FullPath, insErr)
+			return false, entryTrackInfo{}, entryTrackInfo{}, fmt.Errorf("inserting chunk at offset %d for %s: %w", ch.Offset, e.FullPath, insErr)
 		}
+	}
+
+	newInfo = entryTrackInfo{flags: internalFlags, size: e.Size, chunkCount: len(e.Chunks)}
+	return hasExisting, oldInfo, newInfo, nil
+}
+
+// upsertEntry inserts or replaces a single entry in the catalog table.
+//
+// All catalog and chunk mutations are wrapped in a single transaction so that a
+// crash between the DELETE and INSERT cannot leave the catalog in an inconsistent
+// state.  The statistics delta is updated only after the transaction commits
+// successfully, so a rollback never leaves the in-memory delta permanently wrong.
+func (c *Catalog) upsertEntry(e Entry) error {
+	tx, err := c.db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning transaction for %s: %w", e.FullPath, err)
+	}
+	defer tx.Rollback() // no-op after Commit
+
+	hasExisting, oldInfo, newInfo, err := upsertOneInTx(tx, e)
+	if err != nil {
+		return err
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		return fmt.Errorf("committing upsert for %s: %w", e.FullPath, commitErr)
 	}
 
-	// Update the in-memory statistics delta only after the transaction has
-	// committed.  Updating before commit would permanently corrupt the delta
-	// if the transaction were subsequently rolled back.
+	// Update the in-memory statistics delta only after the transaction commits.
 	if hasExisting {
-		c.trackRemove(existingFlags) // existingFlags already has FlagXattr set if BLOB was non-NULL
+		c.trackRemove(oldInfo)
 	}
-	c.trackAdd(internalFlags) // internalFlags has FlagXattr set if new entry has xattrs
+	c.trackAdd(newInfo)
 	return nil
 }
 
@@ -486,124 +562,66 @@ func (c *Catalog) BatchUpsert(entries []Entry) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
-	// Collect per-entry statistics deltas so we can apply them atomically after
-	// the transaction commits (matching the invariant in upsertEntry).
-	type deltaUpdate struct {
-		hasExisting   bool
-		existingFlags int
-		newFlags      int
+	// Collect per-entry tracking info so statistics can be applied atomically
+	// after the transaction commits — updating post-commit means a rollback
+	// cannot leave the in-memory delta in a permanently wrong state.
+	type deltaRecord struct {
+		hasExisting bool
+		oldInfo     entryTrackInfo
+		newInfo     entryTrackInfo
 	}
-	updates := make([]deltaUpdate, 0, len(entries))
+	records := make([]deltaRecord, 0, len(entries))
 
 	for _, e := range entries {
-		p1, p2 := MD5Path(e.FullPath)
-		parentP1, parentP2 := int64(0), int64(0)
-		if e.FullPath != "" {
-			parentPath, ok := ParentAbsPath(e.FullPath)
-			if ok {
-				parentP1, parentP2 = MD5Path(parentPath)
-			}
+		hasExisting, oldInfo, newInfo, upsertErr := upsertOneInTx(tx, e)
+		if upsertErr != nil {
+			return upsertErr
 		}
-
-		internalFlags := e.Flags()
-		dbFlags := internalFlags &^ FlagXattr
-		hardlinks := e.Hardlinks()
-		xattrBlob := cvmfsxattr.Marshal(e.Xattr)
-
-		var existingFlags int
-		var existingXattrPresent bool
-		hasExisting := false
-		if scanErr := tx.QueryRow(
-			"SELECT flags, (xattr IS NOT NULL) FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-		).Scan(&existingFlags, &existingXattrPresent); scanErr == nil {
-			hasExisting = true
-			if existingXattrPresent {
-				existingFlags |= FlagXattr
-			}
-			if _, delErr := tx.Exec(
-				"DELETE FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-			); delErr != nil {
-				return fmt.Errorf("removing old entry %s in batch: %w", e.FullPath, delErr)
-			}
-		}
-
-		if _, insErr := tx.Exec(`
-			INSERT INTO catalog (
-				md5path_1, md5path_2, parent_1, parent_2, hardlinks, hash, size, mode,
-				mtime, mtimens, flags, name, symlink, uid, gid, xattr
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			p1, p2, parentP1, parentP2, hardlinks, e.Hash, e.Size,
-			UnixMode(e.Mode), e.Mtime, e.MtimeNs, dbFlags, e.Name,
-			e.Symlink, e.UID, e.GID, xattrBlob,
-		); insErr != nil {
-			return fmt.Errorf("inserting entry %s in batch: %w", e.FullPath, insErr)
-		}
-
-		if _, delErr := tx.Exec(
-			"DELETE FROM chunks WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-		); delErr != nil {
-			return fmt.Errorf("clearing chunks for %s in batch: %w", e.FullPath, delErr)
-		}
-		for _, ch := range e.Chunks {
-			if _, insErr := tx.Exec(
-				"INSERT INTO chunks (md5path_1, md5path_2, offset, size, hash) VALUES (?, ?, ?, ?, ?)",
-				p1, p2, ch.Offset, ch.Size, ch.Hash,
-			); insErr != nil {
-				return fmt.Errorf("inserting chunk at offset %d for %s in batch: %w", ch.Offset, e.FullPath, insErr)
-			}
-		}
-
-		updates = append(updates, deltaUpdate{
-			hasExisting:   hasExisting,
-			existingFlags: existingFlags,
-			newFlags:      internalFlags,
-		})
+		records = append(records, deltaRecord{hasExisting, oldInfo, newInfo})
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		return fmt.Errorf("committing batch upsert (%d entries): %w", len(entries), commitErr)
 	}
 
-	// Apply statistics deltas only after the transaction has committed
-	// (matching the Fix C1 invariant upheld by upsertEntry).
-	for _, u := range updates {
-		if u.hasExisting {
-			c.trackRemove(u.existingFlags)
+	for _, r := range records {
+		if r.hasExisting {
+			c.trackRemove(r.oldInfo)
 		}
-		c.trackAdd(u.newFlags)
+		c.trackAdd(r.newInfo)
 	}
 	return nil
 }
 
 // Remove deletes an entry (and its chunks) from the catalog by its absolute path.
 //
-// Fix C3: the SELECT, catalog DELETE, and chunk DELETE are wrapped in a single
+// The SELECT, catalog DELETE, and chunk DELETE are all wrapped in a single
 // transaction so a crash midway cannot leave orphan chunks or a missing entry.
-//
-// Fix C1: trackRemove is called only after the transaction commits successfully,
-// so a rollback never leaves the in-memory delta permanently wrong.
-//
-// Fix M2: chunk DELETE errors are now propagated instead of silently ignored.
+// Chunk DELETE errors are propagated rather than silently ignored.
+// trackRemove is called only after the transaction commits successfully, so a
+// rollback never leaves the in-memory delta permanently wrong.
 func (c *Catalog) Remove(absPath string) error {
 	p1, p2 := MD5Path(absPath)
 
 	tx, err := c.db.Begin()
 	if err != nil {
-		return fmt.Errorf("beginning transaction for Remove %s: %w", absPath, err)
+		return fmt.Errorf("beginning transaction for remove %s: %w", absPath, err)
 	}
 	defer tx.Rollback() // no-op after Commit
 
-	// Fetch existing flags so we can decrement the right counter after commit.
+	// Fetch existing flags, size, and chunk count so trackRemove can correctly
+	// decrement all counters (size and chunk counters were added in task #12).
 	// Also read whether the xattr BLOB is non-NULL: FlagXattr is never stored
 	// in the flags column, so we reconstruct it here for trackRemove.
-	// Fix N4: if the entry is absent we return ErrNotFound so callers that
-	// treat deletion as idempotent (e.g. Merge) can distinguish "not found"
-	// from a genuine database error.
+	// If the entry is absent we return ErrNotFound so callers that treat deletion
+	// as idempotent can distinguish "not found" from a genuine database error.
 	var flags int
 	var xattrPresent bool
+	var size int64
 	scanErr := tx.QueryRow(
-		"SELECT flags, (xattr IS NOT NULL) FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-	).Scan(&flags, &xattrPresent)
+		"SELECT flags, (xattr IS NOT NULL), size FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?",
+		p1, p2,
+	).Scan(&flags, &xattrPresent, &size)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -613,6 +631,10 @@ func (c *Catalog) Remove(absPath string) error {
 	if xattrPresent {
 		flags |= FlagXattr
 	}
+	var chunkCount int
+	_ = tx.QueryRow(
+		"SELECT COUNT(*) FROM chunks WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+	).Scan(&chunkCount)
 
 	// Delete catalog entry.
 	if _, delErr := tx.Exec(
@@ -629,19 +651,19 @@ func (c *Catalog) Remove(absPath string) error {
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
-		return fmt.Errorf("committing Remove for %s: %w", absPath, commitErr)
+		return fmt.Errorf("committing remove for %s: %w", absPath, commitErr)
 	}
 
 	// Update the in-memory statistics delta only after the transaction commits.
-	c.trackRemove(flags)
+	c.trackRemove(entryTrackInfo{flags: flags, size: size, chunkCount: chunkCount})
 	return nil
 }
 
 // Close releases the underlying database connection.  It is safe to call on a
 // Catalog that has already been closed or finalised (returns nil in that case).
 //
-// Fix N5: closeOnce ensures that concurrent callers (e.g. a deferred Close and
-// an error-path Close in a goroutine) each block until the first call completes
+// closeOnce ensures that concurrent callers (e.g. a deferred Close and an
+// error-path Close in a goroutine) each block until the first call completes
 // and then return without performing a double-close.
 func (c *Catalog) Close() error {
 	var closeErr error
@@ -664,13 +686,11 @@ func (c *Catalog) Close() error {
 // matching WritableCatalog::InsertNestedCatalog which calls content_hash.ToString()
 // (ToString() defaults to with_suffix=false — see hash.h line 241).
 //
-// Fix N1/C3: the INSERT into nested_catalogs and the UPDATE of the directory
-// entry's flags are wrapped in a single transaction so a crash between them
-// cannot leave the catalog in a structurally inconsistent state.
-//
-// Fix N1/C1: c.delta.SelfNested is incremented only after the transaction
-// commits successfully, so a rollback never permanently corrupts the in-memory
-// statistics delta.
+// The INSERT into nested_catalogs and the UPDATE of the directory entry's flags
+// are wrapped in a single transaction so a crash between them cannot leave the
+// catalog in a structurally inconsistent state.  c.delta.SelfNested is
+// incremented only after the transaction commits, so a rollback never
+// permanently corrupts the in-memory statistics delta.
 func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 	p1, p2 := MD5Path(mountPath)
 	parentPath, _ := ParentAbsPath(mountPath)
@@ -678,7 +698,7 @@ func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 
 	tx, err := c.db.Begin()
 	if err != nil {
-		return fmt.Errorf("beginning transaction for AddNestedMount %s: %w", mountPath, err)
+		return fmt.Errorf("beginning transaction for nested mount at %s: %w", mountPath, err)
 	}
 	defer tx.Rollback() // no-op after Commit
 
@@ -720,10 +740,10 @@ func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
-		return fmt.Errorf("committing AddNestedMount for %s: %w", mountPath, commitErr)
+		return fmt.Errorf("committing nested mount for %s: %w", mountPath, commitErr)
 	}
 
-	// Update in-memory delta only after the transaction commits (Fix N1/C1).
+	// Update in-memory delta only after the transaction commits.
 	c.delta.SelfNested++
 	return nil
 }
@@ -774,9 +794,9 @@ func (c *Catalog) UpdateNestedMount(absPath, hashHex string, size int64) error {
 func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, err error) {
 	now := time.Now().Unix()
 
-	// Fix N2: wrap the three metadata writes in a single transaction so a
-	// crash between any two cannot leave the catalog partially updated
-	// (e.g. revision bumped but statistics not flushed).
+	// Wrap the three metadata writes (revision bump, last_modified, statistics
+	// flush) in a single transaction so a crash between any two cannot leave
+	// the catalog partially updated.
 	tx, err := c.db.Begin()
 	if err != nil {
 		return "", Statistics{}, fmt.Errorf("beginning finalize transaction: %w", err)
@@ -808,11 +828,11 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 		"self_xattr":                 c.delta.SelfXattr,
 		"self_external":              c.delta.SelfExternal,
 		"self_special":               c.delta.SelfSpecial,
-		"self_chunked":               0,
-		"self_chunks":                0,
-		"self_file_size":             0,
-		"self_chunked_size":          0,
-		"self_external_file_size":    0,
+		"self_chunked":               c.delta.SelfChunked,
+		"self_chunks":                c.delta.SelfChunks,
+		"self_file_size":             c.delta.SelfFileSize,
+		"self_chunked_size":          c.delta.SelfChunkedSize,
+		"self_external_file_size":    c.delta.SelfExternalFileSize,
 		"subtree_regular":            c.delta.SubtreeRegular,
 		"subtree_symlink":            c.delta.SubtreeSymlink,
 		"subtree_dir":                c.delta.SubtreeDir,
@@ -820,11 +840,11 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 		"subtree_xattr":              c.delta.SubtreeXattr,
 		"subtree_external":           c.delta.SubtreeExternal,
 		"subtree_special":            c.delta.SubtreeSpecial,
-		"subtree_chunked":            0,
-		"subtree_chunks":             0,
-		"subtree_file_size":          0,
-		"subtree_chunked_size":       0,
-		"subtree_external_file_size": 0,
+		"subtree_chunked":            c.delta.SubtreeChunked,
+		"subtree_chunks":             c.delta.SubtreeChunks,
+		"subtree_file_size":          c.delta.SubtreeFileSize,
+		"subtree_chunked_size":       c.delta.SubtreeChunkedSize,
+		"subtree_external_file_size": c.delta.SubtreeExternalFileSize,
 	}
 	for counter, delta := range deltaMap {
 		if _, err := tx.Exec(
@@ -847,7 +867,7 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 	_, _ = c.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`) //nolint:errcheck // best-effort
 
 	// Close database and nil the pointer so subsequent use panics loudly
-	// rather than silently accessing a closed db (Fix H1).
+	// rather than silently accessing a closed db handle.
 	if err := c.db.Close(); err != nil {
 		return "", Statistics{}, fmt.Errorf("closing database: %w", err)
 	}
@@ -900,8 +920,12 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 		return "", Statistics{}, fmt.Errorf("writing compressed catalog: %w", err)
 	}
 
-	// VACUUM (optional but good practice)
-	// We can't VACUUM after Close(), so skip for now.
+	// Remove the temporary SQLite file now that its content has been durably
+	// written to the CAS object.  This prevents staging directories from
+	// accumulating one .db file per catalog per job.  Best-effort: a failure
+	// here is non-fatal because the CAS object is already written and the
+	// orchestrator removes the entire staging directory on job completion.
+	_ = os.Remove(c.dbPath) //nolint:errcheck
 
 	return hash, savedDelta, nil
 }
@@ -966,6 +990,16 @@ func (c *Catalog) GetStatistics() (*Statistics, error) {
 			stats.SelfExternal = value
 		case "self_special":
 			stats.SelfSpecial = value
+		case "self_chunked":
+			stats.SelfChunked = value
+		case "self_chunks":
+			stats.SelfChunks = value
+		case "self_file_size":
+			stats.SelfFileSize = value
+		case "self_chunked_size":
+			stats.SelfChunkedSize = value
+		case "self_external_file_size":
+			stats.SelfExternalFileSize = value
 		case "subtree_regular":
 			stats.SubtreeRegular = value
 		case "subtree_symlink":
@@ -980,9 +1014,16 @@ func (c *Catalog) GetStatistics() (*Statistics, error) {
 			stats.SubtreeExternal = value
 		case "subtree_special":
 			stats.SubtreeSpecial = value
-			// self_chunked, self_chunks, self_file_size, self_chunked_size,
-			// self_external_file_size and their subtree_ counterparts are tracked
-			// for completeness but not mapped to Statistics fields yet.
+		case "subtree_chunked":
+			stats.SubtreeChunked = value
+		case "subtree_chunks":
+			stats.SubtreeChunks = value
+		case "subtree_file_size":
+			stats.SubtreeFileSize = value
+		case "subtree_chunked_size":
+			stats.SubtreeChunkedSize = value
+		case "subtree_external_file_size":
+			stats.SubtreeExternalFileSize = value
 		}
 	}
 	if err := rows.Err(); err != nil {

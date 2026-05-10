@@ -449,6 +449,56 @@ func TestChunkCompressedSizeMatchesLen(t *testing.T) {
 	}
 }
 
+// TestChunkedBulkHashIsRawFileHash is a regression test for the bulk hash bug.
+//
+// Before the fix, result.Hash for a chunked file was chunks[0].Hash —
+// i.e. SHA-1(zlib(first_chunk)).  The CVMFS standard is SHA-1(full uncompressed
+// content), which clients verify when re-assembling a chunked file.
+//
+// This test constructs a file with at least two chunks so that the two hashes
+// are guaranteed to differ, then asserts result.Hash equals SHA-1(raw data).
+func TestChunkedBulkHashIsRawFileHash(t *testing.T) {
+	// Two distinct chunks of 6 bytes each.
+	data := []byte("AAAAAABBBBBB") // 12 bytes, chunk size = 6 → 2 chunks
+	entry := unpack.FileEntry{
+		Path:    "/chunked.bin",
+		Mode:    0o100644,
+		Size:    int64(len(data)),
+		ModTime: time.Now(),
+		Data:    data,
+	}
+
+	result, err := compressEntry(entry, 6, 0)
+	if err != nil {
+		t.Fatalf("compressEntry: %v", err)
+	}
+	if len(result.Chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(result.Chunks))
+	}
+
+	// CVMFS bulk hash = SHA-1(full uncompressed content).
+	wantBulk := sha1Hex(data)
+
+	// SHA-1(zlib(first_chunk)) — this was the old (wrong) value.
+	oldBuggyHash := sha1Hex(compressZlib(data[:6]))
+
+	if result.Hash != wantBulk {
+		t.Errorf("result.Hash = %s; want SHA-1(raw data) = %s", result.Hash, wantBulk)
+	}
+	if result.Hash == oldBuggyHash {
+		t.Errorf("result.Hash equals the old buggy value SHA-1(zlib(chunk0)) = %s; bulk hash must be SHA-1(raw content)", oldBuggyHash)
+	}
+
+	// Per-chunk CAS keys must still be SHA-1(zlib(chunk)) — not changed by the fix.
+	for i, chunk := range result.Chunks {
+		chunkData := data[chunk.Offset : chunk.Offset+chunk.UncompressedSize]
+		wantChunkHash := sha1Hex(compressZlib(chunkData))
+		if chunk.Hash != wantChunkHash {
+			t.Errorf("chunk[%d].Hash = %s; want SHA-1(zlib(chunk)) = %s", i, chunk.Hash, wantChunkHash)
+		}
+	}
+}
+
 // TestChunkBufferReuse verifies that chunks produced on separate iterations are
 // independent — modifying one chunk's Compressed slice does not affect another
 // (Fix L2 — buffer is reset and content is copied, not shared).

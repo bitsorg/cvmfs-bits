@@ -69,12 +69,12 @@ type SubtreeResult struct {
 // BuildSubtree builds the new subtree catalog for LeasePath and all split
 // sub-catalogs within it.
 //
-// It is equivalent to the inner steps of Merge (path-rewriting, split
-// planning, entry routing, finalization) but skips the HTTP manifest fetch,
-// root catalog download, and chain walk — the three operations that dominate
-// Merge's latency for large repositories.
+// It performs path-rewriting, split planning, entry routing, and finalization
+// entirely from the supplied entry list, without fetching the HTTP manifest,
+// downloading the existing root catalog, or walking a catalog chain.
 //
-// The caller must:
+// # Caller responsibilities
+//
 //  1. Upload every hash in SubtreeResult.AllCatalogHashes+"C" to the local
 //     CAS (o.CAS.Put) before invoking the gateway commit.
 //  2. Pass SubtreeResult.CatalogHashSuffixed as CommitRequest.NewRootHashSuffixed.
@@ -84,6 +84,23 @@ type SubtreeResult struct {
 // The catalog files are written to:
 //
 //	TempDir/data/XY/hashC   (CVMFS standard CAS layout, one file per catalog)
+//
+// # Receiver interaction contract
+//
+// cvmfs_receiver requires two invariants that BuildSubtree upholds:
+//
+//  1. root_prefix must be set for every nested catalog.  When loading a nested
+//     catalog via AttachFreely / LoadFreeCatalog, the receiver calls
+//     LookupPath(rootPrefix) to locate the catalog's root directory entry.
+//     An absent or incorrect root_prefix causes the receiver to fail the
+//     lookup and reject the catalog.
+//
+//  2. The root directory entry of a nested catalog must be stored at
+//     MD5Path(rootPrefix), not at MD5Path("").  The receiver's NormalizePath
+//     for is_regular_mountpoint_ returns the path unchanged, so
+//     LookupPath("/atlas/24.0") computes MD5("/atlas/24.0") and must find an
+//     entry there.  BuildSubtree satisfies this by passing rootPrefix as
+//     Entry.FullPath when creating the root entry inside Create().
 func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*SubtreeResult, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -109,11 +126,13 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	defer leaseCat.Close()
 
 	// The "chain" is exactly one node: the fresh subtree catalog.
-	chain := []catalogChainNode{{cat: leaseCat, path: targetAbsPath, isNew: true}}
+	chain := []catalogChainNode{{cat: leaseCat, path: targetAbsPath}}
 
 	// ── Rewrite entry paths from relative to absolute ─────────────────────────
-	// Mirror of Merge Step 3.5: tar-relative paths (e.g. "usr/lib/foo.so")
-	// become absolute CVMFS paths (e.g. "/atlas/24.0/usr/lib/foo.so").
+	// Callers supply tar-relative paths (e.g. "usr/lib/foo.so").  Prepend the
+	// lease prefix so every FullPath is an absolute CVMFS path
+	// (e.g. "/atlas/24.0/usr/lib/foo.so") before the entries are routed into
+	// the SQLite catalog.
 	prefix := targetAbsPath
 	for i := range entries {
 		rel := entries[i].FullPath
@@ -141,29 +160,34 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	}
 
 	// ── Plan catalog split points ─────────────────────────────────────────────
-	// Identical to Merge Step 3.6: derive split points from .cvmfscatalog
-	// marker files and dirtab glob rules, restricted to the lease boundary.
+	// Inspect the entry list for .cvmfscatalog marker files and dirtab glob
+	// rules.  Every matching directory within the lease boundary becomes a
+	// nested-catalog split point, rooted in its own fresh SQLite database.
 	splitPaths := planSplits(entries, targetAbsPath, dt)
 
 	// Create a fresh child catalog for each split point.
+	//
+	// Each catalog is closed by its Finalize() call in the finalization loop
+	// below (Finalize calls c.db.Close()).  On the error path, closeAllSplits
+	// closes any handles that have not yet been finalized.
 	type newCatNode struct {
 		cat  *Catalog
 		path string
 	}
 	newCats := make(map[string]*newCatNode, len(splitPaths))
+	closeAllSplits := func() {
+		for _, n := range newCats {
+			n.cat.Close() // idempotent via closeOnce
+		}
+	}
 	for _, sp := range splitPaths {
 		splitDBPath := filepath.Join(cfg.TempDir, "split_"+safePathID(sp)+".db")
 		newCat, createErr := Create(splitDBPath, sp)
 		if createErr != nil {
-			for _, n := range newCats {
-				n.cat.Close()
-			}
+			closeAllSplits()
 			return nil, fmt.Errorf("creating new catalog for %q: %w", sp, createErr)
 		}
-		sp2 := sp
-		nc := newCat
-		defer func() { nc.Close() }()
-		newCats[sp2] = &newCatNode{cat: newCat, path: sp}
+		newCats[sp] = &newCatNode{cat: newCat, path: sp}
 	}
 
 	// ── Route entries to the correct catalog ──────────────────────────────────
@@ -212,8 +236,9 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	result := &SubtreeResult{}
 
 	// ── Finalise split catalogs deepest-first ─────────────────────────────────
-	// Mirror of Merge Step 5: sort by descending path length so children are
-	// finalised before their parents, enabling AddNestedMount on each parent.
+	// Sort split paths by descending length so the deepest nested catalogs are
+	// finalised first.  A child must be finalised (and its hash known) before
+	// its parent registers it via AddNestedMount.
 	sortedSplits := make([]string, len(splitPaths))
 	copy(sortedSplits, splitPaths)
 	sort.Slice(sortedSplits, func(i, j int) bool {
@@ -225,12 +250,15 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 
 		hash, delta, finalErr := node.cat.Finalize(cfg.TempDir)
 		if finalErr != nil {
+			closeAllSplits()
 			return nil, fmt.Errorf("finalizing split catalog at %q: %w", sp, finalErr)
 		}
+		// node.cat is now closed by Finalize; no further Close needed for this node.
 
 		casFile := filepath.Join(cfg.TempDir, cvmfshash.ObjectPath(hash)+"C")
 		fi, statErr := os.Stat(casFile)
 		if statErr != nil {
+			closeAllSplits()
 			return nil, fmt.Errorf("stat split catalog %s: %w", hash, statErr)
 		}
 		result.AllCatalogHashes = append(result.AllCatalogHashes, hash)
@@ -244,75 +272,50 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			parentCat = leafCat
 		}
 		if addErr := parentCat.AddNestedMount(sp, hash, fi.Size()); addErr != nil {
+			closeAllSplits()
 			return nil, fmt.Errorf("adding nested mount %q to parent catalog: %w", sp, addErr)
 		}
 
 		// Propagate child statistics into parent delta.
-		parentCat.delta.SubtreeRegular += delta.SelfRegular + delta.SubtreeRegular
-		parentCat.delta.SubtreeSymlink += delta.SelfSymlink + delta.SubtreeSymlink
-		parentCat.delta.SubtreeDir += delta.SelfDir + delta.SubtreeDir
-		parentCat.delta.SubtreeNested += delta.SelfNested + delta.SubtreeNested
-		parentCat.delta.SubtreeXattr += delta.SelfXattr + delta.SubtreeXattr
+		parentCat.delta.SubtreeRegular  += delta.SelfRegular  + delta.SubtreeRegular
+		parentCat.delta.SubtreeSymlink  += delta.SelfSymlink  + delta.SubtreeSymlink
+		parentCat.delta.SubtreeDir      += delta.SelfDir      + delta.SubtreeDir
+		parentCat.delta.SubtreeNested   += delta.SelfNested   + delta.SubtreeNested
+		parentCat.delta.SubtreeXattr    += delta.SelfXattr    + delta.SubtreeXattr
 		parentCat.delta.SubtreeExternal += delta.SelfExternal + delta.SubtreeExternal
-		parentCat.delta.SubtreeSpecial += delta.SelfSpecial + delta.SubtreeSpecial
+		parentCat.delta.SubtreeSpecial  += delta.SelfSpecial  + delta.SubtreeSpecial
+		// Chunked-file and size counters (task #12).
+		parentCat.delta.SubtreeChunked          += delta.SelfChunked          + delta.SubtreeChunked
+		parentCat.delta.SubtreeChunks           += delta.SelfChunks           + delta.SubtreeChunks
+		parentCat.delta.SubtreeFileSize         += delta.SelfFileSize         + delta.SubtreeFileSize
+		parentCat.delta.SubtreeChunkedSize      += delta.SelfChunkedSize      + delta.SubtreeChunkedSize
+		parentCat.delta.SubtreeExternalFileSize += delta.SelfExternalFileSize + delta.SubtreeExternalFileSize
 	}
 
-	// ── Finalise the chain ────────────────────────────────────────────────────
-	// Mirror of Merge Step 6.  With a single-element chain the inner
-	// AddNestedMount / UpdateNestedMount branch never fires; the loop just
-	// finalises the subtree root catalog.
-	var childHash string
-	var childSize int64
-	var childPath string
-	var childDelta Statistics
-	var childIsNew bool
-
-	for i := len(chain) - 1; i >= 0; i-- {
-		node := chain[i]
-
-		// For future extensibility (multi-level chain): register child in parent.
-		if childHash != "" {
-			var nestErr error
-			if childIsNew {
-				nestErr = node.cat.AddNestedMount(childPath, childHash, childSize)
-			} else {
-				nestErr = node.cat.UpdateNestedMount(childPath, childHash, childSize)
-			}
-			if nestErr != nil {
-				return nil, fmt.Errorf("registering nested mount %q in catalog at %q: %w",
-					childPath, node.path, nestErr)
-			}
-			node.cat.delta.SubtreeRegular += childDelta.SelfRegular + childDelta.SubtreeRegular
-			node.cat.delta.SubtreeSymlink += childDelta.SelfSymlink + childDelta.SubtreeSymlink
-			node.cat.delta.SubtreeDir += childDelta.SelfDir + childDelta.SubtreeDir
-			node.cat.delta.SubtreeNested += childDelta.SelfNested + childDelta.SubtreeNested
-			node.cat.delta.SubtreeXattr += childDelta.SelfXattr + childDelta.SubtreeXattr
-			node.cat.delta.SubtreeExternal += childDelta.SelfExternal + childDelta.SubtreeExternal
-			node.cat.delta.SubtreeSpecial += childDelta.SelfSpecial + childDelta.SubtreeSpecial
-		}
-
-		hash, delta, finalErr := node.cat.Finalize(cfg.TempDir)
-		if finalErr != nil {
-			return nil, fmt.Errorf("finalizing catalog at %q: %w", node.path, finalErr)
-		}
-
-		casFile := filepath.Join(cfg.TempDir, cvmfshash.ObjectPath(hash)+"C")
-		fi, statErr := os.Stat(casFile)
-		if statErr != nil {
-			return nil, fmt.Errorf("stat finalized catalog %s: %w", hash, statErr)
-		}
-
-		result.AllCatalogHashes = append(result.AllCatalogHashes, hash)
-		childHash = hash
-		childSize = fi.Size()
-		childPath = node.path
-		childDelta = delta
-		childIsNew = node.isNew
+	// ── Finalise the subtree root catalog ────────────────────────────────────
+	// chain always has exactly one element (the lease root catalog created
+	// above).  A multi-level chain (downloading the existing root catalog and
+	// walking it) was an earlier design that was replaced by this fresh-subtree
+	// approach.  If that path is ever reintroduced, restore the loop and the
+	// child-registration block that previously lived here.
+	//
+	// TODO: if root-level publishes ever need to update an existing root
+	// catalog rather than build a fresh subtree, extend chain here and
+	// re-introduce the parent-registration loop.
+	rootNode := chain[0]
+	rootHash, _, finalErr := rootNode.cat.Finalize(cfg.TempDir)
+	if finalErr != nil {
+		return nil, fmt.Errorf("finalizing subtree root catalog at %q: %w", rootNode.path, finalErr)
 	}
 
-	// childHash now holds the subtree root catalog hash.
-	result.CatalogHash = childHash
-	result.CatalogHashSuffixed = childHash + "C"
+	casFile := filepath.Join(cfg.TempDir, cvmfshash.ObjectPath(rootHash)+"C")
+	if _, statErr := os.Stat(casFile); statErr != nil {
+		return nil, fmt.Errorf("stat finalized root catalog %s: %w", rootHash, statErr)
+	}
+
+	result.AllCatalogHashes = append(result.AllCatalogHashes, rootHash)
+	result.CatalogHash = rootHash
+	result.CatalogHashSuffixed = rootHash + "C"
 
 	return result, nil
 }

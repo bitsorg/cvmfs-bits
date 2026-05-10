@@ -209,6 +209,16 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (R
 	var chunks []Chunk
 	offset := int64(0)
 
+	// Compute the bulk hash: SHA-1 of the full UNCOMPRESSED file content.
+	// CVMFS standard for chunked files: the catalog's "bulk hash" is the SHA-1
+	// of the complete uncompressed file, not of any individual chunk.  This
+	// differs from non-chunked files (where catalog hash = CAS key =
+	// SHA-1(compressed)) but matches what CVMFS clients expect when verifying
+	// chunked file integrity.  Per-chunk CAS keys are still SHA-1(zlib(chunk)).
+	bulkH := sha1.New() //nolint:gosec
+	bulkH.Write(data)
+	bulkHash := hex.EncodeToString(bulkH.Sum(nil))
+
 	// Fix L2: allocate the compression buffer once and reset it between chunks
 	// rather than creating a new bytes.Buffer on every iteration.  For files
 	// split into thousands of chunks this materially reduces GC pressure.
@@ -261,14 +271,12 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (R
 		offset = chunkEnd
 	}
 
-	// For chunked files, Hash holds the SHA-1 of the FIRST chunk's compressed
-	// bytes as the "bulk hash" (used for catalog entry and dedup key of the
-	// overall file object).  The first chunk's hash is a stable, deterministic
-	// representative that the CVMFS catalog stores for chunked files.
-	// If there are no chunks (empty file that somehow reached here), use the
-	// 40-zero sentinel.
+	// For chunked files, result.Hash is the CVMFS standard bulk hash:
+	// SHA-1 of the full uncompressed content (computed above as bulkHash).
+	// Per-chunk CAS keys (SHA-1(zlib(chunk))) are stored in result.Chunks[i].Hash.
+	// If data is empty (no chunks produced), use the 40-zero sentinel.
 	if len(chunks) > 0 {
-		result.Hash = chunks[0].Hash
+		result.Hash = bulkHash
 	} else {
 		result.Hash = "0000000000000000000000000000000000000000"
 	}

@@ -13,6 +13,10 @@ type Metrics struct {
 	PipelineFilesProcessed     prometheus.Counter
 	PipelineBytesCompressed    prometheus.Counter
 	PipelineDedupHits          prometheus.Counter
+	// BloomFalsePositives counts filter queries where the filter said "present"
+	// but CAS.Exists() confirmed the object is NOT there.  A rising rate
+	// signals filter saturation — consider widening bloom_filter_capacity.
+	BloomFalsePositives        prometheus.Counter
 	CASUploadDuration          prometheus.Histogram
 	LeaseAcquireDuration       prometheus.Histogram
 	DistributionDuration       *prometheus.HistogramVec
@@ -68,7 +72,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 		PipelineDedupHits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "cvmfs_prepub_pipeline_dedup_hits_total",
-			Help: "Total number of deduplication hits.",
+			Help: "Total number of deduplication hits (Bloom filter + CAS confirmed).",
+		}),
+		BloomFalsePositives: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "cvmfs_prepub_bloom_false_positives_total",
+			Help: "Bloom filter false positives: filter said present but CAS confirmed absent. Rising rate indicates filter saturation.",
 		}),
 		CASUploadDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "cvmfs_prepub_cas_upload_duration_seconds",
@@ -142,6 +150,7 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.PipelineFilesProcessed,
 		m.PipelineBytesCompressed,
 		m.PipelineDedupHits,
+		m.BloomFalsePositives,
 		m.CASUploadDuration,
 		m.LeaseAcquireDuration,
 		m.DistributionDuration,

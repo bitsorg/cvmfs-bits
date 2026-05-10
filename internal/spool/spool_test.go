@@ -1,9 +1,11 @@
 package spool
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"cvmfs.io/prepub/internal/job"
 	"cvmfs.io/prepub/pkg/observe"
@@ -216,4 +218,122 @@ func isNotExist(err error) bool {
 		}
 		return false
 	}()
+}
+
+// ── IncomingBySize ────────────────────────────────────────────────────────────
+
+// TestIncomingBySize_SortsLargestFirst verifies that IncomingBySize returns
+// incoming jobs in descending TarSize order so the orchestrator dispatches
+// large jobs first (Fix #priority).
+func TestIncomingBySize_SortsLargestFirst(t *testing.T) {
+	s := newTestSpool(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	jobs := []*job.Job{
+		{ID: "job-small", Repo: "r", State: job.StateIncoming, TarSize: 100, CreatedAt: now},
+		{ID: "job-large", Repo: "r", State: job.StateIncoming, TarSize: 999, CreatedAt: now},
+		{ID: "job-medium", Repo: "r", State: job.StateIncoming, TarSize: 500, CreatedAt: now},
+	}
+	for _, j := range jobs {
+		if err := s.WriteManifest(j); err != nil {
+			t.Fatalf("WriteManifest(%s): %v", j.ID, err)
+		}
+	}
+
+	got, err := s.IncomingBySize(ctx)
+	if err != nil {
+		t.Fatalf("IncomingBySize: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("IncomingBySize returned %d jobs; want 3", len(got))
+	}
+
+	// Verify descending TarSize order.
+	wantOrder := []string{"job-large", "job-medium", "job-small"}
+	for i, want := range wantOrder {
+		if got[i].ID != want {
+			t.Errorf("position %d: got %q, want %q", i, got[i].ID, want)
+		}
+	}
+}
+
+// TestIncomingBySize_TieBreakByAge verifies that jobs with equal TarSize are
+// returned in ascending CreatedAt order (oldest first — FIFO within size bucket).
+func TestIncomingBySize_TieBreakByAge(t *testing.T) {
+	s := newTestSpool(t)
+	ctx := context.Background()
+
+	base := time.Now()
+	jobs := []*job.Job{
+		{ID: "job-newer", Repo: "r", State: job.StateIncoming, TarSize: 500, CreatedAt: base.Add(time.Second)},
+		{ID: "job-older", Repo: "r", State: job.StateIncoming, TarSize: 500, CreatedAt: base},
+	}
+	for _, j := range jobs {
+		if err := s.WriteManifest(j); err != nil {
+			t.Fatalf("WriteManifest(%s): %v", j.ID, err)
+		}
+	}
+
+	got, err := s.IncomingBySize(ctx)
+	if err != nil {
+		t.Fatalf("IncomingBySize: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("IncomingBySize returned %d jobs; want 2", len(got))
+	}
+	if got[0].ID != "job-older" {
+		t.Errorf("expected job-older first (oldest wins tie); got %q", got[0].ID)
+	}
+	if got[1].ID != "job-newer" {
+		t.Errorf("expected job-newer second; got %q", got[1].ID)
+	}
+}
+
+// TestIncomingBySize_ZeroTarSizeSortsLast verifies that jobs with TarSize==0
+// (e.g. written before the field was introduced) sort after all jobs that have
+// a real size.
+func TestIncomingBySize_ZeroTarSizeSortsLast(t *testing.T) {
+	s := newTestSpool(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	jobs := []*job.Job{
+		{ID: "job-zero", Repo: "r", State: job.StateIncoming, TarSize: 0, CreatedAt: now},
+		{ID: "job-nonzero", Repo: "r", State: job.StateIncoming, TarSize: 1, CreatedAt: now},
+	}
+	for _, j := range jobs {
+		if err := s.WriteManifest(j); err != nil {
+			t.Fatalf("WriteManifest(%s): %v", j.ID, err)
+		}
+	}
+
+	got, err := s.IncomingBySize(ctx)
+	if err != nil {
+		t.Fatalf("IncomingBySize: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("IncomingBySize returned %d jobs; want 2", len(got))
+	}
+	if got[0].ID != "job-nonzero" {
+		t.Errorf("non-zero size job should be first; got %q", got[0].ID)
+	}
+	if got[1].ID != "job-zero" {
+		t.Errorf("zero-size job should be last; got %q", got[1].ID)
+	}
+}
+
+// TestIncomingBySize_EmptyDir verifies that IncomingBySize returns an empty
+// slice (not an error) when there are no incoming jobs.
+func TestIncomingBySize_EmptyDir(t *testing.T) {
+	s := newTestSpool(t)
+	ctx := context.Background()
+
+	got, err := s.IncomingBySize(ctx)
+	if err != nil {
+		t.Fatalf("IncomingBySize on empty dir: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 jobs; got %d", len(got))
+	}
 }

@@ -1,4 +1,23 @@
-// Package cvmfscatalog provides CVMFS-compatible catalog operations.
+// Package cvmfscatalog creates and manages CVMFS catalogs (SQLite databases).
+//
+// A CVMFS catalog is a content-addressed SQLite database that records the
+// filesystem namespace for one path scope in a CVMFS repository.  Each
+// catalog covers one "lease path" subtree; cvmfs_receiver grafts them
+// together at commit time.
+//
+// Primary API:
+//   - [Create]: build a fresh catalog for a given root prefix.
+//   - [Upsert] / [BatchUpsert]: insert or replace file, directory, or symlink entries.
+//   - [Remove]: delete an entry and its associated chunk records.
+//   - [AddNestedMount]: register a sub-catalog's graft point in the parent.
+//   - [Finalize]: flush statistics, zlib-compress, compute SHA-1, and write
+//     the catalog to the CAS layout (data/XY/hashC).
+//   - [BuildSubtree]: orchestrate Create → Upsert → Finalize for a full lease path.
+//
+// Entry flag bits, hash algorithm IDs, and compression IDs are defined in
+// this file (entry.go) and match the layout in the CVMFS source file
+// cvmfs/catalog_sql.h.  See CATALOG.md in the repository root for a complete
+// description of the catalog schema, flag bit layout, and CAS conventions.
 package cvmfscatalog
 
 import (
@@ -55,9 +74,16 @@ const (
 	// Bits 8-10 = hash algo, bits 11-13 = comp algo, bit 14 = bind-mountpoint,
 	// bit 15 = hidden, bit 16 = direct-I/O.
 	FlagXattr = 1 << 17 // safely above all known CVMFS flag bits; internal only
-	FlagHidden         = 0x8000
-	FlagPosHash        = 8
-	FlagPosComp        = 11
+	FlagHidden = 0x8000
+)
+
+// Bit-field shift positions for hash and compression algorithm IDs packed into
+// the flags column.  Both are unexported because they are implementation
+// details of Flags() and HashAlgoFromFlags(); callers never need to shift by
+// hand.
+const (
+	flagHashShift = 8  // bits 8-10: hash algorithm (stored as HashAlgo-1)
+	flagCompShift = 11 // bits 11-13: compression algorithm (stored as CompAlgo)
 )
 
 // ChunkRecord represents a single chunk of a chunked file.
@@ -84,7 +110,13 @@ type Entry struct {
 	LinkCount      uint32 // 1 for normal non-hardlinked files/dirs
 	IsHidden       bool
 	IsNestedRoot   bool // set on root entry of a nested catalog
-	Chunks         []ChunkRecord  // for chunked files
+	// IsDelete marks this entry as an explicit deletion request.  When true,
+	// BuildSubtree removes the path from the catalog instead of upserting it.
+	// Prefer setting this field over relying on nil Hash to signal deletion —
+	// the nil-Hash convention is fragile: a regular file with a missing hash
+	// is indistinguishable from an intentional deletion.
+	IsDelete       bool          `json:"is_delete,omitempty"`
+	Chunks         []ChunkRecord // for chunked files
 	// Xattr holds extended attributes to store in the catalog xattr BLOB.
 	// A nil map means no xattrs; FlagXattr is set in the flags column when
 	// this map is non-empty.  User xattrs (from the source tar PAX headers)
@@ -162,9 +194,9 @@ func (e *Entry) Flags() int {
 		f = FlagFile | FlagFileSpecial
 	}
 	if e.HashAlgo >= HashSha1 {
-		f |= (int(e.HashAlgo) - 1) << FlagPosHash
+		f |= (int(e.HashAlgo) - 1) << flagHashShift
 	}
-	f |= int(e.CompAlgo) << FlagPosComp
+	f |= int(e.CompAlgo) << flagCompShift
 	if e.IsHidden {
 		f |= FlagHidden
 	}
@@ -206,5 +238,5 @@ func HashSuffix(algo HashAlgo) string {
 
 // HashAlgoFromFlags extracts the hash algorithm from a flags value.
 func HashAlgoFromFlags(flags int) HashAlgo {
-	return HashAlgo(((flags>>FlagPosHash)&7) + 1)
+	return HashAlgo(((flags>>flagHashShift)&7) + 1)
 }

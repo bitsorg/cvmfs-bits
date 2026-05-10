@@ -44,6 +44,11 @@ func NewLocalFS(root string) (*LocalFS, error) {
 	return &LocalFS{Root: root}, nil
 }
 
+// ExistsIsNative implements cas.NativeExistsChecker.
+// LocalFS.Exists is a single os.Stat call (~1 µs on a local filesystem) so
+// a Bloom-filter pre-check would add overhead rather than save CAS calls.
+func (lf *LocalFS) ExistsIsNative() bool { return true }
+
 // Exists checks if an object with the given hash exists in the store.
 func (lf *LocalFS) Exists(ctx context.Context, hash string) (bool, error) {
 	path := filepath.Join(lf.Root, cvmfshash.ObjectPath(hash))

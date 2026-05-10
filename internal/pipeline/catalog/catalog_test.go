@@ -49,7 +49,7 @@ func TestAdd_RegularFile(t *testing.T) {
 		UID:     1000,
 		GID:     1000,
 	}
-	if err := b.Add(context.Background(), e, "abc123"); err != nil {
+	if err := b.Add(context.Background(), e); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestAdd_Directory(t *testing.T) {
 		Mode:    fs.ModeDir | 0o755,
 		ModTime: time.Now(),
 	}
-	if err := b.Add(context.Background(), e, ""); err != nil {
+	if err := b.Add(context.Background(), e); err != nil {
 		t.Fatalf("Add dir: %v", err)
 	}
 	entries := b.Entries()
@@ -118,7 +118,7 @@ func TestAdd_Symlink(t *testing.T) {
 		LinkTarget: "libfoo.so.1",
 		ModTime:    time.Now(),
 	}
-	if err := b.Add(context.Background(), e, ""); err != nil {
+	if err := b.Add(context.Background(), e); err != nil {
 		t.Fatalf("Add symlink: %v", err)
 	}
 	entries := b.Entries()
@@ -145,7 +145,7 @@ func TestAdd_Xattrs(t *testing.T) {
 			"user.myapp.tag":     []byte("stable"),
 		},
 	}
-	if err := b.Add(context.Background(), e, ""); err != nil {
+	if err := b.Add(context.Background(), e); err != nil {
 		t.Fatalf("Add xattr: %v", err)
 	}
 	entry := b.Entries()[0]
@@ -170,7 +170,7 @@ func TestAdd_NoXattrs(t *testing.T) {
 		Mode:    0o755,
 		ModTime: time.Now(),
 	}
-	if err := b.Add(context.Background(), e, ""); err != nil {
+	if err := b.Add(context.Background(), e); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	if b.Entries()[0].Xattr != nil {
@@ -187,8 +187,8 @@ func TestEntries_Multiple(t *testing.T) {
 	paths := []string{"a/b", "a/c", "a/d/e"}
 	for _, p := range paths {
 		e := unpack.FileEntry{Path: p, Mode: 0o644, ModTime: time.Now()}
-		if err := b.Add(context.Background(), e, ""); err != nil {
-			t.Fatalf("Add %q: %v", p, err)
+		if err := b.Add(context.Background(), e); err != nil {
+			t.Fatalf("Add(%q): %v", p, err)
 		}
 	}
 
@@ -200,6 +200,33 @@ func TestEntries_Multiple(t *testing.T) {
 		if entries[i].FullPath != want {
 			t.Errorf("entries[%d].FullPath = %q; want %q", i, entries[i].FullPath, want)
 		}
+	}
+}
+
+// TestAdd_RegularFile_HashAlgoUnconditional verifies that HashAlgo and CompAlgo
+// are always set for regular files regardless of whether any hash was supplied.
+// Before the catalog.Builder.Add() signature change, the guard was
+// "if e.Mode.IsRegular() && hash != "" { ... }" — so an empty hash silently left
+// HashAlgo at the zero value (HashUnknown).  The new implementation sets them
+// unconditionally for any regular file.
+func TestAdd_RegularFile_HashAlgoUnconditional(t *testing.T) {
+	obs := newObs(t)
+	b, _ := New("", obs)
+
+	e := unpack.FileEntry{
+		Path:    "bin/true",
+		Mode:    0o755, // regular file
+		ModTime: time.Now(),
+	}
+	if err := b.Add(context.Background(), e); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	entry := b.Entries()[0]
+	if entry.HashAlgo != cvmfscatalog.HashSha1 {
+		t.Errorf("HashAlgo = %v; want HashSha1 (must be set unconditionally for regular files)", entry.HashAlgo)
+	}
+	if entry.CompAlgo != cvmfscatalog.CompZlib {
+		t.Errorf("CompAlgo = %v; want CompZlib (must be set unconditionally for regular files)", entry.CompAlgo)
 	}
 }
 
@@ -230,7 +257,7 @@ func TestAdd_RootPath(t *testing.T) {
 	for _, p := range []string{"", "/"} {
 		b2, _ := New("", obs)
 		e := unpack.FileEntry{Path: p, Mode: fs.ModeDir | 0o755, ModTime: time.Now()}
-		if err := b2.Add(context.Background(), e, ""); err != nil {
+		if err := b2.Add(context.Background(), e); err != nil {
 			t.Fatalf("Add(%q): %v", p, err)
 		}
 		entry := b2.Entries()[0]

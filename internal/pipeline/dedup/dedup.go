@@ -225,6 +225,11 @@ func (c *Checker) Check(ctx context.Context, hash string) (bool, error) {
 
 	if exists {
 		c.obs.Metrics.PipelineDedupHits.Inc()
+	} else {
+		// Filter said "present" but CAS disagrees — Bloom false positive.
+		// Count these so operators can detect filter saturation in production:
+		// a rising rate means the filter is too small for the current CAS size.
+		c.obs.Metrics.BloomFalsePositives.Inc()
 	}
 
 	return exists, nil

@@ -82,6 +82,20 @@ func validTopicSegment(name, value string) error {
 	return nil
 }
 
+// ValidateRepo returns an error if repo is not a valid MQTT topic segment.
+// Call this at the API boundary (job submission) so that downstream topic
+// constructors — which panic on invalid input — never receive bad data.
+func ValidateRepo(repo string) error {
+	return validTopicSegment("repo", repo)
+}
+
+// ValidateNodeID returns an error if nodeID is not a valid MQTT topic segment.
+// Call this when configuring a receiver node so that downstream topic
+// constructors never receive a bad node ID at runtime.
+func ValidateNodeID(nodeID string) error {
+	return validTopicSegment("node_id", nodeID)
+}
+
 // AnnounceTopic returns the topic on which publishers broadcast pre-warming
 // requests for a specific repository.
 //

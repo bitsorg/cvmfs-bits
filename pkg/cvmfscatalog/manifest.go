@@ -14,8 +14,8 @@ import (
 )
 
 // ErrCatalogNotFound is returned by DownloadCatalog when the server responds
-// with HTTP 404.  Callers (e.g. Merge) use this sentinel to distinguish
-// "catalog missing / repository not yet initialised" from other I/O errors.
+// with HTTP 404.  Callers use this sentinel to distinguish "catalog missing /
+// repository not yet initialised" from other I/O errors.
 var ErrCatalogNotFound = errors.New("catalog not found (404)")
 
 // Manifest represents a parsed .cvmfspublished manifest.
@@ -102,7 +102,7 @@ func ParseManifest(data []byte) (*Manifest, error) {
 // Returns ("", nil) when the repository has never been published (HTTP 404).
 // This is used by the orchestrator to obtain old_root_hash after acquiring a
 // gateway lease but before committing, without downloading the full root
-// catalog SQLite (which Merge requires but BuildSubtree does not).
+// catalog SQLite (BuildSubtree does not require a local catalog copy).
 //
 // The HTTP request is made with the provided context so that job cancellation
 // and per-lease heartbeat timeouts propagate correctly.  client may be nil,

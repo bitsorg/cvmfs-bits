@@ -135,6 +135,44 @@ func TestReadyTopic_PanicsOnSlashInNodeID(t *testing.T) {
 	ReadyTopic("pub-abc", "payload-xyz", "node/injected")
 }
 
+// ── exported API validators ───────────────────────────────────────────────────
+
+// TestValidateRepo verifies the exported API boundary validator.
+// ValidateRepo is called by server.go to reject bad repo names before they reach
+// the topic constructors (which panic on invalid input).
+func TestValidateRepo(t *testing.T) {
+	valid := []string{"atlas.cern.ch", "cms", "repo-with-dashes", "1234"}
+	for _, r := range valid {
+		if err := ValidateRepo(r); err != nil {
+			t.Errorf("ValidateRepo(%q) = %v; want nil", r, err)
+		}
+	}
+
+	invalid := []string{"", "repo/injected", "repo+wild", "repo#hash", "repo\x00nul"}
+	for _, r := range invalid {
+		if err := ValidateRepo(r); err == nil {
+			t.Errorf("ValidateRepo(%q) = nil; want error", r)
+		}
+	}
+}
+
+// TestValidateNodeID verifies the exported API boundary validator for node IDs.
+func TestValidateNodeID(t *testing.T) {
+	valid := []string{"stratum1-cern", "node-1", "550e8400-e29b-41d4-a716-446655440000"}
+	for _, n := range valid {
+		if err := ValidateNodeID(n); err != nil {
+			t.Errorf("ValidateNodeID(%q) = %v; want nil", n, err)
+		}
+	}
+
+	invalid := []string{"", "node/slash", "node+wild", "node#hash", "node\x00nul"}
+	for _, n := range invalid {
+		if err := ValidateNodeID(n); err == nil {
+			t.Errorf("ValidateNodeID(%q) = nil; want error", n)
+		}
+	}
+}
+
 // TestTopics_NoSlashPrefix verifies that all topic constructors return topics
 // that do not start with "/" (MQTT spec: topics must not start with slash for
 // compatibility with most brokers).

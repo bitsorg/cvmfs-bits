@@ -88,7 +88,7 @@ func TestEntryFlags(t *testing.T) {
 				HashAlgo: HashSha256,
 				CompAlgo: CompZlib,
 			},
-			want: FlagFile | ((2-1)<<FlagPosHash) | (int(CompZlib)<<FlagPosComp),
+			want: FlagFile | ((2-1)<<flagHashShift) | (int(CompZlib)<<flagCompShift),
 		},
 		{
 			name: "directory",
@@ -180,11 +180,11 @@ func TestHashAlgoFromFlags(t *testing.T) {
 		want  HashAlgo
 	}{
 		{
-			flags: (int(HashSha1) - 1) << FlagPosHash,
+			flags: (int(HashSha1) - 1) << flagHashShift,
 			want:  HashSha1,
 		},
 		{
-			flags: (int(HashSha256) - 1) << FlagPosHash,
+			flags: (int(HashSha256) - 1) << flagHashShift,
 			want:  HashSha256,
 		},
 	}

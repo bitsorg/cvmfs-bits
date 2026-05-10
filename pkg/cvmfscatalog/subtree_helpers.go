@@ -1,13 +1,9 @@
 package cvmfscatalog
 
-// subtree_helpers.go — helpers used by BuildSubtree (subtree.go).
-//
-// These were previously co-located in merge.go alongside the now-deleted Merge
-// function.  They are preserved here because BuildSubtree uses them directly.
+// subtree_helpers.go — internal helpers used by BuildSubtree (subtree.go).
 
 import (
 	"fmt"
-	"io/fs"
 	"path"
 	"sort"
 	"strings"
@@ -15,12 +11,12 @@ import (
 	"cvmfs.io/prepub/pkg/cvmfsdirtab"
 )
 
-// catalogChainNode is a single catalog in the chain that BuildSubtree writes
-// into — one node for the lease root catalog, plus one for every split point.
+// catalogChainNode is the lease root catalog node used by BuildSubtree.
+// The chain slice always has exactly one element; the struct is kept for
+// forward compatibility in case a multi-level chain is reintroduced.
 type catalogChainNode struct {
-	cat   *Catalog
-	path  string // absolute root prefix for this catalog ("" for repo root)
-	isNew bool   // true when freshly created for this publish (not downloaded from stratum0)
+	cat  *Catalog
+	path string // absolute root prefix for this catalog ("" for repo root)
 }
 
 // normalizeLeasePathForNested converts a lease path (e.g. "atlas/24.0") to
@@ -111,10 +107,11 @@ func findOwner(splitPaths []string, entryPath string) string {
 }
 
 // isDeletion reports whether entry represents a removal rather than an upsert.
-// An entry is a deletion when it has no content hash, is not a directory, and
-// is not a symlink (symlinks have no hash by design).
+//
+// Callers signal deletion by setting Entry.IsDelete = true.  The historical
+// nil-Hash convention has been removed: a regular file with no hash (e.g.
+// hash not yet computed) is not the same as an intentional deletion, and
+// treating it as one led to silent data loss.
 func isDeletion(entry Entry) bool {
-	return (entry.Hash == nil || len(entry.Hash) == 0) &&
-		!entry.Mode.IsDir() &&
-		entry.Mode&fs.ModeSymlink == 0
+	return entry.IsDelete
 }
