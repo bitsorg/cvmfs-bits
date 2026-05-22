@@ -23,6 +23,9 @@ type Provider struct {
 	Tracer trace.Tracer
 	// Metrics holds registered Prometheus metrics.
 	Metrics *Metrics
+	// Registry is the Prometheus gatherer/registerer used for all Metrics above.
+	// Pass this to promhttp.HandlerFor so that /metrics serves the right registry.
+	Registry prometheus.Gatherer
 	// shutdownFuncs are cleanup functions for traces and exporters.
 	shutdownFuncs []func(context.Context) error
 }
@@ -61,7 +64,10 @@ func New(serviceName string, opts ...Option) (*Provider, func(), error) {
 		opt(&popts)
 	}
 
-	// Setup Prometheus metrics
+	// Setup Prometheus metrics. Always use an isolated registry so that
+	// multiple services in the same process do not collide, and so that
+	// /metrics can be served with promhttp.HandlerFor(Provider.Registry, ...)
+	// rather than the process-global default registry.
 	if popts.prometheus == nil {
 		popts.prometheus = prometheus.NewRegistry()
 	}
@@ -93,10 +99,12 @@ func New(serviceName string, opts ...Option) (*Provider, func(), error) {
 
 	tracer := tp.Tracer(serviceName)
 
+	reg, _ := popts.prometheus.(prometheus.Gatherer)
 	p := &Provider{
-		Logger:  logger,
-		Tracer:  tracer,
-		Metrics: metrics,
+		Logger:   logger,
+		Tracer:   tracer,
+		Metrics:  metrics,
+		Registry: reg,
 		shutdownFuncs: []func(context.Context) error{
 			tp.Shutdown,
 			traceExporter.Shutdown,

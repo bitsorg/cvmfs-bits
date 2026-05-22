@@ -48,6 +48,20 @@ type SubtreeConfig struct {
 	// catalog split points.  nil/empty means no dirtab rules (only
 	// .cvmfscatalog marker files determine splits).
 	DirtabContent []byte
+	// DirectGraft controls the root_prefix written into the top-level lease
+	// catalog's properties table.
+	//
+	// false (default — DiffRec path): root_prefix is cleared to "" so that
+	// SimpleCatalogManager, which always loads the submitted catalog with
+	// mountpoint="", computes is_regular_mountpoint_=("" == "")=true and
+	// NormalizePath works correctly during DiffRec traversal.
+	//
+	// true (DirectGraft path): root_prefix is left at its natural value
+	// (targetAbsPath, e.g. "/upload/Python-3.9").  GraftNestedCatalog calls
+	// LoadFreeCatalog(nested_root_ps) with the lease path as mountpoint and
+	// panics if new_catalog->root_prefix() != nested_root_ps, so the correct
+	// path-valued root_prefix must be present.
+	DirectGraft bool
 }
 
 // SubtreeResult holds the catalog hashes produced by BuildSubtree.
@@ -87,20 +101,30 @@ type SubtreeResult struct {
 //
 // # Receiver interaction contract
 //
-// cvmfs_receiver requires two invariants that BuildSubtree upholds:
+// cvmfs_receiver requires different root_prefix values depending on the catalog
+// role:
 //
-//  1. root_prefix must be set for every nested catalog.  When loading a nested
-//     catalog via AttachFreely / LoadFreeCatalog, the receiver calls
-//     LookupPath(rootPrefix) to locate the catalog's root directory entry.
-//     An absent or incorrect root_prefix causes the receiver to fail the
-//     lookup and reject the catalog.
+//  1. TOP-LEVEL lease catalog (this catalog, root_prefix = "").
+//     SimpleCatalogManager (catalog_mgr_ro.cc) always sets mountpoint="" when
+//     loading the submitted catalog.  Catalog::Open computes
+//     is_regular_mountpoint_ = (mountpoint == root_prefix).  If root_prefix
+//     were non-empty (e.g., "/atlas/24.0"), is_regular_mountpoint_ would be
+//     false and NormalizePath would compute MD5(root_prefix+path) instead of
+//     MD5(path), causing all Listing() and LookupPath() calls during DiffRec
+//     to return empty results — no files committed.  Setting root_prefix=""
+//     makes is_regular_mountpoint_=true and NormalizePath=MD5(path).
+//     Entries are still stored at the correct absolute MD5 keys (e.g.,
+//     MD5("/atlas/24.0") for the root entry, MD5("/atlas/24.0/bin") for
+//     children), so only the properties row needs to differ.
 //
-//  2. The root directory entry of a nested catalog must be stored at
-//     MD5Path(rootPrefix), not at MD5Path("").  The receiver's NormalizePath
-//     for is_regular_mountpoint_ returns the path unchanged, so
-//     LookupPath("/atlas/24.0") computes MD5("/atlas/24.0") and must find an
-//     entry there.  BuildSubtree satisfies this by passing rootPrefix as
-//     Entry.FullPath when creating the root entry inside Create().
+//  2. SPLIT (child) nested catalogs (root_prefix = their actual path).
+//     These are loaded by GraftNestedCatalog → LoadFreeCatalog(nested_root_ps)
+//     with nested_root_ps as mountpoint, making is_regular_mountpoint_=true
+//     automatically (mountpoint==root_prefix).  GraftNestedCatalog also
+//     panics if new_catalog->root_prefix() != nested_root_ps, so the correct
+//     path-valued root_prefix must be retained.  LookupPath(rootPrefix) is
+//     called to retrieve the root directory entry from the split catalog; the
+//     entry is stored at MD5Path(rootPrefix) exactly as Create() inserts it.
 func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*SubtreeResult, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -124,6 +148,38 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		return nil, fmt.Errorf("creating subtree catalog at %q: %w", targetAbsPath, err)
 	}
 	defer leaseCat.Close()
+
+	// ── Fix root_prefix for SimpleCatalogManager compatibility ────────────────
+	// cvmfs_receiver loads the submitted catalog via SimpleCatalogManager, which
+	// always sets mountpoint="" (GetNewRootCatalogContext, catalog_mgr_ro.cc).
+	// Catalog::Open computes is_regular_mountpoint_ = (mountpoint == root_prefix).
+	// With root_prefix=targetAbsPath (e.g. "/atlas/24.0") and mountpoint="":
+	//   is_regular_mountpoint_ = false
+	//   NormalizePath(path) = MD5(root_prefix + path)   ← WRONG
+	//     e.g. NormalizePath("/atlas/24.0") = MD5("/atlas/24.0/atlas/24.0")
+	// Every Listing() and LookupPath() call during DiffRec then returns empty,
+	// so no files get committed despite the gateway accepting the payload.
+	//
+	// Setting root_prefix="" makes is_regular_mountpoint_=(""=="")=true:
+	//   NormalizePath(path) = MD5(path)                ← correct
+	// Entries are already stored at the right MD5 keys (e.g. MD5("/atlas/24.0")
+	// with parent MD5("") for the root entry, MD5("/atlas/24.0/bin/sh") with
+	// parent MD5("/atlas/24.0/bin") for content), so only the properties row
+	// needs updating.
+	//
+	// NOTE: split sub-catalogs must keep their real root_prefix — they are loaded
+	// by GraftNestedCatalog → LoadFreeCatalog(nested_root_ps) with their actual
+	// path as mountpoint, which already gives is_regular_mountpoint_=true, and
+	// GraftNestedCatalog panics if new_catalog->root_prefix() != nested_root_ps.
+	// For DiffRec (DirectGraft==false) clear root_prefix to "" so
+	// SimpleCatalogManager (mountpoint="") gets is_regular_mountpoint_=true.
+	// For DirectGraft leave it at targetAbsPath — GraftNestedCatalog panics if
+	// root_prefix != nested_root_ps (the lease path it was called with).
+	if !cfg.DirectGraft {
+		if err := leaseCat.SetRootPrefix(""); err != nil {
+			return nil, fmt.Errorf("clearing root_prefix for lease catalog at %q: %w", targetAbsPath, err)
+		}
+	}
 
 	// The "chain" is exactly one node: the fresh subtree catalog.
 	chain := []catalogChainNode{{cat: leaseCat, path: targetAbsPath}}
@@ -191,12 +247,25 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	}
 
 	// ── Route entries to the correct catalog ──────────────────────────────────
-	// Group non-deletion entries by target catalog for BatchUpsert so all
+	// Group non-deletion entries by target catalog for BatchInsert so all
 	// inserts for a given catalog share a single SQLite transaction (O(1)
-	// BEGIN/COMMIT overhead instead of O(entries)).  Deletions are still
-	// executed immediately so they flush any pending batch first.
+	// BEGIN/COMMIT overhead instead of O(entries)).  BatchInsert is used (not
+	// BatchUpsert) because every target catalog was just created by Create() and
+	// is therefore empty: the per-entry SELECT existence check in BatchUpsert
+	// would always miss and is pure overhead.  Deletions are still executed
+	// immediately so they flush any pending batch first.
+	//
+	// Special case — lease-root "." entry:
+	// Create() pre-inserts a placeholder root directory entry at targetAbsPath so
+	// that the catalog is structurally valid from creation.  The tar's "." entry
+	// (rewritten to FullPath==targetAbsPath) carries the real metadata (mtime,
+	// uid, gid, …) and must replace that placeholder.  BatchInsert requires all
+	// entries to be brand-new (no duplicates), so the root entry is collected
+	// separately and applied with Upsert() — which handles the replace via
+	// SELECT+DELETE+INSERT — after the main batch has been flushed.
 	leafCat := chain[len(chain)-1].cat // = leaseCat (single chain element)
 	batchMap := make(map[*Catalog][]Entry, len(newCats)+1)
+	var leaseCatRootEntry *Entry // tar's "." entry for the lease root catalog, if present
 	for _, entry := range entries {
 		owner := findOwner(splitPaths, entry.FullPath)
 		var targetCat *Catalog
@@ -210,8 +279,8 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			// Flush any pending batch for this catalog before the deletion so
 			// that the Remove operates on a consistent catalog state.
 			if pending := batchMap[targetCat]; len(pending) > 0 {
-				if batchErr := targetCat.BatchUpsert(pending); batchErr != nil {
-					return nil, fmt.Errorf("batch upsert before deletion of %q: %w", entry.FullPath, batchErr)
+				if batchErr := targetCat.BatchInsert(pending); batchErr != nil {
+					return nil, fmt.Errorf("batch insert before deletion of %q: %w", entry.FullPath, batchErr)
 				}
 				delete(batchMap, targetCat)
 			}
@@ -224,12 +293,29 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			}
 			return nil, fmt.Errorf("removing entry %q: %w", entry.FullPath, rmErr)
 		}
+
+		// Intercept the lease-root "." entry: it goes to leafCat but would
+		// collide with the placeholder row inserted by Create().  Divert it
+		// to leaseCatRootEntry so we can Upsert() it after the batch.
+		if targetCat == leafCat && entry.FullPath == targetAbsPath {
+			e := entry
+			leaseCatRootEntry = &e
+			continue
+		}
+
 		batchMap[targetCat] = append(batchMap[targetCat], entry)
 	}
-	// Flush remaining batches.
+	// Flush remaining batches (all entries except the lease-root "." entry).
 	for targetCat, pending := range batchMap {
-		if batchErr := targetCat.BatchUpsert(pending); batchErr != nil {
-			return nil, fmt.Errorf("batch upsert for catalog entries: %w", batchErr)
+		if batchErr := targetCat.BatchInsert(pending); batchErr != nil {
+			return nil, fmt.Errorf("batch insert for catalog entries: %w", batchErr)
+		}
+	}
+	// Apply the lease-root "." entry via Upsert() to replace the Create()
+	// placeholder with the real tar metadata.
+	if leaseCatRootEntry != nil {
+		if upsertErr := leafCat.Upsert(*leaseCatRootEntry); upsertErr != nil {
+			return nil, fmt.Errorf("upserting lease root entry %q: %w", leaseCatRootEntry.FullPath, upsertErr)
 		}
 	}
 

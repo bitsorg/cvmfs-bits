@@ -72,17 +72,75 @@ func (lf *LocalFS) Size(_ context.Context, hash string) (int64, error) {
 	return fi.Size(), nil
 }
 
+// smallFileSizeThreshold is the maximum object size (bytes) for which Put uses
+// the fast direct-write path instead of the temp-file+rename path.
+//
+// At or below this threshold the entire object fits in a single write(2) call,
+// which is atomic with respect to concurrent readers on Linux (POSIX §2.9.7).
+// Using O_EXCL instead of a temp file eliminates the CreateTemp + Chmod +
+// Rename syscalls (6–7 total) and replaces them with open + write + close
+// (3 syscalls).  For archives with hundreds of thousands of small objects
+// (icons, headers, scripts) this roughly halves the syscall overhead for the
+// CAS upload phase.
+const smallFileSizeThreshold = 4096
+
 // Put stores an object atomically.
-// The write goes to a per-upload temp file (avoiding the fixed-name concurrency
-// hazard) which is then renamed into the final CAS path.  io.Copy validates the
-// write; os.Rename is atomic, so a concurrent goroutine racing on the same hash
-// safely overwrites an identical file.  No per-object fsync is issued: the
-// overall publish transaction commits after all objects are written, making
-// per-object durability unnecessary (a crash mid-publish leaves an orphaned
-// partial publish regardless).
+//
+// Small objects (≤ smallFileSizeThreshold bytes): a single open(O_CREAT|O_EXCL)
+// + write + close sequence.  O_EXCL makes the open fail with EEXIST when a
+// concurrent goroutine has already created the file, in which case Put returns
+// nil (idempotent).  A single write(2) for ≤ 4 KiB is atomic on Linux so no
+// temp file is needed.
+//
+// Large objects: write to a per-upload temp file (avoiding the fixed-name
+// concurrency hazard) then rename into the final CAS path atomically.
+// io.Copy validates every byte written; os.Rename is atomic, so a concurrent
+// goroutine racing on the same hash safely overwrites an identical file.
+//
+// No per-object fsync is issued: the overall publish transaction (CVMFS commit)
+// provides the durability boundary.  A crash mid-publish leaves an orphaned
+// partial publish regardless of per-object fsync discipline.
+//
+// Permissions: 0666 before umask, matching the standard CVMFS local uploader
+// (upload_local.h: default_backend_file_mode_ = 0666) so that Apache in the
+// stratum0 container can serve the object over HTTP.  With a typical container
+// umask of 0022 this yields 0644; 0600 causes 403 responses and client EIO.
+//
 // The operation is idempotent: if the object already exists, Put returns nil.
 func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64) error {
 	path := filepath.Join(lf.Root, cvmfshash.ObjectPath(hash))
+
+	// Fast path for small objects — O_EXCL open + single write + close.
+	// This avoids the temp-file dance (CreateTemp, Chmod, Rename) and cuts
+	// the per-object syscall count from 6–7 down to 3.
+	if size >= 0 && size <= smallFileSizeThreshold {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("reading small object: %w", err)
+		}
+
+		// O_EXCL: fail with EEXIST if another goroutine already wrote this hash —
+		// both wrote identical bytes, so the result is correct either way.
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0666)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return nil // already in CAS — idempotent
+			}
+			return fmt.Errorf("creating CAS object: %w", err)
+		}
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			os.Remove(path)
+			return fmt.Errorf("writing small object: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			os.Remove(path)
+			return fmt.Errorf("closing small object: %w", err)
+		}
+		return nil
+	}
+
+	// Slow path for large objects: temp-file + atomic rename.
 
 	// If the object already exists skip the write (idempotent).
 	if _, err := os.Stat(path); err == nil {
@@ -95,8 +153,6 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 		return fmt.Errorf("creating CAS directory: %w", err)
 	}
 
-	// Write to a per-upload temporary file.
-	//
 	// Using a fixed name (path + ".tmp") is a concurrency hazard: if two
 	// goroutines upload the same hash simultaneously (common when concurrent jobs
 	// share library files), the second os.O_TRUNC truncates the first goroutine's
@@ -104,17 +160,9 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 	// place.  The resulting file has the correct hash in its name but wrong
 	// content, causing all CVMFS clients to receive corrupted data.
 	//
-	// Fix: use os.CreateTemp so each upload attempt gets its own uniquely named
-	// temp file.  Concurrent uploads of the same hash now race only on the final
-	// os.Rename, which is atomic — the loser's rename either overwrites an
-	// identical (idempotent) or a complete object, both of which are safe.
-	//
-	// Permissions: os.CreateTemp creates files with mode 0600.  We need 0666
-	// (before umask) to match the standard CVMFS local uploader
-	// (upload_local.h: default_backend_file_mode_ = 0666) so that Apache in the
-	// stratum0 container can serve the object over HTTP.  With the typical
-	// container umask of 0022 this yields 0644; 0600 causes 403 responses and
-	// CVMFS client EIO errors.
+	// os.CreateTemp gives each upload attempt its own uniquely named temp file.
+	// Concurrent uploads of the same hash now race only on the final os.Rename,
+	// which is atomic — the loser's rename overwrites an identical file safely.
 	f, err := os.CreateTemp(dir, ".prepub-")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
@@ -133,10 +181,6 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 	}
 
 	// Close before rename — required on all platforms.
-	// No explicit Sync(): io.Copy validates every byte written, and the
-	// publish transaction (CVMFS commit) provides the durability boundary.
-	// Per-object fsyncs at scale cost one kernel round-trip per CAS object
-	// and are the dominant wall-clock bottleneck for large publishes.
 	if err := f.Close(); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("closing temp file: %w", err)

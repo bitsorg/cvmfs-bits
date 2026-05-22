@@ -93,6 +93,12 @@ type fileConfig struct {
 
 	Gateway struct {
 		URL string `yaml:"url"`
+		// DirectGraft controls the fast-path commit that bypasses DiffRec on the
+		// receiver.  Defaults to true (enabled).  Set to false only when publishes
+		// via this node may update pre-existing content at the lease path, in which
+		// case the standard DiffRec path is required for correctness.
+		// Can be overridden at runtime with --gateway-direct-graft=false.
+		DirectGraft bool `yaml:"direct_graft"`
 	} `yaml:"gateway"`
 
 	CAS struct {
@@ -117,6 +123,11 @@ type fileConfig struct {
 		MaxBackoff        yamlDuration `yaml:"max_backoff"`
 		WorkerMaxAttempts int          `yaml:"worker_max_attempts"`
 		QueueSpoolDir     string       `yaml:"queue_spool_dir"`
+		// BatchSize is the number of objects sent in a single multipart PUT to
+		// each Stratum 1 endpoint.  0 (default) falls back to per-object PUTs.
+		// Setting this to ~100 can dramatically reduce round-trips when objects
+		// are small (typical for CVMFS chunks).
+		BatchSize int `yaml:"batch_size"`
 	} `yaml:"distribution"`
 
 	// MQTT broker settings — used by both publisher and receiver.
@@ -212,6 +223,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth *int,
 	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff *time.Duration,
 	s1QueueSpoolDir *string,
+	s1BatchSize *int,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert *string,
 	controlAddr, dataAddr, dataHost, tlsCert, tlsKey *string,
 	sessionTTL *time.Duration,
@@ -226,6 +238,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	recvBloomFPRate *float64,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
+	gatewayDirectGraft *bool,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -294,6 +307,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		*s1MaxAttempts = fc.Distribution.WorkerMaxAttempts
 	}
 	str("s1-queue-spool-dir", s1QueueSpoolDir, fc.Distribution.QueueSpoolDir)
+	if !has("s1-batch-size") && fc.Distribution.BatchSize != 0 {
+		*s1BatchSize = fc.Distribution.BatchSize
+	}
 
 	// MQTT broker.
 	str("broker-url", brokerURL, fc.BrokerURL)
@@ -340,5 +356,12 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("rekor-signing-key", rekorSigningKey, fc.RekorSigningKey)
 	if !has("oidc-issuers") && len(fc.OIDCIssuers) > 0 {
 		*oidcIssuers = strings.Join(fc.OIDCIssuers, ",")
+	}
+
+	// Gateway commit mode.  The flag defaults to true; config can only reaffirm
+	// true (bool fields have no zero-vs-explicit-false distinction in YAML).
+	// To disable direct-graft use --gateway-direct-graft=false on the CLI.
+	if !has("gateway-direct-graft") && fc.Gateway.DirectGraft {
+		*gatewayDirectGraft = true
 	}
 }

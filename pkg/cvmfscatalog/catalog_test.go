@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"cvmfs.io/prepub/pkg/cvmfshash"
 )
 
 func TestCreateAndUpsert(t *testing.T) {
@@ -402,10 +404,17 @@ func TestFinalizeFlushesStatistics(t *testing.T) {
 		t.Errorf("Expected delta.SelfDir=1, got %d", delta.SelfDir)
 	}
 
-	// Reopen the SQLite database and verify statistics were flushed
-	reopenedDB, err := Open(dbPath)
+	// Reopen the catalog from the CAS output (Finalize removes the source .db).
+	// Decompress the zlib-compressed CAS file into a fresh SQLite file, then
+	// open it with Open() to verify that the statistics were flushed correctly.
+	casFile := filepath.Join(destDir, cvmfshash.ObjectPath(hash)+"C")
+	reopenPath := filepath.Join(tmpdir, "reopen.db")
+	if err := decompressCatalogCAS(casFile, reopenPath); err != nil {
+		t.Fatalf("decompressCatalogCAS: %v", err)
+	}
+	reopenedDB, err := Open(reopenPath)
 	if err != nil {
-		t.Fatalf("Opening database failed: %v", err)
+		t.Fatalf("Opening decompressed catalog failed: %v", err)
 	}
 	defer reopenedDB.db.Close()
 

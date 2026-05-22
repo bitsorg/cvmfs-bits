@@ -305,6 +305,40 @@ func Open(dbPath string) (*Catalog, error) {
 	}, nil
 }
 
+// SetRootPrefix overwrites the root_prefix value in the catalog's properties
+// table and updates the in-memory field.
+//
+// This is called by BuildSubtree on the TOP-LEVEL lease catalog ONLY (not on
+// split sub-catalogs).  The reason is subtle:
+//
+// cvmfs_receiver loads the submitted catalog via SimpleCatalogManager, which
+// hard-codes mountpoint="" in GetNewRootCatalogContext().  Inside Catalog::Open,
+// is_regular_mountpoint_ = (mountpoint == root_prefix).  When root_prefix is
+// non-empty (e.g., "/atlas/24.0") and mountpoint is "", the flag is false and
+// NormalizePath applies the broken transformation:
+//
+//	MD5(root_prefix + path[mountpoint.Len():]) = MD5("/atlas/24.0" + "/atlas/24.0")
+//
+// instead of the correct MD5(path).  Every Listing() and LookupPath() call
+// during DiffRec then returns nothing, so no files are committed.
+//
+// Setting root_prefix="" makes is_regular_mountpoint_=(""=="")=true, restoring
+// NormalizePath to the identity MD5(path).  Entries are already stored at
+// correct absolute-path MD5 keys (e.g., MD5("/atlas/24.0/bin/sh") with parent
+// MD5("/atlas/24.0/bin")), so only the properties row needs updating.
+//
+// Split sub-catalogs are loaded by GraftNestedCatalog via LoadFreeCatalog with
+// their actual path as mountpoint, so they get is_regular_mountpoint_=true
+// automatically — their root_prefix must stay correct for the
+// new_catalog->root_prefix() != nested_root_ps PANIC check.
+func (c *Catalog) SetRootPrefix(rp string) error {
+	if _, err := c.db.Exec(`UPDATE properties SET value = ? WHERE key = 'root_prefix'`, rp); err != nil {
+		return fmt.Errorf("updating root_prefix to %q: %w", rp, err)
+	}
+	c.rootPrefix = rp
+	return nil
+}
+
 // applyUniqueIndexes creates the three named UNIQUE indexes on catalog, chunks,
 // and nested_catalogs tables.  All three statements are idempotent (IF NOT
 // EXISTS) so it is safe to call on a newly created database (which has no
@@ -500,6 +534,55 @@ func upsertOneInTx(tx *sql.Tx, e Entry) (hasExisting bool, oldInfo, newInfo entr
 	return hasExisting, oldInfo, newInfo, nil
 }
 
+// insertOneInTx inserts a single brand-new entry within an existing transaction.
+// It is the fast path used by BatchInsert for fresh (empty) catalogs: there is
+// no existence check (SELECT), no old-row cleanup (DELETE catalog / DELETE
+// chunks), and no old-statistics tracking.  The caller guarantees that no row
+// with the same md5path_1/md5path_2 already exists; if a duplicate is
+// encountered the INSERT fails and the enclosing transaction is rolled back.
+//
+// Returns newInfo for post-commit statistics tracking via trackAdd.
+func insertOneInTx(tx *sql.Tx, e Entry) (newInfo entryTrackInfo, err error) {
+	p1, p2 := MD5Path(e.FullPath)
+	parentP1, parentP2 := int64(0), int64(0)
+	if e.FullPath != "" {
+		parentPath, ok := ParentAbsPath(e.FullPath)
+		if ok {
+			parentP1, parentP2 = MD5Path(parentPath)
+		}
+	}
+
+	internalFlags := e.Flags()
+	dbFlags := internalFlags &^ FlagXattr
+	hardlinks := e.Hardlinks()
+	xattrBlob := cvmfsxattr.Marshal(e.Xattr)
+
+	if _, insErr := tx.Exec(`
+		INSERT INTO catalog (
+			md5path_1, md5path_2, parent_1, parent_2, hardlinks, hash, size, mode,
+			mtime, mtimens, flags, name, symlink, uid, gid, xattr
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p1, p2, parentP1, parentP2, hardlinks, e.Hash, e.Size,
+		UnixMode(e.Mode), e.Mtime, e.MtimeNs, dbFlags, e.Name,
+		e.Symlink, e.UID, e.GID, xattrBlob,
+	); insErr != nil {
+		return entryTrackInfo{}, fmt.Errorf("inserting entry %s: %w", e.FullPath, insErr)
+	}
+
+	// Insert chunk rows.  No prior DELETE is needed: the catalog is fresh so
+	// there are no pre-existing chunks for this path.
+	for _, ch := range e.Chunks {
+		if _, insErr := tx.Exec(
+			"INSERT INTO chunks (md5path_1, md5path_2, offset, size, hash) VALUES (?, ?, ?, ?, ?)",
+			p1, p2, ch.Offset, ch.Size, ch.Hash,
+		); insErr != nil {
+			return entryTrackInfo{}, fmt.Errorf("inserting chunk at offset %d for %s: %w", ch.Offset, e.FullPath, insErr)
+		}
+	}
+
+	return entryTrackInfo{flags: internalFlags, size: e.Size, chunkCount: len(e.Chunks)}, nil
+}
+
 // upsertEntry inserts or replaces a single entry in the catalog table.
 //
 // All catalog and chunk mutations are wrapped in a single transaction so that a
@@ -589,6 +672,52 @@ func (c *Catalog) BatchUpsert(entries []Entry) error {
 			c.trackRemove(r.oldInfo)
 		}
 		c.trackAdd(r.newInfo)
+	}
+	return nil
+}
+
+// BatchInsert inserts multiple brand-new entries into a fresh (empty) catalog
+// in a single SQLite transaction.  It is faster than BatchUpsert for the
+// common case of building a new catalog from scratch because it eliminates the
+// per-entry existence check that BatchUpsert performs:
+//
+//   - BatchUpsert:  N entries → N SELECT + N INSERT  (+ optional DELETE on hit)
+//   - BatchInsert:  N entries → N INSERT  (no SELECT, no DELETE)
+//
+// For a publish with 10 000 files this removes 10 000 otherwise-wasted SELECT
+// queries from the batch transaction.
+//
+// The caller guarantees that the catalog is empty (or at least contains no rows
+// whose md5path_1/md5path_2 collides with any entry in the batch).  If a
+// duplicate path is encountered the INSERT fails and the whole transaction is
+// rolled back, returning an error.  Use BatchUpsert when entries may already
+// exist and silent replacement is desired.
+func (c *Catalog) BatchInsert(entries []Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	tx, err := c.db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning batch insert transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+
+	infos := make([]entryTrackInfo, 0, len(entries))
+	for _, e := range entries {
+		info, insErr := insertOneInTx(tx, e)
+		if insErr != nil {
+			return insErr
+		}
+		infos = append(infos, info)
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		return fmt.Errorf("committing batch insert (%d entries): %w", len(entries), commitErr)
+	}
+
+	for _, info := range infos {
+		c.trackAdd(info)
 	}
 	return nil
 }

@@ -56,6 +56,7 @@ func main() {
 	listen := flag.String("listen", ":8080", "HTTP listen address for the API server [publisher]")
 	publishMode := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
 	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
+	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
 	stratum0URL := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
 	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
@@ -122,6 +123,7 @@ func main() {
 	s1MaxAttempts := flag.Int("s1-max-attempts", 0, "Max delivery attempts per item per endpoint; 0 = unlimited [publisher]")
 	s1QueueDepth := flag.Int("s1-queue-depth", 0, "In-memory queue depth per Stratum 1 endpoint (0 = default 512) [publisher]")
 	s1QueueSpoolDir := flag.String("s1-queue-spool-dir", "", "Directory for persistent per-endpoint distribution queues (default: {spool-root}/dist-queue) [publisher]")
+	s1BatchSize := flag.Int("s1-batch-size", 0, "Objects per multipart PUT to each Stratum 1 endpoint (0 = per-object PUTs) [publisher]")
 
 	// Bloom filter dedup — off by default.
 	//
@@ -212,7 +214,7 @@ func main() {
 			s1Endpoints, s1Quorum, s1Timeout, s1BloomTimeout, s1MQTTTimeout,
 			s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth,
 			s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff,
-			s1QueueSpoolDir,
+			s1QueueSpoolDir, s1BatchSize,
 			brokerURL, brokerClientCert, brokerClientKey, brokerCACert,
 			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
 			sessionTTL, diskHeadroom,
@@ -221,6 +223,7 @@ func main() {
 			bloomMaxSnapshotAge, bloomFilterCapacity, bloomFilterFPRate,
 			recvBloomCapacity, recvBloomFPRate,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
+			gatewayDirectGraft,
 		)
 	}
 
@@ -240,7 +243,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
 			*bloomFilter, *bloomSnapshotDir, *bloomNodeID, *bloomMaxSnapshotAge, *bloomFilterCapacity, *bloomFilterFPRate,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
@@ -248,6 +251,7 @@ func main() {
 			*s1Endpoints, *s1Quorum, *s1Timeout, *s1BloomTimeout, *s1MQTTTimeout,
 			*s1WorkerConcurrency, *s1MaxAttempts, *s1QueueDepth,
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
+			*s1BatchSize,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
@@ -266,7 +270,9 @@ func main() {
 func runPublisher(
 	obs *observe.Provider,
 	devMode bool,
-	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, stratum0URL, repoName, casType, casRoot string,
+	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
+	gatewayDirectGraft bool,
+	cvmfsMount, stratum0URL, repoName, casType, casRoot string,
 	bloomFilterEnabled bool,
 	bloomSnapshotDir, bloomNodeID string,
 	bloomMaxSnapshotAge time.Duration,
@@ -283,6 +289,7 @@ func runPublisher(
 	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth int,
 	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff time.Duration,
 	s1QueueSpoolDir string,
+	s1BatchSize int,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
@@ -564,6 +571,7 @@ func runPublisher(
 				WorkerInitialBackoff: s1InitialBackoff,
 				WorkerMaxBackoff:     s1MaxBackoff,
 				WorkerMaxAttempts:    s1MaxAttempts,
+				BatchSize:            s1BatchSize,
 				// Default spool dir: {spoolRoot}/dist-queue.
 				// Operators can override via --s1-queue-spool-dir or YAML config (queue_spool_dir).
 				QueueSpoolDir: func() string {
@@ -578,7 +586,8 @@ func runPublisher(
 				"mqtt", brokerCfg != nil,
 				"quorum", s1Quorum,
 				"worker_concurrency", distCfg.WorkerConcurrency,
-				"attempt_timeout", distCfg.WorkerAttemptTimeout)
+				"attempt_timeout", distCfg.WorkerAttemptTimeout,
+				"batch_size", distCfg.BatchSize)
 		}
 	}
 
@@ -606,12 +615,13 @@ func runPublisher(
 	}
 
 	orch := &api.Orchestrator{
-		Spool:        sp,
-		CAS:          casBackend,
-		Lease:        leaseBackend,
-		GatewayQueue: gatewayQueue,
-		CVMFSMount:   cvmfsMount,
-		Stratum0URL:  stratum0URL,
+		Spool:           sp,
+		CAS:             casBackend,
+		Lease:           leaseBackend,
+		GatewayQueue:    gatewayQueue,
+		CVMFSMount:      cvmfsMount,
+		Stratum0URL:     stratum0URL,
+		DirectGraft:     gatewayDirectGraft,
 		JobTimeout:   jobTimeout,
 		BrokerConfig: publishBrokerCfg,
 		Pipeline: pipeline.Config{

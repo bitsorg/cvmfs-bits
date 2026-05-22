@@ -545,6 +545,7 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 		"new_root_hash":   newHash,
 		"tag_name":        req.TagName,
 		"tag_description": req.TagDescription,
+		"direct_graft":    req.DirectGraft,
 	})
 	if err != nil {
 		span.RecordError(err)
@@ -622,6 +623,7 @@ func (c *Client) CommitFinalizeOnly(ctx context.Context, req CommitRequest) erro
 		"new_root_hash":   newHash,
 		"tag_name":        req.TagName,
 		"tag_description": req.TagDescription,
+		"direct_graft":    req.DirectGraft,
 	})
 	if err != nil {
 		span.RecordError(err)

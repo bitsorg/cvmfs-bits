@@ -31,6 +31,14 @@ type fakeLease struct {
 	expiresAt time.Time
 }
 
+// CommitRecord records a single commit POST received by the fake gateway.
+type CommitRecord struct {
+	// Token is the lease token that was committed.
+	Token string
+	// DirectGraft is true when the commit body carried "direct_graft":true.
+	DirectGraft bool
+}
+
 type Gateway struct {
 	AcquireLatency  time.Duration
 	AcquireFailRate float64
@@ -38,6 +46,7 @@ type Gateway struct {
 
 	leases   map[string]*fakeLease
 	payloads []Payload
+	commits  []CommitRecord
 	mu       sync.Mutex
 
 	server *httptest.Server
@@ -83,6 +92,26 @@ func (g *Gateway) SubmittedPayloads() []Payload {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]Payload{}, g.payloads...)
+}
+
+// Commits returns a snapshot of all commit records received so far.
+func (g *Gateway) Commits() []CommitRecord {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]CommitRecord{}, g.commits...)
+}
+
+// DirectGraftCount returns the number of commits that carried direct_graft:true.
+func (g *Gateway) DirectGraftCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	for _, c := range g.commits {
+		if c.DirectGraft {
+			n++
+		}
+	}
+	return n
 }
 
 // handleRepos serves GET /api/v1/repos — used by Client.Probe for the startup
@@ -154,10 +183,23 @@ func (g *Gateway) handleLease(w http.ResponseWriter, r *http.Request) {
 		// Commit lease (POST /api/v1/leases/<token>).
 		// The real gateway runs cvmfs_server publish here.  The fake just
 		// removes the lease and returns ok, or rejects unknown tokens.
+		//
+		// Parse the commit body to record direct_graft for test assertions.
+		var commitBody struct {
+			DirectGraft bool `json:"direct_graft"`
+		}
+		// Best-effort decode — ignore parse errors so non-JSON bodies still succeed.
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		json.Unmarshal(bodyBytes, &commitBody) //nolint:errcheck
+
 		g.mu.Lock()
 		_, exists := g.leases[token]
 		if exists {
 			delete(g.leases, token)
+			g.commits = append(g.commits, CommitRecord{
+				Token:       token,
+				DirectGraft: commitBody.DirectGraft,
+			})
 		}
 		g.mu.Unlock()
 

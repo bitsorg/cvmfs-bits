@@ -80,8 +80,23 @@ func TestBuildSubtreeBasic(t *testing.T) {
 	}
 }
 
-// TestBuildSubtreeRootPrefix verifies that the produced catalog carries the
-// correct root_prefix so cvmfs_receiver knows where to graft it.
+// TestBuildSubtreeRootPrefix verifies that the top-level lease catalog has
+// root_prefix="" in its SQLite properties.
+//
+// Why ""?  cvmfs_receiver loads the submitted catalog via SimpleCatalogManager,
+// which hard-codes mountpoint="" in GetNewRootCatalogContext().  Catalog::Open
+// computes is_regular_mountpoint_ = (mountpoint == root_prefix).  If
+// root_prefix were non-empty (e.g. "/atlas/24.0"), is_regular_mountpoint_ would
+// be false and NormalizePath would compute MD5(root_prefix+path) instead of
+// MD5(path), so every Listing() call during DiffRec returns empty and no files
+// are committed.  Setting root_prefix="" makes is_regular_mountpoint_=true and
+// NormalizePath=MD5(path), while entries remain stored at the correct absolute
+// MD5 keys (e.g. MD5("/atlas/24.0") for the root entry).
+//
+// Split sub-catalogs are unaffected: they keep their real root_prefix because
+// GraftNestedCatalog loads them via LoadFreeCatalog(mountpoint=actual_path),
+// giving is_regular_mountpoint_=true automatically, and panics if
+// new_catalog->root_prefix() != nested_root_ps.
 func TestBuildSubtreeRootPrefix(t *testing.T) {
 	tmpdir := t.TempDir()
 	now := time.Now().Unix()
@@ -111,7 +126,10 @@ func TestBuildSubtreeRootPrefix(t *testing.T) {
 	}
 	defer cat.Close()
 
-	wantPrefix := "/atlas/24.0"
+	// The top-level lease catalog must have root_prefix="" so that
+	// SimpleCatalogManager (mountpoint="") sets is_regular_mountpoint_=true
+	// and NormalizePath returns MD5(path) unchanged during DiffRec.
+	wantPrefix := ""
 	if cat.rootPrefix != wantPrefix {
 		t.Errorf("root_prefix = %q; want %q", cat.rootPrefix, wantPrefix)
 	}

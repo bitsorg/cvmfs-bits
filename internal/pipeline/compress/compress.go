@@ -8,8 +8,10 @@ import (
 	"crypto/sha1" //nolint:gosec // CVMFS CAS key = SHA-1(zlib(content)); see hash.go
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"runtime"
+	"sync"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -17,6 +19,37 @@ import (
 	"cvmfs.io/prepub/internal/pipeline/unpack"
 	"cvmfs.io/prepub/pkg/observe"
 )
+
+// zlibWriterPool caches zlib.Writer instances by compression level to avoid
+// allocating a fresh 32 KB zlib internal window on every file.  Each pool is
+// keyed by the effective level constant so Reset(w) is always called on a
+// writer whose level matches the caller's requirement.
+//
+// The pool for each level is created on first use via sync.Pool.New.
+var zlibWriterPools sync.Map // map[int]*sync.Pool
+
+func getZlibWriterPool(level int) *sync.Pool {
+	if p, ok := zlibWriterPools.Load(level); ok {
+		return p.(*sync.Pool)
+	}
+	p := &sync.Pool{
+		New: func() any {
+			// NewWriterLevel only errors on invalid level constants; the caller has
+			// already validated the level via zlibLevel(), so discard the error.
+			w, _ := zlib.NewWriterLevel(io.Discard, level)
+			return w
+		},
+	}
+	actual, _ := zlibWriterPools.LoadOrStore(level, p)
+	return actual.(*sync.Pool)
+}
+
+// sha1Pool caches hash.Hash (SHA-1) instances.  sha1.New() allocates ~100 B
+// of internal state; with thousands of small files the pool eliminates the
+// per-file allocation and the resulting GC pressure.
+var sha1Pool = sync.Pool{
+	New: func() any { return sha1.New() }, //nolint:gosec
+}
 
 // Config holds configuration for the compress stage.
 type Config struct {
@@ -168,19 +201,25 @@ func compressEntry(entry unpack.FileEntry, chunkSize int64, level int) (Result, 
 	// Single-pass compress + hash.
 	//
 	// The CAS key is SHA-1(zlib(content)) (CVMFS convention; see hash.go).
-	// Previously we compressed into a bytes.Buffer, then made a second pass
-	// over the result bytes to compute SHA-1 — two full memory reads of the
-	// compressed data.  Using io.MultiWriter the zlib output flows into both
-	// the accumulation buffer and the SHA-1 hasher simultaneously, halving
-	// the memory traffic for this stage.
+	// zlib output flows into both the accumulation buffer and the SHA-1 hasher
+	// simultaneously via io.MultiWriter, halving the memory traffic for this
+	// stage.
 	//
-	// NewWriterLevel only errors on invalid level constants; we check anyway.
-	h := sha1.New() //nolint:gosec
+	// Both the sha1.Hash and the zlib.Writer are reused across files via
+	// sync.Pool to avoid per-file allocations (~100 B for sha1, ~32 KB for
+	// the zlib internal window state) and the associated GC pressure.
+	h := sha1Pool.Get().(hash.Hash) //nolint:gosec
+	h.Reset()
+	defer sha1Pool.Put(h)
+
+	effectiveLevel := zlibLevel(level)
+	pool := getZlibWriterPool(effectiveLevel)
+	w := pool.Get().(*zlib.Writer)
+	defer pool.Put(w)
+
 	var compBuf bytes.Buffer
-	w, err := zlib.NewWriterLevel(io.MultiWriter(&compBuf, h), zlibLevel(level))
-	if err != nil {
-		return result, fmt.Errorf("zlib init: %w", err)
-	}
+	w.Reset(io.MultiWriter(&compBuf, h))
+
 	if _, err := w.Write(entry.Data); err != nil {
 		return result, fmt.Errorf("zlib write: %w", err)
 	}
@@ -215,14 +254,24 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (R
 	// differs from non-chunked files (where catalog hash = CAS key =
 	// SHA-1(compressed)) but matches what CVMFS clients expect when verifying
 	// chunked file integrity.  Per-chunk CAS keys are still SHA-1(zlib(chunk)).
-	bulkH := sha1.New() //nolint:gosec
+	bulkH := sha1Pool.Get().(hash.Hash) //nolint:gosec
+	bulkH.Reset()
 	bulkH.Write(data)
 	bulkHash := hex.EncodeToString(bulkH.Sum(nil))
+	sha1Pool.Put(bulkH)
 
-	// Fix L2: allocate the compression buffer once and reset it between chunks
+	// Allocate the compression buffer once and reset it between chunks
 	// rather than creating a new bytes.Buffer on every iteration.  For files
 	// split into thousands of chunks this materially reduces GC pressure.
 	var compBuf bytes.Buffer
+
+	// Acquire the pooled zlib.Writer once for all chunks in this file — Reset
+	// is called per-chunk to retarget the writer without reallocating the 32 KB
+	// internal window state.
+	effectiveLevel := zlibLevel(level)
+	pool := getZlibWriterPool(effectiveLevel)
+	w := pool.Get().(*zlib.Writer)
+	defer pool.Put(w)
 
 	// Split data into chunks, compress each independently, and hash the
 	// COMPRESSED bytes.  CVMFS CAS convention: SHA-1(zlib(content)).
@@ -237,28 +286,28 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (R
 
 		// Single-pass compress + hash: zlib output flows into compBuf and the
 		// SHA-1 hasher simultaneously via io.MultiWriter (same optimisation as
-		// compressEntry).  A fresh sha1.Hash is allocated per chunk because each
-		// chunk is an independent CAS object with its own key.
-		h := sha1.New() //nolint:gosec
+		// compressEntry).  A pooled sha1.Hash is used and returned after each
+		// chunk; each chunk is an independent CAS object with its own key.
+		h := sha1Pool.Get().(hash.Hash) //nolint:gosec
+		h.Reset()
 		compBuf.Reset()
-		w, err := zlib.NewWriterLevel(io.MultiWriter(&compBuf, h), zlibLevel(level))
-		if err != nil {
-			return result, fmt.Errorf("zlib init for chunk at offset %d: %w", offset, err)
-		}
+		w.Reset(io.MultiWriter(&compBuf, h))
 		if _, err := w.Write(chunkData); err != nil {
+			sha1Pool.Put(h)
 			return result, fmt.Errorf("zlib write for chunk at offset %d: %w", offset, err)
 		}
 		if err := w.Close(); err != nil {
+			sha1Pool.Put(h)
 			return result, fmt.Errorf("zlib close for chunk at offset %d: %w", offset, err)
 		}
 
-		// Fix L1: use compBuf.Len() instead of len(compBuf.Bytes()).
-		// compBuf.Len() reads the length from an internal int field; Bytes()
-		// returns a slice header (no allocation, but an extra method call).
+		// compBuf.Len() reads the length from an internal int field (cheaper
+		// than len(compBuf.Bytes()) which constructs a full slice header).
 		compressedSize := int64(compBuf.Len())
 		compressed := make([]byte, compressedSize)
 		copy(compressed, compBuf.Bytes())
 		chunkHash := hex.EncodeToString(h.Sum(nil))
+		sha1Pool.Put(h)
 
 		chunks = append(chunks, Chunk{
 			Offset:           offset,

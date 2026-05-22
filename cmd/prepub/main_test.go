@@ -173,6 +173,7 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth := 0, 0, 0
 	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff := time.Duration(0), time.Duration(0), time.Duration(0)
 	s1QueueSpoolDir := ""
+	s1BatchSize := 0
 	brokerURL := ""
 	brokerClientCert := ""
 	brokerClientKey := ""
@@ -202,6 +203,7 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	rekorServer := ""
 	rekorSigningKey := ""
 	oidcIssuers := ""
+	gatewayDirectGraft := false
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
@@ -210,7 +212,7 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency, &s1MaxAttempts, &s1QueueDepth,
 		&s1AttemptTimeout, &s1InitialBackoff, &s1MaxBackoff,
-		&s1QueueSpoolDir,
+		&s1QueueSpoolDir, &s1BatchSize,
 		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
@@ -219,6 +221,7 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
+		&gatewayDirectGraft,
 	)
 
 	if spoolRoot != "/from/config" {
@@ -261,6 +264,7 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	s1WorkerConcurrency2, s1MaxAttempts2, s1QueueDepth2 := 0, 0, 0
 	s1AttemptTimeout2, s1InitialBackoff2, s1MaxBackoff2 := time.Duration(0), time.Duration(0), time.Duration(0)
 	s1QueueSpoolDir2 := ""
+	s1BatchSize2 := 0
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert := "", "", "", ""
 	controlAddr, dataAddr, dataHost, tlsCert, tlsKey := ":9100", ":9101", "", "", ""
 	sessionTTL := time.Hour
@@ -277,6 +281,7 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
+	gatewayDirectGraft2 := false
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
@@ -285,7 +290,7 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency2, &s1MaxAttempts2, &s1QueueDepth2,
 		&s1AttemptTimeout2, &s1InitialBackoff2, &s1MaxBackoff2,
-		&s1QueueSpoolDir2,
+		&s1QueueSpoolDir2, &s1BatchSize2,
 		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
@@ -294,6 +299,7 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
+		&gatewayDirectGraft2,
 	)
 
 	// spool-root was explicitly set on CLI — config value must not override it.
@@ -320,6 +326,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	s1WorkerConcurrency3, s1MaxAttempts3, s1QueueDepth3 := 0, 0, 0
 	s1AttemptTimeout3, s1InitialBackoff3, s1MaxBackoff3 := time.Duration(0), time.Duration(0), time.Duration(0)
 	s1QueueSpoolDir3 := ""
+	s1BatchSize3 := 0
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert := "", "", "", ""
 	controlAddr, dataAddr, dataHost, tlsCert, tlsKey := ":9100", ":9101", "", "", ""
 	sessionTTL := time.Hour
@@ -336,6 +343,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
+	gatewayDirectGraft3 := false
 	applyFileConfig(fc, explicit,
 		&mode, &logLevel, &devMode,
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
@@ -344,7 +352,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency3, &s1MaxAttempts3, &s1QueueDepth3,
 		&s1AttemptTimeout3, &s1InitialBackoff3, &s1MaxBackoff3,
-		&s1QueueSpoolDir3,
+		&s1QueueSpoolDir3, &s1BatchSize3,
 		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
@@ -353,6 +361,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
 		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
+		&gatewayDirectGraft3,
 	)
 
 	// Endpoints slice should be joined with comma.

@@ -155,6 +155,13 @@ type Job struct {
 	NewRootHash string `json:"new_root_hash,omitempty"`
 	// Provenance contains build identity and Rekor transparency log receipt.
 	Provenance *Provenance `json:"provenance,omitempty"`
+	// PreloadExe is the repo-relative path to the application binary whose
+	// startup was traced (e.g. "sw/ROOT/v6-24-06-4/bin/root").  When non-empty
+	// the pipeline generates a .<base>.cvmfspreload file alongside the binary.
+	PreloadExe string `json:"preload_exe,omitempty"`
+	// PreloadPaths is the list of repo-relative paths opened during the traced
+	// startup run.  Only paths present in the submitted tar produce CAS hashes.
+	PreloadPaths []string `json:"preload_paths,omitempty"`
 
 	// ── Per-stage timestamps (gateway/bits path only) ─────────────────────────
 	// All times are zero-value when the stage was not reached or not applicable.

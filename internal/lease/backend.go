@@ -55,6 +55,22 @@ type CommitRequest struct {
 	// gateway mode (NeedsPipeline==true); ignored by LocalBackend.
 	ObjectStore ObjectReader
 
+	// ── Commit mode (gateway mode) ──────────────────────────────────────────
+
+	// DirectGraft requests the fast-path commit on the receiver side.
+	//
+	// When true the commit POST body carries "direct_graft":true, instructing
+	// the cvmfs_receiver to skip DiffRec entirely and graft the pre-built
+	// subtree catalog (already uploaded via SubmitPayload) directly into the
+	// parent catalog.  This is correct only when the lease path is a brand-new
+	// directory with no pre-existing content.
+	//
+	// Set to false (the default) to use the standard CommitProcessor / DiffRec
+	// path, which works for arbitrary add/remove/modify operations.  Both paths
+	// produce identical repository state for the "publish new subtree" case;
+	// DirectGraft is purely a performance optimisation.
+	DirectGraft bool
+
 	// ── Tagging (gateway mode) ───────────────────────────────────────────────
 
 	// TagName is the optional CVMFS snapshot tag to create on commit.

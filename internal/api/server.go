@@ -102,7 +102,9 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	}
 
 	// Unauthenticated routes.
-	s.router.Handle("/api/v1/metrics", promhttp.Handler())
+	// Use the observer's isolated registry — promhttp.Handler() would serve the
+	// process-global default registry, which does not contain our custom metrics.
+	s.router.Handle("/api/v1/metrics", promhttp.HandlerFor(obs.Registry, promhttp.HandlerOpts{}))
 	s.router.HandleFunc("/api/v1/health", s.health).Methods("GET")
 
 	// Console — unauthenticated (read-only, no secrets exposed).
@@ -271,6 +273,12 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		FailedAtState string    `json:"failed_at_state,omitempty"`
 		CreatedAt     time.Time `json:"created_at"`
 		UpdatedAt     time.Time `json:"updated_at"`
+		// Pipeline stage timestamps — omitted when zero (bits-method jobs only).
+		// Used by the console Monitoring chart to build per-job stage breakdowns.
+		PipelineStartedAt time.Time `json:"pipeline_started_at,omitempty"`
+		PipelineEndedAt   time.Time `json:"pipeline_ended_at,omitempty"`
+		LeasedAt          time.Time `json:"leased_at,omitempty"`
+		PublishedAt       time.Time `json:"published_at,omitempty"`
 		// Distribution timestamps and counters for S1 backlog display in the console.
 		// DistributingStartedAt / DistributingEndedAt use omitempty so zero-value
 		// time.Time values are omitted; the JS checks for field presence.
@@ -317,6 +325,10 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 				FailedAtState:         j.FailedAtState,
 				CreatedAt:             j.CreatedAt,
 				UpdatedAt:             j.UpdatedAt,
+				PipelineStartedAt:     j.PipelineStartedAt,
+				PipelineEndedAt:       j.PipelineEndedAt,
+				LeasedAt:              j.LeasedAt,
+				PublishedAt:           j.PublishedAt,
 				DistributingStartedAt: j.DistributingStartedAt,
 				DistributingEndedAt:   j.DistributingEndedAt,
 				DistributionConfirmed: j.DistributionConfirmed,
@@ -348,8 +360,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	var (
 		repo, subPath, webhookURL string
 		tagName, tagDescription   string
-		spoolTarPath              string // final path inside the spool
-		submittedSHA256           string // caller-supplied; may be empty
+		spoolTarPath              string   // final path inside the spool
+		submittedSHA256           string   // caller-supplied; may be empty
+		preloadExe                string   // optional: repo-relative exe path for preload
+		preloadPaths              []string // optional: repo-relative paths opened at startup
 	)
 
 	jobID := uuid.New().String()
@@ -363,13 +377,15 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var req struct {
-			Repo           string `json:"repo"`
-			Path           string `json:"path"`
-			TarPath        string `json:"tar_path"`
-			TarSHA256      string `json:"tar_sha256"`
-			WebhookURL     string `json:"webhook_url"`
-			TagName        string `json:"tag_name"`
-			TagDescription string `json:"tag_description"`
+			Repo           string   `json:"repo"`
+			Path           string   `json:"path"`
+			TarPath        string   `json:"tar_path"`
+			TarSHA256      string   `json:"tar_sha256"`
+			WebhookURL     string   `json:"webhook_url"`
+			TagName        string   `json:"tag_name"`
+			TagDescription string   `json:"tag_description"`
+			PreloadExe     string   `json:"preload_exe"`
+			PreloadPaths   []string `json:"preload_paths"`
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
@@ -442,6 +458,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		submittedSHA256 = req.TarSHA256
 		tagName = req.TagName
 		tagDescription = req.TagDescription
+		preloadExe = req.PreloadExe
+		preloadPaths = req.PreloadPaths
 
 	} else {
 		// ── Multipart upload mode (default) ─────────────────────────────────
@@ -464,6 +482,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		submittedSHA256 = r.FormValue("tar_sha256") // optional
 		tagName = r.FormValue("tag_name")
 		tagDescription = r.FormValue("tag_description")
+		preloadExe = r.FormValue("preload_exe") // optional
+		// preload_paths is a JSON-encoded []string (e.g. '["bin/root","lib/libCore.so"]')
+		if raw := r.FormValue("preload_paths"); raw != "" {
+			if err := json.Unmarshal([]byte(raw), &preloadPaths); err != nil {
+				http.Error(w, `{"error":"preload_paths must be a JSON array of strings"}`, http.StatusBadRequest)
+				return
+			}
+		}
 
 		if err := job.ValidateTagName(tagName); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
@@ -529,6 +555,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.TarSHA256 = submittedSHA256
 	j.TagName = tagName
 	j.TagDescription = tagDescription
+	j.PreloadExe = preloadExe
+	j.PreloadPaths = preloadPaths
 
 	// Record the original filename and size for the console tooltip.
 	// Use Stat on the spool copy since the original may have been moved.

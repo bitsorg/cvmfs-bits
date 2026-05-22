@@ -69,6 +69,15 @@ type Config struct {
 	// this is fast and requires no startup walk, no memory overhead, and has
 	// no risk of filter saturation.  The caller owns the checker's lifecycle.
 	DedupChecker *dedup.Checker
+	// PreloadExe is the repo-relative path to the application binary whose
+	// startup was traced (e.g. "sw/ROOT/v6-24-06-4/bin/root").  When non-empty
+	// and PreloadPaths is non-nil the pipeline writes a .<base>.cvmfspreload
+	// file alongside the binary listing the CAS hashes of its startup files.
+	PreloadExe string
+	// PreloadPaths are the repo-relative paths opened during the traced startup
+	// run.  Only paths present in the submitted tar produce CAS hashes in the
+	// preload file.  Ignored when PreloadExe is empty.
+	PreloadPaths []string
 }
 
 // Result is returned after a successful pipeline run.
@@ -590,8 +599,8 @@ func runFromSortedEntries(
 	// The pre-claim pattern (claim under lock, then dedup-check and upload outside
 	// the lock) ensures each hash is uploaded at most once per job without
 	// requiring the dedup check to be inside a critical section.
-	seenHashes := make(map[string]bool)
-	resultsByPath := make(map[string]fileMeta)
+	seenHashes := make(map[string]bool, len(sortedEntries))
+	resultsByPath := make(map[string]fileMeta, len(sortedEntries))
 
 	// uploadConc is the number of concurrent dedup+upload workers.
 	// Default to 1 for backward compatibility when UploadConc is not set.
@@ -859,6 +868,57 @@ func runFromSortedEntries(
 					result.CatalogEntries[i].Xattr[k] = v
 				}
 			}
+		}
+	}
+
+	// ── Preload file generation ───────────────────────────────────────────────
+	// When the caller requested a preload file (cvmfs_preload was invoked on the
+	// build node), collect the CAS hashes for every startup-traced path that was
+	// present in this tar, compress them into a .<base>.cvmfspreload object, and
+	// inject it as a synthetic catalog entry so the CVMFS client can bulk-fetch
+	// all startup objects before the application is launched from a cold cache.
+	if cfg.PreloadExe != "" && len(cfg.PreloadPaths) > 0 {
+		preloadSet := make(map[string]struct{}, len(cfg.PreloadPaths))
+		for _, p := range cfg.PreloadPaths {
+			preloadSet[p] = struct{}{}
+		}
+		var preloadHashes []string
+		hashSeen := make(map[string]struct{})
+		for relPath, fm := range resultsByPath {
+			if _, ok := preloadSet[relPath]; !ok {
+				continue
+			}
+			if len(fm.chunks) > 0 {
+				// Chunked file: the actual CAS objects are the chunk hashes.
+				for _, ch := range fm.chunks {
+					if _, ok := hashSeen[ch.hash]; !ok {
+						hashSeen[ch.hash] = struct{}{}
+						preloadHashes = append(preloadHashes, ch.hash)
+					}
+				}
+			} else if fm.bulkHash != "" {
+				if _, ok := hashSeen[fm.bulkHash]; !ok {
+					hashSeen[fm.bulkHash] = struct{}{}
+					preloadHashes = append(preloadHashes, fm.bulkHash)
+				}
+			}
+		}
+		if len(preloadHashes) > 0 {
+			entry, casKey, err := buildPreloadEntry(ctx, cfg.PreloadExe, preloadHashes, cfg.CAS)
+			if err != nil {
+				return nil, fmt.Errorf("preload: %w", err)
+			}
+			result.CatalogEntries = append(result.CatalogEntries, *entry)
+			result.ObjectHashes = append(result.ObjectHashes, casKey)
+			result.NewObjectHashes = append(result.NewObjectHashes, casKey)
+			cfg.Obs.Logger.InfoContext(ctx, "preload file generated",
+				"exe", cfg.PreloadExe,
+				"hashes", len(preloadHashes),
+				"file", entry.FullPath)
+		} else {
+			cfg.Obs.Logger.WarnContext(ctx, "preload requested but no matching paths found in tar",
+				"exe", cfg.PreloadExe,
+				"requested", len(cfg.PreloadPaths))
 		}
 	}
 

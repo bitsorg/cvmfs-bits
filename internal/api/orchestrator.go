@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,19 @@ type Orchestrator struct {
 	// If empty, the catalog merge step is skipped and the commit will use an
 	// empty old_root_hash (only safe for the initial publish of a new repository).
 	Stratum0URL string
+	// DirectGraft enables the fast-path commit on the receiver side.
+	//
+	// When true, the commit POST body carries "direct_graft":true, instructing
+	// cvmfs_receiver to skip DiffRec and graft the pre-built subtree catalog
+	// directly into the parent catalog.  This is correct only when the lease
+	// path is a brand-new directory with no pre-existing content.
+	//
+	// Set to false (default) to use the standard CommitProcessor/DiffRec path,
+	// which handles arbitrary add/remove/modify operations safely.  Both paths
+	// produce identical repository state for "publish new subtree"; DirectGraft
+	// is purely a performance optimisation that can be toggled at runtime via
+	// --gateway-direct-graft for A/B comparison and integrity verification.
+	DirectGraft bool
 	// Distribute contains configuration for Stratum 1 push distribution.
 	// nil disables distribution (typical for local mode).
 	Distribute *distribute.Config
@@ -130,12 +144,37 @@ type Orchestrator struct {
 	// a full re-read because at worst both overlap briefly).  On prefetch
 	// failure the channel receives nil and Run() falls back to pipeline.Run().
 	prefetchResults sync.Map // map[string]chan *pipeline.PrefetchResult
+
+	// knownPaths caches "repo!pathComponent" keys for CVMFS path components
+	// confirmed to exist in the repository.  ensureParentDirs uses this to
+	// skip redundant mkdir-p commits on every publish after the first one to
+	// a given path hierarchy.  The map is never deleted from (paths, once
+	// created, persist for the lifetime of the repository).
+	knownPaths sync.Map // map["repo!path"] → struct{}
+
+	// mkdirMu provides per-"repo!graftPath" serialisation for the mkdir-p
+	// gateway commit inside ensureParentDirs.  A dedicated map (rather than
+	// repoMu) keeps mkdir-p contention isolated from the regular content-commit
+	// critical section and allows a double-checked-lock pattern:
+	//   1. Fast path (no lock): check knownPaths — miss → proceed.
+	//   2. Lock mkdirMu for this graftPath.
+	//   3. Re-check knownPaths inside the lock — if now hit, return nil.
+	//   4. Only ONE goroutine per graftPath ever reaches the gateway commit.
+	mkdirMu sync.Map // map["repo!graftPath"] → *sync.Mutex
 }
 
 // repoMutex returns the per-repo mutex for repo, creating it on first call.
 // The same *sync.Mutex is returned for every call with the same repo string.
 func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
 	v, _ := o.commitMu.LoadOrStore(repo, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// mkdirMutex returns the per-"repo!graftPath" mutex used by ensureParentDirs.
+// Using a separate map from commitMu keeps mkdir-p serialisation isolated from
+// the regular content-commit critical section.
+func (o *Orchestrator) mkdirMutex(key string) *sync.Mutex {
+	v, _ := o.mkdirMu.LoadOrStore(key, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
 
@@ -208,6 +247,224 @@ func (o *Orchestrator) takePrefetch(ctx context.Context, jobID string) *pipeline
 	case <-ctx.Done():
 		return nil
 	}
+}
+
+// ensureParentDirs guarantees that the intermediate directory components of
+// j.Path exist in the CVMFS repository before the content subtree is grafted.
+//
+// # Why this is necessary
+//
+// cvmfs_receiver grafts a subtree catalog at the exact lease path.  For the
+// FUSE client to traverse to that path, every ancestor directory must appear
+// as a directory entry in an ancestor catalog.  The gateway does not create
+// missing intermediate directories automatically, so a fresh publish at a
+// deep path (e.g. "releases/ROOT/v6-36-04/el9-x86_64") leaves "releases/",
+// "releases/ROOT/", and "releases/ROOT/v6-36-04/" invisible unless they were
+// written by a prior commit.
+//
+// # Approach — cheap gateway-only mkdir-p
+//
+// A tiny directory-only subtree catalog is built for the first missing
+// ancestor component (e.g. "releases") containing bare directory entries for
+// every missing level down to j.Path.  This catalog is committed to the
+// gateway exactly like a normal content publish:
+//
+//   1. BuildSubtree  — produces a minimal SQLite catalog (a few KB at most)
+//   2. CAS.Put       — uploads the catalog to the local CAS
+//   3. repoMu.Lock   — serialise with respect to other jobs for this repo
+//   4. FetchManifestRootHash — lightweight manifest GET (~200 bytes)
+//   5. GatewayQueue.Acquire / Lease.Acquire for graftPath
+//   6. Lease.Commit  — SubmitPayload + commit POST (creates the dir entries)
+//   7. Mark ancestors in knownPaths so subsequent publishes skip this step
+//
+// The root catalog SQLite file is never downloaded.
+//
+// # Call contract
+//
+// Must be called AFTER Phase 2.6 (BuildSubtree for content) but BEFORE
+// Phase 2.7 (leaf lease acquisition), so that no overlapping path leases
+// exist when the parent lease is acquired.
+func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
+	if o.Stratum0URL == "" || j.Path == "" || !o.Lease.NeedsPipeline() {
+		return nil
+	}
+
+	// Decompose j.Path into its ancestor path components (not including j.Path
+	// itself, which the content commit will create).
+	// "releases/ROOT/v6-36-04/el9-x86_64" →
+	//   ancestors = ["releases", "releases/ROOT", "releases/ROOT/v6-36-04"]
+	parts := strings.Split(strings.Trim(j.Path, "/"), "/")
+	if len(parts) <= 1 {
+		return nil // top-level lease — no intermediate dirs needed
+	}
+	ancestors := make([]string, 0, len(parts)-1)
+	for i := 1; i < len(parts); i++ {
+		ancestors = append(ancestors, strings.Join(parts[:i], "/"))
+	}
+
+	// Fast path: check in-memory cache.  All ancestors known → nothing to do.
+	firstMissing := -1
+	for i, anc := range ancestors {
+		if _, ok := o.knownPaths.Load(j.Repo + "!" + anc); !ok {
+			firstMissing = i
+			break
+		}
+	}
+	if firstMissing == -1 {
+		return nil
+	}
+
+	graftPath := ancestors[firstMissing]
+
+	// Serialize mkdir-p per graftPath with a double-checked lock.
+	//
+	// Problem without this: N concurrent jobs all see the empty knownPaths
+	// cache above and all proceed to build a dir-only catalog and commit it,
+	// serializing through repoMu one by one — turning a one-time O(1) gateway
+	// commit into an O(N) sequential bottleneck that stalls all jobs in
+	// StateLeased.
+	//
+	// Solution: lock a per-"repo!graftPath" mutex (mkdirMu) and re-check
+	// knownPaths inside it.  After the first job commits and populates
+	// knownPaths, every subsequent job that was waiting on mkdirMu sees the
+	// cache hit and returns immediately without touching the gateway.
+	mkdirKey := j.Repo + "!" + graftPath
+	mkdirMuForPath := o.mkdirMutex(mkdirKey)
+	mkdirMuForPath.Lock()
+	defer mkdirMuForPath.Unlock()
+
+	// Double-check: another goroutine committed the dirs while we waited.
+	if _, ok := o.knownPaths.Load(j.Repo + "!" + graftPath); ok {
+		return nil
+	}
+
+	logger := o.Obs.Logger.With("job_id", j.ID, "repo", j.Repo, "graft_path", graftPath)
+	logger.Info("mkdir-p: creating missing parent directory chain", "full_path", j.Path)
+
+	// Build directory entries for the subtree rooted at graftPath.
+	// "." resolves to graftPath itself; deeper entries are relative to it.
+	now := time.Now().Unix()
+	dirEntries := []cvmfscatalog.Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 2},
+	}
+	for _, anc := range ancestors[firstMissing+1:] {
+		rel := strings.TrimPrefix(anc, graftPath+"/")
+		dirEntries = append(dirEntries, cvmfscatalog.Entry{
+			FullPath: rel, Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 2,
+		})
+	}
+	// When using DirectGraft, do NOT add j.Path as a plain directory entry.
+	// GraftNestedCatalog will insert the nested catalog mountpoint at that
+	// location itself; pre-creating it as a regular directory causes the
+	// "invalid attempt to graft nested catalog into existing directory" PANIC.
+	// For the standard DiffRec path we still add a placeholder so that the
+	// content commit can replace it.
+	if !o.DirectGraft {
+		leafRel := strings.TrimPrefix(j.Path, graftPath+"/")
+		dirEntries = append(dirEntries, cvmfscatalog.Entry{
+			FullPath: leafRel, Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 2,
+		})
+	}
+
+	// Build the tiny directory-only subtree catalog.
+	tmpDir, err := os.MkdirTemp("", "cvmfs-mkdir-p-*")
+	if err != nil {
+		return fmt.Errorf("mkdir-p: create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	mkdirResult, err := cvmfscatalog.BuildSubtree(ctx, cvmfscatalog.SubtreeConfig{
+		LeasePath: graftPath,
+		TempDir:   tmpDir,
+	}, dirEntries)
+	if err != nil {
+		return fmt.Errorf("mkdir-p: build subtree for %q: %w", graftPath, err)
+	}
+
+	// Upload the directory-only catalog(s) to the local CAS so Commit can
+	// stream them to the gateway via SubmitPayload.
+	for _, catHash := range mkdirResult.AllCatalogHashes {
+		catFile := filepath.Join(tmpDir, cvmfshash.ObjectPath(catHash)+"C")
+		f, openErr := os.Open(catFile)
+		if openErr != nil {
+			return fmt.Errorf("mkdir-p: open catalog %s: %w", catHash, openErr)
+		}
+		fi, statErr := f.Stat()
+		if statErr != nil {
+			f.Close()
+			return fmt.Errorf("mkdir-p: stat catalog %s: %w", catHash, statErr)
+		}
+		putErr := o.CAS.Put(ctx, catHash+"C", f, fi.Size())
+		f.Close()
+		if putErr != nil {
+			return fmt.Errorf("mkdir-p: CAS upload catalog %s: %w", catHash, putErr)
+		}
+	}
+
+	// Acquire the gateway lease for graftPath BEFORE repoMu so that waiting
+	// for a busy gateway does not block regular content commits from entering
+	// their manifest-fetch critical section.  This mirrors the Phase 2.7
+	// approach in Run(): lease acquired outside the mutex, only the lightweight
+	// manifest-GET + commit-POST happen inside.
+	var mkdirToken string
+	var leaseErr error
+	if o.GatewayQueue != nil {
+		mkdirToken, leaseErr = o.GatewayQueue.Acquire(ctx, j.Repo, graftPath, 0)
+	} else {
+		mkdirToken, leaseErr = o.Lease.Acquire(ctx, j.Repo, graftPath)
+	}
+	if leaseErr != nil {
+		return fmt.Errorf("mkdir-p: acquire lease for %q: %w", graftPath, leaseErr)
+	}
+
+	// Short critical section: serialise manifest-fetch + commit-POST per repo.
+	// repoMu prevents two concurrent mkdir-p (or mkdir-p + content commit)
+	// operations for the same repo from presenting a stale old_root_hash to
+	// the gateway receiver.  The lease is already held so there is no expiry
+	// pressure; a simple blocking Lock() is sufficient.
+	repoMu := o.repoMutex(j.Repo)
+	repoMu.Lock()
+	defer repoMu.Unlock()
+
+	// Fetch current root hash from .cvmfspublished (~200-byte HTTP GET).
+	mkdirOldRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, j.Repo)
+	if fetchErr != nil {
+		_ = o.Lease.Abort(ctx, mkdirToken)
+		return fmt.Errorf("mkdir-p: fetch manifest: %w", fetchErr)
+	}
+
+	// Commit the directory-only subtree catalog.
+	// Lease.Commit handles SubmitPayload + commit POST.  On failure, abort the
+	// lease so the gateway releases it promptly instead of waiting for expiry.
+	commitErr := o.Lease.Commit(ctx, lease.CommitRequest{
+		Token:               mkdirToken,
+		OldRootHash:         mkdirOldRoot,
+		NewRootHashSuffixed: mkdirResult.CatalogHashSuffixed,
+		CatalogHash:         mkdirResult.CatalogHashSuffixed,
+		ObjectStore:         o.CAS,
+		// ObjectHashes intentionally empty: no data objects in a dir-only catalog.
+	})
+	if commitErr != nil {
+		_ = o.Lease.Abort(ctx, mkdirToken)
+		return fmt.Errorf("mkdir-p: commit for %q: %w", graftPath, commitErr)
+	}
+
+	// Wake any job waiting in GatewayQueue.Acquire for graftPath or this repo.
+	if o.GatewayQueue != nil {
+		o.GatewayQueue.NotifyRelease(j.Repo)
+	}
+
+	// Mark all ancestors (and j.Path itself) as known so future publishes to
+	// any sub-path under graftPath skip this step.
+	for _, anc := range ancestors {
+		o.knownPaths.Store(j.Repo+"!"+anc, struct{}{})
+	}
+	o.knownPaths.Store(j.Repo+"!"+j.Path, struct{}{})
+
+	logger.Info("mkdir-p: parent directory chain committed",
+		"catalogs", len(mkdirResult.AllCatalogHashes),
+		"entries", len(dirEntries))
+	return nil
 }
 
 // registerJob records the cancel function for a running job so CancelJob can
@@ -385,6 +642,8 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		// (the log cannot be associated with a specific job).
 		jobPipelineCfg := o.Pipeline
 		jobPipelineCfg.SpoolDir = o.Spool.JobDir(j)
+		jobPipelineCfg.PreloadExe = j.PreloadExe
+		jobPipelineCfg.PreloadPaths = j.PreloadPaths
 
 		// Use the prefetch result (Phase 0 done before the concurrency slot was
 		// acquired) if it is available and succeeded.  This saves the O(tar-scan)
@@ -600,6 +859,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 				LeasePath:     j.Path,
 				TempDir:       o.Spool.JobDir(j),
 				DirtabContent: pipelineResult.DirtabContent,
+				DirectGraft:   o.DirectGraft,
 			}, pipelineResult.CatalogEntries)
 			if buildErr != nil {
 				span.RecordError(buildErr)
@@ -639,6 +899,25 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			logger.Info("subtree catalog ready",
 				"catalogs", len(subtreeResult.AllCatalogHashes),
 				"root_hash", subtreeResult.CatalogHash)
+
+			// ── Phase 2.65: ensure parent directories exist in CVMFS ──────────
+			// cvmfs_receiver grafts a subtree at the exact lease path, but does
+			// NOT create missing intermediate directory entries in ancestor
+			// catalogs.  Without those entries the FUSE client returns ENOENT for
+			// any traversal through those directories.
+			//
+			// ensureParentDirs commits a tiny directory-only subtree catalog for
+			// the first missing ancestor component.  The root catalog SQLite file
+			// is never downloaded — only .cvmfspublished (~200 bytes) is fetched.
+			// A process-lifetime knownPaths cache makes subsequent publishes to
+			// the same hierarchy a no-op.
+			//
+			// Must run BEFORE Phase 2.7 so that no overlapping path lease exists
+			// when the parent-path lease is acquired inside ensureParentDirs.
+			if ensureErr := o.ensureParentDirs(ctx, j); ensureErr != nil {
+				span.RecordError(ensureErr)
+				return o.abortJob(ctx, j, ensureErr)
+			}
 
 			// ── Phase 2.7: pre-acquire lease + submit subtree catalog ──────────
 			// Acquire the gateway lease and upload the catalog BEFORE the mutex so
@@ -899,6 +1178,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		CVMFSDir:       cvmfsDir,
 		TagName:        j.TagName,
 		TagDescription: j.TagDescription,
+		DirectGraft:    o.DirectGraft,
 	}
 	if preMutexLease {
 		// Catalog already uploaded to the gateway in Phase 2.7 (BuildSubtree).

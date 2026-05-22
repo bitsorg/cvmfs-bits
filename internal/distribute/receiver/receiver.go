@@ -250,7 +250,12 @@ func New(cfg Config) (*Receiver, error) {
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/api/v1/announce", r.announceHandler)
 	controlMux.HandleFunc("/api/v1/bloom", r.bloomHandler)
-	controlMux.Handle("/metrics", promhttp.Handler())
+	// Use the observer's isolated registry so that receiver-specific metrics
+	// (cvmfs_receiver_bytes_received_total, etc.) are visible at /metrics.
+	// promhttp.Handler() uses the process-global default registry, which does
+	// NOT contain metrics registered via observe.New → prometheus.NewRegistry().
+	metricsHandler := promhttp.HandlerFor(cfg.Obs.Registry, promhttp.HandlerOpts{})
+	controlMux.Handle("/metrics", metricsHandler)
 
 	r.control = &http.Server{
 		Addr:         cfg.ControlAddr,
