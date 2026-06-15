@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
 // Package notify provides an in-process event bus for job state changes and

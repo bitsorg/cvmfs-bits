@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 //go:build linux
 
