@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // worker.go — per-endpoint distribution worker with retry and backoff.
 //
 // Multiple worker goroutines share a single *endpointWorker; they compete for

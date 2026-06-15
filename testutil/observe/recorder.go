@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package observe provides test helpers for OpenTelemetry tracing.
 //
 // This package lives in testutil/ rather than pkg/observe so that production

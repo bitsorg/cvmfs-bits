@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package api defines the HTTP API server and request handlers for job submission,
 // status polling, and event streaming. The Server manages authenticated requests,
 // spawns background job orchestrators, and gracefully shuts down in-flight jobs.

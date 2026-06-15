@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package distribute manages replication of objects to Stratum 1 endpoints.
 // It handles batch and per-object pushes with quorum enforcement and crash-safe
 // distribution logging.

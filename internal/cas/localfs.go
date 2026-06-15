@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package cas defines the backend interface for content-addressable storage
 // and provides a filesystem-based implementation.
 package cas

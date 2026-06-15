@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package probe has been retired.
 // The probe logic now lives in cmd/prepub/probe.go (package main).
 // This file exists only to keep the directory non-empty; the package

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package dedup provides fast deduplication checking via Bloom filters with
 // CAS confirmation to avoid false positives.
 package dedup

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 package distribute
 
 // push.go — per-object and batch push logic for Stratum 1 distribution.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package cvmfscatalog creates and manages CVMFS catalogs (SQLite databases).
 //
 // A CVMFS catalog is a content-addressed SQLite database that records the

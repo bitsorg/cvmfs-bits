@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Command prepub is the cvmfs-prepub service binary.  It can run in two modes:
 //
 //   - publisher (default): accepts publish jobs via an HTTP API, coordinates

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package pipeline orchestrates the tar-to-catalog transformation:
 // unpacking tar entries, compressing and hashing content, deduplicating against
 // prior uploads, building a deduplicated catalog, and uploading objects to CAS.

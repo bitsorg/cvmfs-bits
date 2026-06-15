@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // main_test.go — unit tests for standalone startup helpers in cmd/prepub.

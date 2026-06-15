@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package api orchestrates the HTTP server and job lifecycle management for the CVMFS pre-publisher.
 // It coordinates the pipeline (unpack, compress, deduplicate), distribution to Stratum 1 replicas,
 // gateway lease acquisition, and publish operations.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package api — GatewayQueue: per-repository serialised lease acquisition.
 //
 // Problem: the gateway allows only one lease per repository path at a time.

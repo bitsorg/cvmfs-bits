@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 package lease
 
 // auth.go — HMAC-SHA1 signing helpers for cvmfs_gateway requests.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package pipeline — preload file generation.
 //
 // buildPreloadEntry compresses a list of CAS hashes into a CVMFS preload file,

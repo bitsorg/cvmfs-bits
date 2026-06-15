@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package cvmfsxattr implements serialization and deserialization of the
 // CVMFS extended attribute (xattr) binary format used in the xattr BLOB
 // column of CVMFS SQLite catalogs.

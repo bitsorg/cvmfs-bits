@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package receiver implements the Stratum 1 pre-warming receiver agent.
 //
 // The receiver accepts compressed CAS objects pushed by the cvmfs-prepub

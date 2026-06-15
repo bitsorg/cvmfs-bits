@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package cvmfshash provides CVMFS-compatible hashing and path utilities.
 package cvmfshash
 

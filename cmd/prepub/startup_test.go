@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // startup_test.go — unit tests for the startup readiness-probe logic in probe.go.

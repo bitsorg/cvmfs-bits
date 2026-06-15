@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package spool manages persistent job state with atomic transitions and crash-safe
 // durability guarantees using journaling, fsync ordering, and atomic renames.
 package spool

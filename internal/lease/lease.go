@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package lease manages gateway lease acquisition, renewal, and release for
 // CVMFS publish operations. Leases provide short-term exclusive publish locks
 // on a repository path, protected by HMAC-SHA1 signed requests (matching the

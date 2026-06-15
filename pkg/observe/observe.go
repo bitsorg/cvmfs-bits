@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package observe provides centralized observability: structured logging, distributed tracing,
 // and Prometheus metrics collection.
 package observe

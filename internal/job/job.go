@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package job defines the job data model, FSM states, and provenance tracking
 // for CVMFS publish operations.
 package job

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // manager.go — queue-driven, per-endpoint distribution manager.
 //
 // Manager maintains one pool of worker goroutines per Stratum 1 endpoint.

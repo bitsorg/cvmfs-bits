@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package broker provides the MQTT topic schema and message types used for
 // coordination between cvmfs-prepub publishers and Stratum 1 receiver agents.
 //

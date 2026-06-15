@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 CERN (European Organization for Nuclear Research)
+// SPDX-License-Identifier: Apache-2.0
+
 // Package cas provides the interface and filesystem implementation for
 // content-addressable storage used by the CVMFS pre-publisher.
 package cas
