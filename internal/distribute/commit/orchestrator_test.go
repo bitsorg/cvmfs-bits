@@ -1,0 +1,262 @@
+// SPDX-FileCopyrightText: 2026 CERN
+// SPDX-License-Identifier: Apache-2.0
+
+package commit
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"cvmfs.io/prepub/internal/distribute/manifest"
+)
+
+// ── fakes ─────────────────────────────────────────────────────────────────────
+
+type fakePinner struct {
+	mu       sync.Mutex
+	pinned   map[string]bool
+	released map[string]bool
+}
+
+func newFakePinner() *fakePinner {
+	return &fakePinner{pinned: map[string]bool{}, released: map[string]bool{}}
+}
+func (p *fakePinner) Pin(txn string, _ []string, _ time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pinned[txn] = true
+}
+func (p *fakePinner) Release(txn string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.released[txn] = true
+}
+func (p *fakePinner) isReleased(txn string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.released[txn]
+}
+
+type fakeCommitter struct {
+	mu      sync.Mutex
+	calls   int
+	err     error
+	lastTxn string
+}
+
+func (c *fakeCommitter) Commit(_ context.Context, _, txn, _ string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	c.lastTxn = txn
+	return c.err
+}
+func (c *fakeCommitter) count() int { c.mu.Lock(); defer c.mu.Unlock(); return c.calls }
+
+type fakeNotifier struct {
+	mu          sync.Mutex
+	announced   []string
+	committed   []string
+	announceErr error
+}
+
+func (n *fakeNotifier) Announce(_, txn, _ string, _ []string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.announced = append(n.announced, txn)
+	return n.announceErr
+}
+func (n *fakeNotifier) Committed(_, txn, _ string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.committed = append(n.committed, txn)
+	return nil
+}
+func (n *fakeNotifier) committedCount() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.committed)
+}
+
+func newTestOrch(t *testing.T, gate *WarmGate, c Committer, n Notifier, p Pinner) *Orchestrator {
+	t.Helper()
+	return &Orchestrator{
+		Journal:     OpenJournal(filepath.Join(t.TempDir(), "txn.jsonl")),
+		Gate:        gate,
+		Pinner:      p,
+		Committer:   c,
+		Notifier:    n,
+		WarmTimeout: 50 * time.Millisecond,
+	}
+}
+
+func nonTerminal(t *testing.T, o *Orchestrator) []manifest.TxnRecord {
+	t.Helper()
+	recs, err := o.Journal.Records()
+	if err != nil {
+		t.Fatalf("journal records: %v", err)
+	}
+	return Reconcile(recs)
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+func TestOrchestratorHappyPath(t *testing.T) {
+	gate := NewWarmGate([]string{"a", "b"}, 2)
+	gate.Ack("t1", "a")
+	gate.Ack("t1", "b") // quorum already met → WaitQuorum returns immediately
+	c := &fakeCommitter{}
+	n := &fakeNotifier{}
+	p := newFakePinner()
+	o := newTestOrch(t, gate, c, n, p)
+
+	out, err := o.Run(context.Background(), Txn{TxnID: "t1", Repo: "r", RootHash: "deadbeef", Hashes: []string{"h1", "h2"}})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !out.Committed || !out.Warmed {
+		t.Fatalf("outcome = %+v, want committed+warmed", out)
+	}
+	if c.count() != 1 {
+		t.Fatalf("committer calls = %d, want 1", c.count())
+	}
+	if n.committedCount() != 1 {
+		t.Fatal("committed broadcast missing")
+	}
+	if !p.isReleased("t1") {
+		t.Fatal("pin not released after commit")
+	}
+	if rem := nonTerminal(t, o); len(rem) != 0 {
+		t.Fatalf("journal should have no non-terminal txns, got %+v", rem)
+	}
+	// WarmGate state must be forgotten.
+	if acked, _ := gate.Warmth("t1"); acked != 0 {
+		t.Fatalf("warm gate not forgotten: acked=%d", acked)
+	}
+}
+
+func TestOrchestratorWarmTimeoutDegradesToCommit(t *testing.T) {
+	gate := NewWarmGate([]string{"a", "b"}, 2) // no acks → quorum never reached
+	c := &fakeCommitter{}
+	p := newFakePinner()
+	o := newTestOrch(t, gate, c, &fakeNotifier{}, p)
+
+	start := time.Now()
+	out, err := o.Run(context.Background(), Txn{TxnID: "t2", Repo: "r", RootHash: "x"})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if time.Since(start) < 40*time.Millisecond {
+		t.Fatal("expected to wait out the warm timeout")
+	}
+	if !out.Committed || out.Warmed {
+		t.Fatalf("outcome = %+v, want committed and NOT warmed (degraded)", out)
+	}
+	if c.count() != 1 {
+		t.Fatal("degraded path must still commit")
+	}
+	if !p.isReleased("t2") {
+		t.Fatal("pin not released")
+	}
+}
+
+func TestOrchestratorCommitErrorAborts(t *testing.T) {
+	gate := NewWarmGate([]string{"a"}, 1)
+	gate.Ack("t3", "a")
+	c := &fakeCommitter{err: errors.New("cvmfs_server publish failed")}
+	p := newFakePinner()
+	o := newTestOrch(t, gate, c, &fakeNotifier{}, p)
+
+	out, err := o.Run(context.Background(), Txn{TxnID: "t3", Repo: "r", RootHash: "x"})
+	if err == nil {
+		t.Fatal("expected commit error")
+	}
+	if out.Committed || !out.Aborted {
+		t.Fatalf("outcome = %+v, want aborted", out)
+	}
+	if !p.isReleased("t3") {
+		t.Fatal("pin must be released on abort")
+	}
+	// Abort is terminal → nothing left to reconcile.
+	if rem := nonTerminal(t, o); len(rem) != 0 {
+		t.Fatalf("aborted txn should be terminal, got %+v", rem)
+	}
+}
+
+func TestOrchestratorAnnounceFailureStillCommits(t *testing.T) {
+	gate := NewWarmGate([]string{"a"}, 1)
+	gate.Ack("t4", "a")
+	c := &fakeCommitter{}
+	n := &fakeNotifier{announceErr: errors.New("broker down")}
+	o := newTestOrch(t, gate, c, n, newFakePinner())
+
+	out, err := o.Run(context.Background(), Txn{TxnID: "t4", Repo: "r"})
+	if err != nil {
+		t.Fatalf("announce failure must not fail the commit: %v", err)
+	}
+	if !out.Committed {
+		t.Fatal("should commit despite announce failure")
+	}
+}
+
+func TestRecoverFinishesWarmTransaction(t *testing.T) {
+	// Simulate a crash: a journal with txn-w left at Warm (catalog never flipped).
+	jp := filepath.Join(t.TempDir(), "txn.jsonl")
+	j := OpenJournal(jp)
+	j.Append(manifest.TxnRecord{TxnID: "txn-w", Repo: "r", Phase: manifest.PhasePrepare, TargetRootHash: "root-w", GCPin: "txn-w", At: time.Now()})
+	j.Append(manifest.TxnRecord{TxnID: "txn-w", Repo: "r", Phase: manifest.PhaseWarm, TargetRootHash: "root-w", GCPin: "txn-w", At: time.Now()})
+
+	c := &fakeCommitter{}
+	p := newFakePinner()
+	n := &fakeNotifier{}
+	o := &Orchestrator{Journal: j, Gate: NewWarmGate(nil, 0), Pinner: p, Committer: c, Notifier: n}
+
+	if err := o.Recover(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if c.count() != 1 || c.lastTxn != "txn-w" {
+		t.Fatalf("recover should re-commit txn-w once, calls=%d last=%q", c.count(), c.lastTxn)
+	}
+	if !p.isReleased("txn-w") {
+		t.Fatal("pin not released after recovery commit")
+	}
+	if n.committedCount() != 1 {
+		t.Fatal("recovery should broadcast committed")
+	}
+	// Idempotent across restarts: a second Recover finds the now-terminal txn and
+	// does nothing.
+	if err := o.Recover(context.Background()); err != nil {
+		t.Fatalf("second recover: %v", err)
+	}
+	if c.count() != 1 {
+		t.Fatalf("second recover must not re-commit, calls=%d", c.count())
+	}
+}
+
+func TestRecoverAbortsPreparedTransaction(t *testing.T) {
+	jp := filepath.Join(t.TempDir(), "txn.jsonl")
+	j := OpenJournal(jp)
+	j.Append(manifest.TxnRecord{TxnID: "txn-p", Repo: "r", Phase: manifest.PhasePrepare, TargetRootHash: "root-p", GCPin: "txn-p", At: time.Now()})
+
+	c := &fakeCommitter{}
+	p := newFakePinner()
+	o := &Orchestrator{Journal: j, Gate: NewWarmGate(nil, 0), Pinner: p, Committer: c}
+
+	if err := o.Recover(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if c.count() != 0 {
+		t.Fatal("prepared-only txn must NOT be committed on recovery")
+	}
+	if !p.isReleased("txn-p") {
+		t.Fatal("pin must be released on abort recovery")
+	}
+	recs, _ := j.Records()
+	if rem := Reconcile(recs); len(rem) != 0 {
+		t.Fatalf("txn-p should be terminal after recovery, got %+v", rem)
+	}
+}

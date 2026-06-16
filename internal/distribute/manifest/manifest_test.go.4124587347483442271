@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: 2026 CERN
+// SPDX-License-Identifier: Apache-2.0
+
+package manifest
+
+import (
+	"bytes"
+	"testing"
+	"time"
+)
+
+func sample() *Manifest {
+	return &Manifest{
+		TransactionID:  "txn-1",
+		Repo:           "cms.cern.ch",
+		BaseRootHash:   "aaaa",
+		TargetRootHash: "bbbb",
+		BaseURLs:       []string{"https://s0/cvmfs/cms.cern.ch/data"},
+		Generator:      GeneratorPipeline,
+		Auth:           AuthPublic,
+		CreatedAt:      time.Unix(1750000000, 0).UTC(),
+		TotalSize:      4096 + 81920,
+		Objects: []ObjRef{
+			{Hash: "00aa", Size: 4096},
+			{Hash: "11bb", Size: 81920, Suffix: "C"},
+		},
+	}
+}
+
+func TestJSONRoundTrip(t *testing.T) {
+	m := sample()
+	if err := m.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := m.Encode(&buf); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, err := Decode(&buf)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.TransactionID != m.TransactionID || got.TargetRootHash != m.TargetRootHash {
+		t.Fatalf("header mismatch: %+v", got)
+	}
+	if len(got.Objects) != 2 || got.Objects[1].Suffix != "C" {
+		t.Fatalf("objects mismatch: %+v", got.Objects)
+	}
+}
+
+func TestNDJSONRoundTrip(t *testing.T) {
+	m := sample()
+	var buf bytes.Buffer
+	if err := m.EncodeNDJSON(&buf); err != nil {
+		t.Fatalf("encode ndjson: %v", err)
+	}
+	var objs []ObjRef
+	hdr, err := DecodeNDJSON(&buf, func(o ObjRef) error {
+		objs = append(objs, o)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("decode ndjson: %v", err)
+	}
+	if hdr.Repo != m.Repo || hdr.Generator != GeneratorPipeline {
+		t.Fatalf("header mismatch: %+v", hdr)
+	}
+	if len(hdr.Objects) != 0 {
+		t.Fatalf("streaming header must carry no inline objects, got %d", len(hdr.Objects))
+	}
+	if len(objs) != 2 || objs[0].Hash != "00aa" || objs[1].Size != 81920 {
+		t.Fatalf("streamed objects mismatch: %+v", objs)
+	}
+}
+
+func TestMissing(t *testing.T) {
+	m := sample()
+	have := map[string]bool{"00aa": true} // already holds the first object
+	missing := m.Missing(func(h string) bool { return have[h] })
+	if len(missing) != 1 || missing[0].Hash != "11bb" {
+		t.Fatalf("missing set wrong: %+v", missing)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	bad := []*Manifest{
+		{Repo: "r", TargetRootHash: "t", BaseURLs: []string{"u"}, Generator: GeneratorPipeline}, // no txn id
+		{TransactionID: "x", TargetRootHash: "t", BaseURLs: []string{"u"}, Generator: GeneratorPipeline}, // no repo
+		{TransactionID: "x", Repo: "r", BaseURLs: []string{"u"}, Generator: GeneratorPipeline}, // no target root
+		{TransactionID: "x", Repo: "r", TargetRootHash: "t", Generator: GeneratorPipeline}, // no base url
+		{TransactionID: "x", Repo: "r", TargetRootHash: "t", BaseURLs: []string{"u"}, Generator: "bogus"}, // bad generator
+	}
+	for i, m := range bad {
+		if err := m.Validate(); err == nil {
+			t.Fatalf("case %d: expected validation error", i)
+		}
+	}
+}

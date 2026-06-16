@@ -1,0 +1,118 @@
+// SPDX-FileCopyrightText: 2026 CERN
+// SPDX-License-Identifier: Apache-2.0
+
+package puller
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"cvmfs.io/prepub/internal/cas"
+	"cvmfs.io/prepub/internal/distribute/manifest"
+	"cvmfs.io/prepub/internal/distribute/serve"
+)
+
+func TestPullBundleVerifiesSkipsAndStaysAligned(t *testing.T) {
+	ctx := context.Background()
+
+	src, err := cas.NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	good1 := []byte("first good object")
+	good2 := []byte("second good object after the corrupt one")
+	present := []byte("already present locally")
+	hGood1, hGood2, hPresent := sha1hex(good1), sha1hex(good2), sha1hex(present)
+	mustPut(t, src, hGood1, good1)
+	mustPut(t, src, hGood2, good2)
+	mustPut(t, src, hPresent, present)
+	// Corrupt object: stored under a hash that does not match its bytes.
+	hBad := sha1hex([]byte("the real bytes"))
+	mustPut(t, src, hBad, []byte("tampered bytes of a different length"))
+
+	srv := httptest.NewServer(&serve.BundleHandler{Store: src})
+	defer srv.Close()
+
+	dst, err := cas.NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustPut(t, dst, hPresent, present) // pre-present → Skipped, never requested
+
+	p := &Puller{Store: dst}
+	// Order matters: the corrupt object sits BETWEEN two good ones to prove the
+	// frame reader re-aligns after a rejected object.
+	m := &manifest.Manifest{
+		TransactionID: "b1", Repo: "cms.cern.ch", TargetRootHash: "ROOT",
+		Generator: manifest.GeneratorDiff, Auth: manifest.AuthPublic,
+		Objects: []manifest.ObjRef{
+			{Hash: hGood1, Size: int64(len(good1))},
+			{Hash: hPresent, Size: int64(len(present))},
+			{Hash: hBad},
+			{Hash: hGood2, Size: int64(len(good2))},
+		},
+	}
+	res, err := p.PullBundle(ctx, srv.URL, m)
+	if err == nil {
+		t.Fatalf("expected error from the corrupt object; res=%+v", res)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("Skipped=%d, want 1", res.Skipped)
+	}
+	if res.Failed != 1 {
+		t.Fatalf("Failed=%d, want 1 (the corrupt object)", res.Failed)
+	}
+	if res.Fetched != 2 {
+		t.Fatalf("Fetched=%d, want 2 (both good objects)", res.Fetched)
+	}
+	// Both good objects installed despite the corrupt one between them.
+	for _, h := range []string{hGood1, hGood2} {
+		if ok, _ := dst.Exists(ctx, h); !ok {
+			t.Fatalf("good object %s not installed (frame misalignment?)", h)
+		}
+	}
+	if ok, _ := dst.Exists(ctx, hBad); ok {
+		t.Fatal("corrupt object must not be installed")
+	}
+}
+
+func TestPullBundleAllPresentNoRequest(t *testing.T) {
+	ctx := context.Background()
+	src, _ := cas.NewLocalFS(t.TempDir())
+	a := []byte("obj-a")
+	hA := sha1hex(a)
+	mustPut(t, src, hA, a)
+
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		(&serve.BundleHandler{Store: src}).ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	dst, _ := cas.NewLocalFS(t.TempDir())
+	mustPut(t, dst, hA, a) // already present
+	st := NewState(t.TempDir())
+	p := &Puller{Store: dst, State: st}
+	m := &manifest.Manifest{
+		TransactionID: "b2", Repo: "lhcb.cern.ch", TargetRootHash: "R2",
+		Generator: manifest.GeneratorDiff, Auth: manifest.AuthPublic,
+		Objects: []manifest.ObjRef{{Hash: hA, Size: int64(len(a))}},
+	}
+	res, err := p.PullBundle(ctx, srv.URL, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Skipped != 1 || res.Fetched != 0 {
+		t.Fatalf("counts: %+v", res)
+	}
+	if hits != 0 {
+		t.Fatalf("no request should be made when nothing is missing, got %d", hits)
+	}
+	// Nothing missing is still a successful sync → state advances.
+	if root, _ := st.Get("lhcb.cern.ch"); root != "R2" {
+		t.Fatalf("state = %q, want R2", root)
+	}
+}

@@ -36,7 +36,9 @@ import (
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
+	"cvmfs.io/prepub/internal/distribute/commit"
 	"cvmfs.io/prepub/internal/distribute/receiver"
+	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/pipeline"
@@ -49,6 +51,11 @@ import (
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────
 	mode := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
+	// ADR-0001 (reserved; not yet active in P0). Data-plane direction and
+	// control-plane transport selectors; parsed now so config/tooling can set
+	// them, wired into behaviour in later phases.
+	distributeMode := flag.String("distribute-mode", "push", "Data-plane distribution: push (legacy) or pull (ADR-0001) [publisher|receiver]")
+	controlPlane := flag.String("control-plane", "mqtt", "Control-plane transport: mqtt or sse (sse reserved; not yet active) [publisher|receiver]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
 	config := flag.String("config", "", "Config file path (reserved for future use)")
@@ -243,6 +250,8 @@ func main() {
 	}))
 
 	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode)
+	obs.Logger.Debug("distribution config (ADR-0001)",
+		"distribute_mode", *distributeMode, "control_plane", *controlPlane)
 
 	switch *mode {
 	case "publisher":
@@ -255,12 +264,13 @@ func main() {
 			*s1WorkerConcurrency, *s1MaxAttempts, *s1QueueDepth,
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*s1BatchSize,
-			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert)
+			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
+			*distributeMode)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*recvStratum0URL)
+			*recvStratum0URL, *distributeMode)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
 		os.Exit(1)
@@ -294,6 +304,7 @@ func runPublisher(
 	s1QueueSpoolDir string,
 	s1BatchSize int,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
+	distributeMode string,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
@@ -657,6 +668,22 @@ func runPublisher(
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
 
+	// ADR-0001 pull mode: serve objects + manifests (incl. the gateway POST
+	// ingest) so Stratum 1 can pull on a prepare announce. Default push leaves
+	// these routes unmounted.
+	if distributeMode == "pull" {
+		// Admission control (ADR D6): cap concurrent receiver pulls and issue one
+		// lease per node at a time. Limits are conservative defaults for the small
+		// Stratum 1 fleet; make them configurable when the benchmark (P5) lands.
+		admission := commit.NewAdmission(commit.Options{MaxConcurrent: 16, MaxPerNode: 1})
+		apiServer.MountDistributeServing(api.DistributeServing{
+			CAS:       casBackend,
+			Manifests: serve.NewMemManifestStore(),
+			Admission: admission,
+		})
+		obs.Logger.Info("ADR-0001: pull-mode distribute serving enabled")
+	}
+
 	// Crash-recovery: re-run jobs that were interrupted by a previous crash.
 	recoverCtx, cancelRecover := context.WithCancel(context.Background())
 
@@ -738,6 +765,7 @@ func runReceiver(
 	coordURL, nodeID, reposFlag string,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
 	stratum0URL string,
+	distributeMode string,
 ) {
 	// Load the HMAC shared secret from the environment.  In DevMode the
 	// receiver skips HMAC verification entirely, so the secret is not required.
@@ -806,6 +834,8 @@ func runReceiver(
 		NodeID:           nodeID,
 		Repos:            repoList,
 		Stratum0URL:      stratum0URL,
+		PullMode:         distributeMode == "pull",
+		PullManifestBase: stratum0URL, // in pull mode this points at the cvmfs-prepub endpoint
 		BrokerURL:        brokerURL,
 		BrokerClientCert: brokerClientCert,
 		BrokerClientKey:  brokerClientKey,

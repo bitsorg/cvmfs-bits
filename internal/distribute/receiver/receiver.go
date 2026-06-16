@@ -32,10 +32,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"cvmfs.io/prepub/internal/broker"
+	"cvmfs.io/prepub/internal/cas"
+	"cvmfs.io/prepub/internal/distribute/puller"
 	"cvmfs.io/prepub/pkg/observe"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -149,6 +152,25 @@ type Config struct {
 	// Defaults to 1 GiB (1 << 30).  Set to 0 to use the default.
 	MaxObjectSize int64
 
+	// PullMode enables ADR-0001 pull-based distribution: on a prepare announce
+	// the receiver fetches the transaction manifest and pulls the objects it is
+	// missing, instead of waiting to be pushed to. Default false (legacy push).
+	PullMode bool
+
+	// PullManifestBase is the cvmfs-prepub base URL the receiver fetches
+	// manifests from in pull mode (the manifest for a transaction is at
+	// PullManifestBase + "/s1/{txn}/manifest"). Object locations come from the
+	// manifest's own BaseURLs.
+	PullManifestBase string
+
+	// OnWarmed, when set, is invoked exactly once after each pull-mode warming
+	// attempt completes (ADR-0001 D6). warmed is true only when every missing
+	// object was fetched and verified, i.e. the receiver is warm for txn; the
+	// publisher routes a true result into its WarmGate quorum. It MUST NOT block
+	// (it runs on the pull goroutine); the broker publish it typically performs
+	// is fire-and-forget. A nil hook disables the ack (pre-broker / tests).
+	OnWarmed func(payloadID, repo string, warmed bool)
+
 	// Obs provides structured logging and metrics.
 	Obs *observe.Provider
 }
@@ -213,6 +235,14 @@ type Receiver struct {
 	//
 	// Key: repo name string.  Value: *sync.Mutex.
 	s0PullMu sync.Map
+
+	// pullCoordinator drives ADR-0001 pull-based warming; non-nil only when
+	// cfg.PullMode is set.
+	pullCoordinator *puller.Coordinator
+	// pullSem bounds concurrent pull goroutines; pullInflight coalesces
+	// concurrent pulls of the same transaction. Both used only in pull mode.
+	pullSem      chan struct{}
+	pullInflight sync.Map
 }
 
 // New creates a Receiver from cfg but does not start any listeners.
@@ -247,6 +277,25 @@ func New(cfg Config) (*Receiver, error) {
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute, // generous for large CAS objects
 		},
+	}
+
+	// Pull mode (ADR-0001): build the coordinator that fetches manifests and
+	// pulls missing objects into the local CAS on announce.
+	if cfg.PullMode {
+		store, err := cas.NewLocalFS(cfg.CASRoot)
+		if err != nil {
+			return nil, fmt.Errorf("receiver: pull-mode CAS at %s: %w", cfg.CASRoot, err)
+		}
+		r.pullCoordinator = &puller.Coordinator{
+			ManifestBase: cfg.PullManifestBase,
+			Client:       r.httpClient,
+			Puller: &puller.Puller{
+				Store:   store,
+				Fetcher: &puller.HTTPFetcher{Client: r.httpClient},
+				State:   puller.NewState(filepath.Join(cfg.CASRoot, ".bits-state")),
+			},
+		}
+		r.pullSem = make(chan struct{}, pullConcurrency)
 	}
 
 	// Control channel mux (HTTPS): announce, bloom filter snapshot, metrics.

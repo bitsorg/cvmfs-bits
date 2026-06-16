@@ -53,22 +53,25 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-// create generates a new session for payloadID with the given TTL and registers
-// it in the store.  The caller must check getByPayload first to ensure
-// idempotency.
+// create returns a live session for payloadID, creating one if none exists.  It
+// is idempotent on payloadID: concurrent calls for the same payload — e.g. two
+// announces racing past a getByPayload miss — return the same session, never a
+// duplicate token. The lookup and insert happen under a single lock hold, so the
+// getByPayload-then-create sequence in the announce handlers is race-free.
 //
 // Returns (session, true) on success, or (nil, false) when the store is at
 // capacity even after pruning expired entries.  The caller should respond with
 // HTTP 429 in the false case.
 func (ss *sessionStore) create(payloadID string, ttl time.Duration) (*session, bool) {
-	token := randomToken()
-	s := &session{
-		token:     token,
-		payloadID: payloadID,
-		expiresAt: time.Now().Add(ttl),
-	}
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
+
+	// Idempotency: a concurrent announce may have created the session after this
+	// caller's getByPayload miss.  Return the existing live session rather than
+	// registering a second token for the same payload.
+	if cur, found := ss.byPayload[payloadID]; found && !cur.expired() {
+		return cur, true
+	}
 
 	// Enforce the capacity limit.  On first breach, purge all expired entries
 	// inline (same work the background cleanup would do) before giving up.
@@ -86,6 +89,12 @@ func (ss *sessionStore) create(payloadID string, ttl time.Duration) (*session, b
 		}
 	}
 
+	token := randomToken()
+	s := &session{
+		token:     token,
+		payloadID: payloadID,
+		expiresAt: time.Now().Add(ttl),
+	}
 	ss.byToken[token] = s
 	ss.byPayload[payloadID] = s
 	return s, true

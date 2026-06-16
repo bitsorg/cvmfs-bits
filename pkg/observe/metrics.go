@@ -8,30 +8,30 @@ import (
 )
 
 type Metrics struct {
-	JobsSubmitted              prometheus.Counter
-	JobsCompleted              prometheus.Counter
-	JobsFailed                 prometheus.Counter
-	JobsRecovered              prometheus.Counter
-	JobFailuresByClass         *prometheus.CounterVec
-	PipelineFilesProcessed     prometheus.Counter
-	PipelineBytesCompressed    prometheus.Counter
-	PipelineDedupHits          prometheus.Counter
+	JobsSubmitted           prometheus.Counter
+	JobsCompleted           prometheus.Counter
+	JobsFailed              prometheus.Counter
+	JobsRecovered           prometheus.Counter
+	JobFailuresByClass      *prometheus.CounterVec
+	PipelineFilesProcessed  prometheus.Counter
+	PipelineBytesCompressed prometheus.Counter
+	PipelineDedupHits       prometheus.Counter
 	// BloomFalsePositives counts filter queries where the filter said "present"
 	// but CAS.Exists() confirmed the object is NOT there.  A rising rate
 	// signals filter saturation — consider widening bloom_filter_capacity.
-	BloomFalsePositives        prometheus.Counter
-	CASUploadDuration          prometheus.Histogram
-	LeaseAcquireDuration       prometheus.Histogram
-	DistributionDuration       *prometheus.HistogramVec
-	SpoolTransitions           *prometheus.CounterVec
-	LeaseHeartbeatErrors       prometheus.Counter
-	PipelineAbortCount         prometheus.Counter
-	CASObjectCount             prometheus.Gauge
-	CASBytesUsed               prometheus.Gauge
-	ReceiverObjectsReceived    prometheus.Counter
-	ReceiverBytesReceived      prometheus.Counter
-	ReceiverBloomSize          prometheus.Gauge
-	ReceiverHeartbeatErrors    prometheus.Counter
+	BloomFalsePositives     prometheus.Counter
+	CASUploadDuration       prometheus.Histogram
+	LeaseAcquireDuration    prometheus.Histogram
+	DistributionDuration    *prometheus.HistogramVec
+	SpoolTransitions        *prometheus.CounterVec
+	LeaseHeartbeatErrors    prometheus.Counter
+	PipelineAbortCount      prometheus.Counter
+	CASObjectCount          prometheus.Gauge
+	CASBytesUsed            prometheus.Gauge
+	ReceiverObjectsReceived prometheus.Counter
+	ReceiverBytesReceived   prometheus.Counter
+	ReceiverBloomSize       prometheus.Gauge
+	ReceiverHeartbeatErrors prometheus.Counter
 
 	// Per-phase job duration histograms.
 	// Label "phase" takes values:
@@ -41,6 +41,20 @@ type Metrics struct {
 	//   commit           — gateway SubmitPayload + Release round-trip
 	//   total_s0         — wall time from job submission to StatePublished
 	JobPhaseDuration *prometheus.HistogramVec
+
+	// ── ADR-0001 pull-based distribution ────────────────────────────────────
+	// Publisher (Stratum 0) side.
+	DistWarmQuorum      *prometheus.CounterVec // result=reached|timeout
+	DistTxn             *prometheus.CounterVec // result=committed|aborted
+	DistCommitDuration  prometheus.Histogram   // three-phase Run wall time
+	DistAdmissionActive prometheus.Gauge       // active pull leases
+	DistAdmissionDenied prometheus.Counter     // lease grants refused (429)
+	DistReconcile       *prometheus.CounterVec // crash recovery, action=commit|abort
+	// Receiver (Stratum 1) side.
+	PullTransactions *prometheus.CounterVec // result=warmed|failed
+	PullObjects      *prometheus.CounterVec // result=fetched|skipped|failed
+	PullDuration     prometheus.Histogram   // per-transaction warming wall time
+	PullCatchup      *prometheus.CounterVec // result=ok|incomplete|error
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -139,6 +153,50 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			// (sub-second) through full pipeline + distribution runs (minutes).
 			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15), // 0.1s … 1638s
 		}, []string{"phase"}),
+
+		// ── pull distribution (ADR-0001) ──
+		DistWarmQuorum: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cvmfs_prepub_dist_warm_quorum_total",
+			Help: "Warm-gate outcomes per transaction (result=reached|timeout).",
+		}, []string{"result"}),
+		DistTxn: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cvmfs_prepub_dist_txn_total",
+			Help: "Three-phase distribution transactions by outcome (result=committed|aborted).",
+		}, []string{"result"}),
+		DistCommitDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "cvmfs_prepub_dist_commit_duration_seconds",
+			Help:    "Wall time of the prepare→warm→commit orchestration.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
+		}),
+		DistAdmissionActive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "cvmfs_prepub_dist_admission_active",
+			Help: "Currently active receiver pull leases.",
+		}),
+		DistAdmissionDenied: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "cvmfs_prepub_dist_admission_denied_total",
+			Help: "Pull lease grants refused because a concurrency cap was reached.",
+		}),
+		DistReconcile: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cvmfs_prepub_dist_reconcile_total",
+			Help: "Crash-recovery resolutions on restart (action=commit|abort).",
+		}, []string{"action"}),
+		PullTransactions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cvmfs_receiver_pull_transactions_total",
+			Help: "Pull-warming attempts by outcome (result=warmed|failed).",
+		}, []string{"result"}),
+		PullObjects: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cvmfs_receiver_pull_objects_total",
+			Help: "Objects handled during pull warming (result=fetched|skipped|failed).",
+		}, []string{"result"}),
+		PullDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "cvmfs_receiver_pull_duration_seconds",
+			Help:    "Wall time to warm one transaction by pulling its missing objects.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
+		}),
+		PullCatchup: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cvmfs_receiver_pull_catchup_total",
+			Help: "Cumulative catch-up runs by outcome (result=ok|incomplete|error).",
+		}, []string{"result"}),
 	}
 }
 
@@ -167,5 +225,15 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.ReceiverBloomSize,
 		m.ReceiverHeartbeatErrors,
 		m.JobPhaseDuration,
+		m.DistWarmQuorum,
+		m.DistTxn,
+		m.DistCommitDuration,
+		m.DistAdmissionActive,
+		m.DistAdmissionDenied,
+		m.DistReconcile,
+		m.PullTransactions,
+		m.PullObjects,
+		m.PullDuration,
+		m.PullCatchup,
 	)
 }
