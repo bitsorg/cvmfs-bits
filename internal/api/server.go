@@ -7,6 +7,8 @@
 package api
 
 import (
+	"golang.org/x/net/netutil"
+	"net"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -93,7 +95,14 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 		spoolRoot:   spoolRoot,
 		stagingRoot: stagingRoot,
 		httpServer: &http.Server{
-			Handler: router,
+			Handler:           router,
+			// Slowloris defenses (the control plane may be internet-exposed; do not
+			// rely on a firewall). ReadHeaderTimeout bounds slow header attacks;
+			// IdleTimeout reaps idle keep-alives. No Read/Write timeout so large tar
+			// uploads and streaming job-event responses are not truncated; per-route
+			// timeouts gate the small control endpoints.
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
 		},
 	}
 	if minConcurrentJobs > 0 {
@@ -169,9 +178,17 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 
 // ListenAndServe starts the HTTP server on addr and blocks until the server
 // exits (either due to an error or a call to Shutdown).
+// maxConnections caps concurrent accepted connections so a connection flood
+// cannot exhaust file descriptors / goroutines (R-DoS).
+const maxConnections = 1024
+
 func (s *Server) ListenAndServe(addr string) error {
 	s.httpServer.Addr = addr
-	return s.httpServer.ListenAndServe()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.httpServer.Serve(netutil.LimitListener(ln, maxConnections))
 }
 
 // Shutdown gracefully stops the HTTP server and waits for all background job

@@ -710,7 +710,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		if shouldDistribute {
 			logger.Info("enqueuing S1 pre-warming (non-blocking)",
 				"objects", len(pipelineResult.ObjectHashes),
-				"new_objects", len(pipelineResult.NewObjectHashes))
+				"new_objects", len(pipelineResult.ObjectHashes))
 
 			if err := o.transition(ctx, j, job.StateDistributing); err != nil {
 				span.RecordError(err)
@@ -732,7 +732,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// is independent of the catalog root, which is not known until commit.
 			if o.Manifests != nil && o.PullObjectBaseURL != "" {
 				objs := make([]manifest.ObjRef, 0, len(pipelineResult.NewObjectHashes))
-				for _, h := range pipelineResult.NewObjectHashes {
+				for _, h := range pipelineResult.ObjectHashes {
 					objs = append(objs, manifest.ObjRef{Hash: h})
 				}
 				rootHash := j.NewRootHash
@@ -749,6 +749,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 					CreatedAt:      time.Now(),
 					TotalSize:      pipelineResult.NBytesComp,
 					Objects:        objs,
+					Provisional:    true,
 				}
 				if perr := o.Manifests.Put(ctx, mf); perr != nil {
 					logger.Warn("pull: failed to store transaction manifest", "txn", j.ID, "error", perr)

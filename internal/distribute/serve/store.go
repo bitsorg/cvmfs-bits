@@ -23,14 +23,18 @@ type ManifestStore interface {
 // MemManifestStore is a concurrency-safe in-memory ManifestStore. Durable
 // storage (so manifests survive a prepub restart) is wired with the transaction
 // journal in P3.
+const defaultMaxManifests = 4096
+
 type MemManifestStore struct {
 	mu    sync.RWMutex
 	byTxn map[string]*manifest.Manifest
+	order []string // FIFO insertion order for bounded eviction
+	max   int
 }
 
 // NewMemManifestStore returns an empty store.
 func NewMemManifestStore() *MemManifestStore {
-	return &MemManifestStore{byTxn: map[string]*manifest.Manifest{}}
+	return &MemManifestStore{byTxn: map[string]*manifest.Manifest{}, max: defaultMaxManifests}
 }
 
 func (s *MemManifestStore) Put(_ context.Context, m *manifest.Manifest) error {
@@ -39,8 +43,27 @@ func (s *MemManifestStore) Put(_ context.Context, m *manifest.Manifest) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.byTxn[m.TransactionID]; !exists {
+		// Evict oldest live entries until there is room for the new one (R-DoS:
+		// a long-running publisher must not accumulate every transaction forever).
+		for s.max > 0 && len(s.byTxn) >= s.max && len(s.order) > 0 {
+			oldest := s.order[0]
+			s.order = s.order[1:]
+			if _, ok := s.byTxn[oldest]; ok {
+				delete(s.byTxn, oldest)
+			}
+		}
+		s.order = append(s.order, m.TransactionID)
+	}
 	s.byTxn[m.TransactionID] = m
 	return nil
+}
+
+// Delete drops a manifest (e.g. once its warm quorum is reached).
+func (s *MemManifestStore) Delete(txn string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byTxn, txn)
 }
 
 func (s *MemManifestStore) Manifest(_ context.Context, txn string) (*manifest.Manifest, bool, error) {

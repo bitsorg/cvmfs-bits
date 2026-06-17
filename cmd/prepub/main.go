@@ -852,15 +852,27 @@ func runReceiver(
 	}
 
 	if discoveryURL != "" && len(repoList) > 0 {
-		d, derr := fetchDiscoveryWithRetry(context.Background(), discoveryURL, repoList[0], obs)
+		discoCtx, discoStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		d, derr := fetchDiscoveryWithRetry(discoCtx, discoveryURL, repoList[0], obs)
+		discoStop()
 		if derr != nil {
+			if discoCtx.Err() != nil {
+				obs.Logger.Info("control-plane: discovery interrupted — shutting down")
+				os.Exit(0)
+			}
 			obs.Logger.Error("control-plane: discovery failed", "error", derr)
 			os.Exit(1)
 		}
-		if d.ControlPlane.URL != "" {
-			brokerURL = d.ControlPlane.URL
-			obs.Logger.Info("control-plane: broker URL learned from discovery", "url", brokerURL, "type", d.ControlPlane.Type)
+		if d.ControlPlane.Type != "" && d.ControlPlane.Type != "mqtt" {
+			obs.Logger.Error("control-plane: discovery advertised unsupported transport", "type", d.ControlPlane.Type)
+			os.Exit(1)
 		}
+		if d.ControlPlane.URL == "" {
+			obs.Logger.Error("control-plane: discovery returned an empty broker URL")
+			os.Exit(1)
+		}
+		brokerURL = d.ControlPlane.URL
+		obs.Logger.Info("control-plane: broker URL learned from discovery", "url", brokerURL, "type", d.ControlPlane.Type)
 	}
 
 	cfg := receiver.Config{

@@ -65,6 +65,10 @@ type Manifest struct {
 	CreatedAt      time.Time `json:"created_at"`
 	TotalSize      int64     `json:"total_size"`
 	Objects        []ObjRef  `json:"objects,omitempty"`
+	// Provisional marks a pre-warm manifest whose TargetRootHash is a placeholder
+	// (the real catalog root is unknown until commit). Receivers pull its objects
+	// but MUST NOT record TargetRootHash as the last-synced root.
+	Provisional    bool      `json:"provisional,omitempty"`
 }
 
 // Validate checks the required fields are present and internally consistent.

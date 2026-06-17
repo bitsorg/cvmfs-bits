@@ -93,7 +93,7 @@ func (p *Puller) Pull(ctx context.Context, m *manifest.Manifest) (Result, error)
 	if res.Failed > 0 {
 		return res, fmt.Errorf("puller: %d of %d objects failed for txn %s", res.Failed, len(missing), m.TransactionID)
 	}
-	if p.State != nil {
+	if p.State != nil && !m.Provisional {
 		if err := p.State.Set(m.Repo, m.TargetRootHash); err != nil {
 			return res, fmt.Errorf("puller: recording synced root: %w", err)
 		}
