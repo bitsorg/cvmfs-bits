@@ -56,6 +56,9 @@ func main() {
 	// them, wired into behaviour in later phases.
 	distributeMode := flag.String("distribute-mode", "push", "Data-plane distribution: push (legacy) or pull (ADR-0001) [publisher|receiver]")
 	controlPlane := flag.String("control-plane", "mqtt", "Control-plane transport: mqtt or sse (sse reserved; not yet active) [publisher|receiver]")
+	embeddedBrokerWSAddr := flag.String("embedded-broker-ws-addr", "", "If set, run an in-process MQTT broker with a WebSocket listener at this address (e.g. :1882); the control plane then runs on S0 with no separate broker [publisher]")
+	controlPlaneURL := flag.String("control-plane-url", "", "Control-plane (broker) URL advertised to receivers via discovery, e.g. ws://cvmfs-prepub:1882 or wss://... [publisher]")
+	pullObjectBaseURL := flag.String("pull-object-base-url", "", "Externally reachable base URL for content-addressed object GETs, embedded in pull manifests as {url}/cvmfs/{repo}/data (e.g. http://cvmfs-prepub:8080) [publisher]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
 	config := flag.String("config", "", "Config file path (reserved for future use)")
@@ -188,6 +191,7 @@ func main() {
 	// is publisher-mode only) to avoid flag-name collisions in the shared flag
 	// set.  Using --receiver-stratum0-url makes the purpose explicit.
 	recvStratum0URL := flag.String("receiver-stratum0-url", "", "Stratum 0 HTTP base URL used by the receiver to pull objects on commit notification (e.g. http://stratum0/cvmfs) [receiver]")
+	discoveryURL := flag.String("discovery-url", "", "Fixed S0 endpoint serving the discovery doc GET {url}/cvmfs/{repo}/.cvmfsbits; the receiver learns its control-plane broker URL from it [receiver]")
 
 	// MQTT broker — shared by publisher and receiver modes.
 	// When set, receivers connect outbound to the broker and publish retained
@@ -265,12 +269,12 @@ func main() {
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*s1BatchSize,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*distributeMode)
+			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*recvStratum0URL, *distributeMode)
+			*recvStratum0URL, *distributeMode, *discoveryURL)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
 		os.Exit(1)
@@ -305,6 +309,7 @@ func runPublisher(
 	s1BatchSize int,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
 	distributeMode string,
+	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
@@ -542,6 +547,23 @@ func runPublisher(
 		}
 	}
 
+	// Embedded control-plane broker (alternative to an external mosquitto): run
+	// an in-process MQTT broker with a WebSocket listener on S0. The publisher's
+	// own broker clients connect on localhost; receivers connect via the URL
+	// advertised in discovery (ADR-0001 D7/D10).
+	var brokerClose func()
+	if embeddedBrokerWSAddr != "" {
+		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, nil, obs)
+		if berr != nil {
+			obs.Logger.Error("failed to start embedded broker", "error", berr)
+			os.Exit(1)
+		}
+		brokerClose = c
+		if brokerURL == "" {
+			brokerURL = "ws://localhost" + embeddedBrokerWSAddr
+		}
+	}
+
 	// Build the orchestrator.
 	// Build the Stratum 1 distribution config.
 	// When neither --s1-endpoints nor --broker-url is set, Distribute is nil
@@ -628,6 +650,7 @@ func runPublisher(
 		}
 	}
 
+	pullManifestStore := serve.NewMemManifestStore()
 	orch := &api.Orchestrator{
 		Spool:           sp,
 		CAS:             casBackend,
@@ -653,6 +676,8 @@ func runPublisher(
 		Notify:      notifyBus,
 		Provenance:  provProvider,
 		Obs:         obs,
+		Manifests:         pullManifestStore,
+		PullObjectBaseURL: pullObjectBaseURL,
 	}
 
 	if jobTimeout > 0 {
@@ -668,6 +693,12 @@ func runPublisher(
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
 
+	if controlPlaneURL != "" {
+		disco := &staticDiscovery{repos: []string{repoName}, cp: serve.ControlPlaneRef{Type: "mqtt", URL: controlPlaneURL}}
+		apiServer.MountDiscovery(&serve.DiscoveryHandler{Source: disco})
+		obs.Logger.Info("control-plane: discovery advertising broker", "url", controlPlaneURL)
+	}
+
 	// ADR-0001 pull mode: serve objects + manifests (incl. the gateway POST
 	// ingest) so Stratum 1 can pull on a prepare announce. Default push leaves
 	// these routes unmounted.
@@ -678,7 +709,7 @@ func runPublisher(
 		admission := commit.NewAdmission(commit.Options{MaxConcurrent: 16, MaxPerNode: 1})
 		apiServer.MountDistributeServing(api.DistributeServing{
 			CAS:       casBackend,
-			Manifests: serve.NewMemManifestStore(),
+			Manifests: pullManifestStore,
 			Admission: admission,
 		})
 		obs.Logger.Info("ADR-0001: pull-mode distribute serving enabled")
@@ -727,6 +758,9 @@ func runPublisher(
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
 		obs.Logger.Error("HTTP server shutdown error", "error", err)
 	}
+	if brokerClose != nil {
+		brokerClose()
+	}
 
 	cancelRecover()
 	doneCh := make(chan struct{})
@@ -766,6 +800,7 @@ func runReceiver(
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
 	stratum0URL string,
 	distributeMode string,
+	discoveryURL string,
 ) {
 	// Load the HMAC shared secret from the environment.  In DevMode the
 	// receiver skips HMAC verification entirely, so the secret is not required.
@@ -813,6 +848,18 @@ func runReceiver(
 	for _, r := range strings.Split(reposFlag, ",") {
 		if trimmed := strings.TrimSpace(r); trimmed != "" {
 			repoList = append(repoList, trimmed)
+		}
+	}
+
+	if discoveryURL != "" && len(repoList) > 0 {
+		d, derr := fetchDiscoveryWithRetry(context.Background(), discoveryURL, repoList[0], obs)
+		if derr != nil {
+			obs.Logger.Error("control-plane: discovery failed", "error", derr)
+			os.Exit(1)
+		}
+		if d.ControlPlane.URL != "" {
+			brokerURL = d.ControlPlane.URL
+			obs.Logger.Info("control-plane: broker URL learned from discovery", "url", brokerURL, "type", d.ControlPlane.Type)
 		}
 	}
 

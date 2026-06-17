@@ -128,6 +128,15 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	return s
 }
 
+// MountDiscovery mounts the signed discovery document (GET /cvmfs/{repo}/.cvmfsbits)
+// on the API router so Stratum 1 receivers can learn the control-plane broker URL
+// from a fixed S0 endpoint (ADR-0001 D10).
+func (s *Server) MountDiscovery(h http.Handler) {
+	if h != nil {
+		s.router.Handle("/cvmfs/{repo}/.cvmfsbits", h).Methods("GET")
+	}
+}
+
 // requireAuth is a middleware that validates the Authorization: Bearer <token> header.
 // If the server was created with an empty token, auth is skipped (dev mode).
 func (s *Server) requireAuth(next http.Handler) http.Handler {

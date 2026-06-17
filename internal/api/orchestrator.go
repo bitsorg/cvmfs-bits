@@ -20,6 +20,8 @@ import (
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
+	"cvmfs.io/prepub/internal/distribute/manifest"
+	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/internal/job"
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
@@ -99,6 +101,15 @@ type Orchestrator struct {
 	// config is for the post-commit "published" notification.  In typical
 	// deployments both configs reference the same broker.
 	BrokerConfig *broker.Config
+	// Manifests, when non-nil, is the per-transaction manifest store used in pull
+	// mode (ADR-0001). The orchestrator records a manifest for each distributed
+	// transaction so a receiver can fetch GET /s1/{txn}/manifest and pull the
+	// objects it is missing. Shares the instance passed to MountDistributeServing.
+	Manifests serve.ManifestStore
+	// PullObjectBaseURL is this publisher's externally reachable base URL for
+	// content-addressed object GETs (e.g. http://cvmfs-prepub:8080), embedded in
+	// each manifest's BaseURLs as PullObjectBaseURL + "/cvmfs/{repo}/data".
+	PullObjectBaseURL string
 	// Pipeline contains configuration for the compression/dedup pipeline.
 	// Only used when Lease.NeedsPipeline() returns true (gateway mode).
 	Pipeline pipeline.Config
@@ -567,7 +578,7 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 	}
 
 	topic := broker.PublishedTopic(repo)
-	if err := client.Publish(topic, 1, false, msg); err != nil {
+	if err := client.Publish(topic, 1, true, msg); err != nil { // retain=true: reconnecting receivers catch up on the latest commit
 		o.Obs.Logger.Warn("mqtt: failed to publish commit notification",
 			"repo", repo, "new_root_hash", newRootHash, "error", err)
 		return
@@ -714,6 +725,37 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 					"job_id", j.ID, "error", err)
 			}
 
+			// Pull mode (ADR-0001): record the transaction manifest so a receiver
+			// triggered by the announce can GET /s1/{txn}/manifest and pull the
+			// objects it is missing. Keyed by j.ID — the same payloadID the announce
+			// carries. Objects are content-addressed (self-verifying), so the fetch
+			// is independent of the catalog root, which is not known until commit.
+			if o.Manifests != nil && o.PullObjectBaseURL != "" {
+				objs := make([]manifest.ObjRef, 0, len(pipelineResult.NewObjectHashes))
+				for _, h := range pipelineResult.NewObjectHashes {
+					objs = append(objs, manifest.ObjRef{Hash: h})
+				}
+				rootHash := j.NewRootHash
+				if rootHash == "" {
+					rootHash = j.ID // placeholder: real root is set at commit; not needed for object pull
+				}
+				mf := &manifest.Manifest{
+					TransactionID:  j.ID,
+					Repo:           j.Repo,
+					TargetRootHash: rootHash,
+					BaseURLs:       []string{strings.TrimRight(o.PullObjectBaseURL, "/") + "/cvmfs/" + j.Repo + "/data"},
+					Generator:      manifest.GeneratorPipeline,
+					Auth:           manifest.AuthPublic,
+					CreatedAt:      time.Now(),
+					TotalSize:      pipelineResult.NBytesComp,
+					Objects:        objs,
+				}
+				if perr := o.Manifests.Put(ctx, mf); perr != nil {
+					logger.Warn("pull: failed to store transaction manifest", "txn", j.ID, "error", perr)
+				} else {
+					logger.Info("pull: transaction manifest stored", "txn", j.ID, "objects", len(objs))
+				}
+			}
 			if o.DistManager != nil {
 				// Queue-driven path: per-endpoint worker pools with retry/backoff.
 				distJobID := j.ID
