@@ -572,7 +572,7 @@ func runPublisher(
 			obs.Logger.Error("embedded broker: --control-plane-url is wss:// but --embedded-broker-tls-cert/--embedded-broker-tls-key are not set")
 			os.Exit(1)
 		}
-		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, brokerTLS, obs)
+		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, brokerTLS, nil, obs)
 		if berr != nil {
 			obs.Logger.Error("failed to start embedded broker", "error", berr)
 			os.Exit(1)
