@@ -39,7 +39,7 @@ func New(root string, obs *observe.Provider) (*Spool, error) {
 	// Fix #12: Spool directories are 0700 — job metadata (including lease tokens)
 	// must not be readable by other local users.
 	// Directories are listed in FSM order: lease is now acquired after distribution.
-	for _, dir := range []string{root, "incoming", "staging", "uploading", "distributing", "leased", "committing", "published", "failed", "aborted"} {
+	for _, dir := range []string{".", "incoming", "staging", "uploading", "distributing", "leased", "committing", "published", "failed", "aborted"} {
 		path := filepath.Join(root, dir)
 		if err := os.MkdirAll(path, 0700); err != nil {
 			return nil, fmt.Errorf("creating spool directory %q: %w", path, err)
