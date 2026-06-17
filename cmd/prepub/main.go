@@ -20,6 +20,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"context"
 	"flag"
 	"fmt"
@@ -59,6 +60,8 @@ func main() {
 	embeddedBrokerWSAddr := flag.String("embedded-broker-ws-addr", "", "If set, run an in-process MQTT broker with a WebSocket listener at this address (e.g. :1882); the control plane then runs on S0 with no separate broker [publisher]")
 	controlPlaneURL := flag.String("control-plane-url", "", "Control-plane (broker) URL advertised to receivers via discovery, e.g. ws://cvmfs-prepub:1882 or wss://... [publisher]")
 	pullObjectBaseURL := flag.String("pull-object-base-url", "", "Externally reachable base URL for content-addressed object GETs, embedded in pull manifests as {url}/cvmfs/{repo}/data (e.g. http://cvmfs-prepub:8080) [publisher]")
+	embeddedBrokerTLSCert := flag.String("embedded-broker-tls-cert", "", "PEM server certificate for the embedded broker WebSocket listener; enables wss:// [publisher]")
+	embeddedBrokerTLSKey := flag.String("embedded-broker-tls-key", "", "PEM private key for --embedded-broker-tls-cert [publisher]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
 	config := flag.String("config", "", "Config file path (reserved for future use)")
@@ -269,7 +272,7 @@ func main() {
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*s1BatchSize,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL)
+			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
@@ -310,6 +313,7 @@ func runPublisher(
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
 	distributeMode string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
+	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
@@ -553,14 +557,33 @@ func runPublisher(
 	// advertised in discovery (ADR-0001 D7/D10).
 	var brokerClose func()
 	if embeddedBrokerWSAddr != "" {
-		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, nil, obs)
+		// Build the broker's server TLS config (H1: real wss://). When no cert is
+		// configured the listener stays plaintext ws:// (dev), but advertising a
+		// wss:// control-plane URL without a cert is a hard misconfiguration.
+		var brokerTLS *tls.Config
+		if embeddedBrokerTLSCert != "" && embeddedBrokerTLSKey != "" {
+			cert, cerr := tls.LoadX509KeyPair(embeddedBrokerTLSCert, embeddedBrokerTLSKey)
+			if cerr != nil {
+				obs.Logger.Error("embedded broker: loading TLS cert/key", "error", cerr)
+				os.Exit(1)
+			}
+			brokerTLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+		} else if strings.HasPrefix(controlPlaneURL, "wss://") {
+			obs.Logger.Error("embedded broker: --control-plane-url is wss:// but --embedded-broker-tls-cert/--embedded-broker-tls-key are not set")
+			os.Exit(1)
+		}
+		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, brokerTLS, obs)
 		if berr != nil {
 			obs.Logger.Error("failed to start embedded broker", "error", berr)
 			os.Exit(1)
 		}
 		brokerClose = c
 		if brokerURL == "" {
-			brokerURL = "ws://localhost" + embeddedBrokerWSAddr
+			scheme := "ws"
+			if brokerTLS != nil {
+				scheme = "wss"
+			}
+			brokerURL = scheme + "://localhost" + embeddedBrokerWSAddr
 		}
 	}
 
