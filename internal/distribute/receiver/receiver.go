@@ -88,14 +88,6 @@ type Config struct {
 	// Never set in production; intended for integration tests only.
 	DevMode bool
 
-	// CoordURL is the base URL of the HepCDN coordination service
-	// (e.g. "https://coord.hepcdn.example.com").  Empty disables coordination.
-	CoordURL string
-
-	// CoordToken is the bearer token used to authenticate with the coordination
-	// service.  Typically read from the PREPUB_COORD_TOKEN environment variable.
-	CoordToken string
-
 	// NodeID is the stable identifier for this receiver node, used in
 	// coordination service registration and heartbeat requests.
 	// Defaults to the system hostname if empty.

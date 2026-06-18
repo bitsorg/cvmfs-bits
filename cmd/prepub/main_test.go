@@ -119,223 +119,104 @@ func TestLoadFileConfig_EmptyFile(t *testing.T) {
 	}
 }
 
-func TestLoadFileConfig_Distribution(t *testing.T) {
+func TestLoadFileConfig_WarmQuorum(t *testing.T) {
 	path := writeYAML(t, `
 distribution:
-  stratum1_endpoints:
-    - https://s1a.example.org
-    - https://s1b.example.org
-  quorum: 0.75
-  timeout: 10m
+  warm_quorum: 0.75
 `)
 	fc, err := loadFileConfig(path)
 	if err != nil {
 		t.Fatalf("loadFileConfig: %v", err)
 	}
-	if len(fc.Distribution.Endpoints) != 2 {
-		t.Errorf("len(Endpoints) = %d; want 2", len(fc.Distribution.Endpoints))
-	}
-	if fc.Distribution.Quorum != 0.75 {
-		t.Errorf("Quorum = %v; want 0.75", fc.Distribution.Quorum)
-	}
-	if fc.Distribution.Timeout.Duration != 10*time.Minute {
-		t.Errorf("Timeout = %v; want 10m", fc.Distribution.Timeout.Duration)
+	if fc.Distribution.WarmQuorum != 0.75 {
+		t.Errorf("WarmQuorum = %v; want 0.75", fc.Distribution.WarmQuorum)
 	}
 }
 
 // ── applyFileConfig ───────────────────────────────────────────────────────────
 
-func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
-	fc := &fileConfig{
-		SpoolRoot:   "/from/config",
-		LogLevel:    "warn",
-		PublishMode: "local",
-	}
-	explicit := map[string]bool{} // nothing set on CLI
+// applyTestVars holds default-valued flag variables for an applyFileConfig call.
+type applyTestVars struct {
+	mode, logLevel                                          string
+	devMode                                                 bool
+	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string
+	cvmfsMount, casType, casRoot                            string
+	stratum0URL, repoName                                   string
+	jobTimeout                                              time.Duration
+	minConcurrentJobs, maxConcurrentJobs                    int
+	warmQuorum                                              float64
+	brokerCACert                                            string
+	controlAddr, dataAddr, dataHost, tlsCert, tlsKey        string
+	sessionTTL                                              time.Duration
+	diskHeadroom                                            float64
+	nodeID, repos, recvStratum0URL                          string
+	provenanceEnabled                                       bool
+	rekorServer, rekorSigningKey, oidcIssuers               string
+	gatewayDirectGraft                                      bool
+}
 
-	// Set up flag variables at their defaults.
-	spoolRoot := "/default/spool"
-	logLevel := "info"
-	mode := "publisher"
-	devMode := false
-	stagingRoot := ""
-	listen := ":8080"
-	publishMode := "gateway"
-	gatewayURL := "https://localhost:4929"
-	cvmfsMount := "/cvmfs"
-	casType := "localfs"
-	casRoot := "/var/lib/cas"
-	stratum0URL := ""
-	repoName := ""
-	jobTimeout := time.Duration(0)
-	s1Endpoints := ""
-	s1Quorum := 1.0
-	s1Timeout := 60 * time.Second
-	s1MQTTTimeout := 30 * time.Second
-	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth := 0, 0, 0
-	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff := time.Duration(0), time.Duration(0), time.Duration(0)
-	s1QueueSpoolDir := ""
-	s1BatchSize := 0
-	brokerURL := ""
-	brokerClientCert := ""
-	brokerClientKey := ""
-	brokerCACert := ""
-	controlAddr := ":9100"
-	dataAddr := ":9101"
-	dataHost := ""
-	tlsCert := ""
-	tlsKey := ""
-	sessionTTL := time.Hour
-	diskHeadroom := 1.2
-	nodeID := ""
-	repos := ""
-	coordURL := ""
-	recvStratum0URL := ""
-	minConcurrentJobs := 0
-	maxConcurrentJobs := 0
-	provenanceEnabled := false
-	rekorServer := ""
-	rekorSigningKey := ""
-	oidcIssuers := ""
-	gatewayDirectGraft := false
+func defaultApplyVars() *applyTestVars {
+	return &applyTestVars{
+		mode: "publisher", logLevel: "info",
+		spoolRoot: "/default/spool", listen: ":8080", publishMode: "gateway",
+		gatewayURL: "https://localhost:4929", cvmfsMount: "/cvmfs",
+		casType: "localfs", casRoot: "/var/lib/cas",
+		jobTimeout: 0, warmQuorum: 1.0,
+		controlAddr: ":9100", dataAddr: ":9101",
+		sessionTTL: time.Hour, diskHeadroom: 1.2,
+	}
+}
+
+func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 	applyFileConfig(fc, explicit,
-		&mode, &logLevel, &devMode,
-		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
-		&stratum0URL, &repoName,
-		&jobTimeout, &minConcurrentJobs, &maxConcurrentJobs,
-		&s1Endpoints, &s1Quorum, &s1Timeout, &s1MQTTTimeout,
-		&s1WorkerConcurrency, &s1MaxAttempts, &s1QueueDepth,
-		&s1AttemptTimeout, &s1InitialBackoff, &s1MaxBackoff,
-		&s1QueueSpoolDir, &s1BatchSize,
-		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
-		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
-		&sessionTTL, &diskHeadroom,
-		&nodeID, &repos, &coordURL, &recvStratum0URL,
-		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
-		&gatewayDirectGraft,
+		&v.mode, &v.logLevel, &v.devMode,
+		&v.spoolRoot, &v.stagingRoot, &v.listen, &v.publishMode, &v.gatewayURL, &v.cvmfsMount, &v.casType, &v.casRoot,
+		&v.stratum0URL, &v.repoName,
+		&v.jobTimeout, &v.minConcurrentJobs, &v.maxConcurrentJobs,
+		&v.warmQuorum,
+		&v.brokerCACert,
+		&v.controlAddr, &v.dataAddr, &v.dataHost, &v.tlsCert, &v.tlsKey,
+		&v.sessionTTL, &v.diskHeadroom,
+		&v.nodeID, &v.repos, &v.recvStratum0URL,
+		&v.provenanceEnabled, &v.rekorServer, &v.rekorSigningKey, &v.oidcIssuers,
+		&v.gatewayDirectGraft,
 	)
+}
 
-	if spoolRoot != "/from/config" {
-		t.Errorf("spoolRoot = %q; want /from/config", spoolRoot)
+func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
+	fc := &fileConfig{SpoolRoot: "/from/config", LogLevel: "warn", PublishMode: "local"}
+	v := defaultApplyVars()
+	v.apply(fc, map[string]bool{})
+
+	if v.spoolRoot != "/from/config" {
+		t.Errorf("spoolRoot = %q; want /from/config", v.spoolRoot)
 	}
-	if logLevel != "warn" {
-		t.Errorf("logLevel = %q; want warn", logLevel)
+	if v.logLevel != "warn" {
+		t.Errorf("logLevel = %q; want warn", v.logLevel)
 	}
-	if publishMode != "local" {
-		t.Errorf("publishMode = %q; want local", publishMode)
+	if v.publishMode != "local" {
+		t.Errorf("publishMode = %q; want local", v.publishMode)
 	}
 }
 
 func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
-	fc := &fileConfig{
-		SpoolRoot: "/from/config",
-	}
-	// Mark spool-root as explicitly set via CLI.
-	explicit := map[string]bool{"spool-root": true}
+	fc := &fileConfig{SpoolRoot: "/from/config"}
+	v := defaultApplyVars()
+	v.spoolRoot = "/from/cli"
+	v.apply(fc, map[string]bool{"spool-root": true})
 
-	spoolRoot := "/from/cli"
-	logLevel := "info"
-	mode := "publisher"
-	devMode := false
-	stagingRoot := ""
-	listen := ":8080"
-	publishMode := "gateway"
-	gatewayURL := "https://localhost:4929"
-	cvmfsMount := "/cvmfs"
-	casType := "localfs"
-	casRoot := "/var/lib/cas"
-	stratum0URL := ""
-	repoName2 := ""
-	jobTimeout2 := time.Duration(0)
-	s1Endpoints := ""
-	s1Quorum := 1.0
-	s1Timeout := 60 * time.Second
-	s1MQTTTimeout := 30 * time.Second
-	s1WorkerConcurrency2, s1MaxAttempts2, s1QueueDepth2 := 0, 0, 0
-	s1AttemptTimeout2, s1InitialBackoff2, s1MaxBackoff2 := time.Duration(0), time.Duration(0), time.Duration(0)
-	s1QueueSpoolDir2 := ""
-	s1BatchSize2 := 0
-	brokerURL, brokerClientCert, brokerClientKey, brokerCACert := "", "", "", ""
-	controlAddr, dataAddr, dataHost, tlsCert, tlsKey := ":9100", ":9101", "", "", ""
-	sessionTTL := time.Hour
-	diskHeadroom := 1.2
-	nodeID, repos, coordURL, recvStratum0URL := "", "", "", ""
-	minConcurrentJobs2 := 0
-	maxConcurrentJobs2 := 0
-	provenanceEnabled := false
-	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
-	gatewayDirectGraft2 := false
-	applyFileConfig(fc, explicit,
-		&mode, &logLevel, &devMode,
-		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
-		&stratum0URL, &repoName2,
-		&jobTimeout2, &minConcurrentJobs2, &maxConcurrentJobs2,
-		&s1Endpoints, &s1Quorum, &s1Timeout, &s1MQTTTimeout,
-		&s1WorkerConcurrency2, &s1MaxAttempts2, &s1QueueDepth2,
-		&s1AttemptTimeout2, &s1InitialBackoff2, &s1MaxBackoff2,
-		&s1QueueSpoolDir2, &s1BatchSize2,
-		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
-		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
-		&sessionTTL, &diskHeadroom,
-		&nodeID, &repos, &coordURL, &recvStratum0URL,
-		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
-		&gatewayDirectGraft2,
-	)
-
-	// spool-root was explicitly set on CLI — config value must not override it.
-	if spoolRoot != "/from/cli" {
-		t.Errorf("spoolRoot = %q; want /from/cli (CLI should win)", spoolRoot)
+	if v.spoolRoot != "/from/cli" {
+		t.Errorf("spoolRoot = %q; want /from/cli (CLI should win)", v.spoolRoot)
 	}
 }
 
-func TestApplyFileConfig_EndpointSlice(t *testing.T) {
+func TestApplyFileConfig_WarmQuorum(t *testing.T) {
 	fc := &fileConfig{}
-	fc.Distribution.Endpoints = []string{"https://s1a.example.org", "https://s1b.example.org"}
+	fc.Distribution.WarmQuorum = 0.5
+	v := defaultApplyVars()
+	v.apply(fc, map[string]bool{})
 
-	explicit := map[string]bool{}
-	s1Endpoints := ""
-	// fill remaining params with throwaway variables
-	mode, logLevel := "publisher", "info"
-	devMode := false
-	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot := "/sp", "", ":8080", "gateway", "https://gw", "/cvmfs", "localfs", "/cas"
-	stratum0URL := ""
-	repoName3 := ""
-	jobTimeout3 := time.Duration(0)
-	s1Quorum := 1.0
-	s1Timeout, s1MQTTTimeout := 60*time.Second, 30*time.Second
-	s1WorkerConcurrency3, s1MaxAttempts3, s1QueueDepth3 := 0, 0, 0
-	s1AttemptTimeout3, s1InitialBackoff3, s1MaxBackoff3 := time.Duration(0), time.Duration(0), time.Duration(0)
-	s1QueueSpoolDir3 := ""
-	s1BatchSize3 := 0
-	brokerURL, brokerClientCert, brokerClientKey, brokerCACert := "", "", "", ""
-	controlAddr, dataAddr, dataHost, tlsCert, tlsKey := ":9100", ":9101", "", "", ""
-	sessionTTL := time.Hour
-	diskHeadroom := 1.2
-	nodeID, repos, coordURL, recvStratum0URL3 := "", "", "", ""
-	minConcurrentJobs3 := 0
-	maxConcurrentJobs3 := 0
-	provenanceEnabled := false
-	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
-	gatewayDirectGraft3 := false
-	applyFileConfig(fc, explicit,
-		&mode, &logLevel, &devMode,
-		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
-		&stratum0URL, &repoName3,
-		&jobTimeout3, &minConcurrentJobs3, &maxConcurrentJobs3,
-		&s1Endpoints, &s1Quorum, &s1Timeout, &s1MQTTTimeout,
-		&s1WorkerConcurrency3, &s1MaxAttempts3, &s1QueueDepth3,
-		&s1AttemptTimeout3, &s1InitialBackoff3, &s1MaxBackoff3,
-		&s1QueueSpoolDir3, &s1BatchSize3,
-		&brokerURL, &brokerClientCert, &brokerClientKey, &brokerCACert,
-		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
-		&sessionTTL, &diskHeadroom,
-		&nodeID, &repos, &coordURL, &recvStratum0URL3,
-		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
-		&gatewayDirectGraft3,
-	)
-
-	// Endpoints slice should be joined with comma.
-	if s1Endpoints != "https://s1a.example.org,https://s1b.example.org" {
-		t.Errorf("s1Endpoints = %q; want joined comma list", s1Endpoints)
+	if v.warmQuorum != 0.5 {
+		t.Errorf("warmQuorum = %v; want 0.5 (copied from config)", v.warmQuorum)
 	}
 }

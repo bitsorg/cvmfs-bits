@@ -6,11 +6,8 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/hmac"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -47,30 +44,6 @@ func (d *staticDiscovery) Discovery(_ context.Context, repo string) (serve.Disco
 		return serve.Discovery{}, false, err
 	}
 	return signed, true, nil
-}
-
-// hmacDiscoverySigner signs the discovery doc with HMAC-SHA256(secret, payload),
-// hex-encoded — the shared-secret integrity guard (H2). No asymmetric keys.
-func hmacDiscoverySigner(secret []byte) serve.Signer {
-	return func(payload []byte) (string, error) {
-		mac := hmac.New(sha256.New, secret)
-		mac.Write(payload)
-		return hex.EncodeToString(mac.Sum(nil)), nil
-	}
-}
-
-// hmacDiscoveryVerify is the receiver-side verifier matching hmacDiscoverySigner.
-func hmacDiscoveryVerify(secret []byte) func(payload []byte, sig string) bool {
-	return func(payload []byte, sig string) bool {
-		mac := hmac.New(sha256.New, secret)
-		mac.Write(payload)
-		want := mac.Sum(nil)
-		got, err := hex.DecodeString(sig)
-		if err != nil {
-			return false
-		}
-		return hmac.Equal(got, want)
-	}
 }
 
 // fetchDiscovery GETs the signed discovery document for repo from the fixed S0

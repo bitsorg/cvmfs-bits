@@ -62,8 +62,6 @@ func main() {
 	// ADR-0001 (reserved; not yet active in P0). Data-plane direction and
 	// control-plane transport selectors; parsed now so config/tooling can set
 	// them, wired into behaviour in later phases.
-	distributeMode := flag.String("distribute-mode", "push", "Data-plane distribution: push (legacy) or pull (ADR-0001) [publisher|receiver]")
-	controlPlane := flag.String("control-plane", "mqtt", "Control-plane transport: mqtt or sse (sse reserved; not yet active) [publisher|receiver]")
 	embeddedBrokerWSAddr := flag.String("embedded-broker-ws-addr", "", "If set, run an in-process MQTT broker with a WebSocket listener at this address (e.g. :1882); the control plane then runs on S0 with no separate broker [publisher]")
 	controlPlaneURL := flag.String("control-plane-url", "", "Control-plane (broker) URL advertised to receivers via discovery, e.g. ws://cvmfs-prepub:1882 or wss://... [publisher]")
 	pullObjectBaseURL := flag.String("pull-object-base-url", "", "Externally reachable base URL for content-addressed object GETs, embedded in pull manifests as {url}/cvmfs/{repo}/data (e.g. http://cvmfs-prepub:8080) [publisher]")
@@ -139,19 +137,8 @@ func main() {
 	repoName := flag.String("repo-name", "", "CVMFS repository name (e.g. atlas.cern.ch) [publisher]")
 
 	// ── Stratum 1 distribution flags (publisher) ─────────────────────────────
-	s1Endpoints := flag.String("s1-endpoints", "", "Comma-separated Stratum 1 HTTPS URLs to pre-warm (e.g. https://s1a.cern.ch,https://s1b.cern.ch) [publisher]")
-	s1Quorum := flag.Float64("s1-quorum", 1.0, "Fraction of Stratum 1 endpoints that must confirm receipt for the publish to proceed (0.5 = majority, 1.0 = all) [publisher]")
-	s1Timeout := flag.Duration("s1-timeout", 60*time.Second, "Per-object/batch timeout for Stratum 1 pushes [publisher]")
-	s1MQTTTimeout := flag.Duration("s1-mqtt-quorum-timeout", 30*time.Second, "Time to wait for receiver ready replies before proceeding (MQTT mode) [publisher]")
+	warmQuorum := flag.Float64("warm-quorum", 1.0, "Fraction of authoritative Stratum 1 replicas that must report warm before the catalog commit proceeds (0.5 = majority, 1.0 = all) [publisher]")
 	// Queue-driven distribution worker flags.
-	s1WorkerConcurrency := flag.Int("s1-worker-concurrency", 0, "Concurrent transfer goroutines per Stratum 1 endpoint (0 = default 2) [publisher]")
-	s1AttemptTimeout := flag.Duration("s1-attempt-timeout", 0, "Per-attempt timeout for a single endpoint distribution run (0 = default 90s) [publisher]")
-	s1InitialBackoff := flag.Duration("s1-initial-backoff", 0, "Initial backoff after a failed distribution attempt (0 = default 5s) [publisher]")
-	s1MaxBackoff := flag.Duration("s1-max-backoff", 0, "Maximum exponential backoff between retry attempts (0 = default 5m) [publisher]")
-	s1MaxAttempts := flag.Int("s1-max-attempts", 0, "Max delivery attempts per item per endpoint; 0 = unlimited [publisher]")
-	s1QueueDepth := flag.Int("s1-queue-depth", 0, "In-memory queue depth per Stratum 1 endpoint (0 = default 512) [publisher]")
-	s1QueueSpoolDir := flag.String("s1-queue-spool-dir", "", "Directory for persistent per-endpoint distribution queues (default: {spool-root}/dist-queue) [publisher]")
-	s1BatchSize := flag.Int("s1-batch-size", 0, "Objects per multipart PUT to each Stratum 1 endpoint (0 = per-object PUTs) [publisher]")
 
 	// Provenance & Rekor transparency log — off by default.
 	provenanceEnabled := flag.Bool("provenance", false, "Enable provenance recording and Rekor transparency log submission [publisher]")
@@ -173,9 +160,6 @@ func main() {
 	diskHeadroom := flag.Float64("disk-headroom", 1.2, "Multiplier applied to announced payload size when checking available disk space [receiver]")
 
 	// HepCDN coordination service — off by default.
-	// CoordURL enables registration, heartbeat, and topology-aware routing.
-	// The bearer token is read from PREPUB_COORD_TOKEN for security.
-	coordURL := flag.String("coord-url", "", "HepCDN coordination service base URL (e.g. https://coord.hepcdn.example.com) [receiver]")
 	nodeID := flag.String("node-id", "", "Stable identifier for this receiver node; defaults to hostname [receiver]")
 	repos := flag.String("repos", "", "Comma-separated list of CVMFS repositories served by this receiver (e.g. atlas.cern.ch,cms.cern.ch) [receiver]")
 	// recvStratum0URL is the Stratum 0 base URL the receiver uses to pull CAS
@@ -192,9 +176,6 @@ func main() {
 	// The broker URL uses Paho format: "tls://broker.cern.ch:8883" (production)
 	// or "tcp://localhost:1883" (development).  mTLS cert/key are required in
 	// production; --broker-ca-cert overrides the system CA pool.
-	brokerURL := flag.String("broker-url", "", "MQTT broker URL (e.g. tls://broker.cern.ch:8883); empty disables MQTT [publisher+receiver]")
-	brokerClientCert := flag.String("broker-client-cert", "", "Path to PEM client certificate for MQTT mTLS [publisher+receiver]")
-	brokerClientKey := flag.String("broker-client-key", "", "Path to PEM client private key for MQTT mTLS [publisher+receiver]")
 	brokerCACert := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker; empty uses system pool [publisher+receiver]")
 
 	flag.Parse()
@@ -218,14 +199,11 @@ func main() {
 			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
 			stratum0URL, repoName,
 			jobTimeout, minConcurrentJobs, maxConcurrentJobs,
-			s1Endpoints, s1Quorum, s1Timeout, s1MQTTTimeout,
-			s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth,
-			s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff,
-			s1QueueSpoolDir, s1BatchSize,
-			brokerURL, brokerClientCert, brokerClientKey, brokerCACert,
+			warmQuorum,
+			brokerCACert,
 			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
 			sessionTTL, diskHeadroom,
-			nodeID, repos, coordURL, recvStratum0URL,
+			nodeID, repos, recvStratum0URL,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			gatewayDirectGraft,
 		)
@@ -244,8 +222,7 @@ func main() {
 	}))
 
 	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode)
-	obs.Logger.Debug("distribution config (ADR-0001)",
-		"distribute_mode", *distributeMode, "control_plane", *controlPlane)
+	obs.Logger.Debug("distribution config (ADR-0001 pull, MQTT-over-wss control plane)")
 
 	switch *mode {
 	case "publisher":
@@ -253,17 +230,14 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
-			*s1Endpoints, *s1Quorum, *s1Timeout, *s1MQTTTimeout,
-			*s1WorkerConcurrency, *s1MaxAttempts, *s1QueueDepth,
-			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
-			*s1BatchSize,
-			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
+			*warmQuorum,
+			*brokerCACert,
+			*embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
-			*coordURL, *nodeID, *repos,
-			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*recvStratum0URL, *distributeMode, *discoveryURL, *brokerAuth, *discoveryVerifyKey,
+			*nodeID, *repos,
+			*brokerCACert,
+			*recvStratum0URL, *discoveryURL, *brokerAuth, *discoveryVerifyKey,
 			*pullConcurrencyFlag, *pullFilesPerRequest, *pullAuto)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
@@ -285,21 +259,20 @@ func runPublisher(
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineUploadConc, pipelineCompressLevel int,
-	s1Endpoints string,
-	s1Quorum float64,
-	s1Timeout, s1MQTTTimeout time.Duration,
-	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth int,
-	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff time.Duration,
-	s1QueueSpoolDir string,
-	s1BatchSize int,
-	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
-	distributeMode string,
+	warmQuorum float64,
+	brokerCACert string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
 	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
 	embeddedBrokerAuth bool,
 	enrollTLSAddr, enrollURL string,
 	discoverySigningKey string,
 ) {
+	// brokerURL is derived from the embedded broker (loopback); the publisher's
+	// own announce/published clients connect there. There is no external broker
+	// and no client-cert mTLS — the embedded broker is reached over ws/wss with a
+	// token. warmQuorum is reserved for the warm-gate commit gating (ADR-0001 D6).
+	brokerURL := ""
+	_ = warmQuorum
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
 		if devMode {
@@ -525,38 +498,19 @@ func runPublisher(
 	}
 
 	// Build the orchestrator.
-	// Build the Stratum 1 distribution config.
-	// When neither --s1-endpoints nor --broker-url is set, Distribute is nil
-	// and distribution is skipped (backward-compatible default).
+	// Build the announce broker config. The publisher emits its pre-commit pull
+	// announce on the embedded broker (brokerURL is the loopback URL derived
+	// above); a nil Distribute disables the announce.
 	var distCfg *distribute.Config
-	{
-		var endpoints []string
-		for _, ep := range strings.Split(s1Endpoints, ",") {
-			if trimmed := strings.TrimSpace(ep); trimmed != "" {
-				endpoints = append(endpoints, trimmed)
-			}
+	if brokerURL != "" {
+		distCfg = &distribute.Config{
+			Obs: obs,
+			BrokerConfig: &broker.Config{
+				BrokerURL: brokerURL,
+				CACert:    brokerCACert,
+			},
 		}
-		var brokerCfg *broker.Config
-		if brokerURL != "" {
-			brokerCfg = &broker.Config{
-				BrokerURL:  brokerURL,
-				ClientCert: brokerClientCert,
-				ClientKey:  brokerClientKey,
-				CACert:     brokerCACert,
-			}
-		}
-		if len(endpoints) > 0 || brokerCfg != nil {
-			hmacSecret := os.Getenv("PREPUB_HMAC_SECRET")
-			if hmacSecret == "" && len(endpoints) > 0 && !devMode {
-				obs.Logger.Error("PREPUB_HMAC_SECRET must be set when --s1-endpoints is configured")
-				os.Exit(1)
-			}
-			distCfg = &distribute.Config{
-				Obs:          obs,
-				BrokerConfig: brokerCfg,
-			}
-			obs.Logger.Info("control-plane announce configured", "broker", brokerCfg != nil)
-		}
+		obs.Logger.Info("control-plane announce configured", "broker", brokerURL)
 	}
 
 	// Attach the publisher's token credentials to the announce broker config so
@@ -571,10 +525,8 @@ func runPublisher(
 	var publishBrokerCfg *broker.Config
 	if brokerURL != "" {
 		publishBrokerCfg = &broker.Config{
-			BrokerURL:  brokerURL,
-			ClientCert: brokerClientCert,
-			ClientKey:  brokerClientKey,
-			CACert:     brokerCACert,
+			BrokerURL: brokerURL,
+			CACert:    brokerCACert,
 			// ClientID is left empty; publishMQTTNotification derives a unique
 			// per-notification suffix from the new root hash.
 		}
@@ -623,17 +575,20 @@ func runPublisher(
 	// Control-plane DoS limiter (internet-exposed; no firewall assumed).
 	ctrlRateLimit := credential.NewIPRateLimiter(5, 10, 4096, 100, 200)
 	if controlPlaneURL != "" {
+		// Ed25519 is the only discovery signer: the publisher signs with its
+		// private key; receivers verify with the matching public key so no shared
+		// secret ever reaches a receiver.
 		var discoSigner serve.Signer
-		if discoverySigningKey != "" {
-			sgn, serr := ed25519SignerFromFile(discoverySigningKey)
-			if serr != nil {
-				obs.Logger.Error("loading discovery signing key", "error", serr)
-				os.Exit(1)
-			}
-			discoSigner = sgn
-		} else if ctrlSecret != nil {
-			discoSigner = hmacDiscoverySigner(ctrlSecret)
+		if discoverySigningKey == "" {
+			obs.Logger.Error("control-plane: --discovery-signing-key is required to advertise the broker (Ed25519-only discovery)")
+			os.Exit(1)
 		}
+		sgn, serr := ed25519SignerFromFile(discoverySigningKey)
+		if serr != nil {
+			obs.Logger.Error("loading discovery signing key", "error", serr)
+			os.Exit(1)
+		}
+		discoSigner = sgn
 		disco := &staticDiscovery{repos: []string{repoName}, cp: serve.ControlPlaneRef{Type: "mqtt", URL: controlPlaneURL}, signer: discoSigner}
 		if enrollOverTLS {
 			disco.enrollURL = enrollURL
@@ -642,10 +597,9 @@ func runPublisher(
 		obs.Logger.Info("control-plane: discovery advertising broker", "url", controlPlaneURL)
 	}
 
-	// ADR-0001 pull mode: serve objects + manifests (incl. the gateway POST
-	// ingest) so Stratum 1 can pull on a prepare announce. Default push leaves
-	// these routes unmounted.
-	if distributeMode == "pull" {
+	// ADR-0001: serve objects + manifests (incl. the gateway POST ingest) so
+	// Stratum 1 can pull on a prepare announce. Pull is the only distribution mode.
+	{
 		// Admission control (ADR D6): cap concurrent receiver pulls and issue one
 		// lease per node at a time. Limits are conservative defaults for the small
 		// Stratum 1 fleet; make them configurable when the benchmark (P5) lands.
@@ -746,16 +700,22 @@ func runReceiver(
 	casRoot string,
 	sessionTTL time.Duration,
 	diskHeadroom float64,
-	coordURL, nodeID, reposFlag string,
-	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
+	nodeID, reposFlag string,
+	brokerCACert string,
 	stratum0URL string,
-	distributeMode string,
 	discoveryURL string,
 	brokerAuth bool,
 	discoveryVerifyKey string,
 	pullConcurrency, pullFilesPerRequest int,
 	pullAuto bool,
 ) {
+	// The receiver learns its broker URL from the signed discovery document; it
+	// authenticates with a token and verifies the broker via --broker-ca-cert.
+	// There is no external --broker-url and no client-cert mTLS. Pull is the only
+	// distribution mode.
+	brokerURL := ""
+	brokerClientCert := ""
+	brokerClientKey := ""
 	// Load the HMAC shared secret from the environment.  In DevMode the
 	// receiver skips HMAC verification entirely, so the secret is not required.
 	hmacSecret := os.Getenv("PREPUB_HMAC_SECRET")
@@ -784,19 +744,6 @@ func runReceiver(
 		}
 	}
 
-	// Coordination service token — loaded from env to keep credentials out of
-	// command lines and logs.  Empty means coordination is disabled even if
-	// --coord-url is set (the receiver will log a warning in that case).
-	coordToken := os.Getenv("PREPUB_COORD_TOKEN")
-	if coordURL != "" && coordToken == "" {
-		if devMode {
-			obs.Logger.Warn("SECURITY: PREPUB_COORD_TOKEN not set — coordination service requests will be unauthenticated (development mode only)")
-		} else {
-			obs.Logger.Error("PREPUB_COORD_TOKEN environment variable must be set when --coord-url is configured")
-			os.Exit(1)
-		}
-	}
-
 	// Parse --repos flag into a slice of repository names.
 	var repoList []string
 	for _, r := range strings.Split(reposFlag, ",") {
@@ -819,17 +766,16 @@ func runReceiver(
 			os.Exit(1)
 		}
 		if brokerAuth {
-			var verified bool
-			if discoveryVerifyKey != "" {
-				vf, verr := ed25519VerifierFromFile(discoveryVerifyKey)
-				if verr != nil {
-					obs.Logger.Error("loading discovery verify key", "error", verr)
-					os.Exit(1)
-				}
-				verified = d.Verify(vf)
-			} else {
-				verified = d.Verify(hmacDiscoveryVerify([]byte(os.Getenv("PREPUB_HMAC_SECRET"))))
+			if discoveryVerifyKey == "" {
+				obs.Logger.Error("control-plane: --discovery-verify-key is required under --broker-auth (Ed25519-only discovery)")
+				os.Exit(1)
 			}
+			vf, verr := ed25519VerifierFromFile(discoveryVerifyKey)
+			if verr != nil {
+				obs.Logger.Error("loading discovery verify key", "error", verr)
+				os.Exit(1)
+			}
+			verified := d.Verify(vf)
 			if !verified {
 				obs.Logger.Error("control-plane: discovery signature verification FAILED — refusing advertised broker (possible MITM)")
 				os.Exit(1)
@@ -910,13 +856,11 @@ func runReceiver(
 		SessionTTL:                sessionTTL,
 		DiskHeadroom:              diskHeadroom,
 		DevMode:                   devMode,
-		CoordURL:                  coordURL,
-		CoordToken:                coordToken,
 		NodeID:                    nodeID,
 		Repos:                     repoList,
 		Stratum0URL:               stratum0URL,
-		PullMode:                  distributeMode == "pull",
-		PullManifestBase:          stratum0URL, // in pull mode this points at the cvmfs-prepub endpoint
+		PullMode:                  true,
+		PullManifestBase:          stratum0URL, // points at the cvmfs-prepub endpoint
 		PullConcurrency:           pullConcurrency,
 		PullFilesPerRequest:       pullFilesPerRequest,
 		PullAuto:                  pullAuto,

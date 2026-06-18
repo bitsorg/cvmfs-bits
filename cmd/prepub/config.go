@@ -109,33 +109,15 @@ type fileConfig struct {
 	} `yaml:"cas"`
 
 	Distribution struct {
-		// Endpoints is a list of Stratum 1 HTTPS URLs.
-		// Equivalent to --s1-endpoints (comma-separated on the CLI).
-		Endpoints         []string     `yaml:"stratum1_endpoints"`
-		Quorum            float64      `yaml:"quorum"`
-		Timeout           yamlDuration `yaml:"timeout"`
-		MQTTQuorumTimeout yamlDuration `yaml:"mqtt_quorum_timeout"`
-
-		// Queue-driven worker settings (Manager).
-		WorkerConcurrency int          `yaml:"worker_concurrency"`
-		QueueDepth        int          `yaml:"queue_depth"`
-		AttemptTimeout    yamlDuration `yaml:"attempt_timeout"`
-		InitialBackoff    yamlDuration `yaml:"initial_backoff"`
-		MaxBackoff        yamlDuration `yaml:"max_backoff"`
-		WorkerMaxAttempts int          `yaml:"worker_max_attempts"`
-		QueueSpoolDir     string       `yaml:"queue_spool_dir"`
-		// BatchSize is the number of objects sent in a single multipart PUT to
-		// each Stratum 1 endpoint.  0 (default) falls back to per-object PUTs.
-		// Setting this to ~100 can dramatically reduce round-trips when objects
-		// are small (typical for CVMFS chunks).
-		BatchSize int `yaml:"batch_size"`
+		// WarmQuorum is the fraction of authoritative Stratum 1 replicas that must
+		// report warm before the catalog commit proceeds (ADR-0001 D6).
+		WarmQuorum float64 `yaml:"warm_quorum"`
 	} `yaml:"distribution"`
 
-	// MQTT broker settings — used by both publisher and receiver.
-	BrokerURL        string `yaml:"broker_url"`
-	BrokerClientCert string `yaml:"broker_client_cert"`
-	BrokerClientKey  string `yaml:"broker_client_key"`
-	BrokerCACert     string `yaml:"broker_ca_cert"`
+	// MQTT broker CA — verifies the control-plane broker's server certificate.
+	// The broker URL is derived from the embedded broker / learned from discovery;
+	// there is no external broker URL or client-cert mTLS.
+	BrokerCACert string `yaml:"broker_ca_cert"`
 
 	// Receiver-mode settings.
 	ControlAddr  string       `yaml:"control_addr"`
@@ -146,8 +128,7 @@ type fileConfig struct {
 	NodeID       string       `yaml:"node_id"`
 	// Repos is a list of CVMFS repositories served by this receiver.
 	// Equivalent to --repos (comma-separated on the CLI).
-	Repos    []string `yaml:"repos"`
-	CoordURL string   `yaml:"coord_url"`
+	Repos []string `yaml:"repos"`
 	// ReceiverStratum0URL is the Stratum 0 HTTP base URL used by the receiver
 	// to pull CAS objects when a PublishedMessage is received over MQTT.
 	// Example: "http://stratum0.example.org/cvmfs"
@@ -204,18 +185,12 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	stratum0URL, repoName *string,
 	jobTimeout *time.Duration,
 	minConcurrentJobs, maxConcurrentJobs *int,
-	s1Endpoints *string,
-	s1Quorum *float64,
-	s1Timeout, s1MQTTTimeout *time.Duration,
-	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth *int,
-	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff *time.Duration,
-	s1QueueSpoolDir *string,
-	s1BatchSize *int,
-	brokerURL, brokerClientCert, brokerClientKey, brokerCACert *string,
+	warmQuorum *float64,
+	brokerCACert *string,
 	controlAddr, dataAddr, dataHost, tlsCert, tlsKey *string,
 	sessionTTL *time.Duration,
 	diskHeadroom *float64,
-	nodeID, repos, coordURL, recvStratum0URL *string,
+	nodeID, repos, recvStratum0URL *string,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
 	gatewayDirectGraft *bool,
@@ -265,35 +240,12 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("tls-cert", tlsCert, fc.Server.TLSCert)
 	str("tls-key", tlsKey, fc.Server.TLSKey)
 
-	// Distribution / Stratum 1.
-	if !has("s1-endpoints") && len(fc.Distribution.Endpoints) > 0 {
-		*s1Endpoints = strings.Join(fc.Distribution.Endpoints, ",")
-	}
-	flt("s1-quorum", s1Quorum, fc.Distribution.Quorum)
-	dur("s1-timeout", s1Timeout, fc.Distribution.Timeout)
-	dur("s1-mqtt-quorum-timeout", s1MQTTTimeout, fc.Distribution.MQTTQuorumTimeout)
-	// Queue-driven worker settings.
-	if !has("s1-worker-concurrency") && fc.Distribution.WorkerConcurrency != 0 {
-		*s1WorkerConcurrency = fc.Distribution.WorkerConcurrency
-	}
-	if !has("s1-queue-depth") && fc.Distribution.QueueDepth != 0 {
-		*s1QueueDepth = fc.Distribution.QueueDepth
-	}
-	dur("s1-attempt-timeout", s1AttemptTimeout, fc.Distribution.AttemptTimeout)
-	dur("s1-initial-backoff", s1InitialBackoff, fc.Distribution.InitialBackoff)
-	dur("s1-max-backoff", s1MaxBackoff, fc.Distribution.MaxBackoff)
-	if !has("s1-max-attempts") && fc.Distribution.WorkerMaxAttempts != 0 {
-		*s1MaxAttempts = fc.Distribution.WorkerMaxAttempts
-	}
-	str("s1-queue-spool-dir", s1QueueSpoolDir, fc.Distribution.QueueSpoolDir)
-	if !has("s1-batch-size") && fc.Distribution.BatchSize != 0 {
-		*s1BatchSize = fc.Distribution.BatchSize
-	}
+	// Warm-quorum: fraction of authoritative Stratum 1 replicas that must report
+	// warm before the catalog commit proceeds (ADR-0001 D6).
+	flt("warm-quorum", warmQuorum, fc.Distribution.WarmQuorum)
 
-	// MQTT broker.
-	str("broker-url", brokerURL, fc.BrokerURL)
-	str("broker-client-cert", brokerClientCert, fc.BrokerClientCert)
-	str("broker-client-key", brokerClientKey, fc.BrokerClientKey)
+	// MQTT broker CA (the only broker flag; the broker URL is derived from the
+	// embedded broker / learned from discovery, and there is no client-cert mTLS).
 	str("broker-ca-cert", brokerCACert, fc.BrokerCACert)
 
 	// Receiver.
@@ -306,7 +258,6 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	if !has("repos") && len(fc.Repos) > 0 {
 		*repos = strings.Join(fc.Repos, ",")
 	}
-	str("coord-url", coordURL, fc.CoordURL)
 	str("receiver-stratum0-url", recvStratum0URL, fc.ReceiverStratum0URL)
 
 	// Provenance.
