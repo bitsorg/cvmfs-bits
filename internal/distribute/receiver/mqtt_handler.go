@@ -33,7 +33,7 @@ const maxHashesPerAnnounce = 1_000_000
 // maxHashLen is the maximum byte length of a single CAS hash string accepted
 // inside an AnnounceMessage.  SHA-256 hex is 64 chars; SHA-512 hex is 128.
 // 256 is a generous bound that covers any realistic algorithm while preventing
-// pathological Bloom-filter hash computations caused by arbitrarily long strings.
+// pathological hash computations caused by arbitrarily long strings.
 const maxHashLen = 256
 
 // mqttPublish publishes v to topic under the mqttMu read-lock so that
@@ -62,8 +62,8 @@ func (r *Receiver) mqttPublish(topic string, v any) bool {
 //  3. Check available disk space against the announced total bytes.
 //  4. Return the existing session if PayloadID was already announced (idempotent).
 //  5. Create a new session (session cap applies; reply with error on rejection).
-//  6. Compute AbsentHashes by filtering the announced hash list through the
-//     receiver's Bloom inventory filter.
+//  6. Compute AbsentHashes by checking each announced hash directly against
+//     the receiver's local CAS (CAS.Exists per hash).
 //  7. Publish a ReadyMessage to the publisher's reply topic.
 //
 // All errors are published back to the publisher as ReadyMessage.Error so
@@ -159,7 +159,7 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 		return
 	}
 	// Reject suspiciously long individual hash strings before they reach the
-	// Bloom filter (which hashes the string bytes internally).
+	// per-hash CAS existence check.
 	for i, h := range ann.Hashes {
 		if len(h) > maxHashLen {
 			replyErr(fmt.Sprintf("hash[%d] length %d exceeds maximum of %d bytes",
@@ -193,10 +193,8 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 		return
 	}
 
-	// Compute the set of hashes the publisher must actually push to us.
-	// If the Bloom inventory filter is not yet ready (CAS walk still in
-	// progress), we report all hashes as absent — the conservative choice
-	// that avoids silently skipping objects we haven't indexed yet.
+	// Compute the set of hashes the publisher must actually push to us by
+	// checking each announced hash directly against the local CAS.
 	absentHashes := r.computeAbsentHashes(ann.Hashes)
 
 	r.cfg.Obs.Logger.Info("mqtt: announce accepted",
@@ -216,21 +214,24 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 }
 
 // computeAbsentHashes returns the subset of hashes that the receiver does not
-// currently hold according to its Bloom inventory filter.
+// currently hold, determined by a direct CAS.Exists check per announced hash.
 //
-// When the inventory is not yet ready (CAS walk still in progress) all hashes
-// are returned as absent — the conservative choice that ensures we never skip
-// an object the publisher needs to send us.
+// The local CAS is the single source of truth for object presence.  On any
+// CAS error for a given hash the hash is treated as absent — the conservative
+// choice that ensures we never silently skip an object the publisher needs to
+// send us.
 func (r *Receiver) computeAbsentHashes(hashes []string) []string {
-	if !r.inv.isReady() {
-		// Bloom not ready — report everything as absent to be safe.
-		absent := make([]string, len(hashes))
-		copy(absent, hashes)
-		return absent
-	}
 	absent := make([]string, 0, len(hashes))
 	for _, h := range hashes {
-		if !r.inv.contains(h) {
+		// Strip any 'C' content-type suffix: the CAS is keyed on the plain hash.
+		plain := strings.TrimSuffix(h, "C")
+		exists, err := r.casStore.Exists(r.bgCtx, plain)
+		if err != nil {
+			r.cfg.Obs.Logger.Warn("mqtt: CAS.Exists failed — treating hash as absent",
+				"hash", plain, "error", err)
+			exists = false
+		}
+		if !exists {
 			absent = append(absent, h)
 		}
 	}
@@ -306,7 +307,7 @@ func (r *Receiver) mqttPublishedHandler(msg *broker.Message) {
 // root catalog hash when Hashes is empty (native ingest path).
 //
 // It is designed to be idempotent: if an object is already in the local CAS
-// (Bloom filter check + filesystem stat), it is skipped.
+// (filesystem stat), it is skipped.
 //
 // All network I/O is governed by ctx so that Shutdown() can cancel in-flight
 // pulls promptly.
@@ -333,22 +334,20 @@ func (r *Receiver) pullFromS0(ctx context.Context, pm broker.PublishedMessage) {
 			"root_hash", pm.NewRootHash)
 	}
 
-	// Filter through Bloom filter to compute the minimal fetch set.
+	// Compute the minimal fetch set by checking the local CAS directly: an
+	// object already on disk is skipped.  The fetch loop below re-checks each
+	// path with os.Stat just before downloading, so a stale result here only
+	// costs an extra stat, never a redundant download.
 	var absent []string
-	if r.inv.isReady() {
-		for _, h := range hashesToFetch {
-			// Strip the 'C' suffix for Bloom filter lookup; the inventory tracks
-			// plain hashes, not content-type suffixed keys.
-			plain := strings.TrimSuffix(h, "C")
-			if !r.inv.contains(plain) {
-				absent = append(absent, h)
-			}
+	for _, h := range hashesToFetch {
+		plain := strings.TrimSuffix(h, "C")
+		if len(plain) < 2 {
+			absent = append(absent, h)
+			continue
 		}
-	} else {
-		// Bloom not ready — treat all hashes as absent (conservative).
-		absent = hashesToFetch
-		logger.Info("mqtt: Bloom filter not ready — fetching all announced hashes",
-			"count", len(absent))
+		if _, err := os.Stat(casPath(r.cfg.CASRoot, plain)); err != nil {
+			absent = append(absent, h)
+		}
 	}
 
 	if len(absent) == 0 {
@@ -375,11 +374,9 @@ func (r *Receiver) pullFromS0(ctx context.Context, pm broker.PublishedMessage) {
 			continue
 		}
 
-		// Check filesystem directly (handles the case where Bloom is not ready).
+		// Check the filesystem directly: if the object is already on disk, skip it.
 		localPath := casPath(r.cfg.CASRoot, plain)
 		if _, err := os.Stat(localPath); err == nil {
-			// Already on disk — just ensure the inventory is updated.
-			r.inv.add(plain)
 			continue
 		}
 
@@ -467,14 +464,10 @@ func (r *Receiver) fetchObjectFromS0(ctx context.Context, objectURL, plain strin
 		os.Remove(tmpPath)
 		// If the file already exists (concurrent fetch or PUT), treat as success.
 		if _, statErr := os.Stat(finalPath); statErr == nil {
-			r.inv.add(plain)
 			return nil
 		}
 		return fmt.Errorf("rename to final path: %w", err)
 	}
-
-	// Update the inventory Bloom filter.
-	r.inv.add(plain)
 
 	r.cfg.Obs.Logger.Debug("mqtt: fetched object from S0",
 		"hash", plain, "sha256", hex.EncodeToString(hasher.Sum(nil)))
@@ -524,16 +517,16 @@ func (r *Receiver) startMQTT() error {
 		DataURL:    r.cfg.dataEndpoint(),
 		ControlURL: r.cfg.controlEndpoint(),
 		Online:     false,
-		BloomReady: false,
+		Ready:      false,
 	}
 
 	brokerCfg := broker.Config{
 		BrokerURL:           r.cfg.BrokerURL,
 		CredentialsProvider: r.cfg.BrokerCredentialsProvider,
-		ClientCert: r.cfg.BrokerClientCert,
-		ClientKey:  r.cfg.BrokerClientKey,
-		CACert:     r.cfg.BrokerCACert,
-		ClientID:   nodeID + "-receiver",
+		ClientCert:          r.cfg.BrokerClientCert,
+		ClientKey:           r.cfg.BrokerClientKey,
+		CACert:              r.cfg.BrokerCACert,
+		ClientID:            nodeID + "-receiver",
 	}
 
 	// Connect with LWT = offline presence message.
@@ -550,7 +543,7 @@ func (r *Receiver) startMQTT() error {
 		DataURL:    r.cfg.dataEndpoint(),
 		ControlURL: r.cfg.controlEndpoint(),
 		Online:     true,
-		BloomReady: r.inv.isReady(),
+		Ready:      true,
 	}
 	if err := client.Publish(presenceTopic, 1, true, onlineMsg); err != nil {
 		// Non-fatal: we're connected, presence just didn't publish.
@@ -604,7 +597,7 @@ func (r *Receiver) startMQTT() error {
 			DataURL:    r.cfg.dataEndpoint(),
 			ControlURL: r.cfg.controlEndpoint(),
 			Online:     true,
-			BloomReady: r.inv.isReady(), // reflect current state at reconnect time
+			Ready:      true, // receiver answers presence via direct CAS.Exists
 		})
 	})
 
@@ -647,7 +640,7 @@ func (r *Receiver) stopMQTT() {
 		DataURL:    r.cfg.dataEndpoint(),
 		ControlURL: r.cfg.controlEndpoint(),
 		Online:     false,
-		BloomReady: false,
+		Ready:      false,
 	}
 	if err := client.Publish(presenceTopic, 1, true, offlineMsg); err != nil {
 		r.cfg.Obs.Logger.Warn("mqtt: failed to publish offline presence on shutdown",

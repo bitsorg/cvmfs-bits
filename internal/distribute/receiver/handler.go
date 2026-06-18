@@ -314,12 +314,8 @@ func (r *Receiver) putObjectHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Update the inventory filter so that subsequent bloom queries reflect the
-	// newly written object without waiting for the next CAS walk.
-	r.inv.add(hash)
 	r.cfg.Obs.Metrics.ReceiverObjectsReceived.Inc()
 	r.cfg.Obs.Metrics.ReceiverBytesReceived.Add(float64(written))
-	r.cfg.Obs.Metrics.ReceiverBloomSize.Set(float64(r.inv.approximateSize()))
 	r.cfg.Obs.Metrics.SpoolTransitions.WithLabelValues("received", "ok").Inc()
 	w.WriteHeader(http.StatusOK)
 }

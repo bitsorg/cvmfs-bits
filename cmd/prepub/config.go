@@ -82,9 +82,8 @@ type fileConfig struct {
 	// very first publish of an empty repository).
 	Stratum0URL string `yaml:"stratum0_url"`
 	// RepoName is the CVMFS repository name for catalog-based dedup seeding at
-	// startup (e.g. "atlas.cern.ch").  When set alongside stratum0_url, the
-	// Bloom filter is seeded by walking the CVMFS catalog tree rather than
-	// scanning the CAS filesystem — much faster for large repositories.
+	// startup (e.g. "atlas.cern.ch").  Retained for labelling publishes; no
+	// longer used for dedup seeding (dedup is a direct CAS.Exists per object).
 	// Leave empty to fall back to the CAS walk (safe, just slower).
 	RepoName string `yaml:"repo_name"`
 
@@ -115,7 +114,6 @@ type fileConfig struct {
 		Endpoints         []string     `yaml:"stratum1_endpoints"`
 		Quorum            float64      `yaml:"quorum"`
 		Timeout           yamlDuration `yaml:"timeout"`
-		BloomQueryTimeout yamlDuration `yaml:"bloom_query_timeout"`
 		MQTTQuorumTimeout yamlDuration `yaml:"mqtt_quorum_timeout"`
 
 		// Queue-driven worker settings (Manager).
@@ -155,20 +153,6 @@ type fileConfig struct {
 	// Example: "http://stratum0.example.org/cvmfs"
 	// Equivalent to --receiver-stratum0-url.
 	ReceiverStratum0URL string `yaml:"receiver_stratum0_url"`
-
-	// Bloom filter dedup (publisher).
-	// BloomFilter enables the in-process Bloom filter for dedup checking.
-	// Setting bloom_snapshot_dir also implies bloom_filter = true.
-	BloomFilter         bool         `yaml:"bloom_filter"`
-	BloomSnapshotDir    string       `yaml:"bloom_snapshot_dir"`
-	BloomNodeID         string       `yaml:"bloom_node_id"`
-	BloomMaxSnapshotAge yamlDuration `yaml:"bloom_max_snapshot_age"`
-	BloomFilterCapacity uint         `yaml:"bloom_filter_capacity"`
-	BloomFilterFPRate   float64      `yaml:"bloom_filter_fp_rate"`
-
-	// Inventory Bloom filter (receiver).
-	BloomCapacity uint    `yaml:"bloom_capacity"`
-	BloomFPRate   float64 `yaml:"bloom_fp_rate"`
 
 	// Provenance / Rekor transparency log.
 	Provenance      bool     `yaml:"provenance"`
@@ -222,7 +206,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	minConcurrentJobs, maxConcurrentJobs *int,
 	s1Endpoints *string,
 	s1Quorum *float64,
-	s1Timeout, s1BloomTimeout, s1MQTTTimeout *time.Duration,
+	s1Timeout, s1MQTTTimeout *time.Duration,
 	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth *int,
 	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff *time.Duration,
 	s1QueueSpoolDir *string,
@@ -232,13 +216,6 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	sessionTTL *time.Duration,
 	diskHeadroom *float64,
 	nodeID, repos, coordURL, recvStratum0URL *string,
-	bloomFilter *bool,
-	bloomSnapshotDir, bloomNodeID *string,
-	bloomMaxSnapshotAge *time.Duration,
-	bloomFilterCapacity *uint,
-	bloomFilterFPRate *float64,
-	recvBloomCapacity *uint,
-	recvBloomFPRate *float64,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
 	gatewayDirectGraft *bool,
@@ -294,7 +271,6 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	}
 	flt("s1-quorum", s1Quorum, fc.Distribution.Quorum)
 	dur("s1-timeout", s1Timeout, fc.Distribution.Timeout)
-	dur("s1-bloom-timeout", s1BloomTimeout, fc.Distribution.BloomQueryTimeout)
 	dur("s1-mqtt-quorum-timeout", s1MQTTTimeout, fc.Distribution.MQTTQuorumTimeout)
 	// Queue-driven worker settings.
 	if !has("s1-worker-concurrency") && fc.Distribution.WorkerConcurrency != 0 {
@@ -332,24 +308,6 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	}
 	str("coord-url", coordURL, fc.CoordURL)
 	str("receiver-stratum0-url", recvStratum0URL, fc.ReceiverStratum0URL)
-
-	// Bloom filter (publisher).
-	if !has("bloom-filter") && fc.BloomFilter {
-		*bloomFilter = true
-	}
-	str("bloom-snapshot-dir", bloomSnapshotDir, fc.BloomSnapshotDir)
-	str("bloom-node-id", bloomNodeID, fc.BloomNodeID)
-	dur("bloom-max-snapshot-age", bloomMaxSnapshotAge, fc.BloomMaxSnapshotAge)
-	if !has("bloom-filter-capacity") && fc.BloomFilterCapacity != 0 {
-		*bloomFilterCapacity = fc.BloomFilterCapacity
-	}
-	flt("bloom-filter-fp-rate", bloomFilterFPRate, fc.BloomFilterFPRate)
-
-	// Bloom filter (receiver).
-	if !has("bloom-capacity") && fc.BloomCapacity != 0 {
-		*recvBloomCapacity = fc.BloomCapacity
-	}
-	flt("bloom-fp-rate", recvBloomFPRate, fc.BloomFPRate)
 
 	// Provenance.
 	if !has("provenance") && fc.Provenance {

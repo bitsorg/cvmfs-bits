@@ -4,13 +4,31 @@
 package receiver
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/pkg/observe"
 )
+
+// makeHash returns a deterministic 64-hex-char CAS hash for the given seed.
+// (Re-homed here after the inventory_test.go file was removed.)
+func makeHash(n int) string {
+	return fmt.Sprintf("%064x", n)
+}
+
+// putObject stores data in the receiver's local CAS under hash so that
+// computeAbsentHashes sees it as present.
+func putObject(t *testing.T, r *Receiver, hash string, data []byte) {
+	t.Helper()
+	if err := r.casStore.Put(context.Background(), hash, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatalf("casStore.Put(%s): %v", hash, err)
+	}
+}
 
 // storeLen returns the number of active sessions in ss (under lock).
 func storeLen(ss *sessionStore) int {
@@ -24,7 +42,7 @@ func storeLen(ss *sessionStore) int {
 // newMQTTTestReceiver creates a Receiver suitable for testing MQTT handler
 // logic.  The broker client is left nil so that mqttPublish is a no-op (the
 // receiver logs "not active" and returns false) — we test the observable
-// side-effects on the session store and inventory instead.
+// side-effects on the session store and the local CAS instead.
 func newMQTTTestReceiver(t *testing.T, repos ...string) *Receiver {
 	t.Helper()
 	obs, shutdown, err := observe.New("test")
@@ -131,62 +149,54 @@ func TestServesRepo_MatchesCaseInsensitively(t *testing.T) {
 
 // ── computeAbsentHashes ──────────────────────────────────────────────────────
 
-// TestComputeAbsentHashes_InventoryNotReady verifies that when the inventory
-// Bloom filter has not yet been populated (CAS walk still in progress), all
-// hashes are reported as absent — the conservative choice.
-func TestComputeAbsentHashes_InventoryNotReady(t *testing.T) {
+// TestComputeAbsentHashes_EmptyCAS verifies that when the local CAS holds none
+// of the announced objects, every hash is reported as absent.
+func TestComputeAbsentHashes_EmptyCAS(t *testing.T) {
 	r := newMQTTTestReceiver(t)
-	// inventory.isReady() starts as false; no CAS walk is triggered by New().
-	hashes := []string{"aaa", "bbb", "ccc"}
+	hashes := []string{makeHash(1), makeHash(2), makeHash(3)}
 	absent := r.computeAbsentHashes(hashes)
 	if len(absent) != len(hashes) {
-		t.Errorf("computeAbsentHashes when not ready: got %d absent, want %d (all)", len(absent), len(hashes))
+		t.Errorf("computeAbsentHashes with empty CAS: got %d absent, want %d (all)", len(absent), len(hashes))
 	}
-	// Verify it's a copy, not the same slice.
+	// Verify it's a fresh slice, not the same backing array.
 	if len(absent) > 0 && &absent[0] == &hashes[0] {
-		t.Error("computeAbsentHashes should return a copy, not the original slice")
+		t.Error("computeAbsentHashes should return a fresh slice, not the original")
 	}
 }
 
-// TestComputeAbsentHashes_InventoryReady_FiltersKnownHashes verifies that once
-// the inventory is marked ready, only hashes absent from the Bloom filter are
-// returned.
-func TestComputeAbsentHashes_InventoryReady_FiltersKnownHashes(t *testing.T) {
+// TestComputeAbsentHashes_FiltersPresentHashes verifies that objects already in
+// the receiver's local CAS are excluded from the absent set, and only the
+// missing object is reported.
+func TestComputeAbsentHashes_FiltersPresentHashes(t *testing.T) {
 	r := newMQTTTestReceiver(t)
 
-	// Manually mark inventory ready and add some known hashes.
-	r.inv.add("known-hash-1")
-	r.inv.add("known-hash-2")
-	// Mark the inventory as ready so computeAbsentHashes uses the filter
-	// rather than the conservative "all absent" fallback.
-	r.inv.mu.Lock()
-	r.inv.ready = true
-	r.inv.mu.Unlock()
+	present1 := makeHash(101)
+	present2 := makeHash(102)
+	missing := makeHash(103)
+	putObject(t, r, present1, []byte("obj-1"))
+	putObject(t, r, present2, []byte("obj-2"))
 
-	hashes := []string{"known-hash-1", "known-hash-2", "unknown-hash-3"}
+	hashes := []string{present1, present2, missing}
 	absent := r.computeAbsentHashes(hashes)
 
-	// Only the unknown hash must appear in the absent list.
+	// Only the missing hash must appear in the absent list.
 	if len(absent) != 1 {
 		t.Fatalf("computeAbsentHashes: got %d absent hashes, want 1; absent=%v", len(absent), absent)
 	}
-	if absent[0] != "unknown-hash-3" {
-		t.Errorf("computeAbsentHashes: got %q, want %q", absent[0], "unknown-hash-3")
+	if absent[0] != missing {
+		t.Errorf("computeAbsentHashes: got %q, want %q", absent[0], missing)
 	}
 }
 
 // TestComputeAbsentHashes_EmptyInput verifies that an empty hash list returns
-// an empty (not nil) slice in both ready and not-ready states.
+// an empty (not nil) slice.
 func TestComputeAbsentHashes_EmptyInput(t *testing.T) {
 	r := newMQTTTestReceiver(t)
 	if absent := r.computeAbsentHashes(nil); absent == nil {
-		t.Error("computeAbsentHashes(nil) should return non-nil empty slice when not ready")
+		t.Error("computeAbsentHashes(nil) should return a non-nil empty slice")
 	}
-	r.inv.mu.Lock()
-	r.inv.ready = true
-	r.inv.mu.Unlock()
 	if absent := r.computeAbsentHashes([]string{}); absent == nil {
-		t.Error("computeAbsentHashes([]) should return non-nil empty slice when ready")
+		t.Error("computeAbsentHashes([]) should return a non-nil empty slice")
 	}
 }
 

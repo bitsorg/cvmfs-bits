@@ -15,8 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bits-and-blooms/bloom/v3"
-
 	"cvmfs.io/prepub/pkg/observe"
 	"cvmfs.io/prepub/testutil/fakecas"
 )
@@ -559,81 +557,6 @@ func TestAnnounceHMACPathWithEndpointPath(t *testing.T) {
 	wantURI := "/stratum1/api/v1/announce"
 	if receivedURI != wantURI {
 		t.Errorf("receiver saw URI %q, want %q", receivedURI, wantURI)
-	}
-}
-
-// ── fetchReceiverBloom tests ──────────────────────────────────────────────────
-
-// TestFetchReceiverBloom_HappyPath verifies that a valid binary-encoded Bloom
-// filter is fetched and deserialised correctly.
-func TestFetchReceiverBloom_HappyPath(t *testing.T) {
-	// Build a filter with a known hash.
-	bf := bloom.NewWithEstimates(1000, 0.01)
-	knownHash := "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-	bf.AddString(knownHash)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/bloom" || r.Method != http.MethodGet {
-			http.Error(w, "unexpected", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		if _, err := bf.WriteTo(w); err != nil {
-			t.Errorf("WriteTo: %v", err)
-		}
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	got, err := fetchReceiverBloom(ctx, srv.URL, "" /* no auth in test */)
-	if err != nil {
-		t.Fatalf("fetchReceiverBloom: %v", err)
-	}
-	if !got.TestString(knownHash) {
-		t.Error("fetched filter does not contain the expected hash")
-	}
-	// A hash we never added should not appear.
-	absent := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-	if got.TestString(absent) {
-		t.Log("note: false positive (acceptable)")
-	}
-}
-
-// TestFetchReceiverBloom_503 verifies that a 503 (inventory building) is
-// returned as an error so the caller falls back to pushing all objects.
-func TestFetchReceiverBloom_503(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Retry-After", "10")
-		http.Error(w, `{"error":"inventory building"}`, http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	_, err := fetchReceiverBloom(ctx, srv.URL, "" /* no auth in test */)
-	if err == nil {
-		t.Fatal("expected error for 503 response")
-	}
-}
-
-// TestFetchReceiverBloom_CorruptBody verifies that a garbled response body is
-// rejected with an error.
-func TestFetchReceiverBloom_CorruptBody(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("this is not a bloom filter"))
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	_, err := fetchReceiverBloom(ctx, srv.URL, "" /* no auth in test */)
-	if err == nil {
-		t.Fatal("expected error for corrupt body")
 	}
 }
 

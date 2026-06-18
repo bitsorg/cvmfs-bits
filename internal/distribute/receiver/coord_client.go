@@ -30,9 +30,9 @@ const (
 	// momentary network hiccup.
 	coordHTTPTimeout = 10 * time.Second
 
-	coordRegisterPath   = "/api/v1/nodes"
-	coordHeartbeatFmt   = "/api/v1/nodes/%s/heartbeat"
-	coordDeregisterFmt  = "/api/v1/nodes/%s"
+	coordRegisterPath  = "/api/v1/nodes"
+	coordHeartbeatFmt  = "/api/v1/nodes/%s/heartbeat"
+	coordDeregisterFmt = "/api/v1/nodes/%s"
 )
 
 // coordRegisterRequest is the JSON body sent on initial registration.
@@ -47,8 +47,8 @@ type coordRegisterRequest struct {
 // It carries lightweight health signals so the coordination service can
 // route pre-warm traffic to nodes that are ready and not overloaded.
 type coordHeartbeatRequest struct {
-	BloomSize uint64 `json:"bloom_size"` // approximate objects in inventory filter
-	Ready     bool   `json:"ready"`      // true once the initial CAS walk has completed
+	ObjectCount uint64 `json:"object_count"` // 0: object count is no longer tracked since the inventory filter was removed (CAS.Exists is the source of truth)
+	Ready       bool   `json:"ready"`        // always true: the receiver answers presence checks via direct CAS.Exists
 }
 
 // CoordClient manages registration and periodic heartbeats with the HepCDN
@@ -70,7 +70,6 @@ type CoordClient struct {
 	token      string
 	controlURL string // this receiver's HTTPS control endpoint
 	dataURL    string // this receiver's plain-HTTP data endpoint
-	inv        *inventory
 	obs        *observe.Provider
 	httpClient *http.Client
 	stop       chan struct{}
@@ -78,14 +77,14 @@ type CoordClient struct {
 	registered atomic.Bool // true once registration has succeeded
 	// newTicker creates the heartbeat ticker.  Overridable in tests to use a
 	// short interval without modifying the production constant.
-	newTicker  func() *time.Ticker
+	newTicker func() *time.Ticker
 }
 
 // newCoordClient returns a configured CoordClient, or nil if coordURL is empty.
 // nodeID defaults to the OS hostname when empty.
 // controlURL is the HTTPS control endpoint of this receiver (e.g. "https://host:9100").
 // dataURL is the plain-HTTP data endpoint (e.g. "http://host:9101").
-func newCoordClient(coordURL, token, nodeID string, repos []string, controlURL, dataURL string, inv *inventory, obs *observe.Provider) *CoordClient {
+func newCoordClient(coordURL, token, nodeID string, repos []string, controlURL, dataURL string, obs *observe.Provider) *CoordClient {
 	if coordURL == "" {
 		return nil
 	}
@@ -111,7 +110,6 @@ func newCoordClient(coordURL, token, nodeID string, repos []string, controlURL, 
 		token:      token,
 		controlURL: controlURL,
 		dataURL:    dataURL,
-		inv:        inv,
 		obs:        obs,
 		httpClient: &http.Client{
 			Timeout: coordHTTPTimeout,
@@ -240,8 +238,8 @@ func (c *CoordClient) register(ctx context.Context) error {
 // heartbeat sends PUT /api/v1/nodes/{node_id}/heartbeat to the coordination service.
 func (c *CoordClient) heartbeat(ctx context.Context) error {
 	body, err := json.Marshal(coordHeartbeatRequest{
-		BloomSize: c.inv.approximateSize(),
-		Ready:     c.inv.isReady(),
+		ObjectCount: 0,
+		Ready:       true,
 	})
 	if err != nil {
 		return fmt.Errorf("coord: marshalling heartbeat request: %w", err)

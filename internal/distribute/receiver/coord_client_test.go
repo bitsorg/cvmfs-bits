@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,8 +93,7 @@ func newTestObs(t *testing.T) *observe.Provider {
 // an empty URL and that Start/Stop are safe no-ops on nil.
 func TestCoordClient_NilWhenURLEmpty(t *testing.T) {
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
-	c := newCoordClient("", "token", "node1", nil, "", "http://localhost:9101", inv, obs)
+	c := newCoordClient("", "token", "node1", nil, "", "http://localhost:9101", obs)
 	if c != nil {
 		t.Fatal("expected nil CoordClient when coordURL is empty")
 	}
@@ -108,9 +106,8 @@ func TestCoordClient_NilWhenURLEmpty(t *testing.T) {
 func TestCoordClient_Register(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
-	c := newCoordClient(srv.URL, "secret", "node-test", []string{"atlas.cern.ch"}, "https://host:9100", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-test", []string{"atlas.cern.ch"}, "https://host:9100", "http://host:9101", obs)
 	if c == nil {
 		t.Fatal("expected non-nil CoordClient")
 	}
@@ -126,15 +123,8 @@ func TestCoordClient_Register(t *testing.T) {
 func TestCoordClient_Heartbeat(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
-	// Add an object so bloom_size > 0.
-	inv.add(makeHash(1))
-	inv.mu.Lock()
-	inv.ready = true
-	inv.mu.Unlock()
-
-	c := newCoordClient(srv.URL, "secret", "node-hb", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-hb", nil, "", "http://host:9101", obs)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -151,11 +141,11 @@ func TestCoordClient_Heartbeat(t *testing.T) {
 	if !ok || hb == nil {
 		t.Fatal("expected a stored heartbeat request body")
 	}
-	if hb.BloomSize != 1 {
-		t.Errorf("expected bloom_size=1, got %d", hb.BloomSize)
+	if hb.ObjectCount != 0 {
+		t.Errorf("expected object_count=0 (no longer tracked), got %d", hb.ObjectCount)
 	}
 	if !hb.Ready {
-		t.Error("expected ready=true")
+		t.Error("expected ready=true (receiver answers presence via direct CAS.Exists)")
 	}
 }
 
@@ -163,9 +153,8 @@ func TestCoordClient_Heartbeat(t *testing.T) {
 func TestCoordClient_Deregister(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
-	c := newCoordClient(srv.URL, "secret", "node-der", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-der", nil, "", "http://host:9101", obs)
 	c.Start()
 	c.Stop()
 
@@ -178,9 +167,8 @@ func TestCoordClient_Deregister(t *testing.T) {
 func TestCoordClient_StopIdempotent(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
-	c := newCoordClient(srv.URL, "secret", "node-idem", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-idem", nil, "", "http://host:9101", obs)
 	c.Start()
 	c.Stop()
 	c.Stop() // second call must be a no-op
@@ -197,9 +185,8 @@ func TestCoordClient_RegistrationFailure(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	fc.statusCode.Store(http.StatusInternalServerError)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
-	c := newCoordClient(srv.URL, "secret", "node-fail", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-fail", nil, "", "http://host:9101", obs)
 	c.Start() // must not panic
 	defer c.Stop()
 
@@ -213,9 +200,8 @@ func TestCoordClient_RegistrationFailure(t *testing.T) {
 func TestCoordClient_NodeIDDefaultsToHostname(t *testing.T) {
 	_, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
-	c := newCoordClient(srv.URL, "token", "" /* nodeID */, nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "token", "" /* nodeID */, nil, "", "http://host:9101", obs)
 	if c == nil {
 		t.Fatal("expected non-nil client")
 	}
@@ -229,9 +215,8 @@ func TestCoordClient_NodeIDDefaultsToHostname(t *testing.T) {
 func TestCoordClient_404OnDeregister(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
-	c := newCoordClient(srv.URL, "secret", "node-404", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-404", nil, "", "http://host:9101", obs)
 
 	// Force the server to return 404 on the deregister call.
 	fc.statusCode.Store(http.StatusNotFound)
@@ -262,9 +247,8 @@ func TestCoordClient_NodeIDWithSlash(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 	// nodeID with a slash — must be percent-encoded to %2F in the path segment.
-	c := newCoordClient(srv.URL, "tok", "atlas/node1", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "tok", "atlas/node1", nil, "", "http://host:9101", obs)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -302,9 +286,8 @@ func TestCoordClient_TrailingSlashNormalised(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 	// Pass the server URL with a trailing slash.
-	c := newCoordClient(srv.URL+"/", "tok", "node-slash", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL+"/", "tok", "node-slash", nil, "", "http://host:9101", obs)
 	c.Start()
 	defer c.Stop()
 
@@ -327,12 +310,11 @@ func TestCoordClient_TrailingSlashNormalised(t *testing.T) {
 func TestCoordClient_HeartbeatRetriesViaRealTicker(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
 	// First register call fails; subsequent ones succeed.
 	fc.statusCode.Store(http.StatusInternalServerError)
 
-	c := newCoordClient(srv.URL, "secret", "node-hbtick", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-hbtick", nil, "", "http://host:9101", obs)
 
 	// Inject a very short ticker so the test doesn't wait 30 s.
 	c.newTicker = func() *time.Ticker {
@@ -381,13 +363,12 @@ func TestCoordClient_HeartbeatRetriesViaRealTicker(t *testing.T) {
 func TestCoordClient_ControlURLInRegisterBody(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
 	const wantControlURL = "https://myhost.example.com:9100"
 	const wantDataURL = "http://myhost.example.com:9101"
 
 	c := newCoordClient(srv.URL, "secret", "node-ctrl", []string{"test.cern.ch"},
-		wantControlURL, wantDataURL, inv, obs)
+		wantControlURL, wantDataURL, obs)
 	c.Start()
 	defer c.Stop()
 
@@ -408,12 +389,11 @@ func TestCoordClient_ControlURLInRegisterBody(t *testing.T) {
 func TestCoordClient_RetryRegistration(t *testing.T) {
 	fc, srv := newFakeCoord(t)
 	obs := newTestObs(t)
-	inv := newInventory(100, 0.01)
 
 	// Override the register handler via statusCode: first POST fails.
 	fc.statusCode.Store(http.StatusInternalServerError)
 
-	c := newCoordClient(srv.URL, "secret", "node-retry", nil, "", "http://host:9101", inv, obs)
+	c := newCoordClient(srv.URL, "secret", "node-retry", nil, "", "http://host:9101", obs)
 	// Patch heartbeat interval to be very short for the test.
 	c.httpClient.Timeout = coordHTTPTimeout
 
@@ -446,43 +426,4 @@ func TestCoordClient_RetryRegistration(t *testing.T) {
 	}
 
 	c.Stop()
-}
-
-// TestInventory_PopulateFromCAS_UnreadableRoot verifies that populateFromCAS
-// sets ready=true even when the root directory cannot be read (fix for permanent
-// 503 bug when os.ReadDir fails with a non-NotExist error).
-func TestInventory_PopulateFromCAS_UnreadableRoot(t *testing.T) {
-	inv := newInventory(100, 0.01)
-
-	// Pass a path that exists as a file (not a directory), which causes
-	// os.ReadDir to return an error that is not os.IsNotExist.
-	// We create a temp file and use its path as the "casRoot".
-	f, err := createTempFile(t)
-	if err != nil {
-		t.Fatalf("creating temp file: %v", err)
-	}
-
-	logged := false
-	logFn := func(msg string, args ...any) { logged = true }
-
-	populateErr := inv.populateFromCAS(context.Background(), f, logFn)
-	if populateErr == nil {
-		t.Error("expected error from populateFromCAS on a file path, got nil")
-	}
-	// The critical invariant: ready must be true despite the error.
-	if !inv.isReady() {
-		t.Error("isReady() should return true even when populateFromCAS returns an error")
-	}
-	_ = logged
-}
-
-// createTempFile creates a temporary file and returns its path.
-func createTempFile(t *testing.T) (string, error) {
-	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "inv-test-*")
-	if err != nil {
-		return "", err
-	}
-	f.Close()
-	return f.Name(), nil
 }

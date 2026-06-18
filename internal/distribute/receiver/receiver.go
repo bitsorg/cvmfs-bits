@@ -19,9 +19,10 @@
 //
 // When BrokerURL is configured the HMAC/HTTP announce path is supplemented (or
 // replaced) by an MQTT control plane: the receiver subscribes to announce
-// topics for its configured repositories, computes the delta against its own
-// Bloom filter, and publishes a ReadyMessage carrying its session token and the
-// list of absent hashes — all without any inbound firewall rules (outbound
+// topics for its configured repositories, computes the absent set by checking
+// each announced hash directly against its local CAS, and publishes a
+// ReadyMessage carrying its session token and the list of absent hashes — all
+// without any inbound firewall rules (outbound
 // TCP 8883 only).  The data channel (plain HTTP PUT) is unchanged.
 //
 // See REFERENCE.md §20 for the HTTP protocol and §21 for the MQTT control plane.
@@ -86,14 +87,6 @@ type Config struct {
 	// DevMode disables TLS on the control channel and skips HMAC verification.
 	// Never set in production; intended for integration tests only.
 	DevMode bool
-
-	// BloomCapacity is the expected number of distinct CAS objects for the
-	// inventory Bloom filter.  0 uses the package default (5 million).
-	BloomCapacity uint
-
-	// BloomFPRate is the desired false-positive rate for the inventory Bloom
-	// filter (0 < BloomFPRate < 1).  0 uses the package default (0.1%).
-	BloomFPRate float64
 
 	// CoordURL is the base URL of the HepCDN coordination service
 	// (e.g. "https://coord.hepcdn.example.com").  Empty disables coordination.
@@ -206,7 +199,7 @@ func (c *Config) dataEndpoint() string {
 
 // controlEndpoint returns the base URL of the HTTPS control channel for this
 // receiver, used when registering with the coordination service so that the
-// service can route bloom-filter queries and announce requests to the node.
+// service can route announce requests to the node.
 func (c *Config) controlEndpoint() string {
 	host := c.DataHost // DataHost is the public hostname; same for both channels
 	if host == "" {
@@ -227,7 +220,7 @@ func (c *Config) controlEndpoint() string {
 type Receiver struct {
 	cfg          Config
 	store        *sessionStore
-	inv          *inventory
+	casStore     cas.Backend    // local CAS used to compute the absent-hash set
 	coord        *CoordClient   // nil when CoordURL is empty
 	mqttMu       sync.RWMutex   // guards mqttClient
 	mqttClient   *broker.Client // nil when BrokerURL is empty; always access under mqttMu
@@ -279,13 +272,19 @@ func New(cfg Config) (*Receiver, error) {
 		cfg.DataAddr = ":9101"
 	}
 
-	inv := newInventory(cfg.BloomCapacity, cfg.BloomFPRate)
+	// Build the local CAS backend used to answer "do I already hold this hash?"
+	// during announce processing.  This is the single source of truth for the
+	// absent-hash computation that replaces the former inventory Bloom filter.
+	casStore, err := cas.NewLocalFS(cfg.CASRoot)
+	if err != nil {
+		return nil, fmt.Errorf("receiver: CAS at %s: %w", cfg.CASRoot, err)
+	}
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	r := &Receiver{
 		cfg:       cfg,
 		store:     newSessionStore(),
-		inv:       inv,
-		coord:     newCoordClient(cfg.CoordURL, cfg.CoordToken, cfg.NodeID, cfg.Repos, cfg.controlEndpoint(), cfg.dataEndpoint(), inv, cfg.Obs),
+		casStore:  casStore,
+		coord:     newCoordClient(cfg.CoordURL, cfg.CoordToken, cfg.NodeID, cfg.Repos, cfg.controlEndpoint(), cfg.dataEndpoint(), cfg.Obs),
 		stopClean: make(chan struct{}),
 		bgCtx:     bgCtx,
 		bgCancel:  bgCancel,
@@ -297,10 +296,7 @@ func New(cfg Config) (*Receiver, error) {
 	// Pull mode (ADR-0001): build the coordinator that fetches manifests and
 	// pulls missing objects into the local CAS on announce.
 	if cfg.PullMode {
-		store, err := cas.NewLocalFS(cfg.CASRoot)
-		if err != nil {
-			return nil, fmt.Errorf("receiver: pull-mode CAS at %s: %w", cfg.CASRoot, err)
-		}
+		store := casStore
 		// Resolve transfer tuning: explicit flags win; --pull-auto fills any unset
 		// knob from a measured-RTT latency class; otherwise sensible defaults.
 		n := cfg.PullConcurrency
@@ -345,10 +341,9 @@ func New(cfg Config) (*Receiver, error) {
 		r.pullSem = make(chan struct{}, pullConcurrency)
 	}
 
-	// Control channel mux (HTTPS): announce, bloom filter snapshot, metrics.
+	// Control channel mux (HTTPS): announce + metrics.
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/api/v1/announce", r.announceHandler)
-	controlMux.HandleFunc("/api/v1/bloom", r.bloomHandler)
 	// Use the observer's isolated registry so that receiver-specific metrics
 	// (cvmfs_receiver_bytes_received_total, etc.) are visible at /metrics.
 	// promhttp.Handler() uses the process-global default registry, which does
@@ -402,22 +397,6 @@ func (r *Receiver) Start() error {
 		if err := sweepTmpFiles(r.bgCtx, r.cfg.CASRoot, r.cfg.Obs.Logger.Info); err != nil &&
 			err != context.Canceled {
 			r.cfg.Obs.Logger.Warn("receiver: .tmp sweep failed", "error", err)
-		}
-	}()
-
-	// Populate the inventory Bloom filter from the on-disk CAS in the background.
-	// The filter is empty (and isReady() returns false) until the walk completes,
-	// so GET /api/v1/bloom returns 503 with Retry-After during the walk.
-	//
-	// Ordering note: the walk goroutine is started before the listeners are
-	// bound so that the walk begins as early as possible.  This is intentional:
-	// the control and data listeners are bound immediately after, and by the time
-	// a sender can reach the announce endpoint the walk is already in progress.
-	// If the walk finishes before any bloom query arrives the 503 window is zero.
-	go func() {
-		if err := r.inv.populateFromCAS(r.bgCtx, r.cfg.CASRoot, r.cfg.Obs.Logger.Info); err != nil &&
-			err != context.Canceled {
-			r.cfg.Obs.Logger.Error("inventory: CAS walk failed", "error", err)
 		}
 	}()
 

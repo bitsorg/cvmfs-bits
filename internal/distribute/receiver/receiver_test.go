@@ -209,10 +209,12 @@ func TestAnnounce_DiskSpaceRejection(t *testing.T) {
 	obs, shutdown, _ := observe.New("test")
 	defer shutdown()
 
-	// Use /dev/null as CAS root — statfs will succeed but available space will
-	// be far less than math.MaxInt64.
+	// Use a real temp dir as CAS root: statfs reports normal free space, which
+	// is far less than the absurd TotalBytes below, so the announce is rejected
+	// with 507.  (A non-writable path like "/" would fail New() now that the
+	// receiver eagerly opens its local CAS for the absent-hash check.)
 	r, err := New(Config{
-		CASRoot: "/",
+		CASRoot: t.TempDir(),
 		DevMode: true,
 		Obs:     obs,
 	})

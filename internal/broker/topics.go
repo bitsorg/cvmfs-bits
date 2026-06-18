@@ -15,8 +15,8 @@
 //     Last-Will-and-Testament so the broker marks them offline on unexpected
 //     disconnect — replacing the HTTP heartbeat loop in coord_client.go.
 //   - Publishers broadcast an AnnounceMessage to all receivers subscribed to a
-//     repository topic.  Each receiver filters the hash list against its own
-//     Bloom filter and replies with a ReadyMessage carrying its session token and
+//     repository topic.  Each receiver checks the hash list against its own
+//     local CAS and replies with a ReadyMessage carrying its session token and
 //     the subset of hashes it actually needs.
 //   - Publishers collect ReadyMessages until quorum is reached (or a timeout
 //     fires), then push objects to each receiver's plain-HTTP data channel using

@@ -30,15 +30,13 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/bits-and-blooms/bloom/v3"
-
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
-// sharedClient is used for all HTTPS control-channel requests (announce,
-// bloom fetch) and for legacy per-object PUTs to endpoints that do not support
+// sharedClient is used for all HTTPS control-channel requests (announce)
+// and for legacy per-object PUTs to endpoints that do not support
 // the announce protocol.  TLS 1.2 is the minimum acceptable version.
 //
 // A 30 s client-level Timeout acts as a safety net for stalled connections
@@ -96,14 +94,6 @@ type Config struct {
 	// distributor automatically falls back to per-object PUTs for the remainder of that
 	// endpoint.
 	BatchSize int
-
-	// BloomQueryTimeout is the per-endpoint timeout for fetching a receiver's
-	// inventory Bloom filter before computing a delta push (GET /api/v1/bloom).
-	// When non-zero and the receiver supports the announce protocol, the
-	// distributor fetches the filter and skips objects the receiver already
-	// holds, reducing unnecessary network traffic.
-	// Set to 0 (default) to disable delta push and always push all objects.
-	BloomQueryTimeout time.Duration
 
 	// BrokerConfig, when non-nil, enables the MQTT control plane.  The
 	// distributor will publish AnnounceMessages to the broker and collect
@@ -275,68 +265,6 @@ func isPrivateIP(ip net.IP) bool {
 		}
 	}
 	return false
-}
-
-// fetchReceiverBloom fetches and deserialises the inventory Bloom filter from a
-// receiver's control channel (GET /api/v1/bloom).
-//
-// A successful response is the binary encoding of a bloom.BloomFilter written
-// by bloom.BloomFilter.WriteTo.  The caller uses the filter to compute a
-// delta: objects already present at the receiver are skipped.
-//
-// Returns an error for any non-200 response or deserialisation failure.
-// A 503 response means the receiver is still building its inventory; the
-// caller should fall back to pushing all objects.
-// fetchReceiverBloom fetches and deserialises the inventory Bloom filter from a
-// receiver's control channel (GET /api/v1/bloom).
-// hmacSecret is the shared HMAC secret; the function derives the bloom-read
-// bearer token from it and attaches it to the Authorization header.
-func fetchReceiverBloom(ctx context.Context, endpoint, hmacSecret string) (*bloom.BloomFilter, error) {
-	url := strings.TrimRight(endpoint, "/") + "/api/v1/bloom"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("fetchReceiverBloom: building request: %w", err)
-	}
-	// Authenticate with the static bloom-read token derived from the shared secret.
-	if hmacSecret != "" {
-		mac := hmac.New(sha256.New, []byte(hmacSecret))
-		mac.Write([]byte("bloom-read"))
-		token := hex.EncodeToString(mac.Sum(nil))
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := sharedClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetchReceiverBloom: GET %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetchReceiverBloom: %s returned HTTP %d", url, resp.StatusCode)
-	}
-
-	bf := new(bloom.BloomFilter)
-	if err := readBloomFilter(bf, resp.Body, url); err != nil {
-		return nil, err
-	}
-	return bf, nil
-}
-
-// readBloomFilter wraps bloom.BloomFilter.ReadFrom with a panic recovery.
-// The bloom library's ReadFrom panics with "makeslice: len out of range" when
-// fed truncated or corrupt data (the header encodes the expected bitset length
-// and ReadFrom allocates that many bytes upfront).  We recover and return an
-// error so the distributor can fall back gracefully.
-func readBloomFilter(bf *bloom.BloomFilter, r io.Reader, url string) (retErr error) {
-	defer func() {
-		if p := recover(); p != nil {
-			retErr = fmt.Errorf("fetchReceiverBloom: corrupt filter body from %s: panic(%v)", url, p)
-		}
-	}()
-	if _, err := bf.ReadFrom(r); err != nil {
-		return fmt.Errorf("fetchReceiverBloom: deserialising filter from %s: %w", url, err)
-	}
-	return nil
 }
 
 // rejectPrivateHost resolves host and rejects it if any returned address falls
@@ -700,7 +628,6 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 			// data endpoint when the receiver supports the protocol and an
 			// HMAC secret is configured.
 			var sessionToken, dataEP string
-			announceSupported := false
 			if cfg.HMACSecret != "" {
 				ar, err := announce(ectx, endpoint, payloadID, hashes, cfg)
 				if err != nil {
@@ -712,7 +639,6 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 					return nil
 				}
 				if ar.supported {
-					announceSupported = true
 					sessionToken = ar.token
 					dataEP = ar.dataEndpoint
 					cfg.Obs.Logger.Info("announce accepted",
@@ -723,35 +649,11 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 				}
 			}
 
-			// Delta push: fetch the receiver's inventory Bloom filter and skip
-			// objects it already holds.  Only attempted when:
-			//   • the receiver supported the announce protocol (it also serves /api/v1/bloom), and
-			//   • BloomQueryTimeout > 0 (the operator has opted in).
-			// On any error we fall back to pushing all objects — the conservative choice.
+			// On the HTTP announce path the publisher pushes every announced
+			// hash: the receiver computes its own absent set on the MQTT control
+			// plane (see distributor_mqtt.go), and the HTTP announce response
+			// does not carry a hash list to diff against.
 			effectiveHashes := hashes
-			if announceSupported && cfg.BloomQueryTimeout > 0 {
-				bctx, bcancel := context.WithTimeout(ectx, cfg.BloomQueryTimeout)
-				bf, berr := fetchReceiverBloom(bctx, endpoint, cfg.HMACSecret)
-				bcancel()
-				if berr != nil {
-					cfg.Obs.Logger.Warn("bloom fetch failed — pushing all objects",
-						"endpoint", endpoint, "error", berr)
-				} else {
-					filtered := make([]string, 0, len(hashes))
-					for _, h := range hashes {
-						if !bf.TestString(h) {
-							filtered = append(filtered, h)
-						}
-					}
-					skipped := len(hashes) - len(filtered)
-					cfg.Obs.Logger.Info("delta push computed",
-						"endpoint", endpoint,
-						"total", len(hashes),
-						"to_push", len(filtered),
-						"skipped", skipped)
-					effectiveHashes = filtered
-				}
-			}
 
 			// pushOne pushes a single object to the endpoint with per-object
 			// exponential backoff retry.  Transient network errors (connection
@@ -854,11 +756,11 @@ func Distribute(ctx context.Context, payloadID string, hashes []string, casBacke
 							}
 						}
 						// Record total batch elapsed time — not averaged per object.
-					// Per-object fallback (pushOne) records one observation per
-					// object at line 287; both histograms use the same metric so
-					// they are directly comparable.
-					cfg.Obs.Metrics.DistributionDuration.WithLabelValues(endpoint).
-						Observe(elapsed.Seconds())
+						// Per-object fallback (pushOne) records one observation per
+						// object at line 287; both histograms use the same metric so
+						// they are directly comparable.
+						cfg.Obs.Metrics.DistributionDuration.WithLabelValues(endpoint).
+							Observe(elapsed.Seconds())
 						continue
 					}
 				}

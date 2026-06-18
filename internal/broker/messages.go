@@ -10,8 +10,9 @@ import "time"
 // topic will receive it and decide whether they can participate.
 //
 // The Hashes field carries the full set of CAS hashes in the payload.  Each
-// receiver intersects this list against its own Bloom filter to compute the
-// subset it does not yet hold, avoiding unnecessary network transfers.
+// receiver checks this list against its own CAS (CAS.Exists per hash) to
+// compute the subset it does not yet hold, avoiding unnecessary network
+// transfers.
 type AnnounceMessage struct {
 	// PayloadID is the publisher's job UUID.  Receivers echo it back in their
 	// ReadyMessage and use it as the session's PayloadID (idempotency key).
@@ -27,7 +28,7 @@ type AnnounceMessage struct {
 	Repo string `json:"repo"`
 
 	// Hashes is the complete list of CAS object hashes in this payload.
-	// Receivers subtract their Bloom filter to compute AbsentHashes.
+	// Receivers subtract the objects already in their CAS to compute AbsentHashes.
 	Hashes []string `json:"hashes"`
 
 	// TotalBytes is the total compressed size of all objects.
@@ -38,9 +39,9 @@ type AnnounceMessage struct {
 // ReadyMessage is published by a receiver to the publisher's ready topic
 // (see ReadyTopic) after it has processed an AnnounceMessage.
 //
-// The receiver computes AbsentHashes by testing each hash from the announce
-// against its own Bloom inventory filter, so the publisher only needs to push
-// the objects the receiver actually lacks — without a separate bloom-fetch
+// The receiver computes AbsentHashes by checking each hash from the announce
+// against its own local CAS (CAS.Exists), so the publisher only needs to push
+// the objects the receiver actually lacks — without a separate inventory-fetch
 // round-trip.
 type ReadyMessage struct {
 	// NodeID is the receiver's stable identifier (same as Config.NodeID).
@@ -78,7 +79,7 @@ type ReadyMessage struct {
 // synchronised with the canonical repository state after every commit.
 //
 // When Hashes is non-empty (bits path) the receiver can use it to compute the
-// delta against its local Bloom filter and fetch only the missing objects.
+// delta against its local CAS and fetch only the missing objects.
 // When Hashes is empty (native ingest path) the receiver falls back to pulling
 // the new root catalog from Stratum 0 and walking the catalog to discover
 // referenced objects — or simply acknowledges the notification and performs a
@@ -98,8 +99,8 @@ type PublishedMessage struct {
 
 	// Hashes is the full list of CAS object hashes that were part of this
 	// publish.  Populated by the bits pipeline; empty for native ingest.
-	// Receivers that have a populated Bloom filter can subtract their local
-	// inventory from this list to compute the minimal fetch set.
+	// Receivers subtract the objects already present in their local CAS from
+	// this list to compute the minimal fetch set.
 	Hashes []string `json:"hashes,omitempty"`
 }
 
@@ -129,9 +130,9 @@ type PresenceMessage struct {
 	// the broker automatically marks the node offline on unexpected disconnect.
 	Online bool `json:"online"`
 
-	// BloomReady is true once the receiver's Bloom inventory filter has been
-	// populated from the on-disk CAS.  A receiver with BloomReady=false can
-	// still participate but will report all hashes as absent (conservative
-	// behaviour equivalent to BloomQueryTimeout=0 on the distributor).
-	BloomReady bool `json:"bloom_ready"`
+	// Ready is true once the receiver is able to answer presence checks.  The
+	// receiver computes the absent-hash set on demand via direct CAS.Exists, so
+	// it is ready as soon as it is online; the LWT/offline presence sets this
+	// to false.
+	Ready bool `json:"ready"`
 }

@@ -150,7 +150,7 @@ func sortHashesBySize(ctx context.Context, log interface {
 
 // attempt performs a single distribution attempt to the endpoint by delegating
 // to the existing Distribute function with a single-endpoint config.
-// Reuses all existing announce, Bloom-delta, batch and per-object retry logic.
+// Reuses all existing announce, absent-set, batch and per-object retry logic.
 func (w *endpointWorker) attempt(ctx context.Context, item WorkItem) bool {
 	cfg := w.cfg
 	// Scope to this endpoint only; quorum is irrelevant for a single endpoint.

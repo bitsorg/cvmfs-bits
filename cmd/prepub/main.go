@@ -45,7 +45,6 @@ import (
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/pipeline"
-	"cvmfs.io/prepub/internal/pipeline/dedup"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
 	"cvmfs.io/prepub/pkg/observe"
@@ -133,19 +132,16 @@ func main() {
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
 
-	// Optional: repository name for catalog-based dedup seeding at startup.
-	// When set alongside --stratum0-url, the Bloom filter is seeded by walking
-	// the CVMFS catalog tree (much faster than scanning the CAS filesystem for
-	// large repositories).  If not set, falls back to the CAS walk.
-	// In single-repo deployments set this to the same value as the repo field
-	// in job submissions (e.g. "atlas.cern.ch").
-	repoName := flag.String("repo-name", "", "CVMFS repository name for catalog-based dedup seeding at startup (e.g. atlas.cern.ch); leave empty to use CAS walk [publisher]")
+	// Optional: repository name.  Retained for forward compatibility and to
+	// label publishes; no longer used for dedup seeding (dedup is a direct
+	// CAS.Exists per object).  In single-repo deployments set this to the same
+	// value as the repo field in job submissions (e.g. "atlas.cern.ch").
+	repoName := flag.String("repo-name", "", "CVMFS repository name (e.g. atlas.cern.ch) [publisher]")
 
 	// ── Stratum 1 distribution flags (publisher) ─────────────────────────────
 	s1Endpoints := flag.String("s1-endpoints", "", "Comma-separated Stratum 1 HTTPS URLs to pre-warm (e.g. https://s1a.cern.ch,https://s1b.cern.ch) [publisher]")
 	s1Quorum := flag.Float64("s1-quorum", 1.0, "Fraction of Stratum 1 endpoints that must confirm receipt for the publish to proceed (0.5 = majority, 1.0 = all) [publisher]")
 	s1Timeout := flag.Duration("s1-timeout", 60*time.Second, "Per-object/batch timeout for Stratum 1 pushes [publisher]")
-	s1BloomTimeout := flag.Duration("s1-bloom-timeout", 0, "Per-endpoint timeout for fetching inventory Bloom filter (0 = disable delta push) [publisher]")
 	s1MQTTTimeout := flag.Duration("s1-mqtt-quorum-timeout", 30*time.Second, "Time to wait for receiver ready replies before proceeding (MQTT mode) [publisher]")
 	// Queue-driven distribution worker flags.
 	s1WorkerConcurrency := flag.Int("s1-worker-concurrency", 0, "Concurrent transfer goroutines per Stratum 1 endpoint (0 = default 2) [publisher]")
@@ -156,23 +152,6 @@ func main() {
 	s1QueueDepth := flag.Int("s1-queue-depth", 0, "In-memory queue depth per Stratum 1 endpoint (0 = default 512) [publisher]")
 	s1QueueSpoolDir := flag.String("s1-queue-spool-dir", "", "Directory for persistent per-endpoint distribution queues (default: {spool-root}/dist-queue) [publisher]")
 	s1BatchSize := flag.Int("s1-batch-size", 0, "Objects per multipart PUT to each Stratum 1 endpoint (0 = per-object PUTs) [publisher]")
-
-	// Bloom filter dedup — off by default.
-	//
-	// By default the pipeline calls CAS.Exists (stat/HEAD) once per object to
-	// detect duplicates before uploading.  For local-disk or S3 CAS this is
-	// fast and requires no startup walk.
-	//
-	// Enable --bloom-filter when CAS.Exists is expensive (high-latency network
-	// CAS) to replace per-object calls with a pre-seeded in-memory index.
-	// --bloom-snapshot-dir additionally enables cross-node snapshot sharing so
-	// all build nodes merge each other's filter state at startup.
-	bloomFilter := flag.Bool("bloom-filter", false, "Enable in-process Bloom filter for dedup; use when CAS.Exists (stat/HEAD) is expensive (e.g. high-latency network CAS) [publisher]")
-	bloomSnapshotDir := flag.String("bloom-snapshot-dir", "", "Directory for shared Bloom filter snapshots (enables cross-node dedup; must be on a shared filesystem; implies --bloom-filter) [publisher]")
-	bloomNodeID := flag.String("bloom-node-id", "", "Unique node ID for this build node (defaults to hostname) [publisher]")
-	bloomMaxSnapshotAge := flag.Duration("bloom-max-snapshot-age", 0, "Maximum age of peer Bloom snapshots to merge (default 24h) [publisher]")
-	bloomFilterCapacity := flag.Uint("bloom-filter-capacity", 0, "Bloom filter capacity — must match across all nodes (default 10 000 000); auto-sized to catalog count when not using shared snapshots [publisher]")
-	bloomFilterFPRate := flag.Float64("bloom-filter-fp-rate", 0, "Bloom filter false-positive rate — must match across all nodes (default 0.01) [publisher]")
 
 	// Provenance & Rekor transparency log — off by default.
 	provenanceEnabled := flag.Bool("provenance", false, "Enable provenance recording and Rekor transparency log submission [publisher]")
@@ -192,12 +171,6 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key for the control channel [receiver]")
 	sessionTTL := flag.Duration("session-ttl", time.Hour, "How long announce sessions remain valid [receiver]")
 	diskHeadroom := flag.Float64("disk-headroom", 1.2, "Multiplier applied to announced payload size when checking available disk space [receiver]")
-
-	// Receiver inventory Bloom filter — controls the in-memory filter that
-	// tracks which CAS objects are present locally.  Values must be consistent
-	// across all receivers that the distributor will compare filters between.
-	recvBloomCapacity := flag.Uint("bloom-capacity", 0, "Inventory Bloom filter capacity (default 5 000 000) [receiver]")
-	recvBloomFPRate := flag.Float64("bloom-fp-rate", 0, "Inventory Bloom filter false-positive rate (default 0.001) [receiver]")
 
 	// HepCDN coordination service — off by default.
 	// CoordURL enables registration, heartbeat, and topology-aware routing.
@@ -245,7 +218,7 @@ func main() {
 			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
 			stratum0URL, repoName,
 			jobTimeout, minConcurrentJobs, maxConcurrentJobs,
-			s1Endpoints, s1Quorum, s1Timeout, s1BloomTimeout, s1MQTTTimeout,
+			s1Endpoints, s1Quorum, s1Timeout, s1MQTTTimeout,
 			s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth,
 			s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff,
 			s1QueueSpoolDir, s1BatchSize,
@@ -253,9 +226,6 @@ func main() {
 			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
 			sessionTTL, diskHeadroom,
 			nodeID, repos, coordURL, recvStratum0URL,
-			bloomFilter, bloomSnapshotDir, bloomNodeID,
-			bloomMaxSnapshotAge, bloomFilterCapacity, bloomFilterFPRate,
-			recvBloomCapacity, recvBloomFPRate,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			gatewayDirectGraft,
 		)
@@ -280,11 +250,10 @@ func main() {
 	switch *mode {
 	case "publisher":
 		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
-			*bloomFilter, *bloomSnapshotDir, *bloomNodeID, *bloomMaxSnapshotAge, *bloomFilterCapacity, *bloomFilterFPRate,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
-			*s1Endpoints, *s1Quorum, *s1Timeout, *s1BloomTimeout, *s1MQTTTimeout,
+			*s1Endpoints, *s1Quorum, *s1Timeout, *s1MQTTTimeout,
 			*s1WorkerConcurrency, *s1MaxAttempts, *s1QueueDepth,
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*s1BatchSize,
@@ -292,7 +261,7 @@ func main() {
 			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
-			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
+			*coordURL, *nodeID, *repos,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
 			*recvStratum0URL, *distributeMode, *discoveryURL, *brokerAuth, *discoveryVerifyKey,
 			*pullConcurrencyFlag, *pullFilesPerRequest, *pullAuto)
@@ -311,11 +280,6 @@ func runPublisher(
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
 	cvmfsMount, stratum0URL, repoName, casType, casRoot string,
-	bloomFilterEnabled bool,
-	bloomSnapshotDir, bloomNodeID string,
-	bloomMaxSnapshotAge time.Duration,
-	bloomFilterCapacity uint,
-	bloomFilterFPRate float64,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
 	jobTimeout, leaseRetryMax time.Duration,
@@ -323,7 +287,7 @@ func runPublisher(
 	pipelineUploadConc, pipelineCompressLevel int,
 	s1Endpoints string,
 	s1Quorum float64,
-	s1Timeout, s1BloomTimeout, s1MQTTTimeout time.Duration,
+	s1Timeout, s1MQTTTimeout time.Duration,
 	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth int,
 	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff time.Duration,
 	s1QueueSpoolDir string,
@@ -447,27 +411,6 @@ func runPublisher(
 
 	notifyBus := notify.NewBus()
 
-	// Shared Bloom filter — enabled only when --bloom-snapshot-dir is set.
-	sharedFilter := dedup.SharedFilterConfig{
-		Enabled:        bloomSnapshotDir != "",
-		Dir:            bloomSnapshotDir,
-		NodeID:         bloomNodeID,
-		MaxSnapshotAge: bloomMaxSnapshotAge,
-		Capacity:       bloomFilterCapacity,
-		FPRate:         bloomFilterFPRate,
-	}
-	if sharedFilter.Enabled {
-		nodeIDForLog := bloomNodeID
-		if nodeIDForLog == "" {
-			if h, err := os.Hostname(); err == nil {
-				nodeIDForLog = h
-			} else {
-				nodeIDForLog = "(hostname unavailable)"
-			}
-		}
-		obs.Logger.Info("shared Bloom filter enabled", "dir", sharedFilter.Dir, "node_id", nodeIDForLog)
-	}
-
 	// Log staging root status so operators can confirm the mode at startup.
 	if stagingRoot != "" {
 		obs.Logger.Info("tar_path submission mode enabled", "staging_root", stagingRoot)
@@ -494,83 +437,11 @@ func runPublisher(
 		os.Exit(1)
 	}
 
-	// ── Shared dedup Bloom filter (optional, gateway mode only) ─────────────
-	//
-	// Default dedup path: the pipeline calls cfg.CAS.Exists once per object
-	// (a stat or S3 HEAD request) before each Put.  For local-disk or S3 CAS
-	// this is fast and requires no startup walk and no memory overhead.
-	//
-	// Enable --bloom-filter (or --bloom-snapshot-dir, which implies it) when
-	// CAS.Exists is expensive — e.g. a high-latency network CAS where each
-	// HEAD request takes tens of milliseconds.  The Bloom filter replaces most
-	// CAS.Exists calls with an in-memory lookup seeded at startup.
-	//
-	// Seed path: walk the CVMFS catalog tree via Stratum 0 (when --stratum0-url
-	// and --repo-name are set) — 10–100× faster than a CAS filesystem walk for
-	// large repositories.  Falls back to a CAS walk when either flag is absent
-	// or Stratum 0 is temporarily unreachable.
-	//
-	// Add() is called after each successful CAS upload so the filter stays
-	// current without any per-job walk.
-	useBloom := bloomFilterEnabled || sharedFilter.Enabled // --bloom-snapshot-dir implies --bloom-filter
-	// If the CAS backend can check existence natively (e.g. local os.Stat or a
-	// direct S3 HEAD), the Bloom filter adds overhead — an in-memory lookup plus
-	// an RWMutex acquire — on top of an already-cheap CAS.Exists call.  Suppress
-	// it unconditionally for such backends and warn if the operator explicitly
-	// requested it, so the flag does not silently become a no-op.
-	if nec, ok := casBackend.(cas.NativeExistsChecker); ok && nec.ExistsIsNative() {
-		if useBloom {
-			obs.Logger.Warn("--bloom-filter / --bloom-snapshot-dir ignored: CAS backend supports native existence checks (os.Stat / S3 HEAD); using direct CAS.Exists instead")
-		}
-		useBloom = false
-	}
-	var sharedDedup *dedup.Checker
-	if casBackend != nil && useBloom {
-		seedMethod := "CAS filesystem walk"
-		if stratum0URL != "" && repoName != "" {
-			seedMethod = "CVMFS catalog tree walk (stratum0)"
-		} else if stratum0URL != "" {
-			seedMethod = "CAS filesystem walk (--repo-name not set; catalog walk unavailable)"
-		}
-		obs.Logger.Info("initializing shared dedup Bloom filter", "method", seedMethod)
-
-		// Ensure the temp directory for catalog SQLite downloads exists.
-		// walkCatalogTree writes one file per catalog hash here; each is removed
-		// immediately after the catalog is processed.
-		dedupTmpDir := spoolRoot + "/dedup-tmp"
-		if mkErr := os.MkdirAll(dedupTmpDir, 0o750); mkErr != nil {
-			obs.Logger.Error("failed to create dedup temp directory", "dir", dedupTmpDir, "error", mkErr)
-			os.Exit(1)
-		}
-
-		// Use a generous timeout: the catalog walk downloads and queries many
-		// SQLite files over HTTP for large repositories.  5 minutes handles repos
-		// with thousands of nested catalogs.  NewFromCatalog's internal CAS-walk
-		// fallback applies its own 30-second timeout if catalog seeding is skipped.
-		dedupInitCtx, dedupInitCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		var dedupInitErr error
-		sharedDedup, dedupInitErr = dedup.NewFromCatalog(
-			dedupInitCtx,
-			stratum0URL, // empty string → CAS walk fallback inside NewFromCatalog
-			repoName,    // empty string → CAS walk fallback inside NewFromCatalog
-			dedupTmpDir, // temp dir for catalog SQLite files; cleaned up per-catalog
-			casBackend,
-			sharedFilter,
-			obs,
-		)
-		dedupInitCancel()
-		if dedupInitErr != nil {
-			obs.Logger.Error("failed to initialize shared dedup Bloom filter at startup", "error", dedupInitErr)
-			os.Exit(1)
-		}
-		obs.Logger.Info("shared dedup Bloom filter ready — all jobs will use this checker")
-	} else if casBackend != nil {
-		if nec, ok := casBackend.(cas.NativeExistsChecker); ok && nec.ExistsIsNative() {
-			obs.Logger.Info("dedup: using direct CAS.Exists per object (CAS backend has native existence check; Bloom filter not needed)")
-		} else {
-			obs.Logger.Info("dedup: using direct CAS.Exists per object (Bloom filter disabled; enable with --bloom-filter for high-latency CAS)")
-		}
-	}
+	// Dedup: the pipeline calls cfg.CAS.Exists once per object (a stat for
+	// local-disk CAS, a HEAD for S3) before each Put.  The CAS backend is the
+	// single source of truth for object presence — no in-memory index, no
+	// startup walk, no shared snapshot state.
+	obs.Logger.Info("dedup: using direct CAS.Exists per object")
 
 	// Embedded control-plane broker (alternative to an external mosquitto): run
 	// an in-process MQTT broker with a WebSocket listener on S0. The publisher's
@@ -687,7 +558,6 @@ func runPublisher(
 				Obs:                  obs,
 				DevMode:              devMode,
 				HMACSecret:           hmacSecret,
-				BloomQueryTimeout:    s1BloomTimeout,
 				BrokerConfig:         brokerCfg,
 				MQTTQuorumTimeout:    s1MQTTTimeout,
 				WorkerConcurrency:    s1WorkerConcurrency,
@@ -769,8 +639,6 @@ func runPublisher(
 			CAS:           casBackend,
 			SpoolDir:      spoolRoot,
 			Obs:           obs,
-			SharedFilter:  sharedFilter,
-			DedupChecker:  sharedDedup, // shared across all jobs — no per-job CAS walk
 		},
 		Distribute:        distCfg,
 		DistManager:       distManager,
@@ -920,8 +788,6 @@ func runReceiver(
 	casRoot string,
 	sessionTTL time.Duration,
 	diskHeadroom float64,
-	bloomCapacity uint,
-	bloomFPRate float64,
 	coordURL, nodeID, reposFlag string,
 	brokerURL, brokerClientCert, brokerClientKey, brokerCACert string,
 	stratum0URL string,
@@ -1086,8 +952,6 @@ func runReceiver(
 		SessionTTL:                sessionTTL,
 		DiskHeadroom:              diskHeadroom,
 		DevMode:                   devMode,
-		BloomCapacity:             bloomCapacity,
-		BloomFPRate:               bloomFPRate,
 		CoordURL:                  coordURL,
 		CoordToken:                coordToken,
 		NodeID:                    nodeID,

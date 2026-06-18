@@ -37,11 +37,11 @@ const defaultMQTTQuorumTimeout = 30 * time.Second
 //
 // # Delta push
 //
-// Unlike the HTTP path (where the distributor fetches the receiver's Bloom
-// filter via GET /api/v1/bloom), the MQTT path delegates delta computation to
+// Unlike the HTTP path (where the distributor pushes every announced hash),
+// the MQTT path delegates absent-set computation to
 // the receiver: each ReadyMessage carries AbsentHashes — the subset of hashes
 // the receiver does not yet hold.  This removes a network round-trip from the
-// critical path and keeps the Bloom filter private to each node.
+// critical path and keeps each node's CAS state private to that node.
 //
 // # Backward compatibility
 //

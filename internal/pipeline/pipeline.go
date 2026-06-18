@@ -24,7 +24,6 @@ import (
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/pipeline/catalog"
 	"cvmfs.io/prepub/internal/pipeline/compress"
-	"cvmfs.io/prepub/internal/pipeline/dedup"
 	"cvmfs.io/prepub/internal/pipeline/unpack"
 	"cvmfs.io/prepub/internal/pipeline/upload"
 	"cvmfs.io/prepub/pkg/cvmfscatalog"
@@ -54,24 +53,6 @@ type Config struct {
 	SpoolDir string
 	// Obs provides logging, tracing, and metrics.
 	Obs *observe.Provider
-	// SharedFilter enables cross-node Bloom filter snapshot sharing (Option B).
-	// Off by default.  See dedup.SharedFilterConfig for details.
-	SharedFilter dedup.SharedFilterConfig
-	// DedupChecker is the optional Bloom-filter dedup checker.  When non-nil
-	// the pipeline uses a two-step dedup path: fast in-memory Bloom filter
-	// negative test followed by a CAS.Exists confirmation for positives.
-	//
-	// Enable this for high-latency CAS backends (e.g. remote S3 or a network
-	// mount) where per-object CAS.Exists calls are expensive enough to make a
-	// pre-seeded in-memory index worthwhile.  Pass a shared *dedup.Checker
-	// created once at service startup so all concurrent jobs share the same
-	// filter state.  Enable via --bloom-filter or --bloom-snapshot-dir.
-	//
-	// When nil (the default) each pipeline run calls cfg.CAS.Exists directly
-	// before every Put — a single stat/HEAD per object.  For local-disk CAS
-	// this is fast and requires no startup walk, no memory overhead, and has
-	// no risk of filter saturation.  The caller owns the checker's lifecycle.
-	DedupChecker *dedup.Checker
 	// PreloadExe is the repo-relative path to the application binary whose
 	// startup was traced (e.g. "sw/ROOT/v6-24-06-4/bin/root").  When non-empty
 	// and PreloadPaths is non-nil the pipeline writes a .<base>.cvmfspreload
@@ -228,11 +209,11 @@ func RunFromPrefetch(ctx context.Context, prefetch *PrefetchResult, cfg Config) 
 // processing without requiring the complete tar to be saved to disk first.
 //
 // Pipeline stages:
-//   0. Collect: buffer all tar entries and sort by descending size (largest first)
-//   1. Fan-out: route each sorted FileEntry to both compress and catalog workers
-//   2. Compress: compress and hash each file using a worker pool
-//   3. Catalog: build the in-memory entry list from catalogChan
-//   4. Dedup+Upload: concurrent dedup check + CAS upload worker pool
+//  0. Collect: buffer all tar entries and sort by descending size (largest first)
+//  1. Fan-out: route each sorted FileEntry to both compress and catalog workers
+//  2. Compress: compress and hash each file using a worker pool
+//  3. Catalog: build the in-memory entry list from catalogChan
+//  4. Dedup+Upload: concurrent dedup check + CAS upload worker pool
 //
 // Sorting by descending size ensures the largest objects enter the compress and
 // upload workers first, so they are in CAS before smaller objects complete.
@@ -527,49 +508,16 @@ func runFromSortedEntries(
 
 	// Stage 4: Concurrent dedup + upload worker pool.
 	//
-	// Dedup strategy — two modes, selected by whether DedupChecker is set:
-	//
-	//   Default (DedupChecker == nil): call cfg.CAS.Exists for each candidate
-	//   hash before uploading.  For local-disk CAS or S3 this is a single
-	//   stat/HEAD request per object — fast enough that no pre-seeded index is
-	//   needed.  There is no startup walk, no memory overhead, and no risk of
-	//   filter saturation.  This mode is also automatically chosen when the CAS
-	//   backend implements cas.NativeExistsChecker even if a DedupChecker is
-	//   configured (see below).
-	//
-	//   Bloom-filter mode (DedupChecker != nil): use a pre-seeded Bloom filter
-	//   for a fast in-memory negative test, confirming positives with CAS.Exists.
-	//   Enable this when CAS.Exists is expensive (e.g. high-latency network CAS
-	//   where each HEAD request takes tens of milliseconds) by passing a shared
-	//   *dedup.Checker seeded at service startup via --bloom-filter or
-	//   --bloom-snapshot-dir.  Backends that implement cas.NativeExistsChecker
-	//   always use the direct path regardless of this setting.
-	dedupChecker := cfg.DedupChecker // nil → direct CAS.Exists path
-	// If the CAS backend supports native existence checks, discard any
-	// configured Bloom filter: the filter adds an in-memory lookup plus RWMutex
-	// overhead on top of an already-cheap CAS.Exists call (os.Stat or S3 HEAD).
-	// This is a safety net; the startup code in main.go already sets DedupChecker
-	// to nil for such backends, but a manually constructed Config could still
-	// carry both.
-	if dedupChecker != nil {
-		if nec, ok := cfg.CAS.(cas.NativeExistsChecker); ok && nec.ExistsIsNative() {
-			cfg.Obs.Logger.DebugContext(ctx, "pipeline: discarding Bloom filter — CAS backend has native exists check (stat/HEAD)")
-			dedupChecker = nil
-		}
-	}
-	if dedupChecker != nil {
-		cfg.Obs.Logger.DebugContext(ctx, "pipeline: Bloom-filter dedup active")
-	} else {
-		cfg.Obs.Logger.DebugContext(ctx, "pipeline: using direct CAS.Exists for dedup (no Bloom filter)")
-	}
+	// Dedup strategy: call cfg.CAS.Exists for each candidate hash before
+	// uploading.  For local-disk CAS this is a single os.Stat; for S3 it is a
+	// single HEAD request.  There is no startup walk, no in-memory index, and no
+	// memory overhead — the CAS backend is the single source of truth for object
+	// presence.
+	cfg.Obs.Logger.DebugContext(ctx, "pipeline: using direct CAS.Exists for dedup")
 
-	// checkExists reports whether hash is already in CAS.
-	// When Bloom-filter mode is active it uses the two-step filter+confirm path;
-	// otherwise it calls CAS.Exists directly — a single stat/HEAD per object.
+	// checkExists reports whether hash is already in CAS via a single
+	// CAS.Exists call (stat/HEAD per object).
 	checkExists := func(workerCtx context.Context, hash string) (bool, error) {
-		if dedupChecker != nil {
-			return dedupChecker.Check(workerCtx, hash)
-		}
 		exists, err := cfg.CAS.Exists(workerCtx, hash)
 		if err != nil {
 			return false, fmt.Errorf("CAS existence check %s: %w", hash, err)
@@ -626,7 +574,7 @@ func runFromSortedEntries(
 		}
 
 		if isDup {
-			// Already in CAS — confirmed by dedup.Check (which increments the
+			// Already in CAS — confirmed by CAS.Exists (which increments the
 			// dedup-hits metric).  Add to ObjectHashes so S1 distribution workers
 			// know to push this object to Stratum 1 replicas.
 			//
@@ -644,11 +592,6 @@ func runFromSortedEntries(
 		// New object: upload to CAS.
 		if err := upload.PutWithRetry(workerCtx, cfg.CAS, hash, compressedData, compressedSize); err != nil {
 			return fmt.Errorf("cas put %s: %w", hash, err)
-		}
-		// Update the Bloom filter (when active) so subsequent jobs and concurrent
-		// workers can dedup against this object without a CAS.Exists round-trip.
-		if dedupChecker != nil {
-			dedupChecker.Add(hash)
 		}
 		if err := uploadLog.Record(hash); err != nil {
 			return fmt.Errorf("recording upload %s: %w", hash, err)
@@ -923,26 +866,6 @@ func runFromSortedEntries(
 				"exe", cfg.PreloadExe,
 				"requested", len(cfg.PreloadPaths))
 		}
-	}
-
-	// Bloom filter snapshot: persist the updated filter so peer nodes can merge
-	// it on their next job start.  Only runs when Bloom-filter mode is active
-	// AND snapshot sharing is enabled (--bloom-snapshot-dir).  Non-fatal — a
-	// missed save only means peers won't see this run's new objects until the
-	// next successful save.  Runs asynchronously to avoid blocking the caller
-	// on shared-filesystem I/O.
-	if dedupChecker != nil && cfg.SharedFilter.Enabled {
-		// Capture locals for the goroutine closure; ctx is already done by the
-		// time we reach here (egCtx is derived from it), so pass background.
-		snapshotDedupChecker := dedupChecker
-		snapshotFilter := cfg.SharedFilter
-		snapshotObs := cfg.Obs
-		go func() {
-			if saveErr := snapshotDedupChecker.SaveSnapshot(snapshotFilter, snapshotObs); saveErr != nil {
-				snapshotObs.Logger.Warn("shared bloom: snapshot save failed (continuing)",
-					"error", saveErr)
-			}
-		}()
 	}
 
 	cfg.Obs.Logger.InfoContext(ctx, "pipeline complete",

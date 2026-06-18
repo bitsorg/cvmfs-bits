@@ -171,7 +171,6 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	s1Endpoints := ""
 	s1Quorum := 1.0
 	s1Timeout := 60 * time.Second
-	s1BloomTimeout := time.Duration(0)
 	s1MQTTTimeout := 30 * time.Second
 	s1WorkerConcurrency, s1MaxAttempts, s1QueueDepth := 0, 0, 0
 	s1AttemptTimeout, s1InitialBackoff, s1MaxBackoff := time.Duration(0), time.Duration(0), time.Duration(0)
@@ -194,14 +193,6 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 	recvStratum0URL := ""
 	minConcurrentJobs := 0
 	maxConcurrentJobs := 0
-	bloomFilter := false
-	bloomSnapshotDir := ""
-	bloomNodeID := ""
-	bloomMaxSnapshotAge := time.Duration(0)
-	bloomFilterCapacity := uint(0)
-	bloomFilterFPRate := 0.0
-	recvBloomCapacity := uint(0)
-	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer := ""
 	rekorSigningKey := ""
@@ -212,7 +203,7 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
 		&stratum0URL, &repoName,
 		&jobTimeout, &minConcurrentJobs, &maxConcurrentJobs,
-		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
+		&s1Endpoints, &s1Quorum, &s1Timeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency, &s1MaxAttempts, &s1QueueDepth,
 		&s1AttemptTimeout, &s1InitialBackoff, &s1MaxBackoff,
 		&s1QueueSpoolDir, &s1BatchSize,
@@ -220,9 +211,6 @@ func TestApplyFileConfig_CopiesWhenNotExplicit(t *testing.T) {
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
 		&nodeID, &repos, &coordURL, &recvStratum0URL,
-		&bloomFilter, &bloomSnapshotDir, &bloomNodeID,
-		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
-		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
 		&gatewayDirectGraft,
 	)
@@ -262,7 +250,6 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	s1Endpoints := ""
 	s1Quorum := 1.0
 	s1Timeout := 60 * time.Second
-	s1BloomTimeout := time.Duration(0)
 	s1MQTTTimeout := 30 * time.Second
 	s1WorkerConcurrency2, s1MaxAttempts2, s1QueueDepth2 := 0, 0, 0
 	s1AttemptTimeout2, s1InitialBackoff2, s1MaxBackoff2 := time.Duration(0), time.Duration(0), time.Duration(0)
@@ -275,13 +262,6 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	nodeID, repos, coordURL, recvStratum0URL := "", "", "", ""
 	minConcurrentJobs2 := 0
 	maxConcurrentJobs2 := 0
-	bloomFilter2 := false
-	bloomSnapshotDir, bloomNodeID := "", ""
-	bloomMaxSnapshotAge := time.Duration(0)
-	bloomFilterCapacity := uint(0)
-	bloomFilterFPRate := 0.0
-	recvBloomCapacity := uint(0)
-	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
 	gatewayDirectGraft2 := false
@@ -290,7 +270,7 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
 		&stratum0URL, &repoName2,
 		&jobTimeout2, &minConcurrentJobs2, &maxConcurrentJobs2,
-		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
+		&s1Endpoints, &s1Quorum, &s1Timeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency2, &s1MaxAttempts2, &s1QueueDepth2,
 		&s1AttemptTimeout2, &s1InitialBackoff2, &s1MaxBackoff2,
 		&s1QueueSpoolDir2, &s1BatchSize2,
@@ -298,9 +278,6 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
 		&nodeID, &repos, &coordURL, &recvStratum0URL,
-		&bloomFilter2, &bloomSnapshotDir, &bloomNodeID,
-		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
-		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
 		&gatewayDirectGraft2,
 	)
@@ -325,7 +302,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	repoName3 := ""
 	jobTimeout3 := time.Duration(0)
 	s1Quorum := 1.0
-	s1Timeout, s1BloomTimeout, s1MQTTTimeout := 60*time.Second, time.Duration(0), 30*time.Second
+	s1Timeout, s1MQTTTimeout := 60*time.Second, 30*time.Second
 	s1WorkerConcurrency3, s1MaxAttempts3, s1QueueDepth3 := 0, 0, 0
 	s1AttemptTimeout3, s1InitialBackoff3, s1MaxBackoff3 := time.Duration(0), time.Duration(0), time.Duration(0)
 	s1QueueSpoolDir3 := ""
@@ -337,13 +314,6 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 	nodeID, repos, coordURL, recvStratum0URL3 := "", "", "", ""
 	minConcurrentJobs3 := 0
 	maxConcurrentJobs3 := 0
-	bloomFilter3 := false
-	bloomSnapshotDir, bloomNodeID := "", ""
-	bloomMaxSnapshotAge := time.Duration(0)
-	bloomFilterCapacity := uint(0)
-	bloomFilterFPRate := 0.0
-	recvBloomCapacity := uint(0)
-	recvBloomFPRate := 0.0
 	provenanceEnabled := false
 	rekorServer, rekorSigningKey, oidcIssuers := "", "", ""
 	gatewayDirectGraft3 := false
@@ -352,7 +322,7 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 		&spoolRoot, &stagingRoot, &listen, &publishMode, &gatewayURL, &cvmfsMount, &casType, &casRoot,
 		&stratum0URL, &repoName3,
 		&jobTimeout3, &minConcurrentJobs3, &maxConcurrentJobs3,
-		&s1Endpoints, &s1Quorum, &s1Timeout, &s1BloomTimeout, &s1MQTTTimeout,
+		&s1Endpoints, &s1Quorum, &s1Timeout, &s1MQTTTimeout,
 		&s1WorkerConcurrency3, &s1MaxAttempts3, &s1QueueDepth3,
 		&s1AttemptTimeout3, &s1InitialBackoff3, &s1MaxBackoff3,
 		&s1QueueSpoolDir3, &s1BatchSize3,
@@ -360,9 +330,6 @@ func TestApplyFileConfig_EndpointSlice(t *testing.T) {
 		&controlAddr, &dataAddr, &dataHost, &tlsCert, &tlsKey,
 		&sessionTTL, &diskHeadroom,
 		&nodeID, &repos, &coordURL, &recvStratum0URL3,
-		&bloomFilter3, &bloomSnapshotDir, &bloomNodeID,
-		&bloomMaxSnapshotAge, &bloomFilterCapacity, &bloomFilterFPRate,
-		&recvBloomCapacity, &recvBloomFPRate,
 		&provenanceEnabled, &rekorServer, &rekorSigningKey, &oidcIssuers,
 		&gatewayDirectGraft3,
 	)
