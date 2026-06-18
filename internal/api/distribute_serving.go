@@ -38,6 +38,9 @@ type DistributeServing struct {
 	// (GET /control/challenge, POST /control/enroll) so receivers can exchange
 	// their out-of-band node key for a short-lived data-plane token.
 	Enroll *credential.EnrollServer
+	// RateLimit, when set, wraps the control endpoints (enroll) to bound request
+	// floods (R-DoS). Typically credential.IPRateLimiter.Middleware.
+	RateLimit func(http.Handler) http.Handler
 }
 
 // MountDistributeServing registers the pull-distribution routes on the server's
@@ -82,8 +85,12 @@ func mountDistributeServing(router *mux.Router, requireAuth mux.MiddlewareFunc, 
 		router.Handle("/s1/catchup", catchup).Methods(http.MethodGet)
 	}
 	if d.Enroll != nil {
-		router.Handle("/control/challenge", d.Enroll.Handler()).Methods(http.MethodGet)
-		router.Handle("/control/enroll", d.Enroll.Handler()).Methods(http.MethodPost)
+		var eh http.Handler = d.Enroll.Handler()
+		if d.RateLimit != nil {
+			eh = d.RateLimit(eh)
+		}
+		router.Handle("/control/challenge", eh).Methods(http.MethodGet)
+		router.Handle("/control/enroll", eh).Methods(http.MethodPost)
 	}
 	if log != nil {
 		log.Info("distribute serving mounted (pull mode)",

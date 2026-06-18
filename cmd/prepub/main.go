@@ -752,9 +752,11 @@ func runPublisher(
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
 
+	// Control-plane DoS limiter (internet-exposed; no firewall assumed).
+	ctrlRateLimit := credential.NewIPRateLimiter(5, 10, 4096, 100, 200)
 	if controlPlaneURL != "" {
 		disco := &staticDiscovery{repos: []string{repoName}, cp: serve.ControlPlaneRef{Type: "mqtt", URL: controlPlaneURL}}
-		apiServer.MountDiscovery(&serve.DiscoveryHandler{Source: disco})
+		apiServer.MountDiscovery(ctrlRateLimit.Middleware(&serve.DiscoveryHandler{Source: disco}))
 		obs.Logger.Info("control-plane: discovery advertising broker", "url", controlPlaneURL)
 	}
 
@@ -771,6 +773,7 @@ func runPublisher(
 			Manifests: pullManifestStore,
 			Admission: admission,
 			Enroll:    enrollSrv,
+			RateLimit: ctrlRateLimit.Middleware,
 		})
 		obs.Logger.Info("ADR-0001: pull-mode distribute serving enabled")
 	}
