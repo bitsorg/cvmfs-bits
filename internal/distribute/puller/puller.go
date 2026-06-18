@@ -7,12 +7,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"sync"
 
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
 	"cvmfs.io/prepub/internal/distribute/manifest"
 )
+
+// defaultSlots is the parallel-transfer default when Slots is unset; chosen to
+// match the cvmfs_server snapshot norm rather than a timid handful.
+const defaultSlots = 16
 
 // Puller fetches a transaction's objects into the local CAS (ADR-0001 D1/D3/R3).
 // It computes the missing set locally (manifest − localstore), so no per-receiver
@@ -23,8 +28,15 @@ type Puller struct {
 	Store cas.Backend
 	// Fetcher transfers individual objects (default: HTTPFetcher).
 	Fetcher distribute.Fetcher
-	// Slots bounds concurrent object fetches (default 4).
+	// Slots bounds concurrent object fetches / bundle requests (default 16).
 	Slots int
+	// FilesPerRequest, when > 1, switches to chunked-bundle transfers: the
+	// missing set is split into chunks of this many objects, each fetched in one
+	// POST /s1/bundle request, with up to Slots requests in flight. 1 (default)
+	// keeps the per-object path.
+	FilesPerRequest int
+	// Client is used for chunked-bundle requests (nil -> http.DefaultClient).
+	Client *http.Client
 	// State, when set, records the last-synced root on a fully successful pull (R4).
 	State *State
 }
@@ -58,7 +70,7 @@ func (p *Puller) Pull(ctx context.Context, m *manifest.Manifest) (Result, error)
 
 	slots := p.Slots
 	if slots <= 0 {
-		slots = 4
+		slots = defaultSlots
 	}
 	sem := make(chan struct{}, slots)
 	var wg sync.WaitGroup

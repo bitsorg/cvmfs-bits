@@ -27,8 +27,11 @@ type Coordinator struct {
 	// ManifestBase + "/s1/{txn}/manifest". Object locations come from the
 	// manifest's own BaseURLs.
 	ManifestBase string
-	Client       *http.Client
-	Puller       *Puller
+	// BundleBase is the base URL for the chunked-bundle endpoint (POST
+	// {BundleBase}/s1/bundle). Empty defaults to ManifestBase.
+	BundleBase string
+	Client     *http.Client
+	Puller     *Puller
 	// MaxManifestBytes caps the manifest body read (0 = 256 MiB default).
 	MaxManifestBytes int64
 	// CatchupBase is the base URL for the cumulative catch-up endpoint
@@ -78,6 +81,16 @@ func (c *Coordinator) OnTransaction(ctx context.Context, txnID string) (Result, 
 	}
 	if err := m.Validate(); err != nil {
 		return Result{}, fmt.Errorf("coordinator: %w", err)
+	}
+	// Chunked-bundle path when the receiver is tuned for >1 file per request;
+	// otherwise the per-object path.
+	if c.Puller != nil && c.Puller.FilesPerRequest > 1 {
+		base := c.BundleBase
+		if base == "" {
+			base = c.ManifestBase
+		}
+		bundleURL := strings.TrimRight(base, "/") + "/s1/bundle"
+		return c.Puller.PullChunked(ctx, bundleURL, m)
 	}
 	return c.Puller.Pull(ctx, m)
 }

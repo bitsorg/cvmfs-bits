@@ -58,6 +58,9 @@ func mountDistributeServing(router *mux.Router, requireAuth mux.MiddlewareFunc, 
 		router.PathPrefix("/cvmfs/").
 			Handler(&serve.ObjectHandler{Store: d.CAS}).
 			Methods(http.MethodGet, http.MethodHead)
+		// Chunked-bundle endpoint: many objects in one streamed response (P-A).
+		router.Handle("/s1/bundle", &serve.BundleHandler{Store: d.CAS}).
+			Methods(http.MethodPost)
 	}
 	if d.Manifests != nil {
 		router.Handle("/s1/{txn}/manifest", &serve.ManifestHandler{Source: d.Manifests}).

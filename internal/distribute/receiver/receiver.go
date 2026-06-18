@@ -163,6 +163,16 @@ type Config struct {
 	// manifest's own BaseURLs.
 	PullManifestBase string
 
+	// PullConcurrency bounds parallel object transfers / bundle requests in pull
+	// mode (0 = default 16).
+	PullConcurrency int
+	// PullFilesPerRequest sets objects per chunked-bundle request in pull mode:
+	// >1 enables the bundle path; 0 or 1 keeps the per-object path.
+	PullFilesPerRequest int
+	// PullAuto measures RTT to Stratum 0 at startup and picks PullConcurrency /
+	// PullFilesPerRequest from a latency-class table when they are left unset.
+	PullAuto bool
+
 	// OnWarmed, when set, is invoked exactly once after each pull-mode warming
 	// attempt completes (ADR-0001 D6). warmed is true only when every missing
 	// object was fetched and verified, i.e. the receiver is warm for txn; the
@@ -218,15 +228,15 @@ type Receiver struct {
 	cfg          Config
 	store        *sessionStore
 	inv          *inventory
-	coord        *CoordClient    // nil when CoordURL is empty
-	mqttMu       sync.RWMutex    // guards mqttClient
-	mqttClient   *broker.Client  // nil when BrokerURL is empty; always access under mqttMu
+	coord        *CoordClient   // nil when CoordURL is empty
+	mqttMu       sync.RWMutex   // guards mqttClient
+	mqttClient   *broker.Client // nil when BrokerURL is empty; always access under mqttMu
 	control      *http.Server
 	data         *http.Server
-	stopClean    chan struct{}        // signal to stop the cleanup goroutine
-	bgCtx        context.Context     // cancelled by Shutdown to stop background goroutines
-	bgCancel     context.CancelFunc  // cancels bgCtx
-	shutdownOnce sync.Once           // ensures Shutdown can be safely called multiple times
+	stopClean    chan struct{}      // signal to stop the cleanup goroutine
+	bgCtx        context.Context    // cancelled by Shutdown to stop background goroutines
+	bgCancel     context.CancelFunc // cancels bgCtx
+	shutdownOnce sync.Once          // ensures Shutdown can be safely called multiple times
 
 	// httpClient is used for outbound S0 fetch requests triggered by
 	// PublishedMessage notifications.  Initialised once in New() and shared
@@ -291,15 +301,47 @@ func New(cfg Config) (*Receiver, error) {
 		if err != nil {
 			return nil, fmt.Errorf("receiver: pull-mode CAS at %s: %w", cfg.CASRoot, err)
 		}
+		// Resolve transfer tuning: explicit flags win; --pull-auto fills any unset
+		// knob from a measured-RTT latency class; otherwise sensible defaults.
+		n := cfg.PullConcurrency
+		k := cfg.PullFilesPerRequest
+		if cfg.PullAuto && (n == 0 || k == 0) {
+			rtt := probeRTT(bgCtx, r.httpClient, cfg.PullManifestBase)
+			an, ak := autoTune(rtt)
+			if n == 0 {
+				n = an
+			}
+			if k == 0 {
+				k = ak
+			}
+			cfg.Obs.Logger.Info("pull: auto-tuned transfer parameters from RTT",
+				"rtt", rtt.String(), "concurrency", n, "files_per_request", k)
+		}
+		if n == 0 {
+			n = 16
+		}
+		if k == 0 {
+			k = 1
+		}
+		mode := "per-object"
+		if k > 1 {
+			mode = "chunked-bundle"
+		}
 		r.pullCoordinator = &puller.Coordinator{
 			ManifestBase: cfg.PullManifestBase,
+			BundleBase:   cfg.PullManifestBase,
 			Client:       r.httpClient,
 			Puller: &puller.Puller{
-				Store:   store,
-				Fetcher: &puller.HTTPFetcher{Client: r.httpClient},
-				State:   puller.NewState(filepath.Join(cfg.CASRoot, ".bits-state")),
+				Store:           store,
+				Fetcher:         &puller.HTTPFetcher{Client: r.httpClient},
+				State:           puller.NewState(filepath.Join(cfg.CASRoot, ".bits-state")),
+				Slots:           n,
+				FilesPerRequest: k,
+				Client:          r.httpClient,
 			},
 		}
+		cfg.Obs.Logger.Info("pull: transfer tuning",
+			"concurrency", n, "files_per_request", k, "mode", mode, "auto", cfg.PullAuto)
 		r.pullSem = make(chan struct{}, pullConcurrency)
 	}
 
@@ -331,8 +373,8 @@ func New(cfg Config) (*Receiver, error) {
 	r.data = &http.Server{
 		Addr:              cfg.DataAddr,
 		Handler:           dataMux,
-		ReadHeaderTimeout: 30 * time.Second,  // guards against Slowloris header drip
-		ReadTimeout:       0,                 // streaming: no per-body read deadline
+		ReadHeaderTimeout: 30 * time.Second, // guards against Slowloris header drip
+		ReadTimeout:       0,                // streaming: no per-body read deadline
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}

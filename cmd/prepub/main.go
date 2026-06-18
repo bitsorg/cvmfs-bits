@@ -75,6 +75,9 @@ func main() {
 	enrollURL := flag.String("enroll-url", "", "HTTPS base URL for the TLS enroll/revoke endpoint, advertised to receivers via discovery (e.g. https://cvmfs-prepub:8443) [publisher]")
 	discoverySigningKey := flag.String("discovery-signing-key", "", "PEM Ed25519 private key to sign the discovery document; receivers verify with the matching public key so no shared secret reaches a receiver [publisher]")
 	discoveryVerifyKey := flag.String("discovery-verify-key", "", "PEM Ed25519 public key to verify the signed discovery document [receiver]")
+	pullConcurrencyFlag := flag.Int("pull-concurrency", 0, "Parallel object transfers / bundle requests in pull mode (0 = default 16) [receiver]")
+	pullFilesPerRequest := flag.Int("pull-files-per-request", 0, "Objects per chunked-bundle request in pull mode; >1 enables bundling, 0/1 = per-object [receiver]")
+	pullAuto := flag.Bool("pull-auto", false, "Measure RTT to Stratum 0 and auto-pick --pull-concurrency/--pull-files-per-request from a latency class when they are unset [receiver]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
 	config := flag.String("config", "", "Config file path (reserved for future use)")
@@ -291,7 +294,8 @@ func main() {
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*recvStratum0URL, *distributeMode, *discoveryURL, *brokerAuth, *discoveryVerifyKey)
+			*recvStratum0URL, *distributeMode, *discoveryURL, *brokerAuth, *discoveryVerifyKey,
+			*pullConcurrencyFlag, *pullFilesPerRequest, *pullAuto)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
 		os.Exit(1)
@@ -925,6 +929,8 @@ func runReceiver(
 	discoveryURL string,
 	brokerAuth bool,
 	discoveryVerifyKey string,
+	pullConcurrency, pullFilesPerRequest int,
+	pullAuto bool,
 ) {
 	// Load the HMAC shared secret from the environment.  In DevMode the
 	// receiver skips HMAC verification entirely, so the secret is not required.
@@ -1089,6 +1095,9 @@ func runReceiver(
 		Stratum0URL:               stratum0URL,
 		PullMode:                  distributeMode == "pull",
 		PullManifestBase:          stratum0URL, // in pull mode this points at the cvmfs-prepub endpoint
+		PullConcurrency:           pullConcurrency,
+		PullFilesPerRequest:       pullFilesPerRequest,
+		PullAuto:                  pullAuto,
 		BrokerURL:                 brokerURL,
 		BrokerClientCert:          brokerClientCert,
 		BrokerClientKey:           brokerClientKey,
