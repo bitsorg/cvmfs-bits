@@ -21,7 +21,7 @@ import (
 // Auth is allow-all in this first cut (dev/testbed); production should replace
 // the AllowHook with an OnConnectAuthenticate/OnACLCheck hook bound to the
 // existing HMAC/token scheme. Caller must call server.Close() on shutdown.
-func startEmbeddedBroker(wsAddr string, tlsCfg *tls.Config, authHook mqttbroker.Hook, obs *observe.Provider) (func(), error) {
+func startEmbeddedBroker(wsAddr string, tlsCfg *tls.Config, authHook *brokerAuthHook, obs *observe.Provider) (func(), error) {
 	server := mqttbroker.New(&mqttbroker.Options{InlineClient: false})
 	if authHook != nil {
 		if err := server.AddHook(authHook, nil); err != nil {

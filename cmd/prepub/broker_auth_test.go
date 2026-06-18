@@ -13,7 +13,7 @@ import (
 func TestBrokerAuthHook(t *testing.T) {
 	secret := []byte("test-secret-at-least-32-bytes-long!!")
 	m := credential.NewMinter(secret)
-	h := newBrokerAuthHook(credential.NewVerifier(secret), "publisher", nil)
+	h := newBrokerAuthHook(credential.NewVerifier(secret), "publisher", newRevocation(), nil)
 
 	pubTok, _, _ := m.Mint("publisher", "control", "n1", time.Minute)
 	recvTok, _, _ := m.Mint("stratum1-a", "control", "n2", time.Minute)

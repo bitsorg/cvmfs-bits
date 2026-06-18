@@ -5,6 +5,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"sync"
 
@@ -29,13 +33,13 @@ type brokerAuthHook struct {
 
 	mu      sync.RWMutex
 	clients map[string]string // mqtt client-id -> authenticated node id
-	revoked map[string]bool   // revoked node ids (denylist)
+	revoc   *revocation       // shared revocation denylist
 }
 
-func newBrokerAuthHook(v *credential.Verifier, publisherNode string, obs *observe.Provider) *brokerAuthHook {
+func newBrokerAuthHook(v *credential.Verifier, publisherNode string, revoc *revocation, obs *observe.Provider) *brokerAuthHook {
 	return &brokerAuthHook{
 		verifier: v, publisherNode: publisherNode, obs: obs,
-		clients: map[string]string{}, revoked: map[string]bool{},
+		clients: map[string]string{}, revoc: revoc,
 	}
 }
 
@@ -56,10 +60,7 @@ func (h *brokerAuthHook) authNode(token string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	h.mu.RLock()
-	revoked := h.revoked[claims.Node]
-	h.mu.RUnlock()
-	if revoked {
+	if h.revoc.IsRevoked(claims.Node) {
 		return "", false
 	}
 	return claims.Node, true
@@ -104,13 +105,9 @@ func (h *brokerAuthHook) OnDisconnect(cl *mqttbroker.Client, _ error, _ bool) {
 	h.mu.Unlock()
 }
 
-// Revoke marks a node revoked (future connects refused). Pair with disconnectNode
-// for immediate cut-off of any live session.
-func (h *brokerAuthHook) Revoke(node string) {
-	h.mu.Lock()
-	h.revoked[node] = true
-	h.mu.Unlock()
-}
+// Revoke marks a node revoked (future connects refused). Pair with active
+// disconnect of live sessions for immediate cut-off.
+func (h *brokerAuthHook) Revoke(node string) { h.revoc.Revoke(node) }
 
 // clientsForNode returns the mqtt client-ids currently authenticated as node
 // (used by the revoke command to actively disconnect live sessions).
@@ -124,4 +121,51 @@ func (h *brokerAuthHook) clientsForNode(node string) []string {
 		}
 	}
 	return ids
+}
+
+// revocation is a shared denylist used by both the enroll key store (refuse new
+// enrollments) and the broker auth hook (refuse new connects).
+type revocation struct {
+	mu  sync.RWMutex
+	set map[string]bool
+}
+
+func newRevocation() *revocation { return &revocation{set: map[string]bool{}} }
+
+func (r *revocation) Revoke(node string) {
+	r.mu.Lock()
+	r.set[node] = true
+	r.mu.Unlock()
+}
+
+func (r *revocation) IsRevoked(node string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.set[node]
+}
+
+// derivedEnrollStore implements credential.EnrollKeyStore by deriving each
+// node's enrollment key as HMAC-SHA256(secret, node). This gives per-node keys
+// (granular revocation via the shared denylist) with ZERO key distribution —
+// both sides derive the same key from the one shared secret. "publisher" is
+// reserved (the publisher mints its own token directly; nobody may enroll as it).
+type derivedEnrollStore struct {
+	secret []byte
+	revoc  *revocation
+}
+
+func (d *derivedEnrollStore) Key(node string) ([]byte, bool) {
+	if node == "" || node == "publisher" || d.revoc.IsRevoked(node) {
+		return nil, false
+	}
+	mac := hmac.New(sha256.New, d.secret)
+	mac.Write([]byte(node))
+	return mac.Sum(nil), true
+}
+
+// randNonce returns a random 128-bit hex nonce (token jti / uniqueness).
+func randNonce() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }

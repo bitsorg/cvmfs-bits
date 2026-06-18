@@ -39,6 +39,7 @@ import (
 	"cvmfs.io/prepub/internal/distribute"
 	"cvmfs.io/prepub/internal/distribute/commit"
 	"cvmfs.io/prepub/internal/distribute/receiver"
+	"cvmfs.io/prepub/internal/distribute/credential"
 	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
@@ -62,6 +63,7 @@ func main() {
 	pullObjectBaseURL := flag.String("pull-object-base-url", "", "Externally reachable base URL for content-addressed object GETs, embedded in pull manifests as {url}/cvmfs/{repo}/data (e.g. http://cvmfs-prepub:8080) [publisher]")
 	embeddedBrokerTLSCert := flag.String("embedded-broker-tls-cert", "", "PEM server certificate for the embedded broker WebSocket listener; enables wss:// [publisher]")
 	embeddedBrokerTLSKey := flag.String("embedded-broker-tls-key", "", "PEM private key for --embedded-broker-tls-cert [publisher]")
+	embeddedBrokerAuth := flag.Bool("embedded-broker-auth", false, "Require token authentication on the embedded broker (needs PREPUB_HMAC_SECRET); receivers enrol via challenge/response [publisher]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
 	config := flag.String("config", "", "Config file path (reserved for future use)")
@@ -272,7 +274,7 @@ func main() {
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*s1BatchSize,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey)
+			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
@@ -314,6 +316,7 @@ func runPublisher(
 	distributeMode string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
 	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
+	embeddedBrokerAuth bool,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
@@ -556,6 +559,9 @@ func runPublisher(
 	// own broker clients connect on localhost; receivers connect via the URL
 	// advertised in discovery (ADR-0001 D7/D10).
 	var brokerClose func()
+	var enrollSrv *credential.EnrollServer
+	var pubCreds func() (string, string)
+	var authHook *brokerAuthHook
 	if embeddedBrokerWSAddr != "" {
 		// Build the broker's server TLS config (H1: real wss://). When no cert is
 		// configured the listener stays plaintext ws:// (dev), but advertising a
@@ -572,7 +578,28 @@ func runPublisher(
 			obs.Logger.Error("embedded broker: --control-plane-url is wss:// but --embedded-broker-tls-cert/--embedded-broker-tls-key are not set")
 			os.Exit(1)
 		}
-		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, brokerTLS, nil, obs)
+		if embeddedBrokerAuth {
+			secret := []byte(os.Getenv("PREPUB_HMAC_SECRET"))
+			if len(secret) < 16 {
+				obs.Logger.Error("embedded broker: --embedded-broker-auth requires PREPUB_HMAC_SECRET (>= 16 bytes)")
+				os.Exit(1)
+			}
+			revoc := newRevocation()
+			minter := credential.NewMinter(secret)
+			authHook = newBrokerAuthHook(credential.NewVerifier(secret), "publisher", revoc, obs)
+			enrollSrv = credential.NewEnrollServer(&derivedEnrollStore{secret: secret, revoc: revoc},
+				minter, func(m string, a ...any) { obs.Logger.Info(m, a...) })
+			enrollSrv.Scope = "control"
+			pubCreds = func() (string, string) {
+				tok, _, merr := minter.Mint("publisher", "control", randNonce(), 10*time.Minute)
+				if merr != nil {
+					return "", ""
+				}
+				return "publisher", tok
+			}
+			obs.Logger.Info("embedded broker: token authentication enabled")
+		}
+		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, brokerTLS, authHook, obs)
 		if berr != nil {
 			obs.Logger.Error("failed to start embedded broker", "error", berr)
 			os.Exit(1)
@@ -673,6 +700,14 @@ func runPublisher(
 		}
 	}
 
+	if pubCreds != nil {
+		if publishBrokerCfg != nil {
+			publishBrokerCfg.CredentialsProvider = pubCreds
+		}
+		if distCfg != nil && distCfg.BrokerConfig != nil {
+			distCfg.BrokerConfig.CredentialsProvider = pubCreds
+		}
+	}
 	pullManifestStore := serve.NewMemManifestStore()
 	orch := &api.Orchestrator{
 		Spool:           sp,
@@ -734,6 +769,7 @@ func runPublisher(
 			CAS:       casBackend,
 			Manifests: pullManifestStore,
 			Admission: admission,
+			Enroll:    enrollSrv,
 		})
 		obs.Logger.Info("ADR-0001: pull-mode distribute serving enabled")
 	}

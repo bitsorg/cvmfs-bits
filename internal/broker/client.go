@@ -54,6 +54,14 @@ type Config struct {
 	// enforce per-node topic ACLs and to resume persistent sessions.
 	// Defaults to the system hostname if empty.
 	ClientID string
+
+	// Username/Password authenticate the MQTT CONNECT (token control plane).
+	// CredentialsProvider, when set, supplies fresh credentials on each
+	// (re)connect — this is how short-lived tokens refresh without a reconnect
+	// storm; it takes precedence over Username/Password.
+	Username string
+	Password string
+	CredentialsProvider func() (username, password string)
 }
 
 // Client wraps a Paho MQTT connection and provides typed publish/subscribe
@@ -106,6 +114,15 @@ func New(cfg Config) (*Client, error) {
 		SetAutoReconnect(true).
 		SetConnectRetryInterval(defaultReconnectWait).
 		SetCleanSession(false) // persist subscriptions across reconnects
+
+	// Control-plane authentication: present the scoped bearer token as the MQTT
+	// password. A CredentialsProvider yields fresh credentials per (re)connect.
+	if cfg.CredentialsProvider != nil {
+		opts.SetCredentialsProvider(cfg.CredentialsProvider)
+	} else if cfg.Username != "" || cfg.Password != "" {
+		opts.SetUsername(cfg.Username)
+		opts.SetPassword(cfg.Password)
+	}
 
 	// Configure mTLS when a client certificate is provided.
 	tlsCfg, err := buildTLSConfig(cfg)
