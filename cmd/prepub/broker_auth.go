@@ -89,13 +89,21 @@ func (h *brokerAuthHook) OnConnectAuthenticate(cl *mqttbroker.Client, pk packets
 	h.mu.Lock()
 	h.clients[cl.ID] = node
 	h.mu.Unlock()
+	// Stash the TOKEN-VERIFIED node on the client connection object itself, so
+	// authorization is tied to the connection's own lifetime. This overwrites
+	// any client-supplied CONNECT username (which is untrusted) with the node
+	// proven by the bearer token, so it cannot be forged. OnACLCheck reads it
+	// from here rather than from a separate map, which a reconnect/takeover plus
+	// OnDisconnect could clear out from under an inflight QoS-1 publish.
+	cl.Properties.Username = []byte(node)
 	return true
 }
 
 func (h *brokerAuthHook) OnACLCheck(cl *mqttbroker.Client, topic string, write bool) bool {
-	h.mu.RLock()
-	node := h.clients[cl.ID]
-	h.mu.RUnlock()
+	// The authenticated node is stored on the connection (set from the verified
+	// token in OnConnectAuthenticate), so it is correct for the whole connection
+	// lifetime and immune to the clients-map / OnDisconnect reconnect race.
+	node := string(cl.Properties.Username)
 	return aclAllowed(node, h.publisherNode, topic, write)
 }
 
