@@ -219,14 +219,10 @@ func (c *Config) controlEndpoint() string {
 // Receiver runs the two-channel pre-warming server.
 type Receiver struct {
 	cfg          Config
-	store        *sessionStore
-	casStore     cas.Backend    // local CAS used to compute the absent-hash set
-	coord        *CoordClient   // nil when CoordURL is empty
-	mqttMu       sync.RWMutex   // guards mqttClient
-	mqttClient   *broker.Client // nil when BrokerURL is empty; always access under mqttMu
-	control      *http.Server
-	data         *http.Server
-	stopClean    chan struct{}      // signal to stop the cleanup goroutine
+	casStore     cas.Backend        // local CAS used to compute the absent-hash set
+	mqttMu       sync.RWMutex       // guards mqttClient
+	mqttClient   *broker.Client     // nil when BrokerURL is empty; always access under mqttMu
+	metrics      *http.Server       // serves /metrics for Prometheus scraping
 	bgCtx        context.Context    // cancelled by Shutdown to stop background goroutines
 	bgCancel     context.CancelFunc // cancels bgCtx
 	shutdownOnce sync.Once          // ensures Shutdown can be safely called multiple times
@@ -281,13 +277,10 @@ func New(cfg Config) (*Receiver, error) {
 	}
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	r := &Receiver{
-		cfg:       cfg,
-		store:     newSessionStore(),
-		casStore:  casStore,
-		coord:     newCoordClient(cfg.CoordURL, cfg.CoordToken, cfg.NodeID, cfg.Repos, cfg.controlEndpoint(), cfg.dataEndpoint(), cfg.Obs),
-		stopClean: make(chan struct{}),
-		bgCtx:     bgCtx,
-		bgCancel:  bgCancel,
+		cfg:      cfg,
+		casStore: casStore,
+		bgCtx:    bgCtx,
+		bgCancel: bgCancel,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute, // generous for large CAS objects
 		},
@@ -341,37 +334,21 @@ func New(cfg Config) (*Receiver, error) {
 		r.pullSem = make(chan struct{}, pullConcurrency)
 	}
 
-	// Control channel mux (HTTPS): announce + metrics.
-	controlMux := http.NewServeMux()
-	controlMux.HandleFunc("/api/v1/announce", r.announceHandler)
-	// Use the observer's isolated registry so that receiver-specific metrics
-	// (cvmfs_receiver_bytes_received_total, etc.) are visible at /metrics.
-	// promhttp.Handler() uses the process-global default registry, which does
-	// NOT contain metrics registered via observe.New → prometheus.NewRegistry().
+	// Metrics server: pull-mode distribution exposes only /metrics for
+	// Prometheus scraping (the legacy HTTP push announce + object listeners are
+	// gone). Use the observer's isolated registry so receiver-specific metrics
+	// (cvmfs_receiver_*, pull_*) are visible; promhttp.Handler() would use the
+	// process-global default registry, which does not contain them.
+	metricsMux := http.NewServeMux()
 	metricsHandler := promhttp.HandlerFor(cfg.Obs.Registry, promhttp.HandlerOpts{})
-	controlMux.Handle("/metrics", metricsHandler)
+	metricsMux.Handle("/metrics", metricsHandler)
 
-	r.control = &http.Server{
+	r.metrics = &http.Server{
 		Addr:         cfg.ControlAddr,
-		Handler:      controlMux,
+		Handler:      metricsMux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
-	}
-
-	// Data channel mux (plain HTTP): object PUTs only.
-	// The body size is not bounded here because CAS objects may be large;
-	// the handler streams directly to disk rather than buffering in memory.
-	dataMux := http.NewServeMux()
-	dataMux.HandleFunc("/api/v1/objects/", r.putObjectHandler)
-
-	r.data = &http.Server{
-		Addr:              cfg.DataAddr,
-		Handler:           dataMux,
-		ReadHeaderTimeout: 30 * time.Second, // guards against Slowloris header drip
-		ReadTimeout:       0,                // streaming: no per-body read deadline
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
 	}
 
 	return r, nil
@@ -381,18 +358,9 @@ func New(cfg Config) (*Receiver, error) {
 // It returns as soon as both listeners are bound; actual request handling
 // continues in background goroutines.  Call Shutdown to stop the servers.
 func (r *Receiver) Start() error {
-	if !r.cfg.DevMode && (r.cfg.TLSCert == "" || r.cfg.TLSKey == "") {
-		return fmt.Errorf("receiver: TLSCert and TLSKey are required for the control channel (set DevMode for tests)")
-	}
-	// Start the background session reaper.
-	go r.runCleanup()
-
-	// Remove any .tmp files left by PUT handlers that were interrupted by a
-	// previous crash.  This must run before the data channel listener opens so
-	// that no new PUT can race with the sweep, and before the CAS walk so that
-	// orphaned temp files are not counted as CAS objects.
-	// Both goroutines receive bgCtx so Shutdown() can interrupt them promptly
-	// on a stalling filesystem (e.g. NFS timeout).
+	// Remove any ".tmp" files left under the CAS by object fetches that were
+	// interrupted by a previous crash, so they are not mistaken for objects.
+	// bgCtx lets Shutdown() interrupt the sweep promptly on a stalling filesystem.
 	go func() {
 		if err := sweepTmpFiles(r.bgCtx, r.cfg.CASRoot, r.cfg.Obs.Logger.Info); err != nil &&
 			err != context.Canceled {
@@ -400,59 +368,28 @@ func (r *Receiver) Start() error {
 		}
 	}()
 
-	// Start the data channel first (plain HTTP — always succeeds if the port
-	// is free) so it is ready before senders receive announce responses.
-	dataLn, err := net.Listen("tcp", r.cfg.DataAddr)
+	// Bind the /metrics listener (plain HTTP) for Prometheus scraping. This is
+	// the only inbound HTTP surface in pull mode; the legacy push announce and
+	// object listeners have been removed.
+	metricsLn, err := net.Listen("tcp", r.cfg.ControlAddr)
 	if err != nil {
-		// On early failure, cancel background goroutines and stop the cleanup
-		// goroutine to avoid goroutine leaks.
 		r.bgCancel()
-		close(r.stopClean)
-		return fmt.Errorf("receiver: binding data channel %s: %w", r.cfg.DataAddr, err)
+		return fmt.Errorf("receiver: binding metrics listener %s: %w", r.cfg.ControlAddr, err)
 	}
 	go func() {
-		if serveErr := r.data.Serve(dataLn); serveErr != nil && serveErr != http.ErrServerClosed {
-			r.cfg.Obs.Logger.Error("data channel error", "error", serveErr)
+		if serveErr := r.metrics.Serve(metricsLn); serveErr != nil && serveErr != http.ErrServerClosed {
+			r.cfg.Obs.Logger.Error("metrics listener error", "error", serveErr)
 		}
 	}()
-	r.cfg.Obs.Logger.Info("receiver data channel listening (plain HTTP)", "addr", r.cfg.DataAddr)
+	r.cfg.Obs.Logger.Info("receiver metrics listening", "addr", r.cfg.ControlAddr)
 
-	// Start the control channel (HTTPS unless DevMode).
-	controlLn, err := net.Listen("tcp", r.cfg.ControlAddr)
-	if err != nil {
-		// On early failure, cancel background goroutines, stop the cleanup
-		// goroutine, and shut down the data channel to avoid goroutine leaks.
-		r.bgCancel()
-		close(r.stopClean)
-		_ = r.data.Shutdown(context.Background())
-		return fmt.Errorf("receiver: binding control channel %s: %w", r.cfg.ControlAddr, err)
-	}
-
-	if r.cfg.DevMode {
-		go func() {
-			if serveErr := r.control.Serve(controlLn); serveErr != nil && serveErr != http.ErrServerClosed {
-				r.cfg.Obs.Logger.Error("control channel error", "error", serveErr)
-			}
-		}()
-		r.cfg.Obs.Logger.Warn("receiver control channel listening (plain HTTP — DEV MODE ONLY)",
-			"addr", r.cfg.ControlAddr)
-	} else {
-		go func() {
-			if serveErr := r.control.ServeTLS(controlLn, r.cfg.TLSCert, r.cfg.TLSKey); serveErr != nil && serveErr != http.ErrServerClosed {
-				r.cfg.Obs.Logger.Error("control channel TLS error", "error", serveErr)
-			}
-		}()
-		r.cfg.Obs.Logger.Info("receiver control channel listening (HTTPS)", "addr", r.cfg.ControlAddr)
-	}
-
-	// Start the coordination service client (no-op when CoordURL is empty).
-	r.coord.Start()
-
-	// Start the MQTT control plane (no-op when BrokerURL is empty).
+	// Start the MQTT control plane (no-op when BrokerURL is empty). This is how
+	// the receiver learns of new transactions (announce) and commits (published)
+	// and triggers its pulls.
 	if err := r.startMQTT(); err != nil {
-		// MQTT is supplemental — log the error but do not abort startup so
-		// the HTTP announce path continues to work.
-		r.cfg.Obs.Logger.Error("receiver: MQTT startup failed — continuing without broker",
+		// MQTT is the only trigger in pull mode; log loudly but do not abort so
+		// the metrics endpoint stays up for diagnosis.
+		r.cfg.Obs.Logger.Error("receiver: MQTT startup failed — no pull trigger active",
 			"error", err)
 	}
 
@@ -462,49 +399,22 @@ func (r *Receiver) Start() error {
 // Shutdown gracefully stops both servers, waiting up to the deadline in ctx.
 // Safe to call multiple times.
 func (r *Receiver) Shutdown(ctx context.Context) error {
-	var ctlErr, dataErr error
+	var metricsErr error
 	r.shutdownOnce.Do(func() {
-		// Cancel background goroutines (CAS walk, tmp sweep) first so they can
-		// exit before the process terminates.  On a stalling filesystem this
-		// prevents Shutdown from blocking waiting for goroutines that will never
-		// complete on their own.
+		// Cancel background goroutines (e.g. the .tmp sweep) first so they can
+		// exit before the process terminates.
 		r.bgCancel()
-		// Stop the cleanup goroutine.
-		close(r.stopClean)
-		// Deregister from the coordination service before closing listeners.
-		r.coord.Stop()
-		// Disconnect from the MQTT broker before closing listeners so an
+		// Disconnect from the MQTT broker before closing the listener so an
 		// explicit offline presence is published before the TCP connection closes.
 		r.stopMQTT()
-		// Shut down the control channel first to stop new announces.
-		ctlErr = r.control.Shutdown(ctx)
-		// Then the data channel once in-flight PUTs can complete.
-		dataErr = r.data.Shutdown(ctx)
+		// Shut down the metrics listener.
+		metricsErr = r.metrics.Shutdown(ctx)
 	})
-	if ctlErr != nil {
-		return ctlErr
-	}
-	return dataErr
+	return metricsErr
 }
 
-// Addrs returns the actual listen addresses of the control and data channels
-// after Start has been called.  Useful in tests where ":0" is used to let the
-// OS assign a free port.
-func (r *Receiver) Addrs() (controlAddr, dataAddr string) {
-	return r.cfg.ControlAddr, r.cfg.DataAddr
-}
-
-// runCleanup sweeps expired sessions every minute for the lifetime of the
-// receiver.  It exits when Shutdown() is called and closes stopClean.
-func (r *Receiver) runCleanup() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.stopClean:
-			return
-		case <-ticker.C:
-			r.store.cleanup()
-		}
-	}
+// Addrs returns the actual listen address of the metrics endpoint after Start
+// has been called. Useful in tests where ":0" lets the OS assign a free port.
+func (r *Receiver) Addrs() (metricsAddr string) {
+	return r.cfg.ControlAddr
 }

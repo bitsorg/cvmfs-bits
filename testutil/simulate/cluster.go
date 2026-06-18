@@ -85,21 +85,10 @@ func (c *Cluster) NewOrchestrator(repo string) *api.Orchestrator {
 
 	leaseClient := lease.NewClient(c.Gateway.URL(), "test-key", "test-secret", c.Obs)
 
+	// Distribution is now broker-driven (the pre-commit announce is published on
+	// the control-plane broker). The simulate cluster has no broker, so Distribute
+	// is left nil; receivers in these tests are exercised directly.
 	var distConfig *distribute.Config
-	if len(c.Stratum1s) > 0 {
-		var endpoints []string
-		for _, s1 := range c.Stratum1s {
-			endpoints = append(endpoints, s1.URL())
-		}
-		distConfig = &distribute.Config{
-			Endpoints:   endpoints,
-			Quorum:      1.0,
-			Timeout:     5 * time.Second,
-			Concurrency: 4,
-			Obs:         c.Obs,
-			DevMode:     true, // test servers use http://127.0.0.1
-		}
-	}
 
 	return &api.Orchestrator{
 		Spool:      sp,

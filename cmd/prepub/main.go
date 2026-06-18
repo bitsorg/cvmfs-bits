@@ -552,51 +552,17 @@ func runPublisher(
 				os.Exit(1)
 			}
 			distCfg = &distribute.Config{
-				Endpoints:            endpoints,
-				Quorum:               s1Quorum,
-				Timeout:              s1Timeout,
-				Obs:                  obs,
-				DevMode:              devMode,
-				HMACSecret:           hmacSecret,
-				BrokerConfig:         brokerCfg,
-				MQTTQuorumTimeout:    s1MQTTTimeout,
-				WorkerConcurrency:    s1WorkerConcurrency,
-				QueueDepth:           s1QueueDepth,
-				WorkerAttemptTimeout: s1AttemptTimeout,
-				WorkerInitialBackoff: s1InitialBackoff,
-				WorkerMaxBackoff:     s1MaxBackoff,
-				WorkerMaxAttempts:    s1MaxAttempts,
-				BatchSize:            s1BatchSize,
-				// Default spool dir: {spoolRoot}/dist-queue.
-				// Operators can override via --s1-queue-spool-dir or YAML config (queue_spool_dir).
-				QueueSpoolDir: func() string {
-					if s1QueueSpoolDir != "" {
-						return s1QueueSpoolDir
-					}
-					return spoolRoot + "/dist-queue"
-				}(),
+				Obs:          obs,
+				BrokerConfig: brokerCfg,
 			}
-			obs.Logger.Info("Stratum 1 distribution configured",
-				"endpoints", len(endpoints),
-				"mqtt", brokerCfg != nil,
-				"quorum", s1Quorum,
-				"worker_concurrency", distCfg.WorkerConcurrency,
-				"attempt_timeout", distCfg.WorkerAttemptTimeout,
-				"batch_size", distCfg.BatchSize)
+			obs.Logger.Info("control-plane announce configured", "broker", brokerCfg != nil)
 		}
 	}
 
-	// Create the queue-driven distribution manager when S1 endpoints are
-	// configured.  The manager is started after the orchestrator is wired up
-	// so that the server startup sequence is linear.
-	// Attach the publisher's token credentials to the distribution broker config
-	// BEFORE NewManager snapshots it, so announce clients present a token (H3).
+	// Attach the publisher's token credentials to the announce broker config so
+	// the one-shot announce client authenticates to the embedded broker (H3).
 	if pubCreds != nil && distCfg != nil && distCfg.BrokerConfig != nil {
 		distCfg.BrokerConfig.CredentialsProvider = pubCreds
-	}
-	var distManager *distribute.Manager
-	if distCfg != nil && len(distCfg.Endpoints) > 0 {
-		distManager = distribute.NewManager(*distCfg, casBackend)
 	}
 
 	// Build a broker config for post-commit publish notifications.
@@ -641,7 +607,6 @@ func runPublisher(
 			Obs:           obs,
 		},
 		Distribute:        distCfg,
-		DistManager:       distManager,
 		Notify:            notifyBus,
 		Provenance:        provProvider,
 		Obs:               obs,
@@ -651,13 +616,6 @@ func runPublisher(
 
 	if jobTimeout > 0 {
 		obs.Logger.Info("per-job timeout enabled", "job_timeout", jobTimeout)
-	}
-
-	// Start the distribution manager after the orchestrator is created so the
-	// manager's worker goroutines have access to the shared CAS backend.
-	if distManager != nil {
-		distManager.Start(context.Background())
-		obs.Logger.Info("distribution manager started", "endpoints", len(distCfg.Endpoints))
 	}
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)

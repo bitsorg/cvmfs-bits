@@ -81,15 +81,10 @@ type Orchestrator struct {
 	// is purely a performance optimisation that can be toggled at runtime via
 	// --gateway-direct-graft for A/B comparison and integrity verification.
 	DirectGraft bool
-	// Distribute contains configuration for Stratum 1 push distribution.
-	// nil disables distribution (typical for local mode).
+	// Distribute carries the control-plane broker configuration used to emit the
+	// pre-commit pull announce (ADR-0001). nil disables the announce (typical for
+	// local mode); receivers then converge on the post-commit published broadcast.
 	Distribute *distribute.Config
-
-	// DistManager is the queue-driven distribution manager.  When non-nil it
-	// is used instead of the legacy fire-and-forget goroutine; each publish job
-	// enqueues a WorkItem and DistManager handles retries, backoff, and
-	// per-endpoint parallelism.  Typically created alongside Distribute.
-	DistManager *distribute.Manager
 
 	// BrokerConfig is the MQTT broker configuration used for publishing commit
 	// notifications (PublishedMessage) after a successful catalog commit.  When
@@ -283,13 +278,13 @@ func (o *Orchestrator) takePrefetch(ctx context.Context, jobID string) *pipeline
 // every missing level down to j.Path.  This catalog is committed to the
 // gateway exactly like a normal content publish:
 //
-//   1. BuildSubtree  — produces a minimal SQLite catalog (a few KB at most)
-//   2. CAS.Put       — uploads the catalog to the local CAS
-//   3. repoMu.Lock   — serialise with respect to other jobs for this repo
-//   4. FetchManifestRootHash — lightweight manifest GET (~200 bytes)
-//   5. GatewayQueue.Acquire / Lease.Acquire for graftPath
-//   6. Lease.Commit  — SubmitPayload + commit POST (creates the dir entries)
-//   7. Mark ancestors in knownPaths so subsequent publishes skip this step
+//  1. BuildSubtree  — produces a minimal SQLite catalog (a few KB at most)
+//  2. CAS.Put       — uploads the catalog to the local CAS
+//  3. repoMu.Lock   — serialise with respect to other jobs for this repo
+//  4. FetchManifestRootHash — lightweight manifest GET (~200 bytes)
+//  5. GatewayQueue.Acquire / Lease.Acquire for graftPath
+//  6. Lease.Commit  — SubmitPayload + commit POST (creates the dir entries)
+//  7. Mark ancestors in knownPaths so subsequent publishes skip this step
 //
 // The root catalog SQLite file is never downloaded.
 //

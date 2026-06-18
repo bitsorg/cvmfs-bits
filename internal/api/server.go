@@ -7,8 +7,6 @@
 package api
 
 import (
-	"golang.org/x/net/netutil"
-	"net"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -16,7 +14,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/net/netutil"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -95,7 +95,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 		spoolRoot:   spoolRoot,
 		stagingRoot: stagingRoot,
 		httpServer: &http.Server{
-			Handler:           router,
+			Handler: router,
 			// Slowloris defenses (the control plane may be internet-exposed; do not
 			// rely on a firewall). ReadHeaderTimeout bounds slow header attacks;
 			// IdleTimeout reaps idle keep-alives. No Read/Write timeout so large tar
@@ -222,12 +222,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			httpErr = ctx.Err()
 		}
 		return httpErr
-	}
-
-	// Phase 2: drain the distribution manager (all job goroutines have finished
-	// so all Enqueue calls have already been made).
-	if s.orch.DistManager != nil {
-		s.orch.DistManager.Drain(ctx)
 	}
 
 	return httpErr

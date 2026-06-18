@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"cvmfs.io/prepub/internal/broker"
 )
@@ -106,136 +105,12 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 	// transaction manifest and pull the missing objects, instead of replying with
 	// a push session. A pull-mode publisher does not push, so we return here.
 	// startPull is bounded and deduplicated (see pull.go).
+	// Pull mode (ADR-0001): the announce is a "prepare" trigger. Fetch the
+	// transaction manifest and pull the missing objects (bounded + deduplicated;
+	// see pull.go). Pull is the only distribution mode.
 	if r.pullCoordinator != nil {
 		r.startPull(ann.PayloadID, ann.Repo)
-		return
 	}
-
-	replyTopic := broker.ReadyTopic(ann.PublisherID, ann.PayloadID, r.cfg.NodeID)
-	nodeID := r.cfg.NodeID
-	if nodeID == "" {
-		nodeID = "unknown"
-	}
-
-	// Helper: publish a ReadyMessage with only an error field set.
-	replyErr := func(errMsg string) {
-		r.cfg.Obs.Logger.Warn("mqtt: rejecting announce",
-			"payload_id", ann.PayloadID, "reason", errMsg)
-		r.mqttPublish(replyTopic, broker.ReadyMessage{
-			NodeID: nodeID,
-			Error:  errMsg,
-		})
-	}
-
-	// Validate that the announced repository is one we serve.
-	if !r.servesRepo(ann.Repo) {
-		// Not our repo — ignore silently.  The topic ACL should prevent this,
-		// but a misconfigured ACL or wildcard subscription should not cause noise.
-		return
-	}
-
-	// Disk space pre-check (same logic as announceHandler).
-	if ann.TotalBytes > 0 {
-		headroom := r.cfg.DiskHeadroom
-		if headroom <= 0 {
-			headroom = 1.2
-		}
-		required := int64(float64(ann.TotalBytes) * headroom)
-		if required < ann.TotalBytes {
-			required = ann.TotalBytes // overflow guard
-		}
-		if err := checkDiskSpace(r.cfg.CASRoot, required); err != nil {
-			replyErr(fmt.Sprintf("insufficient disk space: %v", err))
-			return
-		}
-	}
-
-	// Guard against announce flooding / memory-exhaustion attacks.
-	// A rogue broker client could send an AnnounceMessage with millions of
-	// hashes; computeAbsentHashes would allocate a copy of that entire slice.
-	if len(ann.Hashes) > maxHashesPerAnnounce {
-		replyErr(fmt.Sprintf("announce too large: %d hashes exceed limit of %d",
-			len(ann.Hashes), maxHashesPerAnnounce))
-		return
-	}
-	// Reject suspiciously long individual hash strings before they reach the
-	// per-hash CAS existence check.
-	for i, h := range ann.Hashes {
-		if len(h) > maxHashLen {
-			replyErr(fmt.Sprintf("hash[%d] length %d exceeds maximum of %d bytes",
-				i, len(h), maxHashLen))
-			return
-		}
-	}
-
-	// Idempotent re-announce: reuse the existing session if still valid.
-	if existing, ok := r.store.getByPayload(ann.PayloadID); ok {
-		r.cfg.Obs.Logger.Info("mqtt: re-announce — returning existing session",
-			"payload_id", ann.PayloadID)
-		absentHashes := r.computeAbsentHashes(ann.Hashes)
-		r.mqttPublish(replyTopic, broker.ReadyMessage{
-			NodeID:       nodeID,
-			SessionToken: existing.token,
-			DataURL:      r.cfg.dataEndpoint(),
-			AbsentHashes: absentHashes,
-		})
-		return
-	}
-
-	// Create a new session.
-	ttl := r.cfg.SessionTTL
-	if ttl <= 0 {
-		ttl = time.Hour
-	}
-	s, ok := r.store.create(ann.PayloadID, ttl)
-	if !ok {
-		replyErr("session store at capacity — try again later")
-		return
-	}
-
-	// Compute the set of hashes the publisher must actually push to us by
-	// checking each announced hash directly against the local CAS.
-	absentHashes := r.computeAbsentHashes(ann.Hashes)
-
-	r.cfg.Obs.Logger.Info("mqtt: announce accepted",
-		"payload_id", ann.PayloadID,
-		"publisher_id", ann.PublisherID,
-		"repo", ann.Repo,
-		"total_hashes", len(ann.Hashes),
-		"absent_hashes", len(absentHashes),
-		"session_expires", s.expiresAt.Format(time.RFC3339))
-
-	r.mqttPublish(replyTopic, broker.ReadyMessage{
-		NodeID:       nodeID,
-		SessionToken: s.token,
-		DataURL:      r.cfg.dataEndpoint(),
-		AbsentHashes: absentHashes,
-	})
-}
-
-// computeAbsentHashes returns the subset of hashes that the receiver does not
-// currently hold, determined by a direct CAS.Exists check per announced hash.
-//
-// The local CAS is the single source of truth for object presence.  On any
-// CAS error for a given hash the hash is treated as absent — the conservative
-// choice that ensures we never silently skip an object the publisher needs to
-// send us.
-func (r *Receiver) computeAbsentHashes(hashes []string) []string {
-	absent := make([]string, 0, len(hashes))
-	for _, h := range hashes {
-		// Strip any 'C' content-type suffix: the CAS is keyed on the plain hash.
-		plain := strings.TrimSuffix(h, "C")
-		exists, err := r.casStore.Exists(r.bgCtx, plain)
-		if err != nil {
-			r.cfg.Obs.Logger.Warn("mqtt: CAS.Exists failed — treating hash as absent",
-				"hash", plain, "error", err)
-			exists = false
-		}
-		if !exists {
-			absent = append(absent, h)
-		}
-	}
-	return absent
 }
 
 // mqttPublishedHandler is called by the broker client each time a
