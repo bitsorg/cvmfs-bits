@@ -563,6 +563,7 @@ func runPublisher(
 	var enrollSrv *credential.EnrollServer
 	var pubCreds func() (string, string)
 	var authHook *brokerAuthHook
+	var ctrlSecret []byte
 	if embeddedBrokerWSAddr != "" {
 		// Build the broker's server TLS config (H1: real wss://). When no cert is
 		// configured the listener stays plaintext ws:// (dev), but advertising a
@@ -585,6 +586,7 @@ func runPublisher(
 				obs.Logger.Error("embedded broker: --embedded-broker-auth requires PREPUB_HMAC_SECRET (>= 16 bytes)")
 				os.Exit(1)
 			}
+			ctrlSecret = secret
 			revoc := newRevocation()
 			minter := credential.NewMinter(secret)
 			authHook = newBrokerAuthHook(credential.NewVerifier(secret), "publisher", revoc, obs)
@@ -755,7 +757,11 @@ func runPublisher(
 	// Control-plane DoS limiter (internet-exposed; no firewall assumed).
 	ctrlRateLimit := credential.NewIPRateLimiter(5, 10, 4096, 100, 200)
 	if controlPlaneURL != "" {
-		disco := &staticDiscovery{repos: []string{repoName}, cp: serve.ControlPlaneRef{Type: "mqtt", URL: controlPlaneURL}}
+		var discoSigner serve.Signer
+		if ctrlSecret != nil {
+			discoSigner = hmacDiscoverySigner(ctrlSecret)
+		}
+		disco := &staticDiscovery{repos: []string{repoName}, cp: serve.ControlPlaneRef{Type: "mqtt", URL: controlPlaneURL}, signer: discoSigner}
 		apiServer.MountDiscovery(ctrlRateLimit.Middleware(&serve.DiscoveryHandler{Source: disco}))
 		obs.Logger.Info("control-plane: discovery advertising broker", "url", controlPlaneURL)
 	}
@@ -926,6 +932,12 @@ func runReceiver(
 			}
 			obs.Logger.Error("control-plane: discovery failed", "error", derr)
 			os.Exit(1)
+		}
+		if brokerAuth {
+			if !d.Verify(hmacDiscoveryVerify([]byte(os.Getenv("PREPUB_HMAC_SECRET")))) {
+				obs.Logger.Error("control-plane: discovery signature verification FAILED — refusing advertised broker (possible MITM)")
+				os.Exit(1)
+			}
 		}
 		if d.ControlPlane.Type != "" && d.ControlPlane.Type != "mqtt" {
 			obs.Logger.Error("control-plane: discovery advertised unsupported transport", "type", d.ControlPlane.Type)

@@ -5,6 +5,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,8 +22,9 @@ import (
 // control-plane reference for the repos this publisher serves (ADR-0001 D10).
 // Unsigned in dev (nil Signer).
 type staticDiscovery struct {
-	repos []string
-	cp    serve.ControlPlaneRef
+	repos  []string
+	cp     serve.ControlPlaneRef
+	signer serve.Signer // nil => unsigned (dev)
 }
 
 func (d *staticDiscovery) Discovery(_ context.Context, repo string) (serve.Discovery, bool, error) {
@@ -31,7 +35,36 @@ func (d *staticDiscovery) Discovery(_ context.Context, repo string) (serve.Disco
 	if len(repos) == 0 || (len(repos) == 1 && repos[0] == "") {
 		repos = []string{repo}
 	}
-	return serve.Discovery{Repos: repos, ControlPlane: d.cp}, true, nil
+	doc := serve.Discovery{Repos: repos, ControlPlane: d.cp}
+	signed, err := doc.Sign(d.signer) // nil signer => returned unchanged
+	if err != nil {
+		return serve.Discovery{}, false, err
+	}
+	return signed, true, nil
+}
+
+// hmacDiscoverySigner signs the discovery doc with HMAC-SHA256(secret, payload),
+// hex-encoded — the shared-secret integrity guard (H2). No asymmetric keys.
+func hmacDiscoverySigner(secret []byte) serve.Signer {
+	return func(payload []byte) (string, error) {
+		mac := hmac.New(sha256.New, secret)
+		mac.Write(payload)
+		return hex.EncodeToString(mac.Sum(nil)), nil
+	}
+}
+
+// hmacDiscoveryVerify is the receiver-side verifier matching hmacDiscoverySigner.
+func hmacDiscoveryVerify(secret []byte) func(payload []byte, sig string) bool {
+	return func(payload []byte, sig string) bool {
+		mac := hmac.New(sha256.New, secret)
+		mac.Write(payload)
+		want := mac.Sum(nil)
+		got, err := hex.DecodeString(sig)
+		if err != nil {
+			return false
+		}
+		return hmac.Equal(got, want)
+	}
 }
 
 // fetchDiscovery GETs the signed discovery document for repo from the fixed S0

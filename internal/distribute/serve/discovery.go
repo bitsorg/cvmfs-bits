@@ -53,6 +53,23 @@ func (d Discovery) Sign(s Signer) (Discovery, error) {
 	return d, nil
 }
 
+// Verify recomputes the signature over the canonical (signature-empty) encoding
+// and reports whether it matches d.Signature. A nil verify accepts any document
+// (dev). verify receives the canonical payload and the detached signature and
+// must compare them in constant time.
+func (d Discovery) Verify(verify func(payload []byte, sig string) bool) bool {
+	if verify == nil {
+		return true
+	}
+	unsigned := d
+	unsigned.Signature = ""
+	payload, err := json.Marshal(unsigned)
+	if err != nil {
+		return false
+	}
+	return verify(payload, d.Signature)
+}
+
 // DiscoverySource returns the Discovery document for a repo.
 type DiscoverySource interface {
 	Discovery(ctx context.Context, repo string) (Discovery, bool, error)
