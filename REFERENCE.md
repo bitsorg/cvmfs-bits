@@ -3,6 +3,13 @@
 A Go service for pre-processing, queuing, and publishing software releases
 into CVMFS, complementing the existing overlay-based publishing workflow.
 
+> **Current system.** The recommended deployment is the bits publish pipeline plus
+> the **pull-based distribution with an authenticated WebSocket/TLS control plane**,
+> described end to end with diagrams and the security model in
+> [Part VIII](#part-viii--the-pull-over-wss-control-plane-current-system--security).
+> The earlier push / SSE / external-broker options below remain documented for
+> reference and are summarised in §46.
+
 ---
 
 ## Table of Contents
@@ -59,6 +66,17 @@ into CVMFS, complementing the existing overlay-based publishing workflow.
 
 ### Part VII — REST API Reference
 38. cvmfs-prepub REST API Reference
+
+### Part VIII — The Pull-over-WSS Control Plane (Current System & Security)
+39. Overview and Component Map
+40. Roles, Keys, and Trust Boundaries
+41. Sequence — Receiver Bootstrap and Enrollment
+42. Sequence — Publish, Coordinate, Pull, Warm
+43. Sequence — Revocation
+44. Security Model in Detail
+45. Configuration and Key Provisioning
+46. Alternate (Legacy) Paths
+47. Notes on Horizontal Scalability
 
 ---
 
@@ -4014,3 +4032,283 @@ pre-warm coverage tracking) is a Phase 4 item once the critical path is stable.
 ---
 
 
+
+
+---
+
+# PART VIII — THE PULL-OVER-WSS CONTROL PLANE (CURRENT SYSTEM & SECURITY)
+
+This part documents the system as actually built and validated: the bits publish
+pipeline plus the **pull-based distribution** coordinated over an embedded
+**MQTT-over-WebSocket/TLS** control plane with token authentication. It is the
+recommended configuration; the push / SSE / external-broker variants in earlier
+parts are legacy and summarised in §46.
+
+## 39. Overview and Component Map
+
+A build farm produces release artifacts and submits them to a single Stratum 0
+publisher (`cvmfs-prepub`). The publisher runs the processing pipeline, commits
+through `cvmfs_gateway`, and **coordinates** distribution: it announces each
+transaction on an in-process broker and serves a signed manifest. Stratum 1
+receivers **pull** the objects they are missing from content-addressed storage
+(the CVMFS web tier / CDN), verify each by hash, and warm before the catalog flip.
+
+```mermaid
+flowchart LR
+  subgraph Build["Build farm — O(10) platforms (elastic, stateless)"]
+    B1[bits builder]
+    B2[bits builder]
+  end
+  subgraph S0["Stratum 0 — cvmfs-prepub (stateful core)"]
+    API["REST API :8080"]
+    PIPE["Pipeline<br/>unpack -> dedup -> compress -> CAS"]
+    COMMIT["Commit (gateway lease)"]
+    MSTORE["Durable manifest store (disk)"]
+    BROKER["Embedded broker wss :1882<br/>(token auth + role ACL)"]
+    ENROLL["TLS control :8443<br/>challenge / enroll / revoke"]
+    DISCO["Signed discovery<br/>GET /cvmfs/{repo}/.cvmfsbits"]
+  end
+  GW["cvmfs_gateway<br/>(commit authority, per-repo)"]
+  subgraph S1["Stratum 1 receivers (elastic, no inbound ports)"]
+    R1[receiver]
+    R2[receiver]
+  end
+  CDN["Object serving<br/>CVMFS web / CDN (content-addressed)"]
+  B1 --> API
+  B2 --> API
+  API --> PIPE --> COMMIT --> GW
+  PIPE --> MSTORE
+  COMMIT -->|announce / published| BROKER
+  R1 -->|1 fetch + verify discovery| DISCO
+  R2 -->|1 fetch + verify discovery| DISCO
+  R1 -->|2 enroll over TLS| ENROLL
+  R2 -->|2 enroll over TLS| ENROLL
+  R1 -->|3 subscribe wss + token| BROKER
+  R2 -->|3 subscribe wss + token| BROKER
+  R1 -->|4 GET manifest| MSTORE
+  R2 -->|4 GET manifest| MSTORE
+  R1 -->|5 pull + verify objects| CDN
+  R2 -->|5 pull + verify objects| CDN
+```
+
+The two planes are separated on purpose:
+
+- **Control plane** (small, latency-sensitive): discovery, enrollment, the broker
+  `announce` / `published` / `ready` / `presence` messages, and revocation.
+- **Data plane** (large, throughput-sensitive): content-addressed objects, served
+  as ordinary HTTP static content and therefore freely replicable / CDN-able.
+
+## 40. Roles, Keys, and Trust Boundaries
+
+The Stratum 0 publisher is the only trusted minting authority. Receivers are
+semi-trusted: each can act only as itself. Keys are distributed so that
+compromising a receiver cannot escalate to control of the plane.
+
+| Secret / key | Held by | Purpose | If a receiver is compromised |
+|---|---|---|---|
+| `PREPUB_HMAC_SECRET` (master) | **S0 only** | mint/verify tokens; derive per-node keys | not exposed — receiver never has it |
+| per-node key `HMAC(master, node)` | that one receiver | prove identity during enrollment | attacker can enrol only as that node |
+| Ed25519 discovery **private** key | **S0 only** | sign the discovery document | not exposed |
+| Ed25519 discovery **public** key | all receivers | verify discovery | cannot forge a discovery doc |
+| broker server cert + key | **S0 only** | terminate `wss` / HTTPS | not exposed |
+| CA certificate | S0 + receivers | verify broker + enroll endpoint | public material |
+| scoped bearer token (TTL ~10m) | minted per node on demand | broker password; admin = `publisher` node | only its own receiver-scoped token |
+
+```mermaid
+flowchart TB
+  subgraph Trusted["Trusted — Stratum 0"]
+    M["master secret<br/>(token mint, key derivation)"]
+    DK["Ed25519 private (sign discovery)"]
+    SK["broker server key (wss/TLS)"]
+  end
+  subgraph SemiTrusted["Semi-trusted — each Stratum 1"]
+    NK["per-node key (enrol as self only)"]
+    DP["Ed25519 public (verify only)"]
+    CA["CA cert (verify S0 only)"]
+  end
+  M -. "derives, never sent" .-> NK
+  DK -. "public half" .-> DP
+  SK -. "CA only" .-> CA
+```
+
+**Why this matters.** Before hardening, every receiver held the master secret
+(to derive its own key and to verify HMAC-signed discovery). A single compromised
+receiver could then mint a `publisher` token and forge commit notifications,
+revoke peers, or impersonate any node. The current scheme provisions only the
+per-node key and the discovery *public* key, eliminating that escalation.
+
+## 41. Sequence — Receiver Bootstrap and Enrollment
+
+Discovery is fetched over plain HTTP but **integrity-protected** by an Ed25519
+signature; the token itself is exchanged only over TLS.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant R as Stratum 1 receiver
+  participant D as S0 discovery (HTTP :8080)
+  participant E as S0 control TLS (:8443)
+  participant B as Embedded broker (wss :1882)
+  R->>D: GET /cvmfs/{repo}/.cvmfsbits
+  D-->>R: discovery doc + Ed25519 signature + control-plane URL + enroll URL
+  R->>R: verify signature with discovery.pub  (mismatch => abort: possible MITM)
+  R->>E: GET /control/challenge?node=R   [TLS]
+  E-->>R: nonce = hex(ts || HMAC(serverKey, ts||node))   (stateless: nothing stored)
+  R->>R: MAC = HMAC(nodeKey, node|nonce)
+  R->>E: POST /control/enroll {node, nonce, MAC}   [TLS]
+  E->>E: verify nonce freshness + MAC vs HMAC(master,node); one-time replay guard
+  E-->>R: bearer token (scope "control", TTL 10m)
+  R->>B: CONNECT wss, password=token; verify broker cert via CA
+  B->>B: OnConnectAuthenticate: verify token -> node; bind node to the connection
+  B-->>R: CONNACK; subscribe announce + published (ACL: read ok, write self only)
+```
+
+## 42. Sequence — Publish, Coordinate, Pull, Warm
+
+The manifest is **provisional** (its root hash is a placeholder until commit); the
+objects are content-addressed, so receivers can pre-pull before the catalog flips.
+The post-commit `published` message is **retained**, so a receiver that connects
+late still catches up.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Bld as bits builder
+  participant API as S0 API
+  participant P as Pipeline
+  participant M as Durable manifest store
+  participant B as Broker (wss)
+  participant GW as cvmfs_gateway
+  participant R as Receiver
+  participant O as Object serving (CDN)
+  Bld->>API: POST /api/v1/jobs (tar)
+  API->>P: unpack -> dedup -> compress -> upload to CAS
+  P->>M: Put provisional manifest (durable, key = txn)
+  P->>B: announce(repo, txn, objectHashes)   [pre-warm]
+  B-->>R: announce
+  R->>M: GET /s1/{txn}/manifest
+  R->>O: pull missing objects (verify each hash)
+  API->>GW: acquire lease -> merge catalog -> commit
+  API->>B: published(repo, txn, rootHash)   [retained]
+  B-->>R: published
+  R->>O: pull any remaining objects
+  R->>R: warm (atomic local catalog flip)
+  R-->>B: ready / presence
+  API->>API: quorum of ready reached -> transaction done
+  API->>M: Delete manifest (warm quorum reached)
+```
+
+## 43. Sequence — Revocation
+
+Immediate cut-off combines a denylist (refuse future connects/enrollments) with
+an active disconnect of any live session.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Op as Operator: prepub revoke <node>
+  participant E as S0 control TLS /control/revoke
+  participant B as Broker
+  participant R as Target receiver
+  Op->>Op: mint publisher admin token from PREPUB_HMAC_SECRET
+  Op->>E: POST /control/revoke {node} + Bearer admin token   [TLS]
+  E->>E: verify token AND token.node == "publisher"  (else 403)
+  E->>E: denylist.add(node)
+  E->>B: DisconnectClient(live sessions for node)
+  B--xR: connection closed
+  R->>B: reconnect (token)
+  B--xR: refused (node on denylist)
+```
+
+## 44. Security Model in Detail
+
+- **Transport.** The broker listens on `wss://` (TLS); enrollment and revocation
+  are on a dedicated HTTPS listener that reuses the broker's server certificate.
+  Both sides verify the server certificate against the provisioned CA. The token
+  is therefore never exposed on the wire (enrollment over plain HTTP — the
+  earlier behaviour — is no longer served; `GET :8080/control/challenge` is 404).
+- **Authentication.** Per-node challenge/response proves possession of the
+  per-node key without transmitting it; the server issues a self-verifying,
+  scoped, TTL-bounded HMAC token (`Minter`/`Verifier`). The token is presented as
+  the MQTT CONNECT password and re-supplied on every reconnect by a credentials
+  provider, so short token lifetimes do not require manual rotation.
+- **Authorization.** The auth hook records the token-verified node on the
+  connection object itself and enforces a role ACL on every publish: the
+  publisher may write any control topic; a receiver may write only its own
+  `ready`/`presence` and may not forge `announce`/`published` (which could push
+  the publisher to a premature commit).
+- **Discovery integrity (Ed25519).** The publisher signs the discovery document
+  with its private key; receivers verify with the public key only. The HMAC
+  signer remains as a dev/legacy fallback (`--discovery-signing-key` selects
+  Ed25519; without it, and only in dev, the symmetric path is used).
+- **DoS resistance (no firewall assumed).** The challenge is **stateless**
+  (`nonce = ts || HMAC(serverKey, ts||node)`), so flooding `/control/challenge`
+  costs an HMAC and zero memory; the redeemed-nonce replay set is bounded; an
+  IP rate limiter (per-IP token bucket + global ceiling, bounded tracked-IP set)
+  guards the control endpoints and can honour `X-Forwarded-For` only from
+  configured trusted proxies; HTTP read/idle timeouts and a connection cap bound
+  slow-client attacks.
+- **Revocation.** A shared denylist (consulted by both the enroll key store and
+  the broker auth hook) plus active disconnect gives immediate cut-off; by
+  attrition, access also lapses within one token TTL.
+- **Durability.** Transaction manifests are written to disk and reloaded on
+  startup, so a publisher restart does not strand in-flight transactions or leave
+  the durable distribution queue referencing manifests that have vanished.
+
+## 45. Configuration and Key Provisioning
+
+Publisher flags: `--embedded-broker-ws-addr`, `--control-plane-url wss://…`,
+`--embedded-broker-tls-cert/-key`, `--broker-ca-cert`, `--embedded-broker-auth`,
+`--enroll-tls-addr`, `--enroll-url`, `--discovery-signing-key` (Ed25519 private),
+`--pull-object-base-url`. Environment: `PREPUB_HMAC_SECRET` (master).
+
+Receiver flags: `--broker-auth`, `--discovery-url`, `--receiver-stratum0-url`,
+`--broker-ca-cert`, `--discovery-verify-key` (Ed25519 public). Environment:
+`PREPUB_NODE_KEY` (hex per-node key). **Receivers are given no master secret.**
+
+Provisioning (the testbed `init.sh` does this automatically): generate an Ed25519
+keypair (publisher keeps the private key; the public key is distributed to
+receivers); for each node compute `PREPUB_NODE_KEY = HMAC-SHA256(master, node)`
+on Stratum 0 and hand it to that receiver over a separate channel; mint the broker
+server certificate and CA. In production the discovery private key and broker key
+must be readable only by the publisher process; receivers mount only the CA cert
+and the discovery public key.
+
+Admin: `prepub revoke <node> --enroll-url https://s0:8443 --ca-cert ca.crt`.
+
+## 46. Alternate (Legacy) Paths
+
+These remain in the tree for the moment but are not the recommended configuration
+and are slated for removal once the pull-over-wss path is the sole deployment.
+
+- **Push data plane (Option B, HTTP).** After a `ready` exchange the publisher
+  connects out to each receiver's HTTP endpoint (TCP 9100 inbound at S1) and
+  *pushes* CAS objects. Superseded by pull, which needs no inbound ports at S1.
+- **External mosquitto broker (Option B, MQTT).** The control plane on a separate
+  broker reachable on TCP 8883. Superseded by the in-process `wss` broker (no
+  extra service, reuses the tested MQTT client, bidirectional).
+- **SSE control plane.** A one-way Server-Sent-Events transport for announce /
+  published. Superseded by `wss`, which is bidirectional (needed for `ready`).
+- **HMAC-signed discovery.** Symmetric discovery signing; superseded by Ed25519
+  because symmetric verification requires every verifier to hold a forging key.
+
+## 47. Notes on Horizontal Scalability
+
+For an expected load of O(10) build platforms per release and O(100) repositories,
+the message rate on the broker is trivial; the pressure is on Stratum 0 pipeline
+throughput and on the durability of in-flight coordination state. Components scale
+as follows:
+
+- **Elastic / horizontal:** the build farm, the Stratum 1 receiver fleet, and
+  object serving (content-addressed; served by the CVMFS web tier / CDN, off the
+  publisher's critical path — advertise the CDN base in the manifest `base_urls`).
+- **Single-writer per repository:** the commit authority and the `cvmfs_gateway`
+  for a given repo — two committers for one repo is unsafe; commits to *different*
+  repos parallelise.
+- **Recommended scale-out:** **shard by repository** across K publisher instances,
+  each owning a disjoint subset of repos and running its own embedded broker;
+  discovery routes each receiver to the broker that owns the repo it follows. This
+  scales pipeline throughput ~linearly with K and removes any single global hub,
+  while keeping per-repo coordination local. State that must be durable for a
+  restart / failover (the manifest store; optionally the revocation and rate-limit
+  state) should be persisted or externalised per shard.
