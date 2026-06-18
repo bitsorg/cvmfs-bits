@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -66,17 +67,20 @@ type EnrollServer struct {
 
 	log func(string, ...any)
 
-	mu     sync.Mutex
-	nonces map[string]nonceEntry // outstanding challenges (one-time)
-}
+	// nonceKey signs the stateless challenge nonce (HMAC), generated per process.
+	// The server stores NO nonce, so flooding /control/challenge costs only an
+	// HMAC and zero memory (R-DoS).
+	nonceKey []byte
 
-type nonceEntry struct {
-	node    string
-	expires time.Time
+	mu            sync.Mutex
+	consumed      map[string]struct{} // recently-redeemed nonces (replay guard)
+	consumedOrder []string            // FIFO for bounded eviction
 }
 
 // NewEnrollServer builds an EnrollServer. log may be nil.
 func NewEnrollServer(keys EnrollKeyStore, minter *Minter, log func(string, ...any)) *EnrollServer {
+	nk := make([]byte, 32)
+	_, _ = rand.Read(nk)
 	return &EnrollServer{
 		Keys:     keys,
 		Minter:   minter,
@@ -84,7 +88,8 @@ func NewEnrollServer(keys EnrollKeyStore, minter *Minter, log func(string, ...an
 		TokenTTL: 10 * time.Minute,
 		NonceTTL: 2 * time.Minute,
 		log:      log,
-		nonces:   map[string]nonceEntry{},
+		nonceKey: nk,
+		consumed: map[string]struct{}{},
 	}
 }
 
@@ -135,19 +140,7 @@ func (s *EnrollServer) serveChallenge(w http.ResponseWriter, r *http.Request) {
 	// A challenge is issued for ANY node id (no existence check) so the endpoint
 	// does not reveal which nodes are enrolled; enrollment still fails later
 	// unless the MAC matches a provisioned key.
-	var raw [32]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		http.Error(w, "entropy failure", http.StatusInternalServerError)
-		return
-	}
-	nonce := hex.EncodeToString(raw[:])
-
-	s.mu.Lock()
-	s.sweepLocked(time.Now())
-	s.nonces[nonce] = nonceEntry{node: node, expires: time.Now().Add(s.nonceTTL())}
-	s.mu.Unlock()
-
-	writeJSON(w, http.StatusOK, challengeResp{Nonce: nonce})
+	writeJSON(w, http.StatusOK, challengeResp{Nonce: s.makeNonce(node, time.Now())})
 }
 
 type enrollReq struct {
@@ -179,16 +172,9 @@ func (s *EnrollServer) serveEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Consume the nonce (one-time) and confirm it was issued for this node and is
-	// still valid.
-	s.mu.Lock()
-	s.sweepLocked(time.Now())
-	ent, ok := s.nonces[req.Nonce]
-	if ok {
-		delete(s.nonces, req.Nonce)
-	}
-	s.mu.Unlock()
-	if !ok || ent.node != req.Node || time.Now().After(ent.expires) {
+	// Verify the stateless nonce (HMAC over node+timestamp) is authentic and
+	// unexpired before doing any work.
+	if !s.checkNonce(req.Node, req.Nonce, time.Now()) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -202,6 +188,14 @@ func (s *EnrollServer) serveEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	expected := computeEnrollMAC(key, req.Node, req.Nonce)
 	if decErr != nil || !known || !hmac.Equal(gotMAC, expected) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Replay guard: an authenticated (nonce, MAC) pair is redeemable once within
+	// its window. Only verified enrolls reach this bounded set, so a challenge
+	// flood can never grow it.
+	if !s.consumeNonce(req.Nonce) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -222,13 +216,52 @@ func (s *EnrollServer) serveEnroll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, EnrollResp{Token: token, ExpUnix: exp.Unix(), Scope: s.scope()})
 }
 
-// sweepLocked drops expired nonces; caller holds s.mu.
-func (s *EnrollServer) sweepLocked(now time.Time) {
-	for n, e := range s.nonces {
-		if now.After(e.expires) {
-			delete(s.nonces, n)
-		}
+const maxConsumedNonces = 8192
+
+// makeNonce returns a stateless, self-authenticating nonce:
+// hex(ts8 || HMAC(nonceKey, ts8||node)[:16]). The server stores nothing.
+func (s *EnrollServer) makeNonce(node string, t time.Time) string {
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], uint64(t.Unix()))
+	mac := hmac.New(sha256.New, s.nonceKey)
+	mac.Write(ts[:])
+	mac.Write([]byte(node))
+	return hex.EncodeToString(append(ts[:], mac.Sum(nil)[:16]...))
+}
+
+// checkNonce verifies a nonce was issued by this server for node and is fresh.
+func (s *EnrollServer) checkNonce(node, nonce string, now time.Time) bool {
+	raw, err := hex.DecodeString(nonce)
+	if err != nil || len(raw) != 24 {
+		return false
 	}
+	ts, gotMAC := raw[:8], raw[8:24]
+	mac := hmac.New(sha256.New, s.nonceKey)
+	mac.Write(ts)
+	mac.Write([]byte(node))
+	if !hmac.Equal(gotMAC, mac.Sum(nil)[:16]) {
+		return false
+	}
+	issued := time.Unix(int64(binary.BigEndian.Uint64(ts)), 0)
+	age := now.Sub(issued)
+	return age >= -30*time.Second && age <= s.nonceTTL()
+}
+
+// consumeNonce records a nonce as redeemed; false if already used. Bounded (FIFO).
+func (s *EnrollServer) consumeNonce(nonce string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, dup := s.consumed[nonce]; dup {
+		return false
+	}
+	if len(s.consumed) >= maxConsumedNonces {
+		old := s.consumedOrder[0]
+		s.consumedOrder = s.consumedOrder[1:]
+		delete(s.consumed, old)
+	}
+	s.consumed[nonce] = struct{}{}
+	s.consumedOrder = append(s.consumedOrder, nonce)
+	return true
 }
 
 // computeEnrollMAC is the proof a node computes: HMAC-SHA256(enrollKey, node|nonce).
