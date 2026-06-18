@@ -158,9 +158,16 @@ func (d *derivedEnrollStore) Key(node string) ([]byte, bool) {
 	if node == "" || node == "publisher" || d.revoc.IsRevoked(node) {
 		return nil, false
 	}
-	mac := hmac.New(sha256.New, d.secret)
+	return deriveNodeKey(d.secret, node), true
+}
+
+// deriveNodeKey derives a node's enrollment key as HMAC-SHA256(secret, node).
+// Both the publisher (derivedEnrollStore) and the receiver compute it, so no
+// per-node key is ever transmitted.
+func deriveNodeKey(secret []byte, node string) []byte {
+	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(node))
-	return mac.Sum(nil), true
+	return mac.Sum(nil)
 }
 
 // randNonce returns a random 128-bit hex nonce (token jti / uniqueness).

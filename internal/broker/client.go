@@ -338,6 +338,13 @@ func NewWithLWT(cfg Config, lwtTopic string, lwtQoS byte, lwtRetained bool, lwtP
 		SetConnectRetryInterval(defaultReconnectWait).
 		SetCleanSession(false)
 
+	if cfg.CredentialsProvider != nil {
+		opts.SetCredentialsProvider(cfg.CredentialsProvider)
+	} else if cfg.Username != "" || cfg.Password != "" {
+		opts.SetUsername(cfg.Username)
+		opts.SetPassword(cfg.Password)
+	}
+
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("broker: building TLS config: %w", err)

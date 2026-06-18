@@ -528,7 +528,8 @@ func (r *Receiver) startMQTT() error {
 	}
 
 	brokerCfg := broker.Config{
-		BrokerURL:  r.cfg.BrokerURL,
+		BrokerURL:           r.cfg.BrokerURL,
+		CredentialsProvider: r.cfg.BrokerCredentialsProvider,
 		ClientCert: r.cfg.BrokerClientCert,
 		ClientKey:  r.cfg.BrokerClientKey,
 		CACert:     r.cfg.BrokerCACert,

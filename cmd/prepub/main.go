@@ -197,6 +197,7 @@ func main() {
 	// set.  Using --receiver-stratum0-url makes the purpose explicit.
 	recvStratum0URL := flag.String("receiver-stratum0-url", "", "Stratum 0 HTTP base URL used by the receiver to pull objects on commit notification (e.g. http://stratum0/cvmfs) [receiver]")
 	discoveryURL := flag.String("discovery-url", "", "Fixed S0 endpoint serving the discovery doc GET {url}/cvmfs/{repo}/.cvmfsbits; the receiver learns its control-plane broker URL from it [receiver]")
+	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs PREPUB_HMAC_SECRET and --discovery-url [receiver]")
 
 	// MQTT broker — shared by publisher and receiver modes.
 	// When set, receivers connect outbound to the broker and publish retained
@@ -279,7 +280,7 @@ func main() {
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*recvStratum0URL, *distributeMode, *discoveryURL)
+			*recvStratum0URL, *distributeMode, *discoveryURL, *brokerAuth)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
 		os.Exit(1)
@@ -860,6 +861,7 @@ func runReceiver(
 	stratum0URL string,
 	distributeMode string,
 	discoveryURL string,
+	brokerAuth bool,
 ) {
 	// Load the HMAC shared secret from the environment.  In DevMode the
 	// receiver skips HMAC verification entirely, so the secret is not required.
@@ -934,6 +936,27 @@ func runReceiver(
 		obs.Logger.Info("control-plane: broker URL learned from discovery", "url", brokerURL, "type", d.ControlPlane.Type)
 	}
 
+	var brokerCreds func() (string, string)
+	if brokerAuth {
+		secret := []byte(os.Getenv("PREPUB_HMAC_SECRET"))
+		if len(secret) < 16 {
+			obs.Logger.Error("--broker-auth requires PREPUB_HMAC_SECRET (>= 16 bytes)")
+			os.Exit(1)
+		}
+		if discoveryURL == "" {
+			obs.Logger.Error("--broker-auth requires --discovery-url (the enroll endpoint base)")
+			os.Exit(1)
+		}
+		ec := &credential.Client{Base: discoveryURL, Node: nodeID, Key: deriveNodeKey(secret, nodeID)}
+		brokerCreds = func() (string, string) {
+			tok, terr := ec.Token(context.Background())
+			if terr != nil {
+				obs.Logger.Warn("control-plane: enrollment failed", "error", terr)
+				return "", ""
+			}
+			return nodeID, tok
+		}
+	}
 	cfg := receiver.Config{
 		ControlAddr:      controlAddr,
 		DataAddr:         dataAddr,
@@ -959,6 +982,7 @@ func runReceiver(
 		BrokerClientKey:  brokerClientKey,
 		BrokerCACert:     brokerCACert,
 		Obs:              obs,
+		BrokerCredentialsProvider: brokerCreds,
 	}
 
 	recv, err := receiver.New(cfg)

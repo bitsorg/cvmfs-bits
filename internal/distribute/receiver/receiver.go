@@ -171,6 +171,11 @@ type Config struct {
 	// is fire-and-forget. A nil hook disables the ack (pre-broker / tests).
 	OnWarmed func(payloadID, repo string, warmed bool)
 
+	// BrokerCredentialsProvider, when set, supplies the MQTT username/password
+	// (node id + a freshly-enrolled bearer token) on each broker (re)connect for
+	// the token control plane; nil leaves the connection unauthenticated.
+	BrokerCredentialsProvider func() (string, string)
+
 	// Obs provides structured logging and metrics.
 	Obs *observe.Provider
 }
