@@ -23,8 +23,9 @@ type ControlPlaneRef struct {
 type Discovery struct {
 	Repos        []string        `json:"repos"`
 	ControlPlane ControlPlaneRef `json:"control_plane"`
-	CA           string          `json:"ca,omitempty"`        // PEM trust anchor for the control plane
-	Signature    string          `json:"signature,omitempty"` // detached signature over the doc with this field empty
+	CA           string          `json:"ca,omitempty"`         // PEM trust anchor for the control plane
+	EnrollURL    string          `json:"enroll_url,omitempty"` // HTTPS base for challenge/enroll (token confidentiality)
+	Signature    string          `json:"signature,omitempty"`  // detached signature over the doc with this field empty
 }
 
 // Signer produces a detached signature over the canonical (signature-empty)

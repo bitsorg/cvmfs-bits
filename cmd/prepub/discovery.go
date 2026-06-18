@@ -22,9 +22,10 @@ import (
 // control-plane reference for the repos this publisher serves (ADR-0001 D10).
 // Unsigned in dev (nil Signer).
 type staticDiscovery struct {
-	repos  []string
-	cp     serve.ControlPlaneRef
-	signer serve.Signer // nil => unsigned (dev)
+	repos     []string
+	cp        serve.ControlPlaneRef
+	enrollURL string       // HTTPS enroll base advertised to receivers ("" => none)
+	signer    serve.Signer // nil => unsigned (dev)
 }
 
 func (d *staticDiscovery) Discovery(_ context.Context, repo string) (serve.Discovery, bool, error) {
@@ -35,7 +36,7 @@ func (d *staticDiscovery) Discovery(_ context.Context, repo string) (serve.Disco
 	if len(repos) == 0 || (len(repos) == 1 && repos[0] == "") {
 		repos = []string{repo}
 	}
-	doc := serve.Discovery{Repos: repos, ControlPlane: d.cp}
+	doc := serve.Discovery{Repos: repos, ControlPlane: d.cp, EnrollURL: d.enrollURL}
 	signed, err := doc.Sign(d.signer) // nil signer => returned unchanged
 	if err != nil {
 		return serve.Discovery{}, false, err

@@ -20,8 +20,8 @@
 package main
 
 import (
-	"crypto/tls"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -38,8 +38,8 @@ import (
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
 	"cvmfs.io/prepub/internal/distribute/commit"
-	"cvmfs.io/prepub/internal/distribute/receiver"
 	"cvmfs.io/prepub/internal/distribute/credential"
+	"cvmfs.io/prepub/internal/distribute/receiver"
 	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
@@ -52,6 +52,12 @@ import (
 
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────
+	// Subcommand: prepub revoke <node> -- revoke a receiver's control-plane
+	// access (denylist + active disconnect) via the publisher's TLS endpoint.
+	if len(os.Args) > 1 && os.Args[1] == "revoke" {
+		runRevoke(os.Args[2:])
+		return
+	}
 	mode := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
 	// ADR-0001 (reserved; not yet active in P0). Data-plane direction and
 	// control-plane transport selectors; parsed now so config/tooling can set
@@ -64,6 +70,8 @@ func main() {
 	embeddedBrokerTLSCert := flag.String("embedded-broker-tls-cert", "", "PEM server certificate for the embedded broker WebSocket listener; enables wss:// [publisher]")
 	embeddedBrokerTLSKey := flag.String("embedded-broker-tls-key", "", "PEM private key for --embedded-broker-tls-cert [publisher]")
 	embeddedBrokerAuth := flag.Bool("embedded-broker-auth", false, "Require token authentication on the embedded broker (needs PREPUB_HMAC_SECRET); receivers enrol via challenge/response [publisher]")
+	enrollTLSAddr := flag.String("enroll-tls-addr", "", "With --embedded-broker-auth and a broker TLS cert, serve enroll/revoke over HTTPS at this bind address (e.g. :8443) so the enrollment token never travels in plaintext [publisher]")
+	enrollURL := flag.String("enroll-url", "", "HTTPS base URL for the TLS enroll/revoke endpoint, advertised to receivers via discovery (e.g. https://cvmfs-prepub:8443) [publisher]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
 	config := flag.String("config", "", "Config file path (reserved for future use)")
@@ -275,7 +283,7 @@ func main() {
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*s1BatchSize,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth)
+			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
@@ -318,6 +326,7 @@ func runPublisher(
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
 	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
 	embeddedBrokerAuth bool,
+	enrollTLSAddr, enrollURL string,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
@@ -564,6 +573,9 @@ func runPublisher(
 	var pubCreds func() (string, string)
 	var authHook *brokerAuthHook
 	var ctrlSecret []byte
+	var revoc *revocation
+	var ctrlTLSClose func()
+	var enrollOverTLS bool
 	if embeddedBrokerWSAddr != "" {
 		// Build the broker's server TLS config (H1: real wss://). When no cert is
 		// configured the listener stays plaintext ws:// (dev), but advertising a
@@ -587,7 +599,7 @@ func runPublisher(
 				os.Exit(1)
 			}
 			ctrlSecret = secret
-			revoc := newRevocation()
+			revoc = newRevocation()
 			minter := credential.NewMinter(secret)
 			authHook = newBrokerAuthHook(credential.NewVerifier(secret), "publisher", revoc, obs)
 			enrollSrv = credential.NewEnrollServer(&derivedEnrollStore{secret: secret, revoc: revoc},
@@ -602,12 +614,28 @@ func runPublisher(
 			}
 			obs.Logger.Info("embedded broker: token authentication enabled")
 		}
-		c, berr := startEmbeddedBroker(embeddedBrokerWSAddr, brokerTLS, authHook, obs)
+		c, brokerSrv, berr := startEmbeddedBroker(embeddedBrokerWSAddr, brokerTLS, authHook, obs)
 		if berr != nil {
 			obs.Logger.Error("failed to start embedded broker", "error", berr)
 			os.Exit(1)
 		}
 		brokerClose = c
+		// Serve enroll/revoke over TLS so the enrollment token never travels in plaintext.
+		if embeddedBrokerAuth && enrollTLSAddr != "" {
+			if brokerTLS == nil {
+				obs.Logger.Error("--enroll-tls-addr requires --embedded-broker-tls-cert/--embedded-broker-tls-key")
+				os.Exit(1)
+			}
+			rl := credential.NewIPRateLimiter(5, 10, 4096, 100, 200)
+			ctClose, cterr := startControlTLS(enrollTLSAddr, brokerTLS, enrollSrv, rl.Middleware,
+				credential.NewVerifier(ctrlSecret), revoc, authHook, brokerSrv, obs)
+			if cterr != nil {
+				obs.Logger.Error("failed to start TLS control endpoint", "error", cterr)
+				os.Exit(1)
+			}
+			ctrlTLSClose = ctClose
+			enrollOverTLS = true
+		}
 		if brokerURL == "" {
 			scheme := "ws"
 			if brokerTLS != nil {
@@ -713,13 +741,13 @@ func runPublisher(
 	}
 	pullManifestStore := serve.NewMemManifestStore()
 	orch := &api.Orchestrator{
-		Spool:           sp,
-		CAS:             casBackend,
-		Lease:           leaseBackend,
-		GatewayQueue:    gatewayQueue,
-		CVMFSMount:      cvmfsMount,
-		Stratum0URL:     stratum0URL,
-		DirectGraft:     gatewayDirectGraft,
+		Spool:        sp,
+		CAS:          casBackend,
+		Lease:        leaseBackend,
+		GatewayQueue: gatewayQueue,
+		CVMFSMount:   cvmfsMount,
+		Stratum0URL:  stratum0URL,
+		DirectGraft:  gatewayDirectGraft,
 		JobTimeout:   jobTimeout,
 		BrokerConfig: publishBrokerCfg,
 		Pipeline: pipeline.Config{
@@ -732,11 +760,11 @@ func runPublisher(
 			SharedFilter:  sharedFilter,
 			DedupChecker:  sharedDedup, // shared across all jobs — no per-job CAS walk
 		},
-		Distribute:  distCfg,
-		DistManager: distManager,
-		Notify:      notifyBus,
-		Provenance:  provProvider,
-		Obs:         obs,
+		Distribute:        distCfg,
+		DistManager:       distManager,
+		Notify:            notifyBus,
+		Provenance:        provProvider,
+		Obs:               obs,
 		Manifests:         pullManifestStore,
 		PullObjectBaseURL: pullObjectBaseURL,
 	}
@@ -762,6 +790,9 @@ func runPublisher(
 			discoSigner = hmacDiscoverySigner(ctrlSecret)
 		}
 		disco := &staticDiscovery{repos: []string{repoName}, cp: serve.ControlPlaneRef{Type: "mqtt", URL: controlPlaneURL}, signer: discoSigner}
+		if enrollOverTLS {
+			disco.enrollURL = enrollURL
+		}
 		apiServer.MountDiscovery(ctrlRateLimit.Middleware(&serve.DiscoveryHandler{Source: disco}))
 		obs.Logger.Info("control-plane: discovery advertising broker", "url", controlPlaneURL)
 	}
@@ -774,11 +805,15 @@ func runPublisher(
 		// lease per node at a time. Limits are conservative defaults for the small
 		// Stratum 1 fleet; make them configurable when the benchmark (P5) lands.
 		admission := commit.NewAdmission(commit.Options{MaxConcurrent: 16, MaxPerNode: 1})
+		plaintextEnroll := enrollSrv
+		if enrollOverTLS {
+			plaintextEnroll = nil // enrollment is served over TLS only
+		}
 		apiServer.MountDistributeServing(api.DistributeServing{
 			CAS:       casBackend,
 			Manifests: pullManifestStore,
 			Admission: admission,
-			Enroll:    enrollSrv,
+			Enroll:    plaintextEnroll,
 			RateLimit: ctrlRateLimit.Middleware,
 		})
 		obs.Logger.Info("ADR-0001: pull-mode distribute serving enabled")
@@ -826,6 +861,9 @@ func runPublisher(
 
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
 		obs.Logger.Error("HTTP server shutdown error", "error", err)
+	}
+	if ctrlTLSClose != nil {
+		ctrlTLSClose()
 	}
 	if brokerClose != nil {
 		brokerClose()
@@ -921,6 +959,7 @@ func runReceiver(
 		}
 	}
 
+	enrollBase := discoveryURL
 	if discoveryURL != "" && len(repoList) > 0 {
 		discoCtx, discoStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		d, derr := fetchDiscoveryWithRetry(discoCtx, discoveryURL, repoList[0], obs)
@@ -949,6 +988,10 @@ func runReceiver(
 		}
 		brokerURL = d.ControlPlane.URL
 		obs.Logger.Info("control-plane: broker URL learned from discovery", "url", brokerURL, "type", d.ControlPlane.Type)
+		if d.EnrollURL != "" {
+			enrollBase = d.EnrollURL
+			obs.Logger.Info("control-plane: enroll endpoint learned from discovery (TLS)", "url", enrollBase)
+		}
 	}
 
 	var brokerCreds func() (string, string)
@@ -962,7 +1005,20 @@ func runReceiver(
 			obs.Logger.Error("--broker-auth requires --discovery-url (the enroll endpoint base)")
 			os.Exit(1)
 		}
-		ec := &credential.Client{Base: discoveryURL, Node: nodeID, Key: deriveNodeKey(secret, nodeID)}
+		var enrollHTTP *http.Client
+		if strings.HasPrefix(enrollBase, "https://") {
+			if brokerCACert == "" {
+				obs.Logger.Error("control-plane: TLS enroll endpoint advertised but --broker-ca-cert is not set")
+				os.Exit(1)
+			}
+			hc, herr := caHTTPClient(brokerCACert)
+			if herr != nil {
+				obs.Logger.Error("control-plane: loading enroll CA", "error", herr)
+				os.Exit(1)
+			}
+			enrollHTTP = hc
+		}
+		ec := &credential.Client{Base: enrollBase, HTTP: enrollHTTP, Node: nodeID, Key: deriveNodeKey(secret, nodeID)}
 		brokerCreds = func() (string, string) {
 			tok, terr := ec.Token(context.Background())
 			if terr != nil {
@@ -973,30 +1029,30 @@ func runReceiver(
 		}
 	}
 	cfg := receiver.Config{
-		ControlAddr:      controlAddr,
-		DataAddr:         dataAddr,
-		DataHost:         dataHost,
-		TLSCert:          tlsCert,
-		TLSKey:           tlsKey,
-		HMACSecret:       hmacSecret,
-		CASRoot:          casRoot,
-		SessionTTL:       sessionTTL,
-		DiskHeadroom:     diskHeadroom,
-		DevMode:          devMode,
-		BloomCapacity:    bloomCapacity,
-		BloomFPRate:      bloomFPRate,
-		CoordURL:         coordURL,
-		CoordToken:       coordToken,
-		NodeID:           nodeID,
-		Repos:            repoList,
-		Stratum0URL:      stratum0URL,
-		PullMode:         distributeMode == "pull",
-		PullManifestBase: stratum0URL, // in pull mode this points at the cvmfs-prepub endpoint
-		BrokerURL:        brokerURL,
-		BrokerClientCert: brokerClientCert,
-		BrokerClientKey:  brokerClientKey,
-		BrokerCACert:     brokerCACert,
-		Obs:              obs,
+		ControlAddr:               controlAddr,
+		DataAddr:                  dataAddr,
+		DataHost:                  dataHost,
+		TLSCert:                   tlsCert,
+		TLSKey:                    tlsKey,
+		HMACSecret:                hmacSecret,
+		CASRoot:                   casRoot,
+		SessionTTL:                sessionTTL,
+		DiskHeadroom:              diskHeadroom,
+		DevMode:                   devMode,
+		BloomCapacity:             bloomCapacity,
+		BloomFPRate:               bloomFPRate,
+		CoordURL:                  coordURL,
+		CoordToken:                coordToken,
+		NodeID:                    nodeID,
+		Repos:                     repoList,
+		Stratum0URL:               stratum0URL,
+		PullMode:                  distributeMode == "pull",
+		PullManifestBase:          stratum0URL, // in pull mode this points at the cvmfs-prepub endpoint
+		BrokerURL:                 brokerURL,
+		BrokerClientCert:          brokerClientCert,
+		BrokerClientKey:           brokerClientKey,
+		BrokerCACert:              brokerCACert,
+		Obs:                       obs,
 		BrokerCredentialsProvider: brokerCreds,
 	}
 
