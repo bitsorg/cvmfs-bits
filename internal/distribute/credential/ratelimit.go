@@ -6,6 +6,7 @@ package credential
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,6 +26,8 @@ type IPRateLimiter struct {
 	gRate   float64
 	gBurst  float64
 	gLast   time.Time
+
+	trustedProxies []*net.IPNet // when the peer is one of these, honour X-Forwarded-For
 }
 
 type ipBucket struct {
@@ -79,11 +82,23 @@ func (l *IPRateLimiter) allow(ip string, now time.Time) bool {
 	return true
 }
 
+// TrustProxies marks CIDRs whose requests may carry a trusted X-Forwarded-For
+// header. Only when the immediate peer is in one of these ranges is the
+// forwarded client IP used for rate limiting; otherwise the header is ignored
+// (so a direct client cannot spoof its IP). Default: no trusted proxies.
+func (l *IPRateLimiter) TrustProxies(cidrs []string) {
+	for _, c := range cidrs {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			l.trustedProxies = append(l.trustedProxies, n)
+		}
+	}
+}
+
 // Middleware wraps next, rejecting requests that exceed the per-IP or global
 // budget with 429.
 func (l *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !l.allow(clientIP(r), time.Now()) {
+		if !l.allow(l.clientIP(r), time.Now()) {
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
 		}
@@ -91,10 +106,41 @@ func (l *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func clientIP(r *http.Request) string {
+func (l *IPRateLimiter) trusted(ip string) bool {
+	p := net.ParseIP(ip)
+	if p == nil {
+		return false
+	}
+	for _, n := range l.trustedProxies {
+		if n.Contains(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP returns the IP the rate limiter keys on. When the direct peer is a
+// trusted proxy and X-Forwarded-For is present, it returns the right-most
+// forwarded hop that is not itself a trusted proxy (the real client as seen by
+// the outermost trusted proxy). Otherwise it returns the direct peer.
+func (l *IPRateLimiter) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
-	return host
+	if len(l.trustedProxies) == 0 || !l.trusted(host) {
+		return host
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return host
+	}
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		ip := strings.TrimSpace(parts[i])
+		if ip != "" && !l.trusted(ip) {
+			return ip
+		}
+	}
+	return strings.TrimSpace(parts[0])
 }

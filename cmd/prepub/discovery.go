@@ -5,12 +5,17 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -120,4 +125,62 @@ func fetchDiscoveryWithRetry(ctx context.Context, base, repo string, obs *observ
 			backoff *= 2
 		}
 	}
+}
+
+// --- Asymmetric (Ed25519) discovery signing ------------------------------------
+// The publisher signs the discovery document with an Ed25519 private key; each
+// receiver verifies with only the matching public key. Unlike the HMAC variant,
+// the verifier holds no secret that could mint tokens or forge documents, so the
+// master secret never needs to reach a receiver.
+
+// ed25519SignerFromFile loads a PEM (PKCS#8) Ed25519 private key and returns a
+// serve.Signer producing base64 detached signatures.
+func ed25519SignerFromFile(path string) (serve.Signer, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return nil, fmt.Errorf("discovery signing key %s: no PEM block", path)
+	}
+	k, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	priv, ok := k.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("discovery signing key %s: not an Ed25519 private key", path)
+	}
+	return func(payload []byte) (string, error) {
+		return base64.StdEncoding.EncodeToString(ed25519.Sign(priv, payload)), nil
+	}, nil
+}
+
+// ed25519VerifierFromFile loads a PEM (PKIX) Ed25519 public key and returns a
+// verify function matching ed25519SignerFromFile.
+func ed25519VerifierFromFile(path string) (func(payload []byte, sig string) bool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return nil, fmt.Errorf("discovery verify key %s: no PEM block", path)
+	}
+	k, err := x509.ParsePKIXPublicKey(blk.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := k.(ed25519.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("discovery verify key %s: not an Ed25519 public key", path)
+	}
+	return func(payload []byte, sig string) bool {
+		raw, derr := base64.StdEncoding.DecodeString(sig)
+		if derr != nil {
+			return false
+		}
+		return ed25519.Verify(pub, payload, raw)
+	}, nil
 }

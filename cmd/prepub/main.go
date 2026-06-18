@@ -22,6 +22,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -72,6 +73,8 @@ func main() {
 	embeddedBrokerAuth := flag.Bool("embedded-broker-auth", false, "Require token authentication on the embedded broker (needs PREPUB_HMAC_SECRET); receivers enrol via challenge/response [publisher]")
 	enrollTLSAddr := flag.String("enroll-tls-addr", "", "With --embedded-broker-auth and a broker TLS cert, serve enroll/revoke over HTTPS at this bind address (e.g. :8443) so the enrollment token never travels in plaintext [publisher]")
 	enrollURL := flag.String("enroll-url", "", "HTTPS base URL for the TLS enroll/revoke endpoint, advertised to receivers via discovery (e.g. https://cvmfs-prepub:8443) [publisher]")
+	discoverySigningKey := flag.String("discovery-signing-key", "", "PEM Ed25519 private key to sign the discovery document; receivers verify with the matching public key so no shared secret reaches a receiver [publisher]")
+	discoveryVerifyKey := flag.String("discovery-verify-key", "", "PEM Ed25519 public key to verify the signed discovery document [receiver]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
 	config := flag.String("config", "", "Config file path (reserved for future use)")
@@ -283,12 +286,12 @@ func main() {
 			*s1AttemptTimeout, *s1InitialBackoff, *s1MaxBackoff, *s1QueueSpoolDir,
 			*s1BatchSize,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL)
+			*distributeMode, *embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
 	case "receiver":
 		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
 			*recvBloomCapacity, *recvBloomFPRate, *coordURL, *nodeID, *repos,
 			*brokerURL, *brokerClientCert, *brokerClientKey, *brokerCACert,
-			*recvStratum0URL, *distributeMode, *discoveryURL, *brokerAuth)
+			*recvStratum0URL, *distributeMode, *discoveryURL, *brokerAuth, *discoveryVerifyKey)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
 		os.Exit(1)
@@ -327,6 +330,7 @@ func runPublisher(
 	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
 	embeddedBrokerAuth bool,
 	enrollTLSAddr, enrollURL string,
+	discoverySigningKey string,
 ) {
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
@@ -739,7 +743,11 @@ func runPublisher(
 	if pubCreds != nil && publishBrokerCfg != nil {
 		publishBrokerCfg.CredentialsProvider = pubCreds
 	}
-	pullManifestStore := serve.NewMemManifestStore()
+	pullManifestStore, pmErr := serve.NewSpoolManifestStore(spoolRoot + "/manifests")
+	if pmErr != nil {
+		obs.Logger.Error("failed to open manifest store", "error", pmErr)
+		os.Exit(1)
+	}
 	orch := &api.Orchestrator{
 		Spool:        sp,
 		CAS:          casBackend,
@@ -786,7 +794,14 @@ func runPublisher(
 	ctrlRateLimit := credential.NewIPRateLimiter(5, 10, 4096, 100, 200)
 	if controlPlaneURL != "" {
 		var discoSigner serve.Signer
-		if ctrlSecret != nil {
+		if discoverySigningKey != "" {
+			sgn, serr := ed25519SignerFromFile(discoverySigningKey)
+			if serr != nil {
+				obs.Logger.Error("loading discovery signing key", "error", serr)
+				os.Exit(1)
+			}
+			discoSigner = sgn
+		} else if ctrlSecret != nil {
 			discoSigner = hmacDiscoverySigner(ctrlSecret)
 		}
 		disco := &staticDiscovery{repos: []string{repoName}, cp: serve.ControlPlaneRef{Type: "mqtt", URL: controlPlaneURL}, signer: discoSigner}
@@ -909,6 +924,7 @@ func runReceiver(
 	distributeMode string,
 	discoveryURL string,
 	brokerAuth bool,
+	discoveryVerifyKey string,
 ) {
 	// Load the HMAC shared secret from the environment.  In DevMode the
 	// receiver skips HMAC verification entirely, so the secret is not required.
@@ -973,7 +989,18 @@ func runReceiver(
 			os.Exit(1)
 		}
 		if brokerAuth {
-			if !d.Verify(hmacDiscoveryVerify([]byte(os.Getenv("PREPUB_HMAC_SECRET")))) {
+			var verified bool
+			if discoveryVerifyKey != "" {
+				vf, verr := ed25519VerifierFromFile(discoveryVerifyKey)
+				if verr != nil {
+					obs.Logger.Error("loading discovery verify key", "error", verr)
+					os.Exit(1)
+				}
+				verified = d.Verify(vf)
+			} else {
+				verified = d.Verify(hmacDiscoveryVerify([]byte(os.Getenv("PREPUB_HMAC_SECRET"))))
+			}
+			if !verified {
 				obs.Logger.Error("control-plane: discovery signature verification FAILED — refusing advertised broker (possible MITM)")
 				os.Exit(1)
 			}
@@ -996,10 +1023,24 @@ func runReceiver(
 
 	var brokerCreds func() (string, string)
 	if brokerAuth {
-		secret := []byte(os.Getenv("PREPUB_HMAC_SECRET"))
-		if len(secret) < 16 {
-			obs.Logger.Error("--broker-auth requires PREPUB_HMAC_SECRET (>= 16 bytes)")
-			os.Exit(1)
+		// Per-node enrollment key: prefer the provisioned PREPUB_NODE_KEY (hex) so
+		// the receiver never holds the master secret; fall back to deriving it from
+		// the master (legacy / dev).
+		var nodeKey []byte
+		if nk := strings.TrimSpace(os.Getenv("PREPUB_NODE_KEY")); nk != "" {
+			b, derr := hex.DecodeString(nk)
+			if derr != nil || len(b) == 0 {
+				obs.Logger.Error("PREPUB_NODE_KEY must be non-empty hex")
+				os.Exit(1)
+			}
+			nodeKey = b
+		} else {
+			secret := []byte(os.Getenv("PREPUB_HMAC_SECRET"))
+			if len(secret) < 16 {
+				obs.Logger.Error("--broker-auth requires PREPUB_NODE_KEY (hex) or PREPUB_HMAC_SECRET (>= 16 bytes)")
+				os.Exit(1)
+			}
+			nodeKey = deriveNodeKey(secret, nodeID)
 		}
 		if discoveryURL == "" {
 			obs.Logger.Error("--broker-auth requires --discovery-url (the enroll endpoint base)")
@@ -1018,7 +1059,7 @@ func runReceiver(
 			}
 			enrollHTTP = hc
 		}
-		ec := &credential.Client{Base: enrollBase, HTTP: enrollHTTP, Node: nodeID, Key: deriveNodeKey(secret, nodeID)}
+		ec := &credential.Client{Base: enrollBase, HTTP: enrollHTTP, Node: nodeID, Key: nodeKey}
 		brokerCreds = func() (string, string) {
 			tok, terr := ec.Token(context.Background())
 			if terr != nil {
