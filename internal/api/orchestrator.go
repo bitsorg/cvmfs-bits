@@ -589,6 +589,65 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 		"new_root_hash", newRootHash)
 }
 
+// publishAnnounce broadcasts the pre-commit AnnounceMessage directly on the
+// control-plane broker so Stratum 1 receivers begin pulling the transaction's
+// objects before the catalog flips (ADR-0001 pull mode). It mirrors
+// publishMQTTNotification: a single-use broker.Client connects with the
+// distribution BrokerConfig (which carries the token CredentialsProvider so it
+// authenticates to the embedded broker), publishes one message to the repo
+// announce topic, and disconnects.
+//
+// The announce is best-effort: a failed broadcast is logged but never blocks or
+// fails the publish. Receivers also converge on the post-commit published
+// broadcast and the .cvmfspublished backstop poll, so a missed announce only
+// delays warming, it does not lose data.
+func (o *Orchestrator) publishAnnounce(repo, payloadID string, hashes []string, totalBytes int64) {
+	if o.Distribute == nil || o.Distribute.BrokerConfig == nil ||
+		o.Distribute.BrokerConfig.BrokerURL == "" {
+		return
+	}
+
+	// Per-call ClientID so concurrent announces from different jobs do not
+	// collide on the broker (which would force-disconnect the earlier session).
+	suffix := payloadID
+	if len(suffix) > 8 {
+		suffix = suffix[:8]
+	}
+	cfg := *o.Distribute.BrokerConfig
+	if cfg.ClientID == "" {
+		cfg.ClientID = "cvmfs-prepub-announce-" + suffix
+	} else {
+		cfg.ClientID = cfg.ClientID + "-announce-" + suffix
+	}
+
+	client, err := broker.New(cfg)
+	if err != nil {
+		o.Obs.Logger.Warn("mqtt: failed to connect for announce",
+			"repo", repo, "payload_id", payloadID, "error", err)
+		return
+	}
+	defer client.Disconnect(500)
+
+	// PublisherID matches the legacy distributeMQTT scheme ("pub-"+payloadID) so
+	// the announce is identical on the wire to what receivers handled before.
+	msg := broker.AnnounceMessage{
+		PayloadID:   payloadID,
+		PublisherID: "pub-" + payloadID,
+		Repo:        repo,
+		Hashes:      hashes,
+		TotalBytes:  totalBytes,
+	}
+	if err := client.Publish(broker.AnnounceTopic(repo), 1, false, msg); err != nil {
+		o.Obs.Logger.Warn("mqtt: failed to publish announce",
+			"repo", repo, "payload_id", payloadID, "error", err)
+		return
+	}
+	o.Obs.Logger.Info("mqtt: announce published",
+		"payload_id", payloadID,
+		"repo", repo,
+		"hashes", len(hashes))
+}
+
 // Run executes the job through all pipeline stages.
 //
 // ── Gateway mode (Lease.NeedsPipeline() == true) ─────────────────────────────
@@ -703,10 +762,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		// window as short as possible.  The DistManager handles concurrency,
 		// retries, and backoff per endpoint in its own goroutine pools.
 		// The job proceeds immediately to the serialised commit section below.
-		shouldDistribute := o.DistManager != nil ||
-			(o.Distribute != nil &&
-				(len(o.Distribute.Endpoints) > 0 ||
-					(o.Distribute.BrokerConfig != nil && o.Distribute.BrokerConfig.BrokerURL != "")))
+		shouldDistribute := o.Distribute != nil &&
+			o.Distribute.BrokerConfig != nil &&
+			o.Distribute.BrokerConfig.BrokerURL != ""
 		if shouldDistribute {
 			logger.Info("enqueuing S1 pre-warming (non-blocking)",
 				"objects", len(pipelineResult.ObjectHashes),
@@ -757,60 +815,19 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 					logger.Info("pull: transaction manifest stored", "txn", j.ID, "objects", len(objs))
 				}
 			}
-			if o.DistManager != nil {
-				// Queue-driven path: per-endpoint worker pools with retry/backoff.
-				distJobID := j.ID
-				item := distribute.WorkItem{
-					JobID: j.ID,
-					// Use NewObjectHashes (freshly uploaded objects only) rather
-					// than the full ObjectHashes set.
-					//
-					// ObjectHashes includes every dedup hit — objects that were
-					// already in CAS from previous jobs and were already pushed to
-					// S1 when those jobs ran.  Re-pushing them here means the
-					// DistManager reads the entire accumulated CAS for every job
-					// that shares objects with the first big publish (e.g. a 1.3 GB
-					// Python installation that later jobs all link against).  With
-					// 32 packages and 99% dedup rates this reads 1.3 GB from CAS
-					// for each small subsequent job, explaining the "CAS scanning"
-					// slowdown observed after the first large job.
-					//
-					// NewObjectHashes contains only objects that did not exist in
-					// CAS before this pipeline run — these are the only ones S1
-					// has not yet seen.  Dedup-hit objects were already present on
-					// S1 from the jobs that originally uploaded them.
-					Hashes:     append([]string(nil), pipelineResult.NewObjectHashes...),
-					TotalBytes: pipelineResult.NBytesComp,
-					Repo:       j.Repo,
-					EnqueuedAt: j.DistributingStartedAt,
-				}
-				o.DistManager.Enqueue(item, func(jobID string, confirmed, total int) {
-					// Fired from a DistManager worker goroutine when all endpoints finish.
-					freshJ, readErr := o.Spool.FindJob(distJobID)
-					if readErr != nil {
-						o.Obs.Logger.Warn("dist-result: cannot reload manifest",
-							"job_id", distJobID, "error", readErr)
-						return
-					}
-					freshJ.DistributingEndedAt = time.Now()
-					freshJ.DistributionConfirmed = confirmed
-					freshJ.DistributionTotal = total
-					// Ghost-directory guard: only write if the job directory still
-					// exists at the path derived from freshJ.State.  A narrow race
-					// between FindJob (which read state="leased") and this write can
-					// occur when abortJob concurrently renames leased/<id> →
-					// failed/<id>.  Without the guard, WriteManifest (which calls
-					// MkdirAll) would recreate spool/leased/<id>/, producing a ghost
-					// entry that listJobs returns and Scan recovers on restart.
-					if _, statErr := os.Stat(o.Spool.JobDir(freshJ)); statErr == nil {
-						if writeErr := o.Spool.WriteManifest(freshJ); writeErr != nil {
-							o.Obs.Logger.Warn("dist-result: manifest update failed",
-								"job_id", distJobID, "error", writeErr)
-						}
-					}
-					o.Obs.Logger.Info("dist-result: all endpoints finished",
-						"job_id", distJobID, "confirmed", confirmed, "total", total)
-				})
+			// Pull mode (ADR-0001): publish the pre-commit announce directly on the
+			// embedded broker so receivers begin pulling the new objects before the
+			// catalog flips. This mirrors publishMQTTNotification (the post-commit
+			// "published" broadcast): a single-use broker.Client connects, publishes
+			// one AnnounceMessage, and disconnects. Its CredentialsProvider (carried
+			// on BrokerConfig) authenticates to the token-gated broker. The warm
+			// quorum is gated by the receivers' pull acks; a failed announce only
+			// means receivers converge on the post-commit published broadcast.
+			if o.Distribute != nil && o.Distribute.BrokerConfig != nil &&
+				o.Distribute.BrokerConfig.BrokerURL != "" {
+				o.publishAnnounce(j.Repo, j.ID,
+					append([]string(nil), pipelineResult.NewObjectHashes...),
+					pipelineResult.NBytesComp)
 			}
 			// Job continues immediately to the serialised commit section below.
 		}
