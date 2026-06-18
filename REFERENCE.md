@@ -72,6 +72,7 @@ into CVMFS, complementing the existing overlay-based publishing workflow.
 40. Roles, Keys, and Trust Boundaries
 41. Sequence — Receiver Bootstrap and Enrollment
 42. Sequence — Publish, Coordinate, Pull, Warm
+42b. Comparison with `cvmfs_server snapshot`
 43. Sequence — Revocation
 44. Security Model in Detail
 45. Configuration and Key Provisioning
@@ -197,9 +198,9 @@ to be run alongside it, not as a replacement.
 | **Streaming** | Files must be fully on disk before publish begins | Tar streamed from HTTP body; compress+hash begins on the first byte |
 | **Worker parallelism** | Single-threaded per file in `cvmfs_server`; no worker pool | Configurable worker pool; compress and catalog build overlap |
 | **CAS upload timing** | Inside transaction — network latency is counted against lock hold time | Before lease acquisition — network latency is hidden from the lock window |
-| **Dedup mechanism** | CAS stat per file inside transaction | Bloom filter fast path + CAS confirm; updated in-process after each upload |
-| **Cross-job dedup** | Via shared CAS — each publish rescans the store at lock time | Bloom filter seeded from CAS at startup; incremental updates during the run |
-| **Cross-node dedup** | No built-in mechanism across separate publisher nodes | Shared Bloom filter snapshots on NFS/CephFS (optional, §15) |
+| **Dedup mechanism** | CAS stat per file inside transaction | Direct `CAS.Exists()` per object — `os.Stat` (local FS) or `HEAD` (S3) |
+| **Cross-job dedup** | Via shared CAS — each publish rescans the store at lock time | Via shared CAS — each object checked directly against the store at upload time |
+| **Cross-node dedup** | No built-in mechanism across separate publisher nodes | Inherent — separate nodes share the same content-addressed CAS, so `Exists()` reflects all of them |
 | **When S1 can replicate** | Only after manifest is signed and released | Objects pushed to S1 before catalog commit — pre-warming (Option B) |
 | **Cold-start miss storm** | High — all S1 nodes fetch concurrently after catalog flip | Eliminated — objects already on S1 when catalog flips |
 | **Client latency after publish** | First clients hit slow inter-site links while S1 replicates | Files available immediately from S1 upon catalog flip |
@@ -647,7 +648,7 @@ Unpacker
 Compress+Hash worker pool
   │  chan ProcessedFile (path, casHash, compressedBytes)
   ▼
-Deduplicator (Bloom filter → CAS HEAD check)
+Deduplicator (direct CAS.Exists() — os.Stat / S3 HEAD)
   │  chan NewObject (casHash, compressedBytes)  [only truly new objects]
   ▼
 CAS Uploader (multipart for > 100 MB, idempotent PUT)
@@ -675,11 +676,14 @@ func processFile(r io.Reader) (hash string, compressed []byte, err error) {
 ```
 
 **Deduplication:**  
-A Bloom filter is populated from the list of existing CAS objects at job start.
-Files that hit the filter are confirmed with a single CAS `HEAD` request (false
-positives are harmless — one extra network round-trip). Files that miss are
-guaranteed new and go directly to the uploader. This eliminates the `HEAD` cost
-for the common case where most files in a release already exist in CAS.
+Each compressed object is checked directly against the store with
+`CAS.Exists()` — an `os.Stat` for the local filesystem backend or a single
+`HEAD` request for S3 — via the `cas.NativeExistsChecker` interface. Objects
+that already exist are recorded in the catalog but skipped by the uploader;
+objects that are absent go directly to the uploader. There is no probabilistic
+inventory filter, no startup CAS/catalog walk, and no in-memory inventory to
+populate or size, so the dedup path carries no saturation risk at scale: it is
+exact (no false positives) and stateless.
 
 ### 7.3 Lease Management
 
@@ -1185,7 +1189,7 @@ cvmfs-prepub/
 │   │   ├── unpack/          # Streaming tar reader, path normaliser
 │   │   ├── compress/        # zlib/zstd worker pool
 │   │   ├── hash/            # SHA-256 (+ optional RIPEMD-160 for legacy compat)
-│   │   ├── dedup/           # Bloom filter + CAS existence check
+│   │   ├── dedup/           # Direct CAS existence check (os.Stat / S3 HEAD)
 │   │   ├── upload/          # CAS object uploader, multipart, retry
 │   │   └── catalog/         # Entry collector shim (delegates merge to pkg/cvmfscatalog)
 │   │
@@ -1439,10 +1443,11 @@ across software versions (shared libraries, Python runtimes, common headers) are
 uploaded exactly once.  A `bits` package update that changes only 5% of files
 will only upload that 5%, even if the full software tree is 10 GB.
 
-The pipeline's Bloom filter (§7.3) accelerates the dedup check: before issuing
-a `cas.Get`, the pipeline asks the filter whether the hash is already present.
-The filter provides a probabilistic answer in microseconds, avoiding a disk or
-S3 round-trip for the common case.
+The pipeline's dedup check (§7.2) is a direct `CAS.Exists()` per object — an
+`os.Stat` on the local filesystem backend or a single `HEAD` request on S3.
+Objects that already exist are recorded in the catalog and skipped by the
+uploader; only genuinely new objects are transferred. The check is exact (no
+false positives) and requires no precomputed inventory.
 
 ---
 
@@ -1503,7 +1508,7 @@ associated SSH key management, spool directory, and sequencing constraints.
 | **CVMFS transaction** | `cvmfs_server publish` on stratum-0 | `cvmfs_gateway` lease+payload API |
 | **Stratum 1 pre-warming** | Not supported | Option B (configurable) |
 | **Crash recovery** | Spool directory survives runner restart | WAL-journalled spool in cvmfs-prepub |
-| **Deduplication** | None (re-uploads all blobs) | Bloom filter + CAS HEAD (cross-job) |
+| **Deduplication** | None (re-uploads all blobs) | Direct CAS.Exists() — os.Stat / S3 HEAD (cross-job) |
 | **Provenance** | Not supported | Ed25519 + Rekor transparency log (§18) |
 | **Parallel jobs** | Serialised by CVMFS transaction lock | Serialised by gateway lease; pipeline independent |
 | **CI/CD variables** | `SPOOL_SSH_KEY`, `SPOOL_USER`, `SPOOL_HOST`, `SPOOL_PATH` | `PREPUB_URL`, `PREPUB_API_TOKEN` |
@@ -1602,7 +1607,6 @@ Receiver-specific metrics (see also Part V §31.7):
 |---|---|---|
 | `cvmfs_receiver_objects_received_total` | Counter | CAS objects received via PUT |
 | `cvmfs_receiver_bytes_received_total` | Counter | Compressed bytes received |
-| `cvmfs_receiver_bloom_size` | Gauge | Objects in the inventory Bloom filter |
 | `cvmfs_receiver_heartbeat_errors_total` | Counter | Coordination service errors |
 
 ### 19.2 Structured Logging
@@ -2396,6 +2400,34 @@ access_sources:
   - type: publish_events
 ```
 
+**Pull-over-WSS control plane and security flags** (current system, Part VIII).
+On Stratum 0 the publisher runs an in-process MQTT broker, serves a signed
+discovery document, and serves manifests/objects for receivers to *pull*:
+
+| CLI flag | Default | Notes |
+|---|---|---|
+| `--embedded-broker-ws-addr` | `` | Run an in-process MQTT broker over WebSocket on Stratum 0 (e.g. `:1882`); empty disables the embedded broker |
+| `--control-plane-url` | `` | Broker URL advertised to receivers via discovery (e.g. `wss://cvmfs-prepub:1882`) |
+| `--embedded-broker-tls-cert` | — | PEM server certificate for the embedded broker; enables `wss://` |
+| `--embedded-broker-tls-key` | — | PEM server private key for the embedded broker |
+| `--broker-ca-cert` | — | PEM CA certificate used to verify the broker (set on publisher and receivers) |
+| `--embedded-broker-auth` | `false` | Require token authentication on the broker (challenge/response enrollment) |
+| `--enroll-tls-addr` | `` | HTTPS listener serving challenge / enroll / revoke (e.g. `:8443`), so the bearer token never travels in plaintext |
+| `--enroll-url` | `` | HTTPS enroll endpoint advertised to receivers via discovery (e.g. `https://cvmfs-prepub:8443`) |
+| `--discovery-signing-key` | — | PEM Ed25519 **private** key used to sign the discovery document |
+| `--pull-object-base-url` | `` | Object base URL embedded in pull manifests (e.g. `http://cvmfs-prepub:8080`) |
+
+The publisher master secret is read from the **`PREPUB_HMAC_SECRET`**
+environment variable (**Stratum 0 only**); it mints/verifies tokens and derives
+the per-node keys handed to receivers. See §40 and §45 for the full key model.
+
+**Admin subcommand.** Revoke a receiver node — denylist it for future
+enrollments/connects and disconnect any live session:
+
+```
+prepub revoke <node> [--enroll-url https://cvmfs-prepub:8443] [--ca-cert ca.crt]
+```
+
 **Receiver mode** — `cvmfs-prepub --mode receiver` CLI flags (Stratum 1 node):
 
 ```
@@ -2429,13 +2461,30 @@ access_sources:
 | `--session-ttl` | `1h` | How long an announce session remains valid |
 | `--disk-headroom` | `1.2` | Multiplier applied to `total_bytes` for the disk space pre-check |
 | `--max-object-size` | `1073741824` (1 GiB) | Maximum body size in bytes for a single `PUT /api/v1/objects/{hash}`; requests exceeding this limit are rejected with `413` before any bytes touch disk |
-| `--bloom-capacity` | `5000000` | Inventory Bloom filter capacity (must be consistent across all receivers the distributor compares) |
-| `--bloom-fp-rate` | `0.001` | Inventory Bloom filter false-positive rate (0 < rate < 1) |
 | `--coord-url` | `` | HepCDN coordination service base URL; empty disables coordination (see §22) |
 | `--node-id` | hostname | Stable identifier for this receiver node reported to the coordination service |
 | `--repos` | `` | Comma-separated list of CVMFS repositories served by this receiver (e.g. `atlas.cern.ch,cms.cern.ch`) |
 | `--dev` | `false` | Allow plain HTTP control channel and skip HMAC verification (tests only — never use in production) |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+
+**Pull-over-WSS control plane and security flags** (current system, Part VIII).
+These configure the receiver as a *pull* client of the Stratum 0 broker and
+object store rather than an inbound push target:
+
+| CLI flag | Default | Notes |
+|---|---|---|
+| `--broker-auth` | `false` | Enroll via challenge/response and authenticate to the broker with a scoped bearer token (instead of an anonymous connection) |
+| `--discovery-url` | `` | Fixed Stratum-0 endpoint serving the signed discovery document (e.g. `https://cvmfs-prepub:8080/cvmfs/{repo}/.cvmfsbits`) |
+| `--receiver-stratum0-url` | `` | Stratum-0 base URL the receiver pulls manifests and objects from |
+| `--discovery-verify-key` | — | PEM Ed25519 **public** key used to verify the signed discovery document |
+| `--broker-ca-cert` | — | PEM CA certificate used to verify the broker (and enroll endpoint) server certificate |
+| `--pull-concurrency` | `16` | Number of parallel object transfers / bundle requests |
+| `--pull-files-per-request` | `1` | Objects per request: `1` = one GET per object; `>1` = chunked bundles requested via `POST /s1/bundle` |
+| `--pull-auto` | `false` | Measure RTT to Stratum 0 at startup and auto-pick `--pull-concurrency` / `--pull-files-per-request` from a latency class (CERN <1 ms → 32/1; EU ~20 ms → 16/8; US ~100 ms → 8/32; Asia >200 ms → 8/64); any explicitly set flag overrides the auto choice |
+
+The per-node enrollment key is read from the **`PREPUB_NODE_KEY`** environment
+variable (hex-encoded `HMAC-SHA256(master, node)`, provisioned on Stratum 0 and
+handed to the receiver out of band). **Receivers hold no master secret.**
 
 The HMAC shared secret is read from the **`PREPUB_HMAC_SECRET`** environment
 variable.  It must be set to the same value on the publisher and every receiver.
@@ -2650,72 +2699,36 @@ behind by a previous crash before the atomic rename could complete.  The sweep
 is context-cancellable so `Shutdown()` can interrupt it on a stalling
 filesystem.
 
-### 20.9 Inventory Bloom Filter Endpoint
+### 20.9 Missing-Set Computation (Direct CAS)
 
-The control channel exposes the receiver's local object inventory as a
-serialised Bloom filter at `GET /api/v1/bloom`.  The distributor (and the
-coordination service) fetch this endpoint before pushing a batch of objects so
-that they can skip objects the receiver already holds — **delta push mode**.
+There is **no inventory-filter endpoint** — the receiver advertises nothing for
+the publisher to subtract against. The per-receiver delta is computed from the
+announce itself, with each candidate object tested directly against the
+receiver's local CAS — an `os.Stat` for the
+local filesystem backend or a single `HEAD` for S3, via the
+`cas.NativeExistsChecker` interface.
 
-**Request** — `GET https://<s1-host>:<control-port>/api/v1/bloom`
+When a receiver gets an `AnnounceMessage` (control channel) or reads a pull
+manifest, it walks the announced hash list and, for each hash, calls
+`CAS.Exists()`; the hashes that return `false` form `absent_hashes` — exactly
+the subset it must fetch. This is exact (no false positives, no false
+negatives), requires no startup CAS walk to populate an in-memory filter, and
+carries no saturation or sizing concerns at scale. The cost is one cheap local
+existence check per announced object, parallelised across the receiver's worker
+pool.
 
-| Header | Value |
-|---|---|
-| `Authorization` | `Bearer <token>` where `token = hex(HMAC-SHA256(HMACSecret, "bloom-read"))` |
-
-The token is derived from the same `PREPUB_HMAC_SECRET` shared between the
-publisher and receivers using a fixed label (`"bloom-read"`), so no per-request
-timestamp negotiation is needed.  In `--dev` mode the check is bypassed.
-A missing or invalid token returns `401 Unauthorized`.
-
-**Response — 200 OK:**
-
-- `Content-Type: application/octet-stream`
-- Body: binary-encoded `bloom.BloomFilter` (the format produced by
-  `bloom.BloomFilter.WriteTo` from `github.com/bits-and-blooms/bloom/v3`).
-  Callers deserialise with `bloom.BloomFilter.ReadFrom`.
-
-**Error responses:**
-
-| Status | Meaning |
-|---|---|
-| `200 OK` | Filter ready; body is the binary-encoded Bloom filter |
-| `401 Unauthorized` | Missing or invalid bearer token |
-| `503 Service Unavailable` | Inventory still building (CAS walk in progress); `Retry-After: 10` header set |
-| `405 Method Not Allowed` | Non-GET request |
-
-**Inventory lifecycle:**
-
-1. At receiver startup `populateFromCAS` walks the two-level CAS directory tree
-   (`{cas_root}/{aa}/{aabbcc…}[C]`) and adds every found hash to the filter.
-   While the walk is in progress `isReady()` returns `false` and the endpoint
-   returns `503`.
-2. After the walk completes `isReady()` becomes `true` and the endpoint returns
-   the populated filter.
-3. Every successful object PUT (§20.3) calls `inv.add(hash)` immediately after
-   the atomic rename, keeping the filter current without waiting for a new walk.
-
-**Delta push algorithm in the distributor:**
+**Delta algorithm (receiver):**
 
 ```
-1.  announce(endpoint)              → session_token, data_endpoint
-2.  GET /api/v1/bloom               → BloomFilter bf
-3.  for hash in candidate_hashes:
-        if bf.TestString(hash): skip   // probably already present
-        else: push(hash)               // definitely absent
+1.  receive announce(repo, txn, candidate_hashes)   // or read pull manifest
+2.  absent = [h for h in candidate_hashes if not CAS.Exists(h)]   // os.Stat / S3 HEAD
+3.  reply ready{ ..., absent_hashes: absent }       // push path
+    or pull each h in absent from object serving    // pull path
 ```
 
-Bloom filters have **no false negatives**: if the filter reports a hash absent,
-the object is definitely not at that receiver.  False positives (the filter
-reports an object present when it is not) cause an object to be skipped; the
-receiver will then fetch it during normal CVMFS replication as a lazy repair.
-With the default parameters (5 M capacity, 0.1% FP rate) false positives are
-rare enough to be operationally acceptable.
-
-**Filter parameters** must be identical on all receivers that a single
-distributor queries, otherwise the bit arrays are not comparable.  The defaults
-(`--bloom-capacity 5000000`, `--bloom-fp-rate 0.001`) are suitable for
-repositories with up to five million distinct objects per Stratum 1 node.
+On the publisher (push path) the per-receiver delta is taken directly from the
+receiver's `ReadyMessage.AbsentHashes`; there is no separate inventory-snapshot
+fetch round-trip.
 
 ### 20.10 Prometheus Metrics Endpoint
 
@@ -2728,7 +2741,6 @@ Receiver-specific metrics:
 |---|---|---|
 | `cvmfs_receiver_objects_received_total` | Counter | CAS objects successfully received via PUT |
 | `cvmfs_receiver_bytes_received_total` | Counter | Compressed bytes received via PUT (on-wire size) |
-| `cvmfs_receiver_bloom_size` | Gauge | Approximate number of objects in the inventory Bloom filter |
 | `cvmfs_receiver_heartbeat_errors_total` | Counter | Coordination service heartbeat errors |
 
 The existing `cvmfs_prepub_*` metrics (jobs, pipeline, CAS upload durations)
@@ -2812,8 +2824,9 @@ Publisher                              Broker                    Receiver(s)
 ```
 
 `hashes` is the complete list of CAS objects in the payload.  The receiver
-subtracts its Bloom filter inventory to compute `absent_hashes`—the subset it
-does not yet hold—without a separate bloom-fetch round-trip.
+computes `absent_hashes`—the subset it does not yet hold—by calling
+`CAS.Exists()` (os.Stat / S3 HEAD) on each hash directly, with no separate
+inventory-fetch round-trip.
 
 A receiver rejects announces with more than **1 000 000 hashes** or any
 individual hash string longer than **256 bytes**; such announces are treated as
@@ -2840,7 +2853,7 @@ attacker-controlled list.
 #### Presence and LWT
 
 On connect each receiver publishes a **retained** `PresenceMessage` with
-`online=true` and its current `bloom_ready` state.  It also configures a
+`online=true` and its current `ready` state.  It also configures a
 Last-Will-and-Testament (LWT) on the same topic with `online=false`.
 
 If the receiver disconnects unexpectedly the broker publishes the LWT
@@ -2941,15 +2954,15 @@ Every 30 seconds the receiver sends a PUT to update its health state.
 
 ```json
 {
-  "bloom_size": 3821044,
-  "ready":      true
+  "objects": 3821044,
+  "ready":   true
 }
 ```
 
 | Field | Description |
 |---|---|
-| `bloom_size` | Approximate number of objects in the inventory Bloom filter (from `inv.approximateSize()`) |
-| `ready` | `true` once the initial CAS walk has completed (`inv.isReady()`) |
+| `objects` | Approximate number of objects currently held in the local CAS |
+| `ready` | `true` once the receiver has finished initialising and can serve / pull |
 
 | Header | Value |
 |---|---|
@@ -3915,7 +3928,7 @@ instance in a local test environment.
 | Item | Description |
 |---|---|
 | Full processing pipeline | Unpack → compress+hash → dedup → upload → catalog build |
-| Bloom filter deduplication | Populate from CAS object listing at job start |
+| Direct CAS deduplication | Per-object `CAS.Exists()` (os.Stat / S3 HEAD) at upload time — no inventory to populate |
 | API server | REST endpoint for tar submission, status query, abort |
 | `prepubctl` CLI | drain, abort, status |
 | Lease heartbeat | Goroutine per active lease, abort-on-loss |
@@ -4000,7 +4013,7 @@ larger than a few hundred MB, chunking is important for deduplication (a 10 GB
 file that changes by 1 MB should not require re-uploading 10 GB). The pipeline
 architecture accommodates chunking (the `compress` stage can emit multiple
 `ProcessedFile` messages per input file), but the catalog schema for chunked
-files and the Bloom filter sizing need detailed design work.
+files needs detailed design work.
 
 **Nested catalog pre-splitting.** Delegating catalog splitting to the gateway
 (§7.4) is simpler but may not work for all gateway versions or for very deep
@@ -4010,9 +4023,9 @@ dependency on catalog metadata at job start time.
 
 **Cross-repository deduplication.** The current design deduplicates within a
 single repository's CAS. CVMFS supports shared CAS across repositories. If
-multiple repositories share a backend, the Bloom filter and the RefCounter must
-account for cross-repository references. This is a significant complexity
-increase and is deferred to Phase 4.
+multiple repositories share a backend, the RefCounter must account for
+cross-repository references. This is a significant complexity increase and is
+deferred to Phase 4.
 
 **Client telemetry.** If a future CVMFS client version supports reporting accessed
 file hashes back to the publisher (via the monitoring socket or a dedicated
@@ -4197,6 +4210,59 @@ sequenceDiagram
   API->>API: quorum of ready reached -> transaction done
   API->>M: Delete manifest (warm quorum reached)
 ```
+
+## 42b. Comparison with `cvmfs_server snapshot`
+
+The real baseline for Stratum 1 replication in CVMFS is **`cvmfs_server
+snapshot`** (run as `cvmfs_server snapshot -a` to sweep all replicated repos on
+a host). It is what production Stratum 1 sites use today, so it is the honest
+yardstick for the bits pull path. See the upstream documentation:
+<https://cvmfs.readthedocs.io/en/stable/cpt-replica.html>.
+
+**How `cvmfs_server snapshot` works.** It is **CRON-scheduled** — replication
+latency is whatever the cron interval is, typically minutes. Each run invokes
+`cvmfs_swissknife pull -n <workers>` under the hood. The algorithm is a
+**pull that re-discovers the delta by walking the catalog tree itself**:
+
+1. Fetch the Stratum 0 manifest (`.cvmfspublished`).
+2. If the signed root catalog hash is unchanged, there is nothing to do.
+3. Otherwise, walk the catalog tree from the new root, downloading the new
+   catalogs (compressed SQLite) and enumerating the content chunks they
+   reference.
+4. Download every referenced chunk that is **not already present** locally —
+   **one HTTP GET per chunk**, spread across `N` parallel worker threads
+   (`CVMFS_NUM_WORKERS` / `-n`, commonly 8–16, raised to ~64 at large sites).
+   Each chunk is content-addressed and **hash-verified on arrival**, reusing the
+   Fuse client's integrity checks. There is **no request batching**.
+
+So the snapshot baseline is: **pull, cron-triggered, file-by-file,
+parallel-but-unbatched, with the S1 re-discovering the delta by walking the
+catalog**.
+
+**The bits pull path has the same data plane and adds coordination.** Its data
+plane is *equivalent* to snapshot's — parallel, file-by-file, content-addressed,
+hash-verified GETs. On top of that it adds event-triggering (a `wss` announce
+fires immediately on commit), explicit per-transaction manifests (the delta is
+handed to the receiver rather than rediscovered by a catalog re-walk), **optional
+request bundling** (`--pull-files-per-request` > 1 amortises RTT), and
+**commit coordination** (the publisher can gate the catalog flip on a warm
+quorum of receivers). None of these change the unit of integrity — both verify
+every object by hash.
+
+| Dimension | `cvmfs_server snapshot` (`cvmfs_swissknife pull`) | bits pull (Part VIII) |
+|---|---|---|
+| **Trigger** | CRON-scheduled; latency = cron interval (minutes) | Event-driven `wss` announce on commit — immediate |
+| **Delta discovery** | S1 re-walks the new catalog tree to enumerate referenced chunks | Explicit per-transaction manifest delivered to the receiver |
+| **Unit of transfer** | 1 HTTP GET per chunk | 1 GET per object, **or** a K-object chunked bundle (`POST /s1/bundle`) |
+| **RTT amortization** | None — every chunk is its own request | Optional via `--pull-files-per-request` (bundle K objects per request) |
+| **Concurrency** | `CVMFS_NUM_WORKERS` / `-n` (commonly 8–16, up to ~64) | `--pull-concurrency` (default 16; `--pull-auto` picks per latency class) |
+| **Integrity** | Per-chunk content-addressed hash verification (Fuse client checks) | Per-object content-addressed hash verification |
+| **Coordination** | Each S1 polls Stratum 0 independently; no cross-node coordination | Publisher can gate the commit on a warm quorum of receivers |
+
+In short, the bits pull path is not a different transfer mechanism from
+`cvmfs_server snapshot`; it is the same parallel, file-by-file, hash-verified
+pull, made **event-triggered**, given an **explicit delta manifest**, optionally
+**RTT-batched**, and **commit-coordinated**.
 
 ## 43. Sequence — Revocation
 
