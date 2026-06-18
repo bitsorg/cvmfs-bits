@@ -683,6 +683,11 @@ func runPublisher(
 	// Create the queue-driven distribution manager when S1 endpoints are
 	// configured.  The manager is started after the orchestrator is wired up
 	// so that the server startup sequence is linear.
+	// Attach the publisher's token credentials to the distribution broker config
+	// BEFORE NewManager snapshots it, so announce clients present a token (H3).
+	if pubCreds != nil && distCfg != nil && distCfg.BrokerConfig != nil {
+		distCfg.BrokerConfig.CredentialsProvider = pubCreds
+	}
 	var distManager *distribute.Manager
 	if distCfg != nil && len(distCfg.Endpoints) > 0 {
 		distManager = distribute.NewManager(*distCfg, casBackend)
@@ -703,13 +708,8 @@ func runPublisher(
 		}
 	}
 
-	if pubCreds != nil {
-		if publishBrokerCfg != nil {
-			publishBrokerCfg.CredentialsProvider = pubCreds
-		}
-		if distCfg != nil && distCfg.BrokerConfig != nil {
-			distCfg.BrokerConfig.CredentialsProvider = pubCreds
-		}
+	if pubCreds != nil && publishBrokerCfg != nil {
+		publishBrokerCfg.CredentialsProvider = pubCreds
 	}
 	pullManifestStore := serve.NewMemManifestStore()
 	orch := &api.Orchestrator{
