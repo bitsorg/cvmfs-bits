@@ -8,14 +8,11 @@ complementing the existing overlay-based publishing workflow.
 > repository through `cvmfs_gateway`, and distributes the resulting objects to
 > Stratum 1 receivers using a **pull-based data path coordinated over an embedded
 > MQTT-over-WebSocket/TLS control plane** with token authentication, role ACLs,
-> and Ed25519-signed discovery. The pull control plane is described in
+> and Ed25519-signed discovery. The control plane is described in
 > [Chapter 8](#8-pull-distribution-and-the-control-plane) and specified in
 > [Chapter 31](#31-pull-distribution-protocol).
 >
-> Earlier prototypes of a push data plane, an SSE control plane, an external
-> mosquitto broker, and a separate coordination service have been removed from
-> the current implementation; any residual code lives on the `legacy` git branch.
-
+>
 ---
 
 ## Table of Contents
@@ -68,8 +65,7 @@ complementing the existing overlay-based publishing workflow.
 35. cvmfs-prepub REST API Reference
 
 ### Part VII — Roadmap
-36. Phased Deployment Plan
-37. Open Questions and Future Work
+36. Open Questions and Future Work
 
 ---
 
@@ -187,19 +183,15 @@ controlled setting, so any such number here would be unverified.
 | **Entry point** | Local access to the Stratum 0 node; install files via overlay mount | HTTP POST of a tar archive plus an API token |
 | **Input format** | Arbitrary file tree via overlay mount | Tar archive stream |
 | **Worker parallelism** | As implemented by `cvmfs_server publish` | Configurable compress/upload worker pool (`--pipeline-upload-conc`, pipeline worker count) |
-| **Dedup mechanism** | CAS existence check per file inside the transaction | Direct `CAS.Exists()` per object — `os.Stat` (local FS) or `HEAD` (S3), via `cas.NativeExistsChecker` |
-| **Cross-node dedup** | No built-in mechanism across separate publisher nodes | Nodes sharing one content-addressed CAS see each other's objects through `Exists()` |
 | **Stratum 1 pre-warming** | Not built in; S1 replicates after the catalog flip | Optional: receivers pull objects before the catalog flip (Chapter 8) |
 | **State durability** | Overlay fs is live; an interrupted publish leaves an uncommitted overlay | Each state transition is written to a crash-safe spool with a WAL journal; restarts resume |
-| **Idempotency** | Not guaranteed on re-run after failure | CAS `Put` and gateway `Submit` are idempotent; retries are safe |
 | **Job status** | Exit code + log file | REST API with per-job FSM state; optional SSE event stream and webhook |
-| **Metrics / tracing** | Not built in | OpenTelemetry spans + Prometheus metrics per pipeline stage |
-| **Gateway changes** | Is the gateway workflow | None — uses the existing lease-and-payload API as a client |
+| **Metrics / tracing** | Log files | OpenTelemetry spans + Prometheus metrics per pipeline stage |
 | **S1 / client changes** | None | None to the CVMFS client; receivers run the `--mode receiver` binary for pull pre-warming |
 | **Coexistence** | — | Runs alongside the traditional workflow; the gateway's per-path lease arbitrates |
 | **Publisher identity** | Operator/account on the Stratum 0 node, recorded in server-side logs | Structured fields (`actor`, `git_sha`, `pipeline_id`) in every job manifest |
 | **Identity verification** | No built-in cryptographic check | Optional OIDC token validated against the CI provider's JWKS; `verified=true` is set only on a validated token |
-| **Transparency log** | None | Optional Rekor (`hashedrekord`) submission after publish |
+| **Provenance** | None | Optional Rekor (`hashedrekord`) submission after publish |
 
 The differences above are structural consequences of the design; they do not by
 themselves establish that one path is faster than the other for any given
@@ -255,13 +247,10 @@ a clear error, consistent with GNU tar's ordering guarantee.
 
 ---
 
+## 5. bits and bits-console 
 
----
-
-## 5. WLCG and bits-console Context
-
-This section describes how cvmfs-prepub fits into the broader WLCG software
-distribution pipeline, specifically the bits-console build-to-edge workflow.
+This section describes how cvmfs-prepub fits into the broader software
+distribution pipeline, specifically the bits-console  workflow.
 It covers what bits produces, how the CVMFS namespace is partitioned, and the
 submission protocol between a bits CI job and cvmfs-prepub.  Data flow and
 deduplication are covered in the User Guide (Chapter 16).
@@ -274,7 +263,7 @@ CVMFS namespace path.  For example, a build of the ATLAS offline software might
 emit:
 
 ```
-atlas/24.0.30/x86_64-el9-gcc13-opt/
+lcg/24.0.30/x86_64-el9-gcc13-opt/
     bin/
     lib/
     python/
@@ -294,8 +283,8 @@ lease path:
 
 ```toml
 [publish]
-repo       = "software.cern.ch"
-path       = "atlas/24.0"          # gateway lease will be acquired on this sub-path
+repo       = "sft.cern.ch"
+path       = "lcg/24.0"          # gateway lease will be acquired on this sub-path
 prepub_url = "https://prepub.example.org:8080"
 ```
 
@@ -3511,150 +3500,3 @@ GitHub Actions and GitLab CI (SaaS and self-hosted).  See Chapter 33 for details
 
 ---
 
-# PART VII — ROADMAP
-
-> **Who should read this part:** Site managers and project contributors planning
-> phased adoption, or anyone tracking open design questions and future work.
-
----
-
-## 36. Phased Deployment Plan
-
-### Phase 0 — Foundation (prerequisite, no user-visible change)
-
-| Item | Description |
-|---|---|
-| Repository scaffolding | Go module, CI pipeline, linting, basic test harness |
-| CAS backend | Implement and test `S3Backend` and `LocalFSBackend` |
-| Gateway client | Implement lease acquire/heartbeat/release/payload submit against a test gateway |
-| Spool manager | Implement spool directory transitions with crash-recovery tests |
-| Basic config loading | YAML config, validation, inotify watcher |
-
-Exit criterion: a tar file can be unpacked, all objects hashed and uploaded to a
-test CAS, and the spool transitions to `published/` via a real `cvmfs_gateway`
-instance in a local test environment.
-
----
-
-### Phase 1 — Publisher in Production (milestone: eliminate overlay FS bottleneck)
-
-| Item | Description |
-|---|---|
-| Full processing pipeline | Unpack → compress+hash → dedup → upload → catalog build |
-| Direct CAS deduplication | Per-object `CAS.Exists()` (os.Stat / S3 HEAD) at upload time — no inventory to populate |
-| API server | REST endpoint for tar submission, status query, abort |
-| `prepubctl` CLI | drain, abort, status |
-| Lease heartbeat | Goroutine per active lease, abort-on-loss |
-| Observability | Prometheus metrics: job latency, pipeline throughput, lease events |
-| Integration tests | End-to-end against a real CVMFS repository (test instance) |
-| Runbook | Deployment, monitoring alerts, manual recovery procedures |
-
-Exit criterion: software packages can be published from a tar file into a test
-CVMFS repository at the same or better correctness as the existing overlay workflow,
-with measurable reduction in lock-hold time.
-
-**Parallel operation:** During Phase 1 the existing overlay-based publisher
-continues to run for all production repositories. The new service publishes to a
-dedicated test repository. Both workflows coexist without interference because the
-gateway lease enforces path-level mutual exclusion.
-
----
-
-### Phase 2 — Stratum 1 Pull Pre-Warming (milestone: warm before the catalog flip)
-
-| Item | Description |
-|---|---|
-| Control plane | Embedded MQTT-over-wss broker, signed discovery, enrollment, revocation |
-| Distribution coordinator | Per-transaction announce, durable manifest store, warm-gate |
-| Receiver (pull) | `--mode receiver` pull client; direct-CAS missing-set computation |
-| Distribution metrics | Per-receiver readiness, warm coverage |
-| Alerting | Alert when a warm quorum is not reached within timeout |
-
-Exit criterion: after a publish, the announced objects are present on the warmed
-Stratum 1 receivers before the catalog flip, verified by the receivers' warm/ready
-reports.
-
-**Phased rollout:** Enable pull pre-warming for one Stratum 1 site first, then roll
-out to remaining sites progressively.
-
----
-
-### Phase 3 — Lifecycle Cleanup (milestone: automated content expiry)
-
-| Item | Description |
-|---|---|
-| AccessTracker + LogFileSource | Log file tailer with configurable field mapping |
-| HTTPReceiverSource | Ingestion endpoint for push-based access events |
-| CASBackendSource | S3 event integration or inotify |
-| PublishEventSource | Internal events from the pipeline |
-| GC scheduler + RefCounter | Per-repo cron, catalog walk |
-| Namespace Cleaner | Catalog deletion diff via lease |
-| Tombstone Manager + Reaper | Soft-delete window, rate-limited hard delete |
-| GC dry-run mode | Full deletion plan produced without state changes |
-| GC `prepubctl` commands | `gc-trigger`, `gc-dry-run`, `gc-status`, `tombstone-list` |
-
-Exit criterion: for at least one repository, GC runs unattended on schedule, the
-dry-run plan is reviewed and confirmed correct, then live GC is enabled and
-monitored through one full cycle (namespace cleanup + tombstone expiry + CAS
-reap).
-
-**Rollout order:** Enable dry-run for all GC-eligible repos first. Review plans
-for two full schedule cycles. Enable live GC per-repo with explicit operator sign-
-off.
-
----
-
-### Phase 4 — Hardening and Scale (ongoing)
-
-| Item | Description |
-|---|---|
-| Multi-repo parallelism | Pipelines for multiple repos concurrently |
-| `MultiBackend` for migration | Fan-out write to enable CAS backend migration |
-| Nested catalog pre-splitting | Pre-publisher-controlled catalog depth splitting |
-| Rate limiting and quotas | Per-submitter rate limits on the API |
-| Formal chaos testing | Kill process at each spool state; verify recovery |
-| Security audit | External review of credential handling and GC safety |
-
----
-
-
-## 37. Open Questions and Future Work
-
-**Chunked files (implemented).** Content-defined (xor32) chunking of large files
-is implemented (§9.2): each chunk is an independent CAS object with the `P`
-suffix and the catalog records the bulk hash. Remaining work is tuning the
-default chunk sizes against real release workloads and broadening test coverage.
-
-**Nested catalog pre-splitting.** Delegating catalog splitting to the gateway
-(§9.4) is simpler but may not work for all gateway versions or for very deep
-directory trees. The pre-publisher-controlled approach requires reading the
-existing catalog structure to know where splits currently exist, adding a
-dependency on catalog metadata at job start time.
-
-**Cross-repository deduplication.** The current design deduplicates within a
-single repository's CAS. CVMFS supports shared CAS across repositories. If
-multiple repositories share a backend, the RefCounter must account for
-cross-repository references. This is a significant complexity increase and is
-deferred to Phase 4.
-
-**Client telemetry.** If a future CVMFS client version supports reporting accessed
-file hashes back to the publisher (via the monitoring socket or a dedicated
-endpoint), the `HTTPReceiverSource` can ingest these events directly, providing
-finer-grained access tracking than proxy logs alone.
-
-**Catalog signing key management.** The gateway currently holds the private
-signing key. If the pre-publisher is deployed on a separate host, it cannot sign
-its own catalogs and must rely on the gateway for signing. A future option is to
-support delegated signing tokens with path-scoped validity, avoiding the need for
-the private key to reside on the gateway node.
-
-**Observability.** Phase 1 adds basic Prometheus metrics. Full observability
-(distributed tracing per job, per-file pipeline latency histograms, Stratum 1
-pre-warm coverage tracking) is a Phase 4 item once the critical path is stable.
-
----
-
-
-
-
----
