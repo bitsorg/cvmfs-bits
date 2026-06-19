@@ -36,6 +36,11 @@ type Config struct {
 	Workers int
 	// ChunkSize is the max size of a file before chunking (0 = no chunking).
 	ChunkSize int64
+	// Chunk{Min,Avg,Max} are CVMFS content-defined (xor32) chunking sizes in
+	// bytes; when ChunkAvg > 0 files are split at CVMFS-compatible boundaries.
+	ChunkMin int64
+	ChunkAvg int64
+	ChunkMax int64
 	// UploadConc is the number of concurrent dedup+upload workers per pipeline
 	// run.  Values ≤ 0 default to 1 (sequential) for backward compatibility.
 	// Setting this to 4–8 dramatically reduces staging latency for jobs with
@@ -482,6 +487,9 @@ func runFromSortedEntries(
 		return compress.Run(egCtx, compressChan, compressOut, compress.Config{
 			Workers:       cfg.Workers,
 			ChunkSize:     cfg.ChunkSize,
+			ChunkMin:      cfg.ChunkMin,
+			ChunkAvg:      cfg.ChunkAvg,
+			ChunkMax:      cfg.ChunkMax,
 			CompressLevel: cfg.CompressLevel,
 		}, cfg.Obs)
 	})
@@ -669,7 +677,7 @@ func runFromSortedEntries(
 			resultMu.Lock()
 			if len(compResult.Chunks) > 0 {
 				for _, chunk := range compResult.Chunks {
-					if seenHashes[chunk.Hash] {
+					if seenHashes[chunk.Hash+"P"] {
 						// Intra-job duplicate: the first occurrence already
 						// added this hash to ObjectHashes (if it was a new
 						// upload) or skipped it (if it was a dedup hit).
@@ -677,9 +685,9 @@ func runFromSortedEntries(
 						// otherwise upload the same object twice.
 						cfg.Obs.Metrics.PipelineDedupHits.Inc()
 					} else {
-						seenHashes[chunk.Hash] = true
+						seenHashes[chunk.Hash+"P"] = true
 						tasks = append(tasks, uploadTask{
-							hash:           chunk.Hash,
+							hash:           chunk.Hash + "P",
 							compressed:     chunk.Compressed,
 							compressedSize: chunk.CompressedSize,
 						})

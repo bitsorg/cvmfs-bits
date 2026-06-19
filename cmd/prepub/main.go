@@ -129,6 +129,9 @@ func main() {
 	// Pipeline performance tuning.
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
+	chunkMin := flag.Int64("chunk-min", 4<<20, "CVMFS content-defined chunking: minimum chunk size in bytes [publisher]")
+	chunkAvg := flag.Int64("chunk-avg", 8<<20, "CVMFS content-defined chunking: average chunk size in bytes; 0 disables chunking [publisher]")
+	chunkMax := flag.Int64("chunk-max", 16<<20, "CVMFS content-defined chunking: maximum chunk size in bytes [publisher]")
 
 	// Optional: repository name.  Retained for forward compatibility and to
 	// label publishes; no longer used for dedup seeding (dedup is a direct
@@ -230,6 +233,7 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
+			*chunkMin, *chunkAvg, *chunkMax,
 			*warmQuorum,
 			*brokerCACert,
 			*embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
@@ -259,6 +263,7 @@ func runPublisher(
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineUploadConc, pipelineCompressLevel int,
+	chunkMin, chunkAvg, chunkMax int64,
 	warmQuorum float64,
 	brokerCACert string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
@@ -554,6 +559,9 @@ func runPublisher(
 			Workers:       4,
 			UploadConc:    pipelineUploadConc,
 			CompressLevel: pipelineCompressLevel,
+			ChunkMin:      chunkMin,
+			ChunkAvg:      chunkAvg,
+			ChunkMax:      chunkMax,
 			CAS:           casBackend,
 			SpoolDir:      spoolRoot,
 			Obs:           obs,

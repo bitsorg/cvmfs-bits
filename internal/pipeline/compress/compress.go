@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 
+	"cvmfs.io/prepub/internal/pipeline/chunker"
 	"cvmfs.io/prepub/internal/pipeline/unpack"
 	"cvmfs.io/prepub/pkg/observe"
 )
@@ -58,6 +59,12 @@ var sha1Pool = sync.Pool{
 type Config struct {
 	Workers   int   // number of concurrent workers
 	ChunkSize int64 // 0 = no chunking; files with len(Data) > ChunkSize are split
+	// Chunk{Min,Avg,Max} are CVMFS content-defined (xor32) chunking sizes in
+	// bytes. When ChunkAvg > 0, files larger than ChunkMin are split at
+	// CVMFS-compatible boundaries instead of the fixed-size ChunkSize path.
+	ChunkMin int64
+	ChunkAvg int64
+	ChunkMax int64
 	// CompressLevel is the zlib compression level (1=fastest … 9=best).
 	// 0 is treated as zlib.DefaultCompression (-1 = level 6).
 	// Use zlib.BestSpeed (1) to roughly halve CPU time for CPU-bound publishes
@@ -144,7 +151,14 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 			_, wspan := obs.Tracer.Start(egCtx, "compress.file")
 			defer wspan.End()
 
-			result, err := compressEntry(entry, cfg.ChunkSize, cfg.CompressLevel)
+			var result Result
+			var err error
+			if cfg.ChunkAvg > 0 {
+				det := chunker.NewXor32(uint64(cfg.ChunkMin), uint64(cfg.ChunkAvg), uint64(cfg.ChunkMax))
+				result, err = compressEntryCDC(entry, det, cfg.CompressLevel)
+			} else {
+				result, err = compressEntry(entry, cfg.ChunkSize, cfg.CompressLevel)
+			}
 			if err != nil {
 				wspan.RecordError(err)
 				return fmt.Errorf("compressing %s: %w", entry.Path, err)
@@ -336,5 +350,79 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (R
 	result.Chunks = chunks
 	// For chunked files, Compressed is nil and we don't set CompressedSize
 	// (each chunk has its own compressed size)
+	return result, nil
+}
+
+// compressEntryCDC compresses a file using CVMFS-compatible content-defined
+// (xor32) chunking. The file is split at det.Cuts boundaries; each chunk is an
+// independent CAS object keyed by SHA-1(zlib(chunk)). A file that yields a
+// single piece (size <= min, or no cut found before EOF) is stored whole,
+// matching CVMFS's sole-piece collapse to a bulk object.
+func compressEntryCDC(entry unpack.FileEntry, det *chunker.Xor32, level int) (Result, error) {
+	result := Result{FileEntry: entry}
+
+	if !entry.Mode.IsRegular() {
+		result.Hash = "0000000000000000000000000000000000000000"
+		return result, nil
+	}
+
+	data := entry.Data
+	cuts := det.Cuts(data)
+	if len(cuts) == 0 {
+		// Single piece -> store whole (CVMFS sole-piece collapse).
+		return compressEntry(entry, 0, level)
+	}
+
+	bounds := make([]int64, 0, len(cuts)+2)
+	bounds = append(bounds, 0)
+	bounds = append(bounds, cuts...)
+	bounds = append(bounds, int64(len(data)))
+
+	bulkH := sha1Pool.Get().(hash.Hash) //nolint:gosec
+	bulkH.Reset()
+	bulkH.Write(data)
+	bulkHash := hex.EncodeToString(bulkH.Sum(nil))
+	sha1Pool.Put(bulkH)
+
+	effectiveLevel := zlibLevel(level)
+	pool := getZlibWriterPool(effectiveLevel)
+	w := pool.Get().(*zlib.Writer)
+	defer pool.Put(w)
+
+	var compBuf bytes.Buffer
+	chunks := make([]Chunk, 0, len(bounds)-1)
+	for i := 0; i+1 < len(bounds); i++ {
+		start, end := bounds[i], bounds[i+1]
+		chunkData := data[start:end]
+
+		h := sha1Pool.Get().(hash.Hash) //nolint:gosec
+		h.Reset()
+		compBuf.Reset()
+		w.Reset(io.MultiWriter(&compBuf, h))
+		if _, err := w.Write(chunkData); err != nil {
+			sha1Pool.Put(h)
+			return result, fmt.Errorf("zlib write for chunk at offset %d: %w", start, err)
+		}
+		if err := w.Close(); err != nil {
+			sha1Pool.Put(h)
+			return result, fmt.Errorf("zlib close for chunk at offset %d: %w", start, err)
+		}
+		compressedSize := int64(compBuf.Len())
+		compressed := make([]byte, compressedSize)
+		copy(compressed, compBuf.Bytes())
+		chunkHash := hex.EncodeToString(h.Sum(nil))
+		sha1Pool.Put(h)
+
+		chunks = append(chunks, Chunk{
+			Offset:           start,
+			UncompressedSize: end - start,
+			Hash:             chunkHash,
+			Compressed:       compressed,
+			CompressedSize:   compressedSize,
+		})
+	}
+
+	result.Hash = bulkHash
+	result.Chunks = chunks
 	return result, nil
 }
