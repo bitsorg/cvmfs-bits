@@ -140,6 +140,15 @@ type fileConfig struct {
 	RekorServer     string   `yaml:"rekor_server"`
 	RekorSigningKey string   `yaml:"rekor_signing_key"`
 	OIDCIssuers     []string `yaml:"oidc_issuers"`
+
+	// Chunking overrides the CVMFS content-defined (xor32) chunk sizes in
+	// bytes. Zero/omitted fields keep the CLI defaults (4/8/16 MiB).
+	// Equivalent to --chunk-min/--chunk-avg/--chunk-max.
+	Chunking struct {
+		Min int64 `yaml:"min"`
+		Avg int64 `yaml:"avg"`
+		Max int64 `yaml:"max"`
+	} `yaml:"chunking"`
 }
 
 // yamlDuration allows duration strings like "30s", "10m", "1h" in YAML.
@@ -194,6 +203,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
 	gatewayDirectGraft *bool,
+	chunkMin, chunkAvg, chunkMax *int64,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -207,6 +217,11 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		}
 	}
 	flt := func(flag string, dst *float64, val float64) {
+		if !has(flag) && val != 0 {
+			*dst = val
+		}
+	}
+	i64 := func(flag string, dst *int64, val int64) {
 		if !has(flag) && val != 0 {
 			*dst = val
 		}
@@ -276,4 +291,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	if !has("gateway-direct-graft") && fc.Gateway.DirectGraft {
 		*gatewayDirectGraft = true
 	}
+
+	// Content-defined chunking sizes (xor32); zero/omitted -> CLI default.
+	i64("chunk-min", chunkMin, fc.Chunking.Min)
+	i64("chunk-avg", chunkAvg, fc.Chunking.Avg)
+	i64("chunk-max", chunkMax, fc.Chunking.Max)
 }

@@ -209,6 +209,7 @@ func main() {
 			nodeID, repos, recvStratum0URL,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			gatewayDirectGraft,
+			chunkMin, chunkAvg, chunkMax,
 		)
 	}
 
