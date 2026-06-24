@@ -29,7 +29,7 @@ complementing the existing overlay-based publishing workflow.
 7. Pre-Processor Architecture with Stratum 1 Pre-Warming
 8. Pull Distribution and the Control Plane
 9. Core Subsystems
-10. Lifecycle Cleanup (GC) Subsystem
+10. Transaction Pins and Temp Cleanup
 11. Multi-Build-Node Topology
 12. Go Package Structure
 13. Provenance Architecture
@@ -86,27 +86,11 @@ distribution hierarchy is:
 
 ```
 Stratum 0 (authoritative publisher)
-    └── Stratum 1 replicas  (N sites)
-            └── Squid / proxy caches
-                    └── O(10,000) worker nodes
+    └── O(10) Stratum 1 replicas
+            └── O(10) Squid / proxy caches
+                    └── O(1000) worker nodes
 ```
-
-Software is published by acquiring an exclusive transaction lock on the Stratum 0 repository, creating an overlay filesystem, installing software into the
-`/cvmfs/<repo>` namespace, closing the transaction, then processing all changed files: compression, content hashing, deduplication against the existing
-content-addressable store (CAS), upload to backend storage, catalog update, and manifest signing. Only after the manifest is published can Stratum 1 servers
-replicate the update.
-
-This process is correct but has two fundamental inefficiencies:
-
-- **The transaction lock is held for the full duration of file processing.** Any parallel publishing attempt must wait. For large software releases (tens of GB)
-  this serialises work that is intrinsically parallelisable.
-
-- **Stratum 1 replication begins only after the catalog is committed.** Clients on sites whose Stratum 1 has not yet replicated the new catalog experience a thundering-herd of cache misses against slow inter-site links.
-
-This document describes a complementary publishing service that addresses both problems without replacing or breaking the existing workflow.
-
 ---
-
 
 ## 2. Current Publishing Flow and Its Constraints
 
@@ -128,17 +112,6 @@ acquire lock
       → release lock
   → Stratum 1 can now snapshot
 ```
-
-Constraints:
-
-| Constraint | Impact |
-|---|---|
-| Lock held during file I/O | Serialises concurrent releases |
-| Overlay filesystem required | Requires publisher node privileges |
-| CAS upload inside transaction | Network latency adds to lock time |
-| Stratum 1 pull-on-demand | Cold-start latency after catalog flip |
-| No partial namespace reservation | Cannot pipeline processing of a sub-tree |
-
 ---
 
 
@@ -153,12 +126,10 @@ Constraints:
   point resumes from the last committed spool state with no data loss and no
   double-deletion.
 - **Idempotent operations:** CAS uploads, catalog submissions, and distribution
-  pushes can be safely retried.
-- **Per-repository lifecycle cleanup:** Repositories may be configured to
-  automatically expire and remove content that has not been accessed within a
-  configurable time window.
-- **No proxy-technology dependency:** Access tracking must not be coupled to any
-  specific proxy or caching technology.
+  steps can be safely retried.
+- **No bespoke garbage collection:** Object reclamation is left to CVMFS's own
+  `cvmfs_server gc`; the service holds only short-lived GC pins to protect a
+  transaction's objects during the publish window (Chapter 10).
 
 ---
 
@@ -170,26 +141,24 @@ Constraints:
 `cvmfs-prepub` is designed to run alongside the traditional workflow, not as a
 replacement. The table below lists **architectural** differences that follow
 directly from the design and are checkable against the code and behaviour.
-Performance figures (throughput, latency, "faster"/"more scalable" claims) are
-deliberately omitted: the two paths have not been benchmarked head-to-head in a
-controlled setting, so any such number here would be unverified.
+
 
 ### 4.1 Architectural differences
 
 | Dimension | Traditional `cvmfs_server publish` | `cvmfs-prepub` service |
 |---|---|---|
-| **Lock scope** | Repository transaction held from file I/O through manifest sign | Gateway lease acquired only for the commit (`SubmitPayload` + `Release`); pipeline runs before the lease |
+| **Lock scope** | Path-scoped transaction (`cvmfs_server transaction <repo>/<path>`) held from file I/O through manifest sign | Path-scoped gateway lease acquired only for the commit (`SubmitPayload` + `Release`); pipeline runs before the lease |
 | **When processing runs** | Inside the transaction lock — compress, hash, upload all precede commit while the lock is held | Before the lease is acquired — decoupled from the lock |
-| **Entry point** | Local access to the Stratum 0 node; install files via overlay mount | HTTP POST of a tar archive plus an API token |
+| **Entry point** | Shell access to the publisher (release-manager) node; files are staged in the transaction overlay, which the node pushes to Stratum 0 | HTTP POST of a tar archive plus an API token |
+| **Privilege** | An account on the publisher node (root for the initial repository/server setup) | Root is needed only to install the service; publishing itself uses ordinary user access with an API token |
 | **Input format** | Arbitrary file tree via overlay mount | Tar archive stream |
-| **Worker parallelism** | As implemented by `cvmfs_server publish` | Configurable compress/upload worker pool (`--pipeline-upload-conc`, pipeline worker count) |
 | **Stratum 1 pre-warming** | Not built in; S1 replicates after the catalog flip | Optional: receivers pull objects before the catalog flip (Chapter 8) |
 | **State durability** | Overlay fs is live; an interrupted publish leaves an uncommitted overlay | Each state transition is written to a crash-safe spool with a WAL journal; restarts resume |
 | **Job status** | Exit code + log file | REST API with per-job FSM state; optional SSE event stream and webhook |
 | **Metrics / tracing** | Log files | OpenTelemetry spans + Prometheus metrics per pipeline stage |
 | **S1 / client changes** | None | None to the CVMFS client; receivers run the `--mode receiver` binary for pull pre-warming |
 | **Coexistence** | — | Runs alongside the traditional workflow; the gateway's per-path lease arbitrates |
-| **Publisher identity** | Operator/account on the Stratum 0 node, recorded in server-side logs | Structured fields (`actor`, `git_sha`, `pipeline_id`) in every job manifest |
+| **Publisher identity** | SSH username on the publisher (release-manager) node, recorded in server-side logs | Structured fields (`actor`, `git_sha`, `pipeline_id`) in every job manifest |
 | **Identity verification** | No built-in cryptographic check | Optional OIDC token validated against the CI provider's JWKS; `verified=true` is set only on a validated token |
 | **Provenance** | None | Optional Rekor (`hashedrekord`) submission after publish |
 
@@ -218,22 +187,7 @@ overlay-filesystem workflow continues to work in parallel; the gateway's
 per-path lease enforces mutual exclusion between the two paths at the sub-path
 level.
 
-### 4.4 Hard-link handling — a concrete behavioural difference
-
-The overlay-filesystem approach handles hard links through the Linux VFS: two
-directory entries with the same inode are indistinguishable from any other files
-in the tree. A tar-stream pipeline must handle them explicitly.
-
-In the current implementation the unpack stage maintains a `seenFiles` map keyed
-by cleaned entry path. When a `TypeLink` entry is encountered its data is
-resolved from the map and the entry is emitted as a regular `FileEntry` with the
-same byte content. Both the original path and the hard-linked path then appear in
-the catalog with identical content hashes — the dedup check recognises the hash
-from the earlier upload and skips the second CAS write. Forward hard-link
-references (the link appearing before its target in the stream) are rejected with
-a clear error, consistent with GNU tar's ordering guarantee.
-
-### 4.5 When to use each approach
+### 4.4 When to use each approach
 
 | Scenario | Recommended path |
 |---|---|
@@ -257,13 +211,12 @@ deduplication are covered in the User Guide (Chapter 16).
 
 ### 5.1 What `bits` Produces
 
-`bits` is a build tool that cross-compiles or packages software and emits a
+`bits` is a build tool that builds software and emits a
 **self-describing tar archive** whose directory tree is rooted at the target
-CVMFS namespace path.  For example, a build of the ATLAS offline software might
-emit:
+CVMFS namespace path.  For example, a build might emit:
 
 ```
-lcg/24.0.30/x86_64-el9-gcc13-opt/
+software/24.0.30/x86_64-el9-gcc13-opt/
     bin/
     lib/
     python/
@@ -283,15 +236,15 @@ lease path:
 
 ```toml
 [publish]
-repo       = "sft.cern.ch"
-path       = "lcg/24.0"          # gateway lease will be acquired on this sub-path
+repo       = "software.example.org"
+path       = "groupA/24.0"       # gateway lease will be acquired on this sub-path
 prepub_url = "https://prepub.example.org:8080"
 ```
 
 The `path` field in the config becomes the `path` field of the
-`POST /api/v1/jobs` request.  The gateway will issue a lease scoped to this
+`POST /api/v1/jobs` request.  The gateway issues a path-scoped lease for this
 sub-path, allowing other build nodes to publish to different sub-paths (e.g.
-`cms/`, `lhcb/`) concurrently without conflicting leases.
+`groupB/`, `groupC/`) concurrently without conflicting leases.
 
 ### 5.3 Submission Protocol
 
@@ -303,8 +256,8 @@ POST /api/v1/jobs
 Authorization: Bearer <PREPUB_API_TOKEN>
 Content-Type: multipart/form-data
 
-  repo=software.cern.ch
-  path=atlas/24.0
+  repo=software.example.org
+  path=groupA/24.0
   tar=<binary stream or file reference in the spool staging area>
 ```
 
@@ -349,7 +302,8 @@ HTTP API. The same binary runs on each Stratum 1 in `--mode receiver`, where it
   │  Processing Pipeline:                            │
   │    Unpack ──► Compress+Hash ──► Dedup ──► Upload │
   │                                        │         │
-  │                               Catalog Merge      │
+  │                            Subtree Catalog Build │
+  │                          (gateway grafts/merges) │
   │                                        │         │
   │  Spool: incoming/leased/staging/       │         │
   │         uploading/distributing/        │         │
@@ -373,16 +327,20 @@ HTTP API. The same binary runs on each Stratum 1 in `--mode receiver`, where it
 
 ![CVMFS Pre-Publisher Architecture](docs/cvmfs_prepublisher_architecture.svg)
 
-The `cvmfs_gateway` already exposes a lease-and-payload HTTP API:
+The upstream `cvmfs_gateway` exposes a lease-and-payload HTTP API. These are
+endpoints the prepub **client** calls on the gateway; they are not routes the
+prepub service itself defines:
 
-| Endpoint | Purpose |
+| Endpoint (on `cvmfs_gateway`) | Purpose |
 |---|---|
-| `POST /api/v1/leases/{path}` | Reserve a sub-path for exclusive write |
-| `PUT /api/v1/leases/{token}` | Heartbeat to renew lease TTL |
+| `POST /api/v1/leases/{path}` | Reserve a path-scoped lease for a sub-path |
 | `POST /api/v1/payloads` | Submit pre-processed catalog diff + objects |
-| `DELETE /api/v1/leases/{token}` | Release lease (commit or abort) |
+| `DELETE /api/v1/leases/{token}` | Release the lease (commit or abort) |
 
-The pre-publisher targets this API directly, making it a first-class gateway client rather than a workaround. No gateway modifications are required.
+> The real gateway does not implement `PUT /api/v1/leases/{token}` (it returns
+> `405`); there is no client-side lease heartbeat against this endpoint.
+
+The pre-publisher targets this API directly as a first-class gateway client. No gateway modifications are required.
 
 ---
 
@@ -392,8 +350,10 @@ The pre-publisher targets this API directly, making it a first-class gateway cli
 ### 7.1 Description
 
 A `cvmfs-prepub` publisher accepts tar uploads, runs the full processing
-pipeline (unpack → compress + hash → dedup → CAS upload), merges the catalog,
-and commits via the gateway lease API. To pre-warm Stratum 1 replicas it
+pipeline (unpack → compress + hash → dedup → CAS upload), builds a small
+subtree catalog, and commits via the gateway lease API. The gateway
+(`cvmfs_receiver`) grafts that subtree into the repository and produces the
+final merged root hash. To pre-warm Stratum 1 replicas the publisher
 publishes a per-transaction **announce** on its embedded control-plane broker
 **before** the catalog is committed. Stratum 1 receivers learn of the
 transaction, read a per-transaction manifest, and **pull** the objects they are
@@ -561,6 +521,11 @@ until commit); the objects are content-addressed, so receivers can pre-pull
 before the catalog flips. The post-commit `published` message is **retained**, so
 a receiver that connects late still catches up.
 
+> Commit notifications here travel over this project's own MQTT/SSE control
+> plane. CVMFS upstream provides a separate notification mechanism,
+> `cvmfs_notify`, for announcing new repository revisions; this project does not
+> use it but it remains the upstream equivalent.
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -574,19 +539,21 @@ sequenceDiagram
   participant O as Object serving (CDN)
   Bld->>API: POST /api/v1/jobs (tar)
   API->>P: unpack -> dedup -> compress -> upload to CAS
-  P->>M: Put provisional manifest (durable, key = txn)
-  P->>B: announce(repo, txn, objectHashes)   [pre-warm]
+  P->>M: Put provisional manifest (durable, key = txn; root hash is a placeholder until commit)
+  Note over API,R: Phase 1 — Prepare: pin objects, announce
+  P->>B: announce(repo, txn, objectHashes)   [pre-warm trigger]
   B-->>R: announce
   R->>M: GET /s1/{txn}/manifest
-  R->>O: pull missing objects (verify each hash)
-  API->>GW: acquire lease -> merge catalog -> commit
+  R->>O: pull objects (content-addressed, verify each hash)
+  R-->>B: ready / presence
+  Note over API,R: Phase 2 — wait for warm quorum (commit degraded on timeout)
+  API->>API: warm quorum of ready reached
+  Note over API,GW: Phase 3 — Commit (after warm)
+  API->>GW: acquire lease -> submit subtree -> commit (GW grafts + merges, catalog flip)
   API->>B: published(repo, txn, rootHash)   [retained]
   B-->>R: published
-  R->>O: pull any remaining objects
-  R->>R: warm (atomic local catalog flip)
-  R-->>B: ready / presence
-  API->>API: quorum of ready reached -> transaction done
-  API->>M: Delete manifest (warm quorum reached)
+  R->>R: warm (atomic local catalog flip to rootHash)
+  API->>M: Delete manifest (transaction done)
 ```
 
 ### 8.4 Security Model in Detail
@@ -697,14 +664,15 @@ committing
   ▼
 published ◄──────────────────────────────────────────────────────── terminal
 
-Any state → aborted    (lease released, uploaded objects GC-marked)
+Any state → aborted    (lease released, GC pins dropped, temp files cleaned)
 aborted   → failed     (if the abort itself fails; requires operator intervention)
 ```
 
 #### Recovery on Restart
 
 At startup the service scans all non-terminal spool directories and re-queues
-each job at its current state:
+each job at its current state, resolving it idempotently rather than restarting
+from scratch:
 
 | Found in | Recovery action |
 |---|---|
@@ -715,18 +683,29 @@ each job at its current state:
 | `distributing/` | Re-announce the transaction; receivers re-pull what they still miss |
 | `committing/` | Query gateway for payload status; commit or re-submit |
 
-#### WAL Journal
+#### WAL Journal — rationale and recovery
 
-Each job carries a `journal.jsonl` in its spool directory. Every state transition
-appends a record before the rename:
+The WAL exists for crash-consistency. Each job carries an append-only
+`journal.jsonl` in its spool directory, and a record is written and fsynced
+**before** each guarded action so that the durable record always precedes its
+side effect. If the process crashes between the record and the action, restart
+sees the record and can reconcile; the alternative ordering (act first, log
+later) could leave an unrecorded side effect that recovery cannot reason about.
 
 ```jsonc
 {"t":"2026-04-24T02:00:00Z","from":"uploading","to":"distributing","run":"abc123"}
 {"t":"2026-04-24T02:01:00Z","op":"warm_ready","s1":"stratum1-cern.ch","n_objects":4821}
 ```
 
-The journal is append-only and fsynced. It is the definitive record of what
-happened to a job and is retained in `published/` or `aborted/` for audit.
+For the distribution commit specifically, the commit journal is the source of
+truth for the three-phase commit (Prepare → Warm-quorum → Commit/flip). On
+restart `Orchestrator.Recover` → `Reconcile` resolves non-terminal transactions
+idempotently: a transaction that already reached **Warm** is finished by
+re-running the idempotent commit, while one still at **Prepare** is aborted.
+Because the record is fsynced before each guarded action, recovery always has a
+durable view of how far the transaction progressed. The journal is the
+definitive record of what happened to a job and is retained in `published/` or
+`aborted/` for audit.
 
 ### 9.2 Processing Pipeline
 
@@ -791,8 +770,9 @@ false positives) and stateless.
 
 ### 9.3 Lease Management
 
-The `cvmfs_gateway` lease has a configurable TTL (default 2 minutes). The lease
-manager maintains a heartbeat goroutine per active lease:
+The `cvmfs_gateway` lease has a TTL configured externally on the gateway
+(`max_lease_time`; the testbed commonly uses 600 s). The lease manager maintains
+a renewal goroutine per active lease, renewing well within the configured TTL:
 
 ```go
 type LeaseManager struct {
@@ -818,34 +798,40 @@ func (lm *LeaseManager) Heartbeat(ctx context.Context, token string, ttl time.Du
 }
 ```
 
-If the heartbeat fails, the job FSM transitions to `aborted`. Objects already
-uploaded are GC-marked in a sidecar file; the CAS Reaper (described in §10.3)
-cleans them up during the next GC pass once they are confirmed unreferenced.
+If renewal fails, the job FSM transitions to `aborted`. Any GC *pins* held to
+protect this transaction's objects during the publish window are released, and
+orphaned temporary files staged for the aborted job are cleaned up (see §10).
+The objects themselves remain in the CAS and are reclaimed, if unreferenced, by
+CVMFS's own `cvmfs_server gc`.
 
-### 9.4 Catalog Merge
+### 9.4 Subtree Catalog Construction
 
-Rather than building a standalone catalog and submitting it via the gateway
-payload API, cvmfs-prepub performs a **direct SQLite catalog merge** using the
-`pkg/cvmfscatalog` package.  The merge proceeds as follows:
+The catalog **merge/graft** that produces the final repository root hash is
+performed by the gateway (`cvmfs_receiver`), not by cvmfs-prepub. The prepub
+service only builds a small (typically a few KB) **subtree SQLite catalog**
+covering the lease path and uploads it; the gateway grafts that subtree into the
+repository and produces the new merged root hash.
+
+Subtree construction uses the `pkg/cvmfscatalog` package and proceeds as
+follows:
 
 1. **Fetch the current manifest** — `GET <stratum0_url>/<repo>/.cvmfspublished`
    to obtain the current root catalog hash (`C` field) and hash algorithm.
-2. **Download the root catalog** — fetch `data/XY/<hash>[suffix]` from the
-   Stratum 0 CAS and zlib-decompress it into a temporary SQLite file.
+2. **Download the relevant catalog** — fetch `data/XY/<hash>[suffix]` from the
+   Stratum 0 CAS and zlib-decompress it into a temporary SQLite file, to read
+   the existing entries the subtree depends on.
 3. **Locate the target sub-catalog** — walk the `nested_catalogs` table to find
-   the catalog whose root prefix covers the lease path.  If the lease path is
-   covered by the root catalog, work directly on the root.
-4. **Apply entries** — `Upsert` or `Remove` each `cvmfscatalog.Entry` into the
-   sub-catalog, updating the `statistics` counters atomically.
-5. **Finalise** — increment `revision`, set `last_modified`, VACUUM the SQLite
-   file, zlib-compress it, hash the compressed bytes with the repository's hash
+   the catalog whose root prefix covers the lease path.
+4. **Apply entries** — `Upsert` or `Remove` each `cvmfscatalog.Entry`,
+   updating the `statistics` counters atomically.
+5. **Finalise the subtree** — set `last_modified`, VACUUM the SQLite file,
+   zlib-compress it, hash the compressed bytes with the repository's hash
    algorithm (SHA-1 in the CVMFS CAS convention), and write it to
    `data/XY/<hash>C` in the CAS directory (suffix `C` = catalog).
-6. **Walk parent chain** — update each parent catalog's `nested_catalogs` row
-   with the new child hash; finalise each parent in turn up to the root.
-7. **Return hashes** — `MergeResult.OldRootHash` (plain hex from the manifest)
-   and `MergeResult.NewRootHashSuffixed` (hex plus any algorithm suffix) are
-   passed to the gateway `CommitLease` call.
+6. **Submit to the gateway** — the subtree catalog and its objects are submitted
+   via the gateway payload API. The gateway grafts the subtree, walks the parent
+   chain, increments the revision, and signs the new root manifest; the merged
+   root hash it returns is authoritative.
 
 #### CVMFS catalog schema (version 2.5)
 
@@ -867,10 +853,10 @@ The `statistics` table tracks 14 counters (`num_files`, `num_symlinks`,
 `file_size`, `chunked_file_size`, `num_special`, plus `num_x_*` variants for
 external files) and is updated on every `Upsert`/`Remove`.
 
-#### Secret / private directories
+#### Hidden directories
 
-Files can optionally be published under a hidden path using a cryptographically
-random share token, analogous to a Google Docs share link:
+Files can optionally be published under a hidden (not-listed) path using a
+random token in the path component:
 
 ```
 .shares/<64-hex-token>/<content-path>
@@ -879,22 +865,21 @@ random share token, analogous to a Google Docs share link:
 Both `.shares/` and `.shares/<token>/` are inserted into the catalog with the
 `kFlagHidden` (0x8000) flag, which causes CVMFS clients to skip them in
 `readdir()` while still serving them on direct `open()` or `stat()` calls.  The
-share token is 32 random bytes (256 bits) of entropy, making brute-force
-enumeration infeasible.
+token is 32 random bytes (256 bits) of entropy.
 
-The secret directory entries are created by `cvmfscatalog.SharesDirEntry()` and
+The hidden directory entries are created by `cvmfscatalog.SharesDirEntry()` and
 `cvmfscatalog.TokenDirEntry(token, mtime)`.  A new token is generated by
 `cvmfscatalog.NewToken()`.  The actual content entries are created under
 `cvmfscatalog.SharePath(token, contentPath)` with normal (non-hidden) flags,
 so that once a user knows the token, ordinary tools (`ls`, `cat`, `cvmfs_config
 stat`) can access the files.
 
-**Security note:** the obscurity is provided by the 256-bit token, not by access
-control. The catalog SQLite file is publicly readable on any Stratum 0 or Stratum
-1; anyone who can read the full catalog can enumerate share tokens.  This is the
-same trade-off as Google Docs links — suitable for controlled-disclosure
-scenarios (e.g. sharing a pre-release build with a collaborator) but not for
-content that must be kept secret from site administrators.
+**Security note:** this only hides the entries from directory listings; it is
+not access control. The catalog SQLite file is publicly readable on any Stratum
+0 or Stratum 1, so anyone who can read the full catalog can enumerate the tokens.
+It is suitable for controlled-disclosure scenarios (e.g. sharing a pre-release
+build with a collaborator) but not for content that must be kept secret from
+site administrators.
 
 ### 9.5 CAS Backend Abstraction
 
@@ -942,227 +927,39 @@ retained state. See Chapter 31 for the protocol detail.
 ---
 
 
-## 10. Lifecycle Cleanup (GC) Subsystem
+## 10. Transaction Pins and Temp Cleanup
 
-![CVMFS GC and Lifecycle Cleanup Architecture](docs/cvmfs_gc_lifecycle_architecture.svg)
+bits does **not** garbage-collect CAS objects. Reclaiming unreferenced objects
+from the namespace is the job of CVMFS's own `cvmfs_server gc`, which walks the
+catalog reference graph and deletes objects no longer reachable from any retained
+revision. That mechanism is sufficient for namespace cleanup, and the prepub
+service does not duplicate or replace it.
 
-Certain repositories require automatic expiry and removal of content that has not
-been accessed within a configurable window. This affects both the CVMFS namespace
-(catalog entries) and backend CAS objects. The GC subsystem is opt-in per
-repository and completely independent of the publishing pipeline.
+What the prepub service does maintain is much narrower:
 
-### 10.1 Access Tracking
+### 10.1 GC Pins
 
-CVMFS clients do not report access back to the server and catalogs do not record
-`atime`. Access information is reconstructed from the distribution layer.
+During a publish, objects are uploaded to the CAS **before** the catalog that
+references them is committed. Until the commit lands, those objects are not yet
+reachable from any catalog and would be eligible for reclamation by a concurrent
+`cvmfs_server gc`. To prevent that, the prepub service holds short-lived GC
+**pins** that protect a transaction's objects for the duration of the
+prepare → commit window. Once the catalog flip makes the objects reachable
+(or the job aborts), the pins are released.
 
-#### AccessEvent and AccessEventSource
+The pins protect only in-flight objects; they do not track access, expire
+content, or delete anything.
 
-All access data flows through a single normalized type and a pluggable source
-interface. There is no dependency on any specific proxy technology.
+### 10.2 Temp-File Cleanup
 
-```go
-type AccessEvent struct {
-    Repo      string
-    CASHash   string    // may be empty if only path is known
-    Path      string    // may be empty if only hash is known
-    Timestamp time.Time
-    Source    string    // "stratum1", "cas-backend", "publish", "external"
-}
+The other housekeeping the service performs is removing **orphaned temporary
+files** — partial uploads, staging scratch, and spool artifacts left behind by
+jobs that aborted or crashed. This cleanup operates only on the service's own
+temporary working directories; it never touches committed CAS objects.
 
-type AccessEventSource interface {
-    Name() string
-    Events(ctx context.Context) (<-chan AccessEvent, <-chan error)
-    Close() error
-}
-```
-
-The `AccessTracker` fan-ins from all configured sources, deduplicates events
-(same hash within a 1-minute window), and writes to a per-repository SQLite
-database keyed by `(repo, cas_hash)`.
-
-#### Built-in Sources
-
-**Stratum1LogSource** — The primary default source. Tails the Stratum 1 HTTP
-server access log. Format is defined by operator-supplied field mapping
-(regex/grok capture groups), so it works with nginx, Apache, or any HTTP server
-without technology-specific code:
-
-```go
-type LogFileSourceConfig struct {
-    Path         string
-    FieldMap     map[string]string  // logical field → regex capture
-    TimeFormat   string
-    PollInterval time.Duration
-}
-// Example FieldMap for a typical nginx CVMFS log line:
-// hash:      `data/\w{2}/([0-9a-f]{40})`
-// repo:      `cvmfs/([^/\s]+)`
-// timestamp: `\[([^\]]+)\]`
-```
-
-**HTTPReceiverSource** — The pre-publisher exposes `POST /api/v1/access-events`
-accepting a JSON batch of `AccessEvent` structs. Any infrastructure component that
-can make an HTTP call can feed access data: a log shipper, a CDN webhook, a custom
-agent. Authenticated with a pre-shared HMAC token.
-
-**CASBackendSource** — Reads access events from the storage backend. For S3:
-server access logs or S3 EventBridge notifications. For local filesystem: inotify
-on the CAS data directory. Captures accesses that bypass Stratum 1 (internal
-tooling, direct S3 reads).
-
-**PublishEventSource** — The pre-publisher emits an `AccessEvent` with
-`Source: "publish"` for every object it successfully publishes. This unconditionally
-establishes `last_written` as a floor for `last_seen`, ensuring freshly published
-content is never a GC candidate within its TTL even before any proxy logs arrive.
-
-#### Proxy Cache Coverage
-
-Stratum 1 only sees requests that miss the proxy cache. If a file is continuously
-cache-hit at the proxy, Stratum 1 may not see it for the duration of the proxy
-TTL. The `soft_delete_period` (§10.2) provides the primary buffer against this
-(proxy TTLs are hours to days; the tombstone window is days to weeks). For
-deployments that need stronger guarantees, configure the `HTTPReceiverSource` and
-have proxy nodes periodically POST a summary of hashes served in the last N hours.
-This is proxy-agnostic: it is a small script or log-shipper configuration, not a
-Squid-specific integration.
-
-### 10.2 Cleanup Policy
-
-Each repository may optionally include a `gc` section in its configuration. The
-absence of this section means GC is disabled for that repository.
-
-```yaml
-gc:
-  enabled: true
-  access_ttl: 180d           # expire content not seen for this long
-  soft_delete_period: 14d    # tombstone window before hard CAS delete
-  schedule: "0 2 * * 0"     # cron: weekly at 02:00 Sunday
-  dry_run: false             # if true, produce deletion plan only
-  exempt_tags: [stable, lts-2024]   # tag names never subject to expiry
-  exempt_paths:
-    - "/cvmfs/repo/critical/**"
-    - "/cvmfs/repo/releases/latest"
-  access_sources: [stratum1, cas_backend, publish]
-  max_deletion_rate: 100     # CAS objects deleted per second
-
-access_sources:
-  - type: log_file
-    name: stratum1-primary
-    path: /var/log/nginx/cvmfs-access.log
-    field_map:
-      hash:      'data/\w{2}/([0-9a-f]{40})'
-      repo:      'cvmfs/([^/\s]+)'
-      timestamp: '\[([^\]]+)\]'
-    time_format: "02/Jan/2006:15:04:05 -0700"
-
-  - type: http_receiver
-    name: external-push
-    listen: ":9200"
-    auth_token_env: CVMFS_ACCESS_TOKEN
-
-  - type: cas_backend
-    name: s3-primary
-
-  - type: publish_events
-```
-
-### 10.3 GC Pipeline
-
-GC runs are serialised per repository: no concurrent GC and publish can hold a
-lease on the same path simultaneously (the gateway enforces this). A GC run
-proceeds through four phases.
-
-**Phase 1 — Reference Counter.**  
-Before any deletion decision, the reference counter walks every catalog in the
-repository: the current head catalog, all nested sub-catalogs, and every tagged
-revision. It builds a map of `casHash → refcount`. Only objects with `refcount = 0`
-are eligible for deletion. Any catalog read error aborts the entire GC run; the
-system never silently skips a catalog.
-
-```go
-type RefCounter struct {
-    backend CASBackend
-    catalog CatalogReader
-}
-
-func (rc *RefCounter) BuildRefMap(ctx context.Context, repo string) (map[string]int, error) {
-    refs := make(map[string]int)
-    tags, err := rc.catalog.ListTags(ctx, repo)
-    if err != nil {
-        return nil, fmt.Errorf("listing tags: %w", err)  // abort on any error
-    }
-    for _, tag := range tags {
-        if err := rc.walkCatalog(ctx, tag.RootHash, refs); err != nil {
-            return nil, fmt.Errorf("walking tag %s: %w", tag.Name, err)
-        }
-    }
-    return refs, nil
-}
-```
-
-**Phase 2 — Namespace Cleaner.**  
-Acquires a gateway lease on the target path subtree. Removes expired entries from
-the catalog using the same catalog-diff pipeline as the publishing workflow (a
-deletion diff: zero-payload rows for removed paths). Commits via
-`POST /api/v1/payloads`. Directory entries are cleaned bottom-up; a directory
-that becomes empty after file removal is itself removed unless protected by
-`exempt_paths`.
-
-**Phase 3 — Tombstone Manager.**  
-Objects whose refcount reached zero after the namespace cleanup are written into
-`tombstone.db` with a `delete_after` timestamp:
-
-```go
-type TombstoneEntry struct {
-    CASHash      string
-    Repo         string
-    GCRunID      string
-    TombstonedAt time.Time
-    DeleteAfter  time.Time
-    Revoked      bool    // true if re-access detected during soft-delete window
-}
-```
-
-During the tombstone period, if the `AccessTracker` records a new access for a
-tombstoned hash, the entry is immediately revoked. Revoked entries are never
-passed to the CAS Reaper.
-
-**Phase 4 — CAS Reaper.**  
-Runs continuously, scanning `tombstone.db` for entries past their `DeleteAfter`
-time. Before each deletion it re-checks `refcount = 0` against the current catalog
-state (TOCTOU guard: a publish could have re-introduced the file during the
-tombstone window). Deletions are batched and rate-limited by `max_deletion_rate`.
-Each deletion is appended to a signed audit JSONL file retained in `published/`.
-
-### 10.4 GC Job State Machine
-
-GC jobs use the same crash-safe spool model as publishing jobs:
-
-```
-gc-scheduled/
-  │  refcount walk complete, candidate set produced
-  ▼
-gc-scanning/
-  │  namespace cleaner lease acquired, catalog diff committed
-  ▼
-ns-cleaning/
-  │  tombstone entries written to tombstone.db
-  ▼
-tombstoned/
-  │  soft_delete_period elapsed, refcount re-verified, no revocations
-  ▼
-gc-reaping/
-  │  CAS objects deleted, audit log written
-  ▼
-gc-complete/ ◄──────────────────────────────────────────────────── terminal
-
-Any state → gc-aborted/   (lease released, tombstones revoked)
-```
-
-A GC run aborted at any point revokes all tombstone entries it created, releases
-any held lease, and logs the abort reason. Aborted GC runs do not result in data
-loss or orphaned objects.
+Aborted jobs release any pins they held and have their temp files cleaned up;
+the underlying objects, if unreferenced, are reclaimed later by
+`cvmfs_server gc`.
 
 ---
 
@@ -1171,11 +968,13 @@ loss or orphaned objects.
 
 ### 11.1 Motivation
 
-Large HEP experiments ship software on different schedules and require different
+Different groups ship software on different schedules and require different
 build environments.  Serialising all publishes through a single build node
 creates a bottleneck.  The cvmfs-prepub architecture supports horizontal scaling
-by assigning each experiment group its own build node and a scoped set of
+by assigning each group its own build node and a scoped set of
 credentials, so multiple groups can publish in parallel without interfering.
+Multiple publisher nodes may also serve the same repository, each scoped to a
+disjoint sub-path.
 
 ### 11.2 Per-Group Namespace Partitioning
 
@@ -1183,10 +982,10 @@ The CVMFS gateway issues leases at sub-path granularity.  Two jobs that target
 non-overlapping sub-paths can hold leases simultaneously:
 
 ```
-software.cern.ch/atlas/   ← ATLAS build node holds lease while publishing
-software.cern.ch/cms/     ← CMS build node holds lease simultaneously — no conflict
-software.cern.ch/lhcb/    ← LHCb build node holds lease simultaneously
-software.cern.ch/common/  ← shared toolchain; only one node at a time
+software.example.org/groupA/   ← groupA build node holds lease while publishing
+software.example.org/groupB/   ← groupB build node holds lease simultaneously — no conflict
+software.example.org/groupC/   ← groupC build node holds lease simultaneously
+software.example.org/common/   ← shared toolchain; only one node at a time
 ```
 
 The gateway enforces mutual exclusion at the sub-path level.  `cvmfs-prepub`
@@ -1201,13 +1000,13 @@ independently and the gateway arbitrates.
                        │   (issues leases, signs manifests)│
                        └────────┬────────┬────────┬───────┘
                                 │ lease  │ lease  │ lease
-                      atlas/    │  cms/  │  lhcb/ │
+                     groupA/   │ groupB/│ groupC/│
               ┌─────────────────┘        │        └─────────────────┐
               ▼                          ▼                          ▼
   ┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐
-  │  ATLAS build node│      │   CMS build node │      │  LHCb build node │
+  │  groupA build    │      │  groupB build    │      │  groupC build    │
   │  bits + prepub   │      │  bits + prepub   │      │  bits + prepub   │
-  │  token: atlas-01 │      │  token: cms-01   │      │  token: lhcb-01  │
+  │  token: groupA-01│      │  token: groupB-01│      │  token: groupC-01│
   └────────┬─────────┘      └────────┬─────────┘      └────────┬─────────┘
            │                         │                         │
            └─────────────────────────┼─────────────────────────┘
@@ -1221,7 +1020,7 @@ independently and the gateway arbitrates.
 Each build node runs its own `cvmfs-prepub` process (or connects to a shared
 prepub service with separate API tokens and path-scoped gateway keys).  The CAS
 can be shared across nodes on a fast network filesystem (NFS, CephFS) to
-maximise cross-experiment deduplication, or kept local per node if isolation is
+increase cross-group deduplication, or kept local per node if isolation is
 preferred.
 
 ### 11.4 Credential Scoping
@@ -1232,11 +1031,11 @@ Each build node receives a distinct pair of credentials:
 |---|---|---|
 | `PREPUB_API_TOKEN` | Controls which jobs the node can submit to this prepub instance | Environment variable / secrets manager |
 | `CVMFS_GATEWAY_SECRET` | Authorises lease acquisition; scoped per key-ID to a sub-path prefix | Environment variable / secrets manager |
-| Gateway key-ID | e.g. `atlas-build-01` | Config file |
+| Gateway key-ID | e.g. `groupA-build-01` | Config file |
 
-The gateway's key table maps each key-ID to a permitted path prefix.  An ATLAS
-key can acquire leases on `atlas/*` but will receive `403 Forbidden` if it
-attempts to acquire a lease on `cms/*`.  This is the primary authorization
+The gateway's key table maps each key-ID to a permitted path prefix.  A groupA
+key can acquire leases on `groupA/*` but will receive `403 Forbidden` if it
+attempts to acquire a lease on `groupB/*`.  This is the primary authorization
 boundary between groups.
 
 ### 11.5 Parallel Publishing
@@ -1252,11 +1051,11 @@ Add a `group` label to all Prometheus metrics by injecting it via the config:
 
 ```toml
 [observability]
-extra_labels = { group = "atlas" }
+extra_labels = { group = "groupA" }
 ```
 
 This allows per-group Grafana dashboards to show job throughput, pipeline
-latency, and CAS dedup ratio independently for each experiment.
+latency, and CAS dedup ratio independently for each group.
 
 ---
 
@@ -1293,26 +1092,12 @@ cvmfs-prepub/
 │   │
 │   ├── broker/              # MQTT client, message types, topic schema (control plane)
 │   ├── distribute/          # Distribution coordinator (announce / pull / warm)
-│   │   ├── serve/           # Discovery, per-txn manifest, object/bundle/catchup serving
+│   │   ├── serve/           # Discovery, per-txn manifest, object/bundle/catchup serving;
+│   │   │                    #   short-lived GC pins protecting in-flight objects (pin.go, Chapter 10)
 │   │   ├── commit/          # Commit orchestrator, warm-gate, admission
 │   │   ├── credential/      # Token mint/verify, per-node enrollment, rate limit
-│   │   └── receiver/        # --mode receiver: pull client, MQTT handler
-│   │
-│   ├── gc/                  # GC subsystem
-│   │   ├── policy.go        # CleanupPolicy, loader, inotify watcher
-│   │   ├── scheduler.go     # Cron runner, per-repo serialisation
-│   │   ├── refcount.go      # Reference counter across all catalogs + tags
-│   │   ├── nscleaner.go     # Namespace deletion via lease + payload
-│   │   ├── tombstone.go     # TombstoneEntry, soft-delete DB
-│   │   └── reaper.go        # CAS hard-delete, rate limiter, audit
-│   │
-│   ├── access/              # Access tracking subsystem
-│   │   ├── tracker.go       # AccessTracker: fan-in, dedup, SQLite write
-│   │   ├── source.go        # AccessEventSource interface + AccessEvent type
-│   │   ├── logfile.go       # Configurable log file tailer (regex field mapping)
-│   │   ├── httpreceiver.go  # HTTP POST endpoint source
-│   │   ├── casbackend.go    # S3 event notifications / inotify
-│   │   └── publish.go       # Internal publish event source
+│   │   └── receiver/        # --mode receiver: pull client, MQTT handler;
+│   │                        #   orphaned temp-file cleanup (cas_helpers.go)
 │   │
 │   └── cas/                 # CAS backend abstraction
 │       ├── cas.go           # CASBackend interface
@@ -1323,18 +1108,18 @@ cvmfs-prepub/
 └── pkg/
     ├── cvmfshash/           # CVMFS content hash encoding (base16 + chunk format)
     └── cvmfscatalog/        # CVMFS catalog: schema 2.5 SQLite, MD5 path encoding,
-                             #   manifest parsing, catalog download + merge, secret dirs
+                             #   manifest parsing, catalog download, subtree build, hidden dirs
         ├── entry.go         # Entry struct, MD5Path, flag constants, mode conversion
         ├── catalog.go       # Create/Open/Upsert/Remove/Finalize (compress+hash→CAS path)
         ├── manifest.go      # ParseManifest, DownloadCatalog (zlib-decompress from HTTP)
-        ├── merge.go         # Merge: fetch manifest → download catalog → apply entries → finalise
+        ├── merge.go         # Build subtree catalog (gateway grafts it + returns merged root hash)
         └── secret.go        # NewToken, SharePath, SharesDirEntry, TokenDirEntry (kFlagHidden)
 ```
 
 Key design constraints on package boundaries:
 
-- `gc` and `access` communicate only through the `AccessEventSource` interface.
-  No GC code imports any access source implementation.
+- `gc` holds only transaction pins and cleans temp files; it performs no object
+  reclamation (that is `cvmfs_server gc`'s responsibility).
 - `pipeline` stages communicate only through typed Go channels.
   No stage imports another stage's implementation.
 - `spool` has no knowledge of what the job contains; it only manages directory
@@ -1374,7 +1159,7 @@ The provenance system needs to satisfy three properties:
 ┌───────────────────────────────────────────────────────────────────┐
 │  Layer 1: File → Content Hash                                     │
 │  Source: CVMFS signed catalog (.cvmfspublished)                   │
-│  /atlas/24.0/libAtlasROOT.so  →  <content-hash>                  │
+│  /groupA/24.0/libExample.so  →  <content-hash>                   │
 │  Signature: Stratum 0 gateway key (existing CVMFS trust anchor)   │
 └─────────────────────────┬─────────────────────────────────────────┘
                           │  reverse-index by hash
@@ -1607,8 +1392,8 @@ associated SSH key management, spool directory, and sequencing constraints.
 ## 18. Coexistence with `cvmfs_server publish`
 
 The gateway's per-path lease enforces mutual exclusion at sub-path granularity.
-A `cvmfs-prepub` job on `atlas/24.0` and a traditional `cvmfs_server publish` on
-`cms/` can hold leases simultaneously without conflict.  Both workflows compete
+A `cvmfs-prepub` job on `groupA/24.0` and a traditional `cvmfs_server publish` on
+`groupB/` can hold leases simultaneously without conflict.  Both workflows compete
 only if they target the same sub-path at the same time, in which case one must
 wait — the same constraint that applies between two traditional publishes.
 
@@ -1628,8 +1413,7 @@ for manual or infrequent publishes on other repositories.
 | CVMFS client | Unmodified; verifies the same manifest signature |
 | Traditional `cvmfs_server publish` | Continues to work in parallel |
 
-For the behavioural difference in hard-link handling and guidance on when to use
-each path, see §4.4 and §4.5.
+For guidance on when to use each path, see §4.4.
 
 ---
 
@@ -1717,9 +1501,9 @@ replication machinery untouched.
 ### 21.2 Publisher-Only Deployment (Zero Stratum 1 Changes)
 
 The pre-publisher is a first-class client of the existing `cvmfs_gateway`
-lease-and-payload API (`POST /api/v1/leases`, `PUT /api/v1/leases/{token}`,
-`POST /api/v1/payloads`).  No gateway modifications are required; gateway ≥ 1.2
-is sufficient.
+lease-and-payload API (`POST /api/v1/leases` to reserve a path-scoped lease,
+`POST /api/v1/payloads` to submit, `DELETE /api/v1/leases/{token}` to release).
+No gateway modifications are required; gateway ≥ 1.2 is sufficient.
 
 After the catalog is committed, Stratum 1 servers replicate it exactly as they do
 today — by running `cvmfs_server snapshot` and fetching the new manifest and any
@@ -1731,18 +1515,6 @@ verification are all unaware that a different publishing path was used.
 **New infrastructure required:** the `cvmfs-prepub` binary on one node with
 write access to the CAS backend and network reach to the gateway.  That node can
 be the Stratum 0 host or a separate build node.
-
-### 21.3 Recommended Rollout Order
-
-1. **Publisher on a test repository** — validate correctness alongside the
-   existing workflow; no Stratum 1 involvement.
-2. **Pull pre-warming on one Stratum 1 site** — deploy the receiver on a single
-   replica and observe its warm behaviour before and after a publish.
-3. **Pull pre-warming on remaining Stratum 1 sites** progressively as confidence
-   grows.
-4. **CI-driven repositories** migrated from the overlay workflow to
-   `cvmfs-prepub`; manual ad-hoc publishes can remain on `cvmfs_server publish`
-   indefinitely.
 
 ---
 
@@ -1771,7 +1543,7 @@ cvmfs-prepub --mode receiver \
   --broker-auth \
   --broker-ca-cert  /etc/cvmfs-receiver/ca.crt \
   --receiver-stratum0-url http://cvmfs-prepub:8080/cvmfs \
-  --repos atlas.cern.ch,cms.cern.ch \
+  --repos software.example.org,other.example.org \
   --cas-root /srv/cvmfs/stratum1/cas
 # PREPUB_NODE_KEY=<hex per-node key, provisioned on Stratum 0> in the environment
 ```
@@ -2127,7 +1899,7 @@ Chapter 11 (Multi-Build-Node Topology). In summary:
 
 1. Give each build node its own `PREPUB_API_TOKEN` and a gateway key-ID scoped
    (in the gateway's key table) to its repository sub-path prefix; a key for
-   `atlas/*` receives `403 Forbidden` if it attempts a lease on `cms/*`
+   `groupA/*` receives `403 Forbidden` if it attempts a lease on `groupB/*`
    (§11.2, §11.4).
 2. Because the gateway serialises only within a sub-path, independent groups
    publish in parallel; distribution to Stratum 1 is pull-based, so the
@@ -2137,11 +1909,11 @@ Chapter 11 (Multi-Build-Node Topology). In summary:
 
 ```toml
 [observability]
-extra_labels = { group = "atlas" }
+extra_labels = { group = "groupA" }
 ```
 
 Share the CAS across build nodes on a fast network filesystem (NFS, CephFS) to
-maximise cross-experiment deduplication, or keep it local per node for isolation.
+maximise cross-group deduplication, or keep it local per node for isolation.
 
 ---
 
@@ -2174,11 +1946,11 @@ accepts unauthenticated submissions.
 
 ### 25.2 Offline verification workflow
 
-Given a suspect file at `/cvmfs/software.cern.ch/atlas/24.0/libAtlasROOT.so`:
+Given a suspect file at `/cvmfs/software.example.org/groupA/24.0/libExample.so`:
 
 ```bash
 # 1. Get the content hash from the CVMFS catalog
-attr -g hash /cvmfs/software.cern.ch/atlas/24.0/libAtlasROOT.so
+attr -g hash /cvmfs/software.example.org/groupA/24.0/libExample.so
 # → a3f9b812...
 
 # 2. Query Rekor by hash (returns matching log entry UUIDs)
@@ -2203,8 +1975,8 @@ cat /var/spool/cvmfs-prepub/published/550e8400-.../job.json | jq .provenance
 # → { "verified": true, "oidc_issuer": "...", "git_sha": "c4e9f2a", ... }
 
 # 6. Confirm the git commit
-git -C atlas-sw show c4e9f2a --show-signature
-# → Author: atlas-releaser <rel@cern.ch>
+git -C example-sw show c4e9f2a --show-signature
+# → Author: ci-releaser <rel@cern.ch>
 # → gpg: Good signature from "ATLAS Release Team <atlas-rel@cern.ch>"
 ```
 
@@ -2391,40 +2163,11 @@ chunking:                     # CVMFS content-defined (xor32) chunk sizes; bytes
 # distribution: block — see "Pull control plane flags" below and Chapter 8.
 
 repositories:
-  - name: atlas.cern.ch
-    gc:
-      enabled: true
-      access_ttl: 180d
-      soft_delete_period: 14d
-      schedule: "0 2 * * 0"
-      dry_run: false
-      exempt_tags: [stable, lts-2024]
-      exempt_paths: ["/cvmfs/atlas.cern.ch/releases/latest"]
-      max_deletion_rate: 100
+  - name: groupA.example.org
+  - name: groupB.example.org
 
-  - name: cms.cern.ch
-    gc:
-      enabled: false           # GC disabled for this repo
-
-access_sources:
-  - type: log_file
-    name: stratum1-cern
-    path: /var/log/nginx/cvmfs-stratum1-access.log
-    field_map:
-      hash:      'data/\w{2}/([0-9a-f]{40})'
-      repo:      'cvmfs/([^/\s]+)'
-      timestamp: '\[([^\]]+)\]'
-    time_format: "02/Jan/2006:15:04:05 -0700"
-
-  - type: http_receiver
-    name: external
-    listen: ":9200"
-    auth_token_env: CVMFS_ACCESS_TOKEN
-
-  - type: cas_backend
-    name: s3-primary
-
-  - type: publish_events
+# Object reclamation is performed by CVMFS's own `cvmfs_server gc`; the prepub
+# service has no GC policy of its own (see Chapter 10).
 ```
 
 **Pull control plane and security flags** (Chapter 8).
@@ -2474,7 +2217,7 @@ connections and needs no inbound ports.
 | `--broker-auth` | `false` | Enroll via challenge/response and authenticate to the broker with a scoped bearer token instead of connecting anonymously |
 | `--broker-ca-cert` | — | PEM CA certificate used to verify the broker and enroll endpoint server certificate; empty uses the system pool |
 | `--receiver-stratum0-url` | `` | Stratum-0 base URL the receiver pulls manifests and objects from on commit notification |
-| `--repos` | `` | Comma-separated list of CVMFS repositories this receiver follows (e.g. `atlas.cern.ch,cms.cern.ch`) |
+| `--repos` | `` | Comma-separated list of CVMFS repositories this receiver follows (e.g. `software.example.org,other.example.org`) |
 | `--node-id` | hostname | Stable identifier for this receiver node |
 | `--cas-root` | `/var/lib/cvmfs-prepub/cas` | Local CAS root directory (e.g. `/srv/cvmfs/stratum1/cas`) |
 | `--pull-concurrency` | `16` (`0`=default) | Number of parallel object transfers / bundle requests |
@@ -2581,7 +2324,7 @@ validated at construction time to reject characters with special MQTT meaning
 {
   "txn":          "<transaction id>",
   "publisher_id": "pub-<id>",
-  "repo":         "atlas.cern.ch",
+  "repo":         "software.example.org",
   "hashes":       ["<hash>", "..."],
   "total_bytes":  1234567
 }
@@ -2925,14 +2668,14 @@ After a job reaches `published` state the orchestrator calls `Provenance.Submit`
 ```json
 {
   "provenance": {
-    "git_repo":    "atlas-release/atlas-sw",
+    "git_repo":    "example-org/example-sw",
     "git_sha":     "c4e9f2a…",
     "git_ref":     "refs/heads/main",
-    "actor":       "atlas-releaser",
+    "actor":       "ci-releaser",
     "pipeline_id": "14280931847",
     "build_system": "github-actions",
     "oidc_issuer": "https://token.actions.githubusercontent.com",
-    "oidc_subject": "repo:atlas-release/atlas-sw:ref:refs/heads/main",
+    "oidc_subject": "repo:example-org/example-sw:ref:refs/heads/main",
     "verified":    true,
     "rekor_server":          "https://rekor.sigstore.dev",
     "rekor_uuid":            "24296fb24b3d…",
@@ -3035,8 +2778,8 @@ visibility; Rekor gives the durable, externally-auditable receipt.
 ### 34.1 Publisher (Stratum 0)
 
 The publisher is a first-class client of the existing `cvmfs_gateway`
-lease-and-payload API (`POST /api/v1/leases`, `PUT /api/v1/leases/{token}`,
-`POST /api/v1/payloads`); gateway ≥ 1.2 is sufficient and no gateway
+lease-and-payload API (`POST /api/v1/leases`, `POST /api/v1/payloads`,
+`DELETE /api/v1/leases/{token}`); gateway ≥ 1.2 is sufficient and no gateway
 modifications are required. It needs:
 
 - a recent Go toolchain to build (or a prebuilt binary);
@@ -3082,14 +2825,14 @@ matches the hash referenced by the signed catalog.
 key as part of the payload commit. The pre-publisher does not hold the private
 key; it submits the catalog diff and the gateway performs signing.
 
-**GC safety.** The reference counter is conservative: any catalog read error
-aborts the GC run entirely. The TOCTOU guard (refcount re-check immediately before
-CAS deletion) prevents races between a concurrent publish and a GC run that
-overlapped during the tombstone window. GC and publish are also serialised at the
-gateway lease level for any overlapping path.
+**GC safety.** Object reclamation is `cvmfs_server gc`'s job, not the prepub
+service's. The service's only GC role is to hold short-lived pins that protect a
+transaction's freshly uploaded objects until the catalog flip makes them
+reachable, so a concurrent `cvmfs_server gc` cannot reclaim in-flight objects
+(Chapter 10).
 
-**Audit trail.** Every publishing job and every GC run produces a signed JSONL
-audit log retained in the published/gc-complete spool directory.
+**Audit trail.** Every publishing job produces a signed JSONL audit log retained
+in the `published/` spool directory.
 
 ---
 
@@ -3200,8 +2943,8 @@ pipelines.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `repo` | string | Yes | Repository name (e.g. `atlas.cern.ch`) |
-| `path` | string | No | Gateway lease sub-path (e.g. `atlas/24.0`). Empty = root lease. |
+| `repo` | string | Yes | Repository name (e.g. `software.example.org`) |
+| `path` | string | No | Gateway lease sub-path (e.g. `groupA/24.0`). Empty = root lease. |
 | `tar` | file | Yes | The tar archive to publish (binary). Maximum 10 GiB. |
 | `tar_sha256` | string | No | Hex-encoded SHA-256 of the tar. If present, verified before the job starts. Mismatch → 400. |
 | `webhook_url` | string | No | URL to POST when the job reaches a terminal state. |
@@ -3213,12 +2956,12 @@ pipelines.
 ```sh
 curl -sf -X POST https://prepub.example.com/api/v1/jobs \
   -H "Authorization: Bearer $PREPUB_API_TOKEN" \
-  -F "repo=atlas.cern.ch" \
-  -F "path=atlas/24.0" \
-  -F "tar=@atlas-24.0.tar;type=application/octet-stream" \
-  -F "tar_sha256=$(sha256sum atlas-24.0.tar | cut -d' ' -f1)" \
-  -F "tag_name=atlas-24.0.0" \
-  -F "tag_description=ATLAS 24.0.0 release"
+  -F "repo=software.example.org" \
+  -F "path=groupA/24.0" \
+  -F "tar=@groupA-24.0.tar;type=application/octet-stream" \
+  -F "tar_sha256=$(sha256sum groupA-24.0.tar | cut -d' ' -f1)" \
+  -F "tag_name=groupA-24.0.0" \
+  -F "tag_description=groupA 24.0.0 release"
 ```
 
 #### 35.5.2 Staged tar reference (Content-Type: application/json)
@@ -3231,13 +2974,13 @@ to be configured on the server; submissions are rejected if it is not set.
 
 ```json
 {
-  "repo":            "atlas.cern.ch",
-  "path":            "atlas/24.0",
-  "tar_path":        "/staging/atlas/atlas-24.0.tar",
+  "repo":            "software.example.org",
+  "path":            "groupA/24.0",
+  "tar_path":        "/staging/groupA/groupA-24.0.tar",
   "tar_sha256":      "e3b0c44298fc1c...",
   "webhook_url":     "https://ci.example.com/hooks/cvmfs",
-  "tag_name":        "atlas-24.0.0",
-  "tag_description": "ATLAS 24.0.0 release"
+  "tag_name":        "groupA-24.0.0",
+  "tag_description": "groupA 24.0.0 release"
 }
 ```
 
@@ -3292,8 +3035,8 @@ Returns the current state of a job.
 {
   "job_id":             "3f7a2b1c-0000-0000-0000-aabbccddeeff",
   "state":              "published",
-  "repo":               "atlas.cern.ch",
-  "path":               "atlas/24.0",
+  "repo":               "software.example.org",
+  "path":               "groupA/24.0",
   "n_objects":          14823,
   "n_bytes_raw":        4831838208,
   "n_bytes_compressed": 1923145728,
@@ -3325,9 +3068,9 @@ Fields with zero/empty values are omitted from the JSON response.
 | `queued` | No | Job accepted; waiting for a worker goroutine |
 | `processing` | No | Pipeline running: unpacking, hashing, deduplicating, uploading |
 | `distributing` | No | Announce published; Stratum 1 receivers pull and warm (when pull pre-warming is enabled) |
-| `leased` | No | Gateway lease acquired; catalog merge in progress |
-| `committing` | No | Payload submitted to gateway; waiting for commit acknowledgement |
-| `published` | **Yes** | Catalog committed and manifest signed; job complete |
+| `leased` | No | Gateway lease acquired; subtree catalog being built |
+| `committing` | No | Subtree payload submitted to gateway; gateway grafts/merges and signs; waiting for commit acknowledgement |
+| `published` | **Yes** | Catalog committed and manifest signed by the gateway; job complete |
 | `failed` | **Yes** | Unrecoverable error; `error` field contains details |
 | `aborted` | **Yes** | Job was cancelled via `POST /api/v1/jobs/{id}/abort` |
 
@@ -3444,8 +3187,8 @@ affect the job outcome.
 {
   "job_id":     "3f7a2b1c-0000-0000-0000-aabbccddeeff",
   "state":      "published",
-  "repo":       "atlas.cern.ch",
-  "path":       "atlas/24.0",
+  "repo":       "software.example.org",
+  "path":       "groupA/24.0",
   "error":      "",
   "updated_at": "2025-05-01T12:04:37Z"
 }
@@ -3466,10 +3209,10 @@ to the Rekor transparency log after publish (see Chapter 33).
 **Unverified provenance (plain headers):**
 
 ```
-X-Provenance-Git-Repo:    atlas-release/atlas-sw
+X-Provenance-Git-Repo:    example-org/example-sw
 X-Provenance-Git-SHA:     c4e9f2a...
 X-Provenance-Git-Ref:     refs/heads/main
-X-Provenance-Actor:       atlas-releaser
+X-Provenance-Actor:       ci-releaser
 X-Provenance-Pipeline-ID: 14280931847
 ```
 
