@@ -86,6 +86,7 @@ func main() {
 	publishMode := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
 	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
+	gatewayRootMerge := flag.Bool("gateway-root-merge", false, "[publisher] Optional A/B path: build the catalog from the repository root down to the lease path and let the gateway 3-way merge it, instead of grafting a leaf subtree and pre-creating parent directories. Default off. Mutually exclusive with --gateway-direct-graft; if both are set, --gateway-root-merge wins (root-merge implies no direct graft).")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
 	stratum0URL := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
 	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
@@ -209,8 +210,17 @@ func main() {
 			nodeID, repos, recvStratum0URL,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			gatewayDirectGraft,
+			gatewayRootMerge,
 			chunkMin, chunkAvg, chunkMax,
 		)
+	}
+
+	// Mutual exclusion: --gateway-root-merge wins over --gateway-direct-graft
+	// (root-merge implies no direct graft).  Clearing gatewayDirectGraft here
+	// keeps the orchestrator's DirectGraft / RootMerge invariant local to one
+	// place and ensures the commit POST carries direct_graft=false.
+	if *gatewayRootMerge {
+		*gatewayDirectGraft = false
 	}
 
 	// ── Observability (common setup) ──────────────────────────────────────────
@@ -230,7 +240,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayRootMerge, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
@@ -258,6 +268,7 @@ func runPublisher(
 	devMode bool,
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
+	gatewayRootMerge bool,
 	cvmfsMount, stratum0URL, repoName, casType, casRoot string,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
@@ -554,6 +565,7 @@ func runPublisher(
 		CVMFSMount:   cvmfsMount,
 		Stratum0URL:  stratum0URL,
 		DirectGraft:  gatewayDirectGraft,
+		RootMerge:    gatewayRootMerge,
 		JobTimeout:   jobTimeout,
 		BrokerConfig: publishBrokerCfg,
 		Pipeline: pipeline.Config{
