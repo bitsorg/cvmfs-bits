@@ -153,8 +153,6 @@ type applyTestVars struct {
 	provenanceEnabled                                       bool
 	rekorServer, rekorSigningKey, oidcIssuers               string
 	gatewayDirectGraft                                      bool
-	gatewayRootMerge                                        bool
-	chunkMin, chunkAvg, chunkMax                            int64
 }
 
 func defaultApplyVars() *applyTestVars {
@@ -182,8 +180,6 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.nodeID, &v.repos, &v.recvStratum0URL,
 		&v.provenanceEnabled, &v.rekorServer, &v.rekorSigningKey, &v.oidcIssuers,
 		&v.gatewayDirectGraft,
-		&v.gatewayRootMerge,
-		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
 	)
 }
 

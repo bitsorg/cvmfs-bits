@@ -81,24 +81,6 @@ type Orchestrator struct {
 	// is purely a performance optimisation that can be toggled at runtime via
 	// --gateway-direct-graft for A/B comparison and integrity verification.
 	DirectGraft bool
-	// RootMerge selects the optional "root-merge" commit path (A/B testing).
-	//
-	// When true, the orchestrator builds the catalog from the repository ROOT
-	// down to the lease path (BuildFromRoot) and submits the commit with
-	// direct_graft=false and the current HEAD root hash, so the gateway performs
-	// its standard 3-way DiffRec merge.  Because the root-anchored catalog
-	// already carries the full ancestor directory chain, the ensureParentDirs
-	// (mkdir-p) subsystem is SKIPPED.
-	//
-	// RootMerge is mutually exclusive with the graft + mkdir-p path: it is the
-	// alternative to DirectGraft, not a modifier of it.  When both RootMerge and
-	// DirectGraft are set, RootMerge wins (root-merge implies direct_graft=false);
-	// main.go enforces this by clearing DirectGraft whenever RootMerge is set.
-	//
-	// Default false — the existing graft + mkdir-p path is unchanged.  This flag
-	// exists purely for A/B comparison and integrity verification of the merge
-	// path against the graft path.
-	RootMerge bool
 	// Distribute carries the control-plane broker configuration used to emit the
 	// pre-commit pull announce (ADR-0001). nil disables the announce (typical for
 	// local mode); receivers then converge on the post-commit published broadcast.
@@ -928,38 +910,18 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		if pipelineResult != nil && o.Stratum0URL != "" && j.Path != "" {
 			// ── Phase 2.6: build subtree catalog ──────────────────────────────
 			subtreePhaseStart := time.Now()
-			// commitMode tags metrics/logs so an A/B run is measurable:
-			//   "graft"      — leaf subtree graft + mkdir-p parent dirs (default).
-			//   "root-merge" — root-anchored catalog + gateway 3-way DiffRec merge.
-			commitMode := "graft"
-			if o.RootMerge {
-				commitMode = "root-merge"
-			}
-			logger.Info("building catalog", "repo", j.Repo, "path", j.Path, "commit_mode", commitMode)
+			logger.Info("building subtree catalog", "repo", j.Repo, "path", j.Path)
 
 			var buildErr error
-			if o.RootMerge {
-				// Root-merge path: build the catalog from the repository ROOT
-				// down to the lease path.  direct_graft is forced false at
-				// commit time and the ancestor chain is carried by this catalog,
-				// so the ensureParentDirs (mkdir-p) pass below is skipped.
-				subtreeResult, buildErr = cvmfscatalog.BuildFromRoot(ctx, cvmfscatalog.SubtreeConfig{
-					LeasePath:     j.Path,
-					TempDir:       o.Spool.JobDir(j),
-					DirtabContent: pipelineResult.DirtabContent,
-					DirectGraft:   false,
-				}, pipelineResult.CatalogEntries)
-			} else {
-				subtreeResult, buildErr = cvmfscatalog.BuildSubtree(ctx, cvmfscatalog.SubtreeConfig{
-					LeasePath:     j.Path,
-					TempDir:       o.Spool.JobDir(j),
-					DirtabContent: pipelineResult.DirtabContent,
-					DirectGraft:   o.DirectGraft,
-				}, pipelineResult.CatalogEntries)
-			}
+			subtreeResult, buildErr = cvmfscatalog.BuildSubtree(ctx, cvmfscatalog.SubtreeConfig{
+				LeasePath:     j.Path,
+				TempDir:       o.Spool.JobDir(j),
+				DirtabContent: pipelineResult.DirtabContent,
+				DirectGraft:   o.DirectGraft,
+			}, pipelineResult.CatalogEntries)
 			if buildErr != nil {
 				span.RecordError(buildErr)
-				return o.abortJob(ctx, j, fmt.Errorf("catalog build (mode=%s): %w", commitMode, buildErr))
+				return o.abortJob(ctx, j, fmt.Errorf("subtree catalog build: %w", buildErr))
 			}
 
 			// Upload the subtree catalog file(s) to the local CAS so that
@@ -1010,14 +972,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			//
 			// Must run BEFORE Phase 2.7 so that no overlapping path lease exists
 			// when the parent-path lease is acquired inside ensureParentDirs.
-			//
-			// Root-merge path: SKIPPED.  BuildFromRoot already materialised the
-			// full ancestor directory chain inside the root-anchored catalog, so
-			// no separate mkdir-p commit (and no mkdirMu serialisation) is needed.
-			if o.RootMerge {
-				logger.Info("root-merge: skipping ensureParentDirs (ancestor chain carried by root catalog)",
-					"repo", j.Repo, "path", j.Path)
-			} else if ensureErr := o.ensureParentDirs(ctx, j); ensureErr != nil {
+			if ensureErr := o.ensureParentDirs(ctx, j); ensureErr != nil {
 				span.RecordError(ensureErr)
 				return o.abortJob(ctx, j, ensureErr)
 			}
@@ -1275,21 +1230,13 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 
 	// Build the commit request, populating fields for whichever backend is active.
 	cvmfsDir := filepath.Join(o.CVMFSMount, j.Repo, j.Path)
-	// directGraft is forced false on the root-merge path: the gateway must run
-	// its standard 3-way DiffRec merge against the existing repository root
-	// (root-merge implies no direct graft).  o.DirectGraft is already cleared by
-	// main.go when RootMerge is set; the explicit guard keeps the invariant local.
-	directGraft := o.DirectGraft
-	if o.RootMerge {
-		directGraft = false
-	}
 	req := lease.CommitRequest{
 		Token:          token,
 		TarPath:        j.TarPath,
 		CVMFSDir:       cvmfsDir,
 		TagName:        j.TagName,
 		TagDescription: j.TagDescription,
-		DirectGraft:    directGraft,
+		DirectGraft:    o.DirectGraft,
 	}
 	if preMutexLease {
 		// Catalog already uploaded to the gateway in Phase 2.7 (BuildSubtree).
