@@ -101,6 +101,13 @@ type fileConfig struct {
 		// case the standard DiffRec path is required for correctness.
 		// Can be overridden at runtime with --gateway-direct-graft=false.
 		DirectGraft bool `yaml:"direct_graft"`
+		// RootMerge selects the optional A/B "root-merge" commit path: build the
+		// catalog from the repository root down to the lease path and let the
+		// gateway 3-way merge it (instead of grafting a leaf subtree + mkdir-p).
+		// Defaults to false.  Mutually exclusive with DirectGraft; when set it
+		// wins (root-merge implies no direct graft).  Override at runtime with
+		// --gateway-root-merge.
+		RootMerge bool `yaml:"root_merge"`
 	} `yaml:"gateway"`
 
 	CAS struct {
@@ -203,6 +210,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
 	gatewayDirectGraft *bool,
+	gatewayRootMerge *bool,
 	chunkMin, chunkAvg, chunkMax *int64,
 ) {
 	has := func(name string) bool { return explicit[name] }
@@ -290,6 +298,12 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	// To disable direct-graft use --gateway-direct-graft=false on the CLI.
 	if !has("gateway-direct-graft") && fc.Gateway.DirectGraft {
 		*gatewayDirectGraft = true
+	}
+	// Optional A/B root-merge commit path.  The flag defaults to false; config
+	// can only reaffirm true (bool fields have no zero-vs-explicit-false
+	// distinction in YAML).  Enable on the CLI with --gateway-root-merge.
+	if !has("gateway-root-merge") && fc.Gateway.RootMerge {
+		*gatewayRootMerge = true
 	}
 
 	// Content-defined chunking sizes (xor32); zero/omitted -> CLI default.
