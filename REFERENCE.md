@@ -798,7 +798,25 @@ func (lm *LeaseManager) Heartbeat(ctx context.Context, token string, ttl time.Du
 }
 ```
 
-If renewal fails, the job FSM transitions to `aborted`. Any GC *pins* held to
+The illustration above shows the renewal loop, but the stock `cvmfs_gateway`
+does **not** implement a lease-renewal endpoint: `PUT /api/v1/leases/<token>`
+returns `405 Method Not Allowed`. The lease manager treats that 405 as a
+permanent capability signal — it stops attempting renewal and does **not** abort
+the job; the lease simply remains valid for the gateway's `max_lease_time`. Only
+repeated genuine renewal errors (against a gateway that does support renewal)
+abort the job, after `maxConsecutiveHeartbeatFailures` consecutive failures.
+
+Because the lease cannot be renewed on a stock gateway, the held-lease window is
+hard-bounded by `max_lease_time`. The design keeps that window small — the
+compress/upload pipeline runs **before** the lease, so only the small
+subtree-catalog submit and the gateway commit happen under it — and the acquire
+loop's `--lease-retry-max` (default 12 min) **must be larger than the gateway's
+`max_lease_time`** so that, if a lease lapses, a fresh one is re-acquired within
+the same retry window. If `max_lease_time` exceeds `--lease-retry-max`, or a
+single commit's under-lease work exceeds `max_lease_time`, the publish fails with
+no way to extend the lease.
+
+When the job is aborted, the FSM transitions to `aborted`. Any GC *pins* held to
 protect this transaction's objects during the publish window are released, and
 orphaned temporary files staged for the aborted job are cleaned up (see §10).
 The objects themselves remain in the CAS and are reclaimed, if unreferenced, by
@@ -833,25 +851,46 @@ follows:
    chain, increments the revision, and signs the new root manifest; the merged
    root hash it returns is authoritative.
 
-#### CVMFS catalog schema (version 2.5)
+#### CVMFS catalog schema (version 2.5, schema_revision 7)
 
-The `catalog` table has the following columns (key ones annotated):
+A catalog is a SQLite database with six tables: `catalog`, `chunks`,
+`nested_catalogs`, `bind_mountpoints`, `statistics`, and `properties`.
 
-| Column | Role |
-|---|---|
-| `md5path_1`, `md5path_2` | MD5 of the absolute path, split into two little-endian `int64`; root entry = `MD5("")` |
-| `parent_1`, `parent_2` | MD5 of the parent directory path |
-| `name` | Basename only (empty for the root entry) |
-| `flags` | Bit-packed: `FlagDir=1`, `FlagDirNestedMount=2`, `FlagFile=4`, `FlagLink=8`, `FlagDirNestedRoot=32`, `FlagFileChunk=64`, `FlagHidden=0x8000`; hash algorithm encoded as `(algo-1) << 8` |
-| `size` | File size in bytes; for symlinks, length of the link target |
-| `mtime` | Unix timestamp (seconds) |
-| `symlink` | Symlink target (non-empty only when `FlagLink` is set) |
-| `hardlinks` | `(linkcount << 32) \| inode`; for regular files, `linkcount=1` and `inode=md5path_1 & 0x7fffffff` |
+The `catalog` table holds one row per filesystem entry, with all 16 columns:
 
-The `statistics` table tracks 14 counters (`num_files`, `num_symlinks`,
-`num_dir`, `num_nested_catalogs`, `num_chunked_files`, `num_chunks`,
-`file_size`, `chunked_file_size`, `num_special`, plus `num_x_*` variants for
-external files) and is updated on every `Upsert`/`Remove`.
+| Column | Type | Role |
+|---|---|---|
+| `md5path_1`, `md5path_2` | INTEGER | MD5 of the absolute path, split into two little-endian `int64`; root entry = `MD5("")` |
+| `parent_1`, `parent_2` | INTEGER | MD5 of the parent directory path |
+| `hardlinks` | INTEGER | `(linkcount << 32) \| hardlink-group`; for non-hard-linked files `linkcount=1` |
+| `hash` | BLOB | Content hash of the object (raw bytes); `NULL` for directories and symlinks |
+| `size` | INTEGER | File size in bytes; for symlinks, length of the link target |
+| `mode` | INTEGER | POSIX mode bits (permissions + file type) |
+| `mtime` | INTEGER | Modification time (Unix seconds) |
+| `mtimens` | INTEGER | Nanosecond component of `mtime` |
+| `flags` | INTEGER | Bit-packed entry type/attributes: `FlagDir=1`, `FlagDirNestedMount=2`, `FlagFile=4`, `FlagLink=8`, `FlagFileSpecial=16`, `FlagDirNestedRoot=32`, `FlagFileChunk=64`, `FlagFileExternal=128`, bind-mountpoint = `0x4000` (bit 14, CVMFS-side), `FlagHidden=0x8000` (bit 15). Bits 8–10 hold the hash algorithm as `(algo-1)` (SHA-1→0, SHA-256→1, RIPEMD-160→2); bits 11–13 hold the compression algorithm as its raw value (zlib=0, none=1). Xattr presence is **not** a flag bit — it is signalled by a non-NULL `xattr` BLOB |
+| `name` | TEXT | Basename only (empty for the root entry) |
+| `symlink` | TEXT | Symlink target (non-empty only when `FlagLink` is set) |
+| `uid` | INTEGER | Owner user ID |
+| `gid` | INTEGER | Owner group ID |
+| `xattr` | BLOB | Extended-attributes blob; `NULL` when none (`FlagXattr` is set when present) |
+
+The other tables:
+
+| Table | Columns | Role |
+|---|---|---|
+| `chunks` | `md5path_1`, `md5path_2`, `offset`, `size`, `hash` | One row per chunk of a chunked file (`FlagFileChunk`) |
+| `nested_catalogs` | `path`, `sha1`, `size` | Mountpoints of nested catalogs |
+| `bind_mountpoints` | `path`, `sha1`, `size` | Bind mountpoints — required for schema 2.5 revision ≥ 4; the receiver crashes (`assert` in `Sql::LazyInit`) if the table is absent, even when empty |
+| `statistics` | `counter`, `value` | Per-catalog counters (see below) |
+| `properties` | `key`, `value` | Repository properties: `schema` (`2.5`), `schema_revision` (`7`), `root_prefix`, `revision`, `previous_revision` |
+
+The `statistics` table carries 24 required counters — the `self_*` group (this
+catalog only) and the `subtree_*` group (this catalog plus its nested
+catalogs), each over `{regular, symlink, special, dir, nested, chunked, chunks,
+file_size, chunked_size, xattr, external, external_file_size}`. Every catalog
+must have a row for each counter or `cvmfs_receiver` aborts on load; the values
+are recomputed on every `Upsert`/`Remove` and flushed in `Finalize`.
 
 #### Hidden directories
 
@@ -2950,6 +2989,8 @@ pipelines.
 | `webhook_url` | string | No | URL to POST when the job reaches a terminal state. |
 | `tag_name` | string | No | Snapshot tag name to embed in the catalog commit. Must match `^[A-Za-z0-9._-]+$`, max 255 chars. Empty = no tag. |
 | `tag_description` | string | No | Human-readable description for the snapshot tag. |
+| `preload_exe` | string | No | Repo-relative path to an application binary; the pipeline traces it and writes a `.<base>.cvmfspreload` warm-up list alongside it. |
+| `preload_paths` | string (JSON array) | No | JSON-encoded list of repo-relative paths to record in the preload list, e.g. `["bin/app","lib/libcore.so"]`. |
 
 **Example:**
 
@@ -2993,6 +3034,8 @@ to be configured on the server; submissions are rejected if it is not set.
 | `webhook_url` | string | No | Webhook URL for terminal-state notification |
 | `tag_name` | string | No | Snapshot tag name (same rules as multipart mode) |
 | `tag_description` | string | No | Human-readable tag description |
+| `preload_exe` | string | No | Repo-relative path to an application binary; the pipeline traces it and writes a `.<base>.cvmfspreload` warm-up list alongside it |
+| `preload_paths` | array | No | List of repo-relative paths to record in the preload list |
 
 The server validates that `tar_path` is within the configured `--staging-root`
 (directory traversal attempts are rejected with `400`) and moves or hard-links
@@ -3052,12 +3095,23 @@ Returns the current state of a job.
 | `state` | Current FSM state (see §35.6.1) |
 | `repo` | Repository name |
 | `path` | Gateway lease sub-path (empty = root) |
+| `tag_name` | Snapshot tag embedded in the commit (when set) |
+| `tar_name` | Original tar filename (when provided) |
+| `tar_size` | Size of the submitted tar in bytes |
 | `n_objects` | Number of CAS objects written (0 until pipeline completes) |
+| `n_new_objects` | Objects newly written after deduplication (the remainder were already in the CAS) |
 | `n_bytes_raw` | Uncompressed size of all objects in bytes |
 | `n_bytes_compressed` | Compressed size of all objects as stored in the CAS |
+| `new_root_hash` | Authoritative merged root hash returned by the gateway after commit |
 | `error` | Non-empty only when `state` is `failed` |
+| `failed_at_state` | The state at which the job failed (only when `state` is `failed`) |
 | `created_at` | UTC timestamp of job submission |
 | `updated_at` | UTC timestamp of the most recent state transition |
+| `pipeline_started_at`, `pipeline_ended_at` | UTC timestamps bounding the processing pipeline |
+| `leased_at` | UTC timestamp when the gateway lease was acquired |
+| `published_at` | UTC timestamp when the catalog commit completed |
+| `distributing_started_at`, `distributing_ended_at` | UTC timestamps bounding Stratum 1 pull/warm distribution |
+| `distribution_confirmed`, `distribution_total` | Receivers that confirmed warm vs. total expected |
 
 Fields with zero/empty values are omitted from the JSON response.
 
