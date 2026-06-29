@@ -145,22 +145,34 @@ directly from the design and are checkable against the code and behaviour.
 
 ### 4.1 Architectural differences
 
-| Dimension | Traditional `cvmfs_server publish` | `cvmfs-prepub` service |
-|---|---|---|
-| **Lock scope** | Path-scoped transaction (`cvmfs_server transaction <repo>/<path>`) held from file I/O through manifest sign | Path-scoped gateway lease acquired only for the commit (`SubmitPayload` + `Release`); pipeline runs before the lease |
-| **When processing runs** | Inside the transaction lock — compress, hash, upload all precede commit while the lock is held | Before the lease is acquired — decoupled from the lock |
-| **Entry point** | Shell access to the publisher (release-manager) node; files are staged in the transaction overlay, which the node pushes to Stratum 0 | HTTP POST of a tar archive plus an API token |
-| **Privilege** | An account on the publisher node (root for the initial repository/server setup) | Root is needed only to install the service; publishing itself uses ordinary user access with an API token |
-| **Input format** | Arbitrary file tree via overlay mount | Tar archive stream |
-| **Stratum 1 pre-warming** | Not built in; S1 replicates after the catalog flip | Optional: receivers pull objects before the catalog flip (Chapter 8) |
-| **State durability** | Overlay fs is live; an interrupted publish leaves an uncommitted overlay | Each state transition is written to a crash-safe spool with a WAL journal; restarts resume |
-| **Job status** | Exit code + log file | REST API with per-job FSM state; optional SSE event stream and webhook |
-| **Metrics / tracing** | Log files | OpenTelemetry spans + Prometheus metrics per pipeline stage |
-| **S1 / client changes** | None | None to the CVMFS client; receivers run the `--mode receiver` binary for pull pre-warming |
-| **Coexistence** | — | Runs alongside the traditional workflow; the gateway's per-path lease arbitrates |
-| **Publisher identity** | SSH username on the publisher (release-manager) node, recorded in server-side logs | Structured fields (`actor`, `git_sha`, `pipeline_id`) in every job manifest |
-| **Identity verification** | No built-in cryptographic check | Optional OIDC token validated against the CI provider's JWKS; `verified=true` is set only on a validated token |
-| **Provenance** | None | Optional Rekor (`hashedrekord`) submission after publish |
+| Dimension | Traditional `cvmfs_server publish` | `cvmfs_server ingest` | `cvmfs-prepub` service |
+|---|---|---|---|
+| **Lock scope** | Path-scoped transaction (`cvmfs_server transaction <repo>/<path>`) held from file I/O through manifest sign | Internally opens and closes a transaction — a path-scoped gateway lease on a gateway-backed repo — held across tar extraction, processing, and publish | Path-scoped gateway lease acquired only for the commit (`SubmitPayload` + `Release`); pipeline runs before the lease |
+| **When processing runs** | Inside the transaction lock — compress, hash, upload all precede commit while the lock is held | Inside the transaction — the tar is extracted, compressed, hashed, and uploaded while the lease is held | Before the lease is acquired — decoupled from the lock |
+| **Entry point** | Shell access to the publisher (release-manager) node; files are staged in the transaction overlay, which the node pushes to Stratum 0 | `cvmfs_server` CLI on a publisher (release-manager) node; `--tar_file` is a local path, extracted at `--base_dir` | HTTP POST of a tar archive plus an API token |
+| **Privilege** | An account on the publisher node (root for the initial repository/server setup) | `cvmfs_server` access on the publisher node (same as `publish`) | Root is needed only to install the service; publishing itself uses ordinary user access with an API token |
+| **Input format** | Arbitrary file tree via overlay mount | Tar archive (`--tar_file`); `--catalog` creates a nested catalog at `--base_dir`, `--delete` removes a subtree | Tar archive stream |
+| **Stratum 1 pre-warming** | Not built in; S1 replicates after the catalog flip | Not built in | Optional: receivers pull objects before the catalog flip (Chapter 8) |
+| **State durability** | Overlay fs is live; an interrupted publish leaves an uncommitted overlay | Transaction-based; an interrupted ingest aborts the transaction (same as `publish`) | Each state transition is written to a crash-safe spool with a WAL journal; restarts resume |
+| **Job status** | Exit code + log file | Exit code + log file | REST API with per-job FSM state; optional SSE event stream and webhook |
+| **Metrics / tracing** | Log files | Log files | OpenTelemetry spans + Prometheus metrics per pipeline stage |
+| **S1 / client changes** | None | None | None to the CVMFS client; receivers run the `--mode receiver` binary for pull pre-warming |
+| **Coexistence** | — | Part of `cvmfs_server`; uses the same transaction/lease, so it interoperates with both paths | Runs alongside the traditional workflow; the gateway's per-path lease arbitrates |
+| **Publisher identity** | SSH username on the publisher (release-manager) node, recorded in server-side logs | Node user (same as `publish`) | Structured fields (`actor`, `git_sha`, `pipeline_id`) in every job manifest |
+| **Identity verification** | No built-in cryptographic check | No built-in cryptographic check | Optional OIDC token validated against the CI provider's JWKS; `verified=true` is set only on a validated token |
+| **Provenance** | None | None | Optional Rekor (`hashedrekord`) submission after publish |
+
+`cvmfs_server ingest` closes the two gaps that might otherwise look
+prepub-specific: it already accepts a **tar archive** directly, and on a
+gateway-backed repository its internal transaction is a path-scoped lease, so
+independent sub-paths can be published **concurrently** from separate publisher
+nodes. What stays specific to `cvmfs-prepub` is the set of rows where both
+`cvmfs_server` paths agree and prepub differs: the compress/hash/dedup pipeline
+moved off the leased window, Stratum 1 pre-warming before the catalog flip, the
+crash-safe spool/WAL and REST/FSM/SSE control plane, per-stage
+OpenTelemetry/Prometheus, a remote HTTP entry point that needs no shell or
+`cvmfs_server` on the publisher node, and the optional OIDC identity check and
+Rekor provenance.
 
 The differences above are structural consequences of the design; they do not by
 themselves establish that one path is faster than the other for any given
@@ -168,14 +180,29 @@ workload.
 
 ### 4.2 Where the structural difference lies
 
-In the traditional workflow the exclusive transaction is held while files are
-compressed, hashed, dedup-checked, and uploaded. `cvmfs-prepub` reorders this:
-the compress → hash → dedup → CAS-upload pipeline runs **before** a gateway
-lease is requested, so by the time the lease is acquired every object is already
-in the CAS. The lease window therefore covers only `SubmitPayload` and
-`Release`. The same reordering enables Stratum 1 pre-warming: because receivers
-can pull objects before the catalog flip (Chapter 8), the objects are already
-present locally when clients see the new revision.
+Against the traditional **non-gateway** workflow the structural difference is
+large: there the exclusive transaction is held while files are compressed,
+hashed, dedup-checked, and uploaded. `cvmfs-prepub` runs that whole pipeline —
+compress → hash → dedup → upload to its own CAS, plus Stratum 1 distribution —
+**before** it requests a gateway lease.
+
+Against a **gateway-backed** repository — the relevant "what is done today"
+baseline — the reordering is narrower than it first appears, and the reviewer's
+caution is fair. A gateway publisher already transmits only the *new* objects,
+and `cvmfs-prepub` does the same: under the lease its commit still streams the
+new compressed objects to the gateway via `SubmitPayload` (the gateway remains
+the sole writer to authoritative storage; see `internal/lease/lease.go`
+`Commit`) before finalising. The leased window is therefore **not** reduced to a
+trivial metadata commit — it is proportional to the new-object payload, just as
+a gateway `publish` or `ingest` is. What `cvmfs-prepub` genuinely takes out of
+the leased window is the **compress/hash/dedup** work, which is done beforehand;
+and what it adds that neither `publish` nor `ingest` offers is **Stratum 1
+pre-warming** — receivers pull the objects during the pre-lease distribution
+phase (Chapter 8), so the objects are already present on the replicas when
+clients see the new revision. The observable benefit is consequently largest
+where the publisher would otherwise spend significant CPU compressing and
+hashing under the lease, or where Stratum 1 warm-up latency matters — not a
+universal reduction of the leased window.
 
 ### 4.3 What the prepub service does not change
 
@@ -193,8 +220,7 @@ level.
 |---|---|
 | Ad-hoc manual publish by an operator on the Stratum 0 node | Traditional `cvmfs_server publish` |
 | CI/CD pipeline publishing a build artifact from an external build node | `cvmfs-prepub` |
-| Multiple teams publishing to different sub-paths in parallel | `cvmfs-prepub` |
-| Rollout where Stratum 1 pre-warming before the catalog flip is wanted | `cvmfs-prepub` (Chapter 8) |
+| Multiple teams publishing to different sub-paths in parallel | `cvmfs-prepub` or `cvmfs_server ingest` |
 | Repository with sparse, infrequent, small updates | Either; traditional is simpler |
 | Environment requiring a structured, externally verifiable audit trail | `cvmfs-prepub` with `--provenance` (Chapter 33) |
 | Air-gapped or self-hosted transparency log required | `cvmfs-prepub` with `--rekor-server <internal-url>` |
@@ -733,8 +759,7 @@ Catalog Accumulator
 
 **CAS key and compression.**  Each regular file is zlib-compressed and the
 **CAS key is the SHA-1 of the compressed bytes** — the CVMFS CAS convention; the
-C++ receiver's hash enum only recognises SHA-1, RIPEMD-160, and SHAKE-128, so
-SHA-256 keys would be rejected (`pkg/cvmfshash/hash.go`,
+C++ receiver's hash enum only recognises SHA-1, RIPEMD-160, and SHAKE-128 (`pkg/cvmfshash/hash.go`,
 `internal/pipeline/compress/compress.go`). Compression and hashing are done in a
 single pass: the zlib output stream is fed to both an accumulation buffer and the
 SHA-1 hasher via `io.MultiWriter`, with the `zlib.Writer` and `sha1.Hash`
