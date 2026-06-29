@@ -124,12 +124,15 @@ acquire lock
   committed catalog update with pre-warmed Stratum 1s.
 - **Crash-safe:** Every state transition is durable. A process restart at any
   point resumes from the last committed spool state with no data loss and no
-  double-deletion.
+  *double-deletion* — a replayed step never removes the same object, spool entry,
+  or temp file twice (this is a property of the spool FSM and is unrelated to
+  CVMFS garbage collection).
 - **Idempotent operations:** CAS uploads, catalog submissions, and distribution
   steps can be safely retried.
 - **No bespoke garbage collection:** Object reclamation is left to CVMFS's own
-  `cvmfs_server gc`; the service holds only short-lived GC pins to protect a
-  transaction's objects during the publish window (Chapter 10).
+  `cvmfs_server gc`; the service adds no reclamation policy of its own. It only
+  keeps an in-memory record of an in-flight transaction's objects so they are not
+  dropped from its own distribution path before the commit lands (Chapter 10).
 
 ---
 
@@ -1001,18 +1004,32 @@ service does not duplicate or replace it.
 
 What the prepub service does maintain is much narrower:
 
-### 10.1 GC Pins
+### 10.1 In-flight Object Tracking ("Pins")
 
-During a publish, objects are uploaded to the CAS **before** the catalog that
-references them is committed. Until the commit lands, those objects are not yet
-reachable from any catalog and would be eligible for reclamation by a concurrent
-`cvmfs_server gc`. To prevent that, the prepub service holds short-lived GC
-**pins** that protect a transaction's objects for the duration of the
-prepare → commit window. Once the catalog flip makes the objects reachable
-(or the job aborts), the pins are released.
+A publish writes its objects into the repository's own object store — the
+`data/XX/<hash>` tree that `cvmfs_server gc` scans — **before** the catalog that
+references them is committed. During that prepare → commit window the objects are
+unreferenced, exactly as the objects a traditional `cvmfs_server publish` writes
+are unreferenced until its transaction commits.
 
-The pins protect only in-flight objects; they do not track access, expire
-content, or delete anything.
+The service keeps an **in-memory registry** (the `Pinner`) of the objects each
+in-flight transaction has uploaded, with a TTL and a periodic sweep so a crash
+cannot leak an entry permanently. The commit orchestrator pins a transaction's
+hashes when the pipeline finishes and releases them on commit or abort. Its role
+is bookkeeping for the window — most usefully so the distributor can serve an
+in-flight object to a Stratum 1 receiver before the catalog flip.
+
+This registry does **not**, on its own, stop an external `cvmfs_server gc`: an
+in-process table cannot prevent a separate `cvmfs_server gc` process from
+sweeping the object store. Protection of the pre-commit objects rests on the same
+footing CVMFS itself relies on — `cvmfs_server gc` is not run concurrently with a
+publish (CVMFS preserves recent revisions, and reclamation of just-published
+objects is therefore not a target), and the intended durable guard is to hold the
+gateway lease across the commit or attach a short-lived named tag, which
+`cvmfs_server gc` honours as a preserved revision — not a bespoke object-pin
+system. Reclamation of genuinely unreferenced objects remains entirely
+`cvmfs_server gc`'s job; the prepub service implements no garbage collector of its
+own.
 
 ### 10.2 Temp-File Cleanup
 
@@ -2890,10 +2907,13 @@ key as part of the payload commit. The pre-publisher does not hold the private
 key; it submits the catalog diff and the gateway performs signing.
 
 **GC safety.** Object reclamation is `cvmfs_server gc`'s job, not the prepub
-service's. The service's only GC role is to hold short-lived pins that protect a
-transaction's freshly uploaded objects until the catalog flip makes them
-reachable, so a concurrent `cvmfs_server gc` cannot reclaim in-flight objects
-(Chapter 10).
+service's, which implements no garbage collector of its own. The service only
+keeps an in-memory record of a transaction's freshly uploaded objects for the
+prepare → commit window (so the distributor can serve them before the catalog
+flip). It does not, by itself, prevent a concurrently-run `cvmfs_server gc` from
+sweeping the store; as with the traditional workflow, `cvmfs_server gc` is simply
+not run concurrently with a publish, and the durable guard for the window is the
+gateway lease or a short-lived named tag (Chapter 10).
 
 **Audit trail.** Every publishing job produces a signed JSONL audit log retained
 in the `published/` spool directory.
