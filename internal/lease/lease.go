@@ -505,9 +505,52 @@ func (c *Client) Heartbeat(ctx context.Context, token string, interval time.Dura
 
 // ── Backend interface implementation ─────────────────────────────────────────
 
+// gatewayCommitURL returns the endpoint that finalises a publish transaction.
+//
+// The standard commit is POST /api/v1/leases/<token>.  When req.DirectGraft is
+// set the request instead targets the dedicated graft endpoint
+// POST /api/v1/leases/<token>/graft (gateway/frontend/leases.go
+// MakeGraftHandler): the gateway grafts the pre-built subtree catalog into the
+// parent, skipping the DiffRec catalog merge.  The fast path is selected by the
+// endpoint itself, not by a flag in the request body.
+func (c *Client) gatewayCommitURL(req CommitRequest) string {
+	u := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(req.Token))
+	if req.DirectGraft {
+		u += "/graft"
+	}
+	return u
+}
+
+// gatewayCommitBody marshals the JSON body shared by the commit and graft
+// endpoints.  Both decode an identical body — catalog root hashes plus the
+// optional snapshot tag — so no "direct_graft" field is sent; the endpoint
+// (see gatewayCommitURL) selects the DirectGraft fast path.
+func gatewayCommitBody(req CommitRequest) ([]byte, error) {
+	// Use NewRootHashSuffixed if provided; otherwise fall back to CatalogHash
+	// for backward compatibility.
+	newHash := req.NewRootHashSuffixed
+	if newHash == "" {
+		newHash = req.CatalogHash
+	}
+
+	body, err := json.Marshal(map[string]interface{}{
+		"old_root_hash":   req.OldRootHash,
+		"new_root_hash":   newHash,
+		"tag_name":        req.TagName,
+		"tag_description": req.TagDescription,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshalling commit body: %w", err)
+	}
+	return body, nil
+}
+
 // Commit implements Backend for the gateway mode.  It uploads all staged CAS
 // objects to the gateway via SubmitPayload, then finalises the publish by
 // POSTing to /api/v1/leases/<token> — distinct from DELETE which cancels.
+//
+// When req.DirectGraft is set the finalise step instead POSTs to the dedicated
+// graft endpoint /api/v1/leases/<token>/graft; see gatewayCommitURL.
 //
 // Per gateway/frontend/leases.go:
 //
@@ -534,25 +577,14 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 		return fmt.Errorf("gateway submit payload: %w", err)
 	}
 
-	// 2. POST /api/v1/leases/<token> to finalise the publish transaction.
-	commitURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(req.Token))
+	// 2. POST the finalise request.  DirectGraft targets the dedicated graft
+	//    endpoint; otherwise the standard commit endpoint (see gatewayCommitURL).
+	commitURL := c.gatewayCommitURL(req)
 
-	// Use NewRootHashSuffixed if provided; otherwise fall back to CatalogHash for backward compatibility.
-	newHash := req.NewRootHashSuffixed
-	if newHash == "" {
-		newHash = req.CatalogHash
-	}
-
-	commitBody, err := json.Marshal(map[string]interface{}{
-		"old_root_hash":   req.OldRootHash,
-		"new_root_hash":   newHash,
-		"tag_name":        req.TagName,
-		"tag_description": req.TagDescription,
-		"direct_graft":    req.DirectGraft,
-	})
+	commitBody, err := gatewayCommitBody(req)
 	if err != nil {
 		span.RecordError(err)
-		return fmt.Errorf("marshalling commit body: %w", err)
+		return err
 	}
 
 	postReq, err := http.NewRequestWithContext(ctx, "POST", commitURL, bytes.NewReader(commitBody))
@@ -614,23 +646,12 @@ func (c *Client) CommitFinalizeOnly(ctx context.Context, req CommitRequest) erro
 	ctx, span := c.obs.Tracer.Start(ctx, "lease.commit_finalize_only")
 	defer span.End()
 
-	commitURL := fmt.Sprintf("%s/api/v1/leases/%s", c.BaseURL, url.PathEscape(req.Token))
+	commitURL := c.gatewayCommitURL(req)
 
-	newHash := req.NewRootHashSuffixed
-	if newHash == "" {
-		newHash = req.CatalogHash
-	}
-
-	commitBody, err := json.Marshal(map[string]interface{}{
-		"old_root_hash":   req.OldRootHash,
-		"new_root_hash":   newHash,
-		"tag_name":        req.TagName,
-		"tag_description": req.TagDescription,
-		"direct_graft":    req.DirectGraft,
-	})
+	commitBody, err := gatewayCommitBody(req)
 	if err != nil {
 		span.RecordError(err)
-		return fmt.Errorf("marshalling commit body: %w", err)
+		return err
 	}
 
 	postReq, err := http.NewRequestWithContext(ctx, "POST", commitURL, bytes.NewReader(commitBody))

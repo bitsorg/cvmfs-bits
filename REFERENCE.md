@@ -335,12 +335,29 @@ prepub service itself defines:
 |---|---|
 | `POST /api/v1/leases/{path}` | Reserve a path-scoped lease for a sub-path |
 | `POST /api/v1/payloads` | Submit pre-processed catalog diff + objects |
-| `DELETE /api/v1/leases/{token}` | Release the lease (commit or abort) |
+| `POST /api/v1/leases/{token}` | Commit the lease (standard `DiffRec` merge) |
+| `POST /api/v1/leases/{token}/graft` | Commit the lease via the DirectGraft fast path (see below) |
+| `DELETE /api/v1/leases/{token}` | Release the lease (abort) |
 
 > The real gateway does not implement `PUT /api/v1/leases/{token}` (it returns
 > `405`); there is no client-side lease heartbeat against this endpoint.
 
-The pre-publisher targets this API directly as a first-class gateway client. No gateway modifications are required.
+**DirectGraft fast path.** When the publisher is publishing a brand-new
+directory subtree — nothing to diff against the parent — it can request the
+`.../graft` endpoint instead of the standard commit. The gateway then grafts the
+pre-built subtree catalog directly into the parent catalog
+(`WritableCatalogManager::TryGraftNestedCatalog`), skipping the `DiffRec`
+catalog merge entirely. The request body is **identical** to a standard commit
+(`old_root_hash`, `new_root_hash`, `tag_name`, `tag_description`); the dedicated
+endpoint — not a body flag — selects the fast path. It is toggled client-side by
+`--gateway-direct-graft` (the `DirectGraft` commit field) and is a pure
+performance optimisation: both paths produce identical repository state for the
+"publish new subtree" case.
+
+The pre-publisher targets this API directly as a first-class gateway client. The
+standard commit, payload, and lease endpoints require no gateway modifications;
+the experimental `.../graft` endpoint requires the dedicated graft support added
+in cvmfs PR #4296.
 
 ---
 
@@ -1444,7 +1461,7 @@ for manual or infrequent publishes on other repositories.
 
 | Layer | Status |
 |---|---|
-| `cvmfs_gateway` | Unmodified; targeted via existing lease-and-payload API |
+| `cvmfs_gateway` | Targeted via the existing lease-and-payload API; the DirectGraft fast path additionally requires the `.../graft` endpoint from cvmfs PR #4296 |
 | Stratum 1 replication daemon | Unmodified (`cvmfs_server snapshot` unchanged) |
 | Stratum 0 CAS layout | Identical; objects written with the same path structure |
 | Signed manifest format | Identical; gateway signs as usual |
@@ -2131,7 +2148,7 @@ Use this checklist before deploying.  Full detail is in Chapter 34.
 
 **Publisher (Stratum 0):**
 - [ ] Recent Go toolchain on the Stratum 0 node
-- [ ] `cvmfs_gateway` ≥ 1.2 with the lease-and-payload API
+- [ ] `cvmfs_gateway` ≥ 1.2 with the lease-and-payload API (plus the `.../graft` endpoint from cvmfs PR #4296 if using `--gateway-direct-graft`)
 - [ ] Write access to the CAS backend (local filesystem or S3-compatible)
 - [ ] Outbound HTTPS from the publisher to the gateway
 
