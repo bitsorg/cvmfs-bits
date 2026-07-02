@@ -70,10 +70,12 @@ type Orchestrator struct {
 	Stratum0URL string
 	// DirectGraft enables the fast-path commit on the receiver side.
 	//
-	// When true, the commit POST body carries "direct_graft":true, instructing
-	// cvmfs_receiver to skip DiffRec and graft the pre-built subtree catalog
-	// directly into the parent catalog.  This is correct only when the lease
-	// path is a brand-new directory with no pre-existing content.
+	// When true, the finalise step POSTs to the dedicated gateway graft
+	// endpoint (/api/v1/leases/<token>/graft) instead of the standard commit
+	// endpoint, instructing cvmfs_receiver to skip DiffRec and graft the
+	// pre-built subtree catalog directly into the parent catalog.  This is
+	// correct only when the lease path is a brand-new directory with no
+	// pre-existing content.
 	//
 	// Set to false (default) to use the standard CommitProcessor/DiffRec path,
 	// which handles arbitrary add/remove/modify operations safely.  Both paths
