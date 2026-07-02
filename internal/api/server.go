@@ -31,6 +31,7 @@ import (
 
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/job"
+	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/spool"
 	"cvmfs.io/prepub/pkg/observe"
@@ -134,7 +135,64 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	auth.HandleFunc("/{id}/events", s.jobEvents).Methods("GET")
 	auth.HandleFunc("/{id}/log", s.jobLogHandler).Methods("GET")
 
+	// Fail-fast namespace reservation (POST /api/v1/reserve). Authenticated.
+	reserve := s.router.PathPrefix("/api/v1/reserve").Subrouter()
+	reserve.Use(s.requireAuth)
+	reserve.HandleFunc("", s.reserveHandler).Methods("POST")
+
 	return s
+}
+
+// reserveHandler handles POST /api/v1/reserve. Fail-fast namespace check:
+// acquire a single-attempt gateway lease on {"repo","path"} and release it at
+// once. Returns 204 free, 409 taken, 400 bad body, 502 gateway error.
+func (s *Server) reserveHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := s.obs.Tracer.Start(r.Context(), "api.reserve")
+	defer span.End()
+
+	var req struct {
+		Repo string `json:"repo"`
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Repo == "" {
+		http.Error(w, `{"error":"repo is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Fail-fast reservation is a gateway concern: only the gateway *lease.Client
+	// can take a single-attempt lease on a path. Single-host (local) mode has no
+	// shared gateway lease to conflict on, so the namespace is always reservable.
+	cl, ok := s.orch.Lease.(*lease.Client)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// TryAcquireOnce (no path_busy retry): fail immediately if the namespace is
+	// taken instead of waiting out the gateway's max_lease_time like publish does.
+	token, err := cl.TryAcquireOnce(ctx, req.Repo, req.Path)
+	if err != nil {
+		if errors.Is(err, lease.ErrPathBusy) {
+			s.obs.Logger.Info("reserve: namespace taken", "repo", req.Repo, "path", req.Path)
+			http.Error(w, `{"error":"namespace taken: another publisher holds the lease"}`, http.StatusConflict)
+			return
+		}
+		// Log the detail; return a generic error so gateway internals are not leaked.
+		s.obs.Logger.Warn("reserve: lease acquire failed", "repo", req.Repo, "path", req.Path, "error", err)
+		http.Error(w, `{"error":"reservation failed"}`, http.StatusBadGateway)
+		return
+	}
+
+	// Release without committing — this was only a reservation probe.
+	if err := cl.Release(ctx, token, false); err != nil {
+		s.obs.Logger.Warn("reserve: lease release failed (will expire on its own)",
+			"repo", req.Repo, "path", req.Path, "error", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // MountDiscovery mounts the signed discovery document (GET /cvmfs/{repo}/.cvmfsbits)
