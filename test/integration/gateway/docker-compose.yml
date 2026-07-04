@@ -1,0 +1,150 @@
+# docker-compose.yml – cvmfs-bits ↔ cvmfs_gateway integration stack
+#
+# Brings up the minimum needed to exercise cvmfs-prepub publishing against a
+# real cvmfs_gateway + cvmfs_receiver, backed by S3 (Garage).  It combines two
+# fixtures from the cvmfs source tree (checked out at $CVMFS_SRC):
+#
+#   • the S3 backend from  test/common/container/s3-integration      (Garage)
+#   • a MOUNTLESS gateway  test/common/container/publish-mountless   (no FUSE,
+#     no systemd, no privileged) built from cvmfs@devel
+#
+# Unlike publish-mountless, there is NO cvmfs publisher container here: the
+# publisher is cvmfs-prepub, which talks the gateway lease/payload/commit API
+# directly over HTTP.  prepub runs on the host (see run.sh) and reaches the
+# gateway via the published port 4929.
+#
+# Services
+# --------
+#   garage        – Garage S3-compatible object storage (v2)
+#   garage-setup  – one-shot init: layout, key, bucket, website access
+#   gateway       – cvmfs_gateway + cvmfs_receiver (mountless, unprivileged)
+#
+# Requires the environment variable CVMFS_SRC to point at a cvmfs checkout
+# (devel branch) so the gateway image and Garage fixtures can be built/mounted.
+#
+# Usage
+# -----
+#   CVMFS_SRC=/path/to/cvmfs docker compose up --build -d
+#   # gateway API → http://localhost:4929   garage web → http://localhost:3902
+#   CVMFS_SRC=/path/to/cvmfs docker compose down -v --remove-orphans
+
+name: cvmfs-bits-gateway
+
+# ---------------------------------------------------------------------------
+# Fixed credentials – dev/test only.  The S3 creds must match between
+# garage-setup and gateway.  GW_KEY_ID/GW_KEY_SECRET are the gateway lease key:
+# the entrypoint writes them to /etc/cvmfs/keys/<repo>.gw, and repo.json (see
+# the gateway volume mounts) associates that "default" key with test.repo.org.
+# prepub must sign with the same id/secret (see run.sh).
+# ---------------------------------------------------------------------------
+x-s3-env: &s3-env
+    S3_ACCESS_KEY: GK00c4f5e0a1b2c3d4e5f60011
+    S3_SECRET_KEY: 00c4f5e0a1b2c3d4e5f6001100c4f5e0a1b2c3d4e5f6001100c4f5e0a1b2c3d4
+    S3_BUCKET: cvmfs
+
+x-gw-key-env: &gw-key-env
+    GW_KEY_ID: mykey
+    GW_KEY_SECRET: mysecret
+
+services:
+
+    # -----------------------------------------------------------------------
+    # Garage – S3-compatible object storage (v2)
+    #
+    # The network alias cvmfs.web.garage.internal lets the gateway (and Garage
+    # itself) map the <bucket>.web.garage.internal Host header to this
+    # container, so the Stratum-0 URL resolves inside the compose network.
+    # -----------------------------------------------------------------------
+    garage:
+        image: docker.io/dxflrs/garage:v2.2.0
+        container_name: cvmfs-bits-garage
+        hostname: cvmfs-garage
+        networks:
+            default:
+                aliases:
+                    - cvmfs.web.garage.internal
+        volumes:
+            - ${CVMFS_SRC:?set CVMFS_SRC to a cvmfs checkout}/test/common/container/publish-mountless/config/garage.toml:/etc/garage.toml:ro
+            - garage-meta:/var/lib/garage/meta
+            - garage-data:/var/lib/garage/data
+        ports:
+            - "3902:3902"   # Web / website access (anonymous reads, verification)
+        healthcheck:
+            test: ["CMD", "/garage", "node", "id"]
+            interval: 3s
+            timeout: 5s
+            retries: 10
+
+    # -----------------------------------------------------------------------
+    # Garage setup – runs once after Garage is healthy
+    # -----------------------------------------------------------------------
+    garage-setup:
+        image: alpine:3
+        container_name: cvmfs-bits-garage-setup
+        depends_on:
+            garage:
+                condition: service_healthy
+        environment:
+            GARAGE_ADMIN_URL: http://cvmfs-garage:3903
+            GARAGE_ADMIN_TOKEN: garage-admin-token
+            SETUP_GARAGE_DEBUG: "1"
+            <<: *s3-env
+        volumes:
+            - ${CVMFS_SRC:?set CVMFS_SRC to a cvmfs checkout}/test/common/container/publish-mountless/scripts/setup_garage.sh:/setup_garage.sh:ro
+        entrypoint: ["/bin/sh", "-c"]
+        command:
+            - |
+              set -e
+              echo '[garage-setup] Installing curl, jq, openssl ...'
+              apk add --no-cache curl jq openssl
+              echo '[garage-setup] Running setup_garage.sh ...'
+              sh /setup_garage.sh
+        restart: "no"
+
+    # -----------------------------------------------------------------------
+    # Gateway + Receiver (mountless – no FUSE, no privileged, no systemd)
+    #
+    # Built from the cvmfs@devel source tree.  The entrypoint runs
+    # `cvmfs_server mkfs -P -D` on first boot to initialise test.repo.org on
+    # the S3 backend, writes the gateway lease key, then starts cvmfs_gateway.
+    # -----------------------------------------------------------------------
+    gateway:
+        build:
+            context: ${CVMFS_SRC:?set CVMFS_SRC to a cvmfs checkout}
+            dockerfile: test/common/container/publish-mountless/Dockerfile.gateway
+        image: cvmfs-gateway-mountless:latest
+        container_name: cvmfs-bits-gateway
+        hostname: cvmfs-gateway
+        depends_on:
+            garage-setup:
+                condition: service_completed_successfully
+        environment:
+            REPO_NAME: test.repo.org
+            REPO_OWNER: root
+            GARAGE_HOST: cvmfs-garage
+            GARAGE_S3_PORT: "3900"
+            # Stratum-0 URL points at Garage's web endpoint via the network
+            # alias, so the receiver can fetch existing catalogs on commit.
+            STRATUM0_URL: http://cvmfs.web.garage.internal:3902
+            <<: [*gw-key-env, *s3-env]
+        volumes:
+            # Gateway access config: repo.json must list test.repo.org (as a
+            # "default"-keyed repo) or the gateway won't know the repository and
+            # rejects every lease with "invalid key ID specified".  user.json
+            # sets enable_key_endpoint so the repo signing keys can be fetched.
+            # The image bakes in gateway/config/{repo,user}.json, which only
+            # know example_repo.domain.org, so we overlay the mountless ones.
+            - ${CVMFS_SRC:?set CVMFS_SRC to a cvmfs checkout}/test/common/container/publish-mountless/config/repo.json:/etc/cvmfs/gateway/repo.json:ro
+            - ${CVMFS_SRC:?set CVMFS_SRC to a cvmfs checkout}/test/common/container/publish-mountless/config/user.json:/etc/cvmfs/gateway/user.json:ro
+            - etc-cvmfs-repos:/etc/cvmfs/repositories.d
+            - etc-cvmfs-keys:/etc/cvmfs/keys
+            - var-lib-gateway:/var/lib/cvmfs-gateway
+        ports:
+            - "4929:4929"   # Gateway lease API (prepub connects here)
+
+volumes:
+    garage-meta:
+    garage-data:
+    etc-cvmfs-repos:
+    etc-cvmfs-keys:
+    var-lib-gateway:
