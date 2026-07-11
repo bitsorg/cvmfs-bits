@@ -34,6 +34,7 @@ import (
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/spool"
+	"cvmfs.io/prepub/pkg/cvmfscatalog"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
@@ -170,6 +171,22 @@ func (s *Server) reserveHandler(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	// Reject a path that is already published: a package/version is published
+	// once, so a duplicate must fail before it wastes a build. The gateway lease
+	// probe below cannot catch this (a lease on an existing path is granted), so
+	// walk the published catalog. Best-effort: a probe error must not block a
+	// legitimate publish, so on error we log and fall through to the lease probe.
+	if s.orch.Stratum0URL != "" && req.Path != "" {
+		if exists, exErr := cvmfscatalog.PathExists(ctx, nil, s.orch.Stratum0URL, req.Repo, req.Path); exErr != nil {
+			s.obs.Logger.Warn("reserve: existence check failed — allowing",
+				"repo", req.Repo, "path", req.Path, "error", exErr)
+		} else if exists {
+			s.obs.Logger.Info("reserve: path already published", "repo", req.Repo, "path", req.Path)
+			http.Error(w, `{"error":"already published: this package/version already exists in the repository"}`, http.StatusConflict)
+			return
+		}
 	}
 
 	// TryAcquireOnce (no path_busy retry): fail immediately if the namespace is

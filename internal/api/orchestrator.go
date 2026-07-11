@@ -1296,6 +1296,25 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 				"hint", "mount "+filepath.Join(o.CVMFSMount, j.Repo))
 			// Fall through to provenance + StatePublished.
 		} else {
+			// A DirectGraft commit is rejected with a generic "merge_error" when
+			// the target subtree already exists (receiver TryGraftNestedCatalog →
+			// "invalid attempt to graft nested catalog into existing directory").
+			// Confirm against the published catalog and surface a clear, terminal
+			// "already published" error instead of the cryptic gateway reason —
+			// a package/version publishes once and is never retried.
+			if o.Stratum0URL != "" && j.Path != "" &&
+				strings.Contains(commitErr.Error(), "merge_error") {
+				if exists, exErr := cvmfscatalog.PathExists(ctx, nil, o.Stratum0URL, j.Repo, j.Path); exErr == nil && exists {
+					clearErr := fmt.Errorf(
+						"already published: %s/%s already exists in the repository; "+
+							"a package/version publishes once (rebuild with a new revision to republish)",
+						j.Repo, j.Path)
+					span.RecordError(clearErr)
+					logger.Error("commit rejected: target already published",
+						"repo", j.Repo, "path", j.Path)
+					return o.abortJob(ctx, j, clearErr)
+				}
+			}
 			span.RecordError(commitErr)
 			logger.Error("commit failed", "error", commitErr)
 			return o.abortJob(ctx, j, commitErr)
