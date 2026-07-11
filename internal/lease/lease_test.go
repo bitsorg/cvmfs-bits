@@ -461,6 +461,84 @@ func TestCommit_SendsTagFields(t *testing.T) {
 	}
 }
 
+// TestCommit_DirectGraftRouting verifies that DirectGraft selects the dedicated
+// graft endpoint (POST /api/v1/leases/<token>/graft) while a plain commit uses
+// POST /api/v1/leases/<token>, and that no "direct_graft" flag is sent in the
+// body (the endpoint, not a body field, selects the fast path).
+func TestCommit_DirectGraftRouting(t *testing.T) {
+	const (
+		token       = "lease-tok-graft"
+		catalogHash = "feedface"
+	)
+
+	for _, tc := range []struct {
+		name        string
+		directGraft bool
+		wantPath    string
+	}{
+		{"plain commit", false, "/api/v1/leases/" + token},
+		{"direct graft", true, "/api/v1/leases/" + token + "/graft"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu           sync.Mutex
+				capturedPath string
+				capturedBody []byte
+			)
+
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/payloads":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"status":"ok"}`))
+				case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/leases/"):
+					data, _ := io.ReadAll(r.Body)
+					mu.Lock()
+					capturedPath = r.URL.Path
+					capturedBody = data
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"status":"ok"}`))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			c := newTestClient(t, srv)
+			store := &mockObjectReader{
+				objects: map[string][]byte{catalogHash: []byte("fake-compressed-catalog")},
+			}
+
+			req := CommitRequest{
+				Token:       token,
+				CatalogHash: catalogHash,
+				ObjectStore: store,
+				DirectGraft: tc.directGraft,
+			}
+			if err := c.Commit(context.Background(), req); err != nil {
+				t.Fatalf("Commit: %v", err)
+			}
+
+			mu.Lock()
+			path := capturedPath
+			body := capturedBody
+			mu.Unlock()
+
+			if path != tc.wantPath {
+				t.Errorf("commit POST path = %q; want %q", path, tc.wantPath)
+			}
+			var got map[string]interface{}
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatalf("decode commit body %q: %v", body, err)
+			}
+			if _, ok := got["direct_graft"]; ok {
+				t.Errorf("commit body must not carry a direct_graft flag; got %q", body)
+			}
+		})
+	}
+}
+
 // TestCommit_EmptyTagName checks that when TagName is empty the commit body
 // still contains a "tag_name" key (empty string) so the gateway receives a
 // well-formed request.
