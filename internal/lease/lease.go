@@ -137,6 +137,18 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 // check for this error to distinguish a transient contention from a hard failure.
 var ErrPathBusy = errors.New("path_busy: another publisher holds the lease")
 
+// ErrMergeConflict is returned by Commit / CommitFinalizeOnly when the gateway
+// rejects the commit with a "merge_error": the old_root_hash we committed against
+// no longer matches the repository HEAD because a concurrent publish moved it
+// (e.g. a parallel sibling / ensureParentDirs commit on the shared parent).
+//
+// Because same-path leases are exclusive, this is never a genuine content
+// conflict — it means the base moved out from under us. The caller can re-fetch
+// the current root hash and re-POST the commit on the same lease (the subtree
+// graft is independent of the parent's other entries). Callers detect it with
+// errors.Is(err, ErrMergeConflict).
+var ErrMergeConflict = errors.New("gateway merge conflict (stale old_root_hash)")
+
 // errPathBusy is the unexported alias kept for backward-compatibility inside
 // this package (Acquire still uses errors.Is(err, errPathBusy)).
 var errPathBusy = ErrPathBusy
@@ -593,6 +605,11 @@ func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	}
 	if result.Status != "ok" {
 		err := fmt.Errorf("gateway commit status %q: %s", result.Status, result.Reason)
+		if result.Reason == "merge_error" {
+			// Base moved under us (concurrent publish); mark retryable so the
+			// orchestrator can re-base against the current root and re-commit.
+			err = fmt.Errorf("%w: status %q: %s", ErrMergeConflict, result.Status, result.Reason)
+		}
 		span.RecordError(err)
 		return err
 	}
@@ -666,6 +683,11 @@ func (c *Client) CommitFinalizeOnly(ctx context.Context, req CommitRequest) erro
 	}
 	if result.Status != "ok" {
 		err := fmt.Errorf("gateway commit status %q: %s", result.Status, result.Reason)
+		if result.Reason == "merge_error" {
+			// Base moved under us (concurrent publish); mark retryable so the
+			// orchestrator can re-base against the current root and re-commit.
+			err = fmt.Errorf("%w: status %q: %s", ErrMergeConflict, result.Status, result.Reason)
+		}
 		span.RecordError(err)
 		return err
 	}

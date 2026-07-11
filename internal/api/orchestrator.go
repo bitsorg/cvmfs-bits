@@ -1274,14 +1274,54 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	logger.Info("committing")
 	commitPhaseStart := time.Now()
 
+	// Commit with re-base-on-merge-conflict retry.
+	//
+	// A merge_error means a concurrent publish moved the repo root between our
+	// old_root_hash fetch (Phase 3.5) and this commit POST — typically a parallel
+	// ensureParentDirs / sibling commit on the shared parent during the initial
+	// burst before the parent directory exists. Same-path leases are exclusive, so
+	// this is never a genuine content conflict: the base simply moved. Re-fetch the
+	// current root and re-POST the commit on the SAME lease — the subtree graft is
+	// independent of the parent's other entries, so it merges cleanly under the new
+	// root. This keeps jobs concurrent (only the loser of a race retries) instead
+	// of serialising the whole repo on the parent directory.
+	//
+	// If the failed commit dropped the lease, the re-POST returns a non-merge error
+	// and we fall through to abortJob — no worse than before the retry.
+	const maxCommitRebase = 5
 	var commitErr error
-	if preMutexLease {
-		// Catalog already uploaded in Phase 2.7.  Only the commit POST remains.
-		// Type-assertion is safe: preMutexLease is only set when o.GatewayQueue != nil.
-		lc := o.Lease.(*lease.Client)
-		commitErr = lc.CommitFinalizeOnly(ctx, req)
-	} else {
-		commitErr = o.Lease.Commit(ctx, req)
+	for attempt := 0; ; attempt++ {
+		if preMutexLease {
+			// Catalog already uploaded in Phase 2.7.  Only the commit POST remains.
+			// Type-assertion is safe: preMutexLease is only set when o.GatewayQueue != nil.
+			lc := o.Lease.(*lease.Client)
+			commitErr = lc.CommitFinalizeOnly(ctx, req)
+		} else {
+			commitErr = o.Lease.Commit(ctx, req)
+		}
+		if commitErr == nil || !errors.Is(commitErr, lease.ErrMergeConflict) ||
+			attempt >= maxCommitRebase || subtreeResult == nil || o.Stratum0URL == "" {
+			break
+		}
+		backoff := time.Duration(20*(attempt+1)) * time.Millisecond
+		logger.Warn("commit merge conflict — re-basing against current root and retrying",
+			"attempt", attempt+1, "backoff", backoff, "repo", j.Repo, "path", j.Path,
+			"error", commitErr)
+		select {
+		case <-ctx.Done():
+			commitErr = fmt.Errorf("cancelled during commit re-base: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		newOld, fetchErr := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, j.Repo)
+		if fetchErr != nil {
+			logger.Error("commit re-base: manifest fetch failed — keeping merge error",
+				"error", fetchErr)
+			break // keep the merge-conflict commitErr; abortJob handles it below
+		}
+		req.OldRootHash = newOld
 	}
 
 	if commitErr != nil {
