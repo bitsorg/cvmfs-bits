@@ -189,6 +189,53 @@ func (o *Orchestrator) mkdirMutex(key string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
+// waitForManifestPropagation is the serialize-until-published barrier. After a
+// commit advances the repository, the receiver's NEXT commit grafts against the
+// base manifest it fetches from stratum0 — which lags the gateway's committed
+// state under rapid sequential commits, so the next graft can miss the parent
+// directory this commit just created (a spurious merge_error). Called while the
+// per-repo commit lock is still held, it blocks until stratum0's published root
+// advances past baseRoot (the root this commit was applied against) so the next
+// job's commit sees a current base. This is a barrier, not a retry.
+//
+// It is bounded: on timeout (or ctx cancellation) it logs loudly and returns the
+// last-seen root rather than hanging — the commit itself already succeeded, so a
+// wedged stratum0 degrades to the pre-barrier racy behaviour instead of blocking
+// the pipeline forever. Returns the observed root (suffixed), or "" if never seen.
+func (o *Orchestrator) waitForManifestPropagation(ctx context.Context, repo, path, baseRoot string) string {
+	if o.Stratum0URL == "" {
+		return ""
+	}
+	const barrierTimeout = 60 * time.Second
+	const barrierPoll = 250 * time.Millisecond
+	start := time.Now()
+	deadline := start.Add(barrierTimeout)
+	var last string
+	for {
+		root, err := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, repo)
+		if err == nil {
+			last = root
+			if root != baseRoot {
+				o.Obs.Logger.Info("serialize-until-published: stratum0 reflects commit",
+					"repo", repo, "path", path, "waited", time.Since(start).Round(time.Millisecond))
+				return root
+			}
+		} else {
+			o.Obs.Logger.Warn("serialize-until-published: manifest fetch failed — retrying",
+				"repo", repo, "error", err)
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			o.Obs.Logger.Error("serialize-until-published: stratum0 did not reflect the commit before the barrier deadline; the next publish to this repo may race on a stale base",
+				"repo", repo, "path", path, "waited", time.Since(start).Round(time.Millisecond))
+			return last
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(barrierPoll):
+		}
+	}
+}
+
 // StartPrefetch starts a background goroutine that performs Phase 0 of the
 // pipeline (collect+validate+sort all tar entries into memory) BEFORE the
 // concurrency slot is acquired.  This means the blocking tar scan overlaps
@@ -459,6 +506,13 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 		_ = o.Lease.Abort(ctx, mkdirToken)
 		return fmt.Errorf("mkdir-p: commit for %q: %w", graftPath, commitErr)
 	}
+
+	// Serialize-until-published: block until stratum0 reflects this parent-dir
+	// commit before returning, so the content graft that immediately follows (and
+	// any concurrent job) grafts onto a base that already contains these
+	// directories. Same barrier as the content commit; bounded, best-effort on
+	// timeout.
+	_ = o.waitForManifestPropagation(ctx, j.Repo, graftPath, mkdirOldRoot)
 
 	// Wake any job waiting in GatewayQueue.Acquire for graftPath or this repo.
 	if o.GatewayQueue != nil {
@@ -1329,17 +1383,16 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		o.GatewayQueue.NotifyRelease(j.Repo)
 	}
 
-	// Store the new catalog root hash so callers can poll Stratum 1 for propagation.
-	//
-	// cvmfs_receiver produces the final merged root hash during the graft; we
-	// don't know it ahead of time.  Fetch the updated manifest post-commit to
-	// record it in j.NewRootHash.  This is a small HTTP GET (~500 bytes) and
-	// the manifest is immediately updated after a successful commit.
+	// ── Serialize-until-published barrier ────────────────────────────────────
+	// Hold the per-repo commit lock until stratum0 reflects this commit, so the
+	// next package's graft sees a base that already contains the parent dirs this
+	// commit created — otherwise, under rapid sequential commits, stratum0 lags
+	// and the next graft fails with a spurious merge_error. cvmfs_receiver
+	// produces the final merged root during the graft; we learn it by polling the
+	// manifest until it advances past the base we committed against (oldRootHash),
+	// which doubles as recording j.NewRootHash for S1 propagation tracking.
 	if subtreeResult != nil && o.Stratum0URL != "" {
-		if newRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, j.Repo); fetchErr != nil {
-			logger.Warn("could not fetch new root hash from manifest post-commit",
-				"error", fetchErr)
-		} else {
+		if newRoot := o.waitForManifestPropagation(ctx, j.Repo, j.Path, oldRootHash); newRoot != "" {
 			// FetchManifestRootHash returns hash+"C"; strip the suffix for
 			// j.NewRootHash which is always plain hex (no content-type suffix).
 			j.NewRootHash = strings.TrimSuffix(newRoot, "C")
