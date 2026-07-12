@@ -87,6 +87,9 @@ func main() {
 	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
+	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
+	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
+	ingestEnv := flag.String("ingest-env", "", "Comma-separated extra env for the ingestsql finalize, e.g. 'LD_LIBRARY_PATH=/opt/cvmfs/lib' [publisher]")
 	stratum0URL := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
 	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
 	casRoot := flag.String("cas-root", "/var/lib/cvmfs-prepub/cas", "CAS root directory [publisher|receiver]")
@@ -231,6 +234,7 @@ func main() {
 	switch *mode {
 	case "publisher":
 		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
+			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
@@ -259,6 +263,7 @@ func runPublisher(
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
 	cvmfsMount, stratum0URL, repoName, casType, casRoot string,
+	ingestSwissknife, ingestConfigPrefix, ingestEnv string,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
 	jobTimeout, leaseRetryMax time.Duration,
@@ -547,15 +552,18 @@ func runPublisher(
 		os.Exit(1)
 	}
 	orch := &api.Orchestrator{
-		Spool:        sp,
-		CAS:          casBackend,
-		Lease:        leaseBackend,
-		GatewayQueue: gatewayQueue,
-		CVMFSMount:   cvmfsMount,
-		Stratum0URL:  stratum0URL,
-		DirectGraft:  gatewayDirectGraft,
-		JobTimeout:   jobTimeout,
-		BrokerConfig: publishBrokerCfg,
+		Spool:              sp,
+		CAS:                casBackend,
+		Lease:              leaseBackend,
+		GatewayQueue:       gatewayQueue,
+		CVMFSMount:         cvmfsMount,
+		Stratum0URL:        stratum0URL,
+		DirectGraft:        gatewayDirectGraft,
+		IngestSwissknife:   ingestSwissknife,
+		IngestConfigPrefix: ingestConfigPrefix,
+		IngestEnv:          splitCSV(ingestEnv),
+		JobTimeout:         jobTimeout,
+		BrokerConfig:       publishBrokerCfg,
 		Pipeline: pipeline.Config{
 			Workers:       4,
 			UploadConc:    pipelineUploadConc,
@@ -931,4 +939,19 @@ func parseLogLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// splitCSV splits a comma-separated flag value into a slice, trimming spaces and
+// dropping empty entries. Returns nil for an empty string.
+func splitCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
