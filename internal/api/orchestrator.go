@@ -181,6 +181,44 @@ func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
+// acquireCommitLock acquires the per-repo commit serialisation mutex, honouring
+// context cancellation. It returns an unlock func (always non-nil, idempotent)
+// that the caller must defer to release the lock at Run() return, plus an error
+// if ctx fired before the lock was obtained.
+//
+// sync.Mutex.Lock() is not interruptible, so a blocking Lock() is run in a
+// goroutine and raced against ctx.Done(). On ctx-cancel the still-pending Lock()
+// is handed to a cleanup goroutine that unlocks as soon as it wins, so the mutex
+// is never abandoned and future jobs for the repo are not permanently blocked.
+//
+// The lock must be taken BEFORE the repo is mutated — i.e. before ensureParentDirs
+// (Phase 2.65) for subtree jobs — and held through the content commit and its
+// serialize-until-published barrier (Phase 4), so a package's parent-dir creation
+// and content graft form one serialised, fully-propagated unit.
+func (o *Orchestrator) acquireCommitLock(ctx context.Context, repo string) (func(), error) {
+	repoMu := o.repoMutex(repo)
+	lockCh := make(chan struct{})
+	go func() {
+		repoMu.Lock()
+		close(lockCh)
+	}()
+	start := time.Now()
+	select {
+	case <-lockCh:
+		if waited := time.Since(start); waited > 5*time.Second {
+			o.Obs.Logger.Warn("waited for per-repo commit serialisation lock",
+				"repo", repo, "waited", waited.Round(time.Millisecond))
+		}
+		var once sync.Once
+		return func() { once.Do(repoMu.Unlock) }, nil
+	case <-ctx.Done():
+		go func() { <-lockCh; repoMu.Unlock() }()
+		return func() {}, fmt.Errorf(
+			"cancelled waiting for commit serialisation lock (waited %s): %w",
+			time.Since(start).Round(time.Millisecond), ctx.Err())
+	}
+}
+
 // mkdirMutex returns the per-"repo!graftPath" mutex used by ensureParentDirs.
 // Using a separate map from commitMu keeps mkdir-p serialisation isolated from
 // the regular content-commit critical section.
@@ -329,11 +367,14 @@ func (o *Orchestrator) takePrefetch(ctx context.Context, jobID string) *pipeline
 //
 //  1. BuildSubtree  — produces a minimal SQLite catalog (a few KB at most)
 //  2. CAS.Put       — uploads the catalog to the local CAS
-//  3. repoMu.Lock   — serialise with respect to other jobs for this repo
-//  4. FetchManifestRootHash — lightweight manifest GET (~200 bytes)
-//  5. GatewayQueue.Acquire / Lease.Acquire for graftPath
-//  6. Lease.Commit  — SubmitPayload + commit POST (creates the dir entries)
-//  7. Mark ancestors in knownPaths so subsequent publishes skip this step
+//  3. FetchManifestRootHash — lightweight manifest GET (~200 bytes)
+//  4. GatewayQueue.Acquire / Lease.Acquire for graftPath
+//  5. Lease.Commit  — SubmitPayload + commit POST (creates the dir entries)
+//  6. Mark ancestors in knownPaths so subsequent publishes skip this step
+//
+// The caller (Run, Phase 2.65) already holds the per-repo commit lock — this
+// function does NOT take it — so the mkdir commit and the content commit that
+// follows are one serialised, fully-propagated unit.
 //
 // The root catalog SQLite file is never downloaded.
 //
@@ -475,14 +516,10 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 		return fmt.Errorf("mkdir-p: acquire lease for %q: %w", graftPath, leaseErr)
 	}
 
-	// Short critical section: serialise manifest-fetch + commit-POST per repo.
-	// repoMu prevents two concurrent mkdir-p (or mkdir-p + content commit)
-	// operations for the same repo from presenting a stale old_root_hash to
-	// the gateway receiver.  The lease is already held so there is no expiry
-	// pressure; a simple blocking Lock() is sufficient.
-	repoMu := o.repoMutex(j.Repo)
-	repoMu.Lock()
-	defer repoMu.Unlock()
+	// The caller (Run, Phase 2.65) holds the per-repo commit lock across this
+	// mkdir-p commit AND the content commit that follows, so no other job for
+	// this repo can commit in between and present a stale old_root_hash to the
+	// gateway receiver. This function does not take the lock itself.
 
 	// Fetch current root hash from .cvmfspublished (~200-byte HTTP GET).
 	mkdirOldRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, j.Repo)
@@ -909,8 +946,17 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		preMutexLease bool
 		// err is used across Phases 3.5 and 4 for catalog and commit operations.
 		err error
+		// releaseCommit unlocks the per-repo commit serialisation mutex. It is
+		// assigned when the lock is acquired — before Phase 2.65 for subtree jobs,
+		// or before Phase 3 for root-level jobs — and fires at Run() return, so the
+		// lock spans the whole repo-mutation phase (parent dirs → content commit →
+		// serialize-until-published barrier). commitLockHeld guards against a
+		// double acquire between the two entry points.
+		releaseCommit  = func() {}
+		commitLockHeld bool
 	)
 	defer func() { cancelHeartbeat(); leaseCancel() }()
+	defer func() { releaseCommit() }()
 
 	// ── Phase 2.5–4: per-repo serialisation ─────────────────────────────────
 	// Acquire a per-repo mutex so that only ONE job per repo is in the
@@ -1014,6 +1060,30 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 				"catalogs", len(subtreeResult.AllCatalogHashes),
 				"root_hash", subtreeResult.CatalogHash)
 
+			// All CPU-intensive work (pipeline + subtree build) is done. Release
+			// the concurrency slot now so the next queued job can start staging
+			// while this job holds the per-repo commit lock for its serialised
+			// mutation phase below. (sync.Once-guarded: safe to call again later.)
+			if onStagingComplete != nil {
+				onStagingComplete()
+			}
+
+			// ── Acquire the per-repo commit lock BEFORE mutating the repo ─────────
+			// Hold it across ensureParentDirs (Phase 2.65), the pre-commit lease +
+			// SubmitPayload (Phase 2.7) and the content commit + barrier (Phase 4),
+			// so each package's parent-dir creation and content graft are one
+			// serialised, fully-propagated unit. Without this the cold-start burst
+			// races: many jobs commit content against a base whose parent dirs are
+			// not yet committed/propagated, all fail merge_error, and we do not retry.
+			unlockCommit, lockErr := o.acquireCommitLock(ctx, j.Repo)
+			if lockErr != nil {
+				span.RecordError(lockErr)
+				return o.abortJob(ctx, j, lockErr)
+			}
+			releaseCommit = unlockCommit
+			commitLockHeld = true
+			logger.Info("acquired per-repo commit serialisation lock (pre-mutation)", "repo", j.Repo)
+
 			// ── Phase 2.65: ensure parent directories exist in CVMFS ──────────
 			// cvmfs_receiver grafts a subtree at the exact lease path, but does
 			// NOT create missing intermediate directory entries in ancestor
@@ -1027,7 +1097,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// the same hierarchy a no-op.
 			//
 			// Must run BEFORE Phase 2.7 so that no overlapping path lease exists
-			// when the parent-path lease is acquired inside ensureParentDirs.
+			// when the parent-path lease is acquired inside ensureParentDirs. The
+			// per-repo commit lock is already held (above), so the mkdir commit and
+			// the content commit are serialised together.
 			if ensureErr := o.ensureParentDirs(ctx, j); ensureErr != nil {
 				span.RecordError(ensureErr)
 				return o.abortJob(ctx, j, ensureErr)
@@ -1114,77 +1186,26 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 
 		}
 
-		// ── Release pipeline concurrency slot (gateway mode) ──────────────────
-		// All CPU-intensive work is complete: compress workers finished (pipeline),
-		// subtree catalog was built (Phase 2.6), and catalog was submitted to the
-		// gateway (Phase 2.7).  What remains is:
-		//   • a context-aware mutex wait (no CPU)
-		//   • a manifest GET (~500 bytes, network only)
-		//   • a commit POST to cvmfs_receiver (network / gateway I/O, no compress)
-		//
-		// Releasing the slot here lets the next queued job start its own
-		// compress pipeline immediately, overlapping with this job's commit wait.
-		// Without this early release, every waiting job in StateIncoming was
-		// blocked behind the mutex + commit POST duration even though those phases
-		// consume no pipeline-level CPU.
+		// Release the pipeline concurrency slot (idempotent). Subtree jobs already
+		// released it and took the commit lock above (before Phase 2.65). This
+		// covers root-level publishes (j.Path == "") which skip that block.
 		if onStagingComplete != nil {
 			onStagingComplete()
 		}
 
-		// Fix: replace the non-interruptible Lock() with a context-aware acquire.
-		//
-		// sync.Mutex.Lock() cannot be interrupted by context cancellation.  When
-		// a job's JobTimeout fires (or the operator cancels a job via CancelJob),
-		// the goroutine would block here forever even though its context is done,
-		// keeping the job stuck in StateLeased indefinitely and preventing future
-		// jobs for the same repo from ever acquiring the mutex (livelock).
-		//
-		// Pattern: spawn a goroutine that calls the blocking Lock() and closes
-		// a channel when it succeeds.  The select below races that channel against
-		// ctx.Done().  If the context fires first, a cleanup goroutine waits for
-		// the channel (the blocking Lock will eventually return once the current
-		// lock-holder finishes) and immediately unlocks so the mutex is not
-		// permanently abandoned.
-		repoMu := o.repoMutex(j.Repo)
-		lockCh := make(chan struct{})
-		go func() {
-			repoMu.Lock()
-			close(lockCh)
-		}()
-
-		lockWaitStart := time.Now()
-		select {
-		case <-lockCh:
-			defer repoMu.Unlock()
-			if waited := time.Since(lockWaitStart); waited > 5*time.Second {
-				logger.Warn("waited for per-repo commit serialisation lock",
-					"repo", j.Repo, "waited", waited.Round(time.Millisecond))
+		// Root-level publishes did not enter the subtree block above, so acquire
+		// the per-repo commit lock here — still BEFORE Phase 3 lease acquisition,
+		// so FetchManifestRootHash sees the previous job's fully committed manifest.
+		if !commitLockHeld {
+			unlockCommit, lockErr := o.acquireCommitLock(ctx, j.Repo)
+			if lockErr != nil {
+				span.RecordError(lockErr)
+				return o.abortJob(ctx, j, lockErr)
 			}
-		case <-leaseCtx.Done():
-			// The pre-acquired lease expired (or heartbeat fired onExpire) while
-			// we were queued waiting for the mutex.  Hand the mutex goroutine off
-			// to a cleanup goroutine so future jobs are not permanently blocked.
-			go func() { <-lockCh; repoMu.Unlock() }()
-			leaseErr := fmt.Errorf(
-				"gateway lease expired while waiting for commit lock (waited %s): %w",
-				time.Since(lockWaitStart).Round(time.Millisecond), leaseCtx.Err())
-			span.RecordError(leaseErr)
-			return o.abortJob(ctx, j, leaseErr)
-		case <-ctx.Done():
-			// Our goroutine will eventually acquire the lock; hand it off to a
-			// cleanup goroutine that immediately releases it so future jobs
-			// for this repo are not permanently blocked.
-			go func() { <-lockCh; repoMu.Unlock() }()
-			ctxErr := fmt.Errorf("cancelled waiting for commit serialisation lock (waited %s): %w",
-				time.Since(lockWaitStart).Round(time.Millisecond), ctx.Err())
-			span.RecordError(ctxErr)
-			return o.abortJob(ctx, j, ctxErr)
+			releaseCommit = unlockCommit
+			commitLockHeld = true
+			logger.Info("acquired per-repo commit serialisation lock", "repo", j.Repo)
 		}
-		lockWaitTotal := time.Since(lockWaitStart)
-		logger.Info("acquired per-repo commit serialisation lock",
-			"repo", j.Repo,
-			"waited", lockWaitTotal.Round(time.Millisecond),
-		)
 	}
 
 	// ── Phase 3: acquire lease / open transaction ─────────────────────────────
