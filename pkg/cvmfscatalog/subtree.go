@@ -28,11 +28,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"cvmfs.io/prepub/pkg/cvmfsdirtab"
 	"cvmfs.io/prepub/pkg/cvmfshash"
@@ -215,6 +217,34 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			entries[i].Name = ""
 		} else {
 			entries[i].Name = path.Base(entries[i].FullPath)
+		}
+	}
+
+	// ── Ensure the nested-catalog root directory entry is present and named ───
+	// A tar may contain only files with no "." root entry (bits modulefiles
+	// packages are a single bare file).  Without an explicit root dir the
+	// nested-catalog root is created nameless, so its mount-point in the parent
+	// catalog is unreachable and the directory appears empty.  Synthesize the
+	// root dir entry when missing — mirroring the coarse-publish
+	// buildset.expand() behaviour, which already handles this case correctly.
+	if prefix != "" {
+		hasRoot := false
+		for i := range entries {
+			if entries[i].FullPath == prefix {
+				entries[i].IsNestedRoot = true
+				hasRoot = true
+				break
+			}
+		}
+		if !hasRoot {
+			entries = append(entries, Entry{
+				FullPath:     prefix,
+				Name:         path.Base(prefix),
+				Mode:         fs.ModeDir | 0o755,
+				Mtime:        time.Now().Unix(),
+				LinkCount:    2,
+				IsNestedRoot: true,
+			})
 		}
 	}
 
