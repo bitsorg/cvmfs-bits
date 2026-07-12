@@ -101,6 +101,46 @@ func TestAssembleConflictDifferentFingerprint(t *testing.T) {
 	}
 }
 
+// A branching multi-package build must synthesise the intermediate ancestor
+// directories between the common lease root and each package root, so the
+// ingestsql descriptor is self-contained (ingestsql panics otherwise).
+func TestAssembleFillsIntermediateDirs(t *testing.T) {
+	a := Member{Path: "arch/Packages/foo/1.0", BitsFingerprint: "fa", Entries: []cvmfscatalog.Entry{fileEntry("bin/foo")}}
+	b := Member{Path: "arch/Packages/bar/2.0", BitsFingerprint: "fb", Entries: []cvmfscatalog.Entry{fileEntry("bin/bar")}}
+	entries, conflicts := Assemble([]Member{a, b})
+	if len(conflicts) != 0 {
+		t.Fatalf("unexpected conflicts: %v", conflicts)
+	}
+	dirs := map[string]cvmfscatalog.Entry{}
+	for _, e := range entries {
+		if e.Mode.IsDir() {
+			dirs[e.FullPath] = e
+		}
+	}
+	// intermediate package parents + lease root are present as dirs
+	for _, want := range []string{"arch/Packages", "arch/Packages/foo", "arch/Packages/bar"} {
+		if _, ok := dirs[want]; !ok {
+			t.Errorf("missing intermediate dir %q; have %v", want, keysDir(dirs))
+		}
+	}
+	// nothing above the lease root (arch/Packages) is emitted
+	if _, ok := dirs["arch"]; ok {
+		t.Errorf("emitted dir above the lease root: arch")
+	}
+	// package roots kept their nested marking
+	if e := dirs["arch/Packages/foo/1.0"]; !e.IsNestedRoot {
+		t.Errorf("package root not nested: %+v", e)
+	}
+}
+
+func keysDir(m map[string]cvmfscatalog.Entry) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 func keys(m map[string]cvmfscatalog.Entry) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

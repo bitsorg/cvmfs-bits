@@ -129,6 +129,7 @@ func Assemble(members []Member) (entries []cvmfscatalog.Entry, conflicts []Confl
 		}
 		byPath[m.Path] = append(byPath[m.Path], m)
 	}
+	var kept []string // package paths actually included (for the lease-root prefix)
 	for _, p := range order {
 		group := byPath[p]
 		fp := group[0].BitsFingerprint
@@ -147,8 +148,84 @@ func Assemble(members []Member) (entries []cvmfscatalog.Entry, conflicts []Confl
 			continue
 		}
 		entries = append(entries, expand(group[0])...)
+		kept = append(kept, group[0].Path)
 	}
+	// ingestsql does NOT reliably auto-create intermediate directories for a
+	// branching multi-package tree (it panics "catalog for directory ... cannot
+	// be found" when a package's ancestor dir is missing). Emit every ancestor
+	// directory between the build's common root (the lease path) and each entry
+	// so the descriptor is self-contained.
+	entries = fillAncestorDirs(entries, commonDirPrefix(kept))
 	return entries, conflicts
+}
+
+// fillAncestorDirs adds a directory entry for every ancestor path (down to and
+// including leaseRoot) that is not already present. Ancestors above leaseRoot are
+// left out — they are the graft attach point and must already exist. Added dirs
+// are ordinary (non-nested); package roots keep their nested marking from expand.
+func fillAncestorDirs(entries []cvmfscatalog.Entry, leaseRoot string) []cvmfscatalog.Entry {
+	leaseRoot = strings.Trim(leaseRoot, "/")
+	have := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		have[strings.Trim(e.FullPath, "/")] = struct{}{}
+	}
+	needed := map[string]struct{}{}
+	for _, e := range entries {
+		p := strings.Trim(e.FullPath, "/")
+		for p != "" && p != leaseRoot {
+			i := strings.LastIndex(p, "/")
+			if i < 0 {
+				break
+			}
+			p = p[:i] // parent
+			if leaseRoot != "" && p != leaseRoot && !strings.HasPrefix(p, leaseRoot+"/") {
+				break // reached/above the lease root's ancestors
+			}
+			if _, ok := have[p]; !ok {
+				needed[p] = struct{}{}
+			}
+		}
+	}
+	if leaseRoot != "" {
+		if _, ok := have[leaseRoot]; !ok {
+			needed[leaseRoot] = struct{}{}
+		}
+	}
+	for p := range needed {
+		entries = append(entries, cvmfscatalog.Entry{
+			FullPath: p, Name: path.Base(p), Mode: fs.ModeDir | 0o755, LinkCount: 2,
+		})
+	}
+	return entries
+}
+
+// commonDirPrefix returns the longest directory path that is an ancestor of (or
+// equal to) every path in paths — the natural lease root for the build.
+func commonDirPrefix(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	prefix := strings.Trim(paths[0], "/")
+	for _, p := range paths[1:] {
+		prefix = commonTwo(prefix, strings.Trim(p, "/"))
+		if prefix == "" {
+			return ""
+		}
+	}
+	return prefix
+}
+
+func commonTwo(a, b string) string {
+	as, bs := strings.Split(a, "/"), strings.Split(b, "/")
+	n := len(as)
+	if len(bs) < n {
+		n = len(bs)
+	}
+	i := 0
+	for i < n && as[i] == bs[i] {
+		i++
+	}
+	return strings.Join(as[:i], "/")
 }
 
 // expand rewrites a member's package-relative entries to repo-relative paths and
