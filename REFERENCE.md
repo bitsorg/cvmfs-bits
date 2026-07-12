@@ -3314,3 +3314,54 @@ GitHub Actions and GitLab CI (SaaS and self-hosted).  See Chapter 33 for details
 
 ---
 
+
+## 36. Coarse publish — build accumulate + finalize (ADR-0007)
+
+Instead of committing every package to the gateway separately, a whole build can
+be published in a single commit. Package jobs record their catalog entries into
+a build-scoped accumulator; one finalize job then assembles them into one
+`cvmfs_swissknife ingestsql` descriptor and commits the set. This removes the
+per-package commit races entirely and retires the Go catalog builder in favour
+of the canonical cvmfs catalog code.
+
+### 36.1 API
+
+- **Package jobs** — `POST /api/v1/jobs` with a `build_id` form field (multipart).
+  A non-empty `build_id` makes the prepub upload the objects and pipeline as
+  usual, then record the package's entries and finish in state `accumulated`
+  (no gateway commit). Empty `build_id` = legacy per-package commit.
+- **Finalize job** — `POST /api/v1/jobs` with `finalize=true` + `build_id` and
+  **no tar**. The prepub assembles all of the build's accumulated packages into
+  one descriptor and publishes them in a single commit, finishing in `published`.
+  (`POST /api/v1/builds/{id}/finalize` does the same out-of-band.)
+
+Dedup/conflict is keyed on the package **bits fingerprint** (the tar SHA-256):
+same path + same fingerprint is idempotent; a differing fingerprint at the same
+path is excluded and reported (validate-then-commit partial success).
+
+### 36.2 Deployment
+
+The finalize runs `cvmfs_swissknife ingestsql`, so the environment that runs it
+(the prepub, or a host running `cmd/prepub-finalize`) needs:
+
+- `cvmfs_swissknife` built with the *spooler-follows-upstream* patch (it uses the
+  repo's `CVMFS_UPSTREAM_STORAGE` rather than assuming S3), plus its shared libs
+  (set `LD_LIBRARY_PATH`).
+- An ingestsql gateway-client config prefix `-C <dir>` containing
+  `<repo>/{config,gatewaykey,pubkey}`, where `config` sets `CVMFS_GATEWAY`,
+  `CVMFS_STRATUM0`, `CVMFS_HTTP_PROXY`, and `CVMFS_UPSTREAM_STORAGE` (the repo's
+  spooler def — `local,...` co-located, or `S3,...` for a shared S3 store).
+- Prepub flags: `--ingest-swissknife`, `--ingest-config-prefix`, `--ingest-env`
+  (empty `--ingest-config-prefix` leaves finalize disabled).
+
+Object flow: file objects are written to the CAS (which must be the shared store
+— S3 in a multi-host deployment) by the pipeline and are never sent through the
+gateway, so they are present before finalize. `ingestsql` references them by hash
+and uploads only the catalog objects it builds (via its spooler); no local store
+mount is required when the store is S3.
+
+### 36.3 CI (bits-console)
+
+Opt-in via `PREPUB_COARSE=true`: `cvmfs-prepub-publish.yml` submits every package
+with `build_id=$CI_PIPELINE_ID`, waits for them to reach `accumulated`, then
+submits one finalize job and waits for `published`.
