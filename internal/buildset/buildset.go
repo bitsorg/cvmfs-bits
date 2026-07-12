@@ -235,8 +235,11 @@ func expand(m Member) []cvmfscatalog.Entry {
 	out := make([]cvmfscatalog.Entry, 0, len(m.Entries)+1)
 	haveRoot := false
 	for _, e := range m.Entries {
-		rel := strings.Trim(e.FullPath, "/")
-		if rel == "" {
+		// Pipeline entries are package-relative; the package root is emitted as
+		// "." (and paths may carry a leading "./"). Normalise both to the base.
+		rel := strings.TrimPrefix(e.FullPath, "./")
+		rel = strings.Trim(rel, "/")
+		if rel == "" || rel == "." {
 			e.FullPath = base
 		} else {
 			e.FullPath = base + "/" + rel
