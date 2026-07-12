@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"cvmfs.io/prepub/internal/broker"
+	"cvmfs.io/prepub/internal/buildset"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
 	"cvmfs.io/prepub/internal/distribute/manifest"
@@ -926,6 +927,38 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		if onStagingComplete != nil {
 			onStagingComplete()
 		}
+	}
+
+	// ── Coarse publish (ADR-0007): accumulate entries, defer the commit ──────
+	// When the job belongs to a build (BuildID set), its objects are already in
+	// CAS and pre-warmed to the Stratum 1s above.  Record its catalog entries in
+	// the build-scoped accumulator and finish in StateAccumulated; a single
+	// end-of-build finalize (POST /builds/{id}/finalize) then publishes the whole
+	// set in one gateway commit via ingestsql.  An empty BuildID preserves the
+	// legacy per-package commit path below.
+	if j.BuildID != "" && pipelineResult != nil && j.Path != "" {
+		if onStagingComplete != nil {
+			onStagingComplete()
+		}
+		if recErr := buildset.Record(o.Spool.Root, j.BuildID, buildset.Member{
+			JobID:           j.ID,
+			Repo:            j.Repo,
+			Path:            j.Path,
+			BitsFingerprint: j.TarSHA256,
+			Entries:         pipelineResult.CatalogEntries,
+			Dirtab:          string(pipelineResult.DirtabContent),
+		}); recErr != nil {
+			span.RecordError(recErr)
+			return o.abortJob(ctx, j, fmt.Errorf("buildset record: %w", recErr))
+		}
+		if err := o.transition(ctx, j, job.StateAccumulated); err != nil {
+			span.RecordError(err)
+			return err
+		}
+		logger.Info("accumulated into build (deferred publish)",
+			"build_id", j.BuildID, "path", j.Path,
+			"entries", len(pipelineResult.CatalogEntries))
+		return nil
 	}
 
 	// ── Lease-management variables (used across Phases 2.7, 3, 3.5, 4) ────────

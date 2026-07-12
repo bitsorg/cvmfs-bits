@@ -36,13 +36,15 @@ var validTransitions = map[State]map[State]bool{
 	StateUploading: {
 		StateDistributing: true,
 		StateLeased:       true, // fast path: no Stratum 1s → acquire lease directly
+		StateAccumulated:  true, // coarse publish: record entries, defer commit to finalize
 		StateAborted:      true,
 		StateFailed:       true,
 	},
 	StateDistributing: {
-		StateLeased:  true, // lease acquired HERE — after all replicas have the objects
-		StateAborted: true,
-		StateFailed:  true,
+		StateLeased:      true, // lease acquired HERE — after all replicas have the objects
+		StateAccumulated: true, // coarse publish: record entries, defer commit to finalize
+		StateAborted:     true,
+		StateFailed:      true,
 	},
 	StateLeased: {
 		StateCommitting: true, // only the commit window needs the lease
@@ -54,9 +56,10 @@ var validTransitions = map[State]map[State]bool{
 		StateAborted:   true,
 		StateFailed:    true,
 	},
-	StatePublished: {},
-	StateAborted:   {},
-	StateFailed:    {},
+	StateAccumulated: {},
+	StatePublished:   {},
+	StateAborted:     {},
+	StateFailed:      {},
 }
 
 // Transition validates that a state transition from→to is allowed.
@@ -73,5 +76,5 @@ func Transition(from, to State) error {
 
 // IsTerminal returns true if the state is a terminal state.
 func IsTerminal(s State) bool {
-	return s == StatePublished || s == StateAborted || s == StateFailed
+	return s == StatePublished || s == StateAccumulated || s == StateAborted || s == StateFailed
 }

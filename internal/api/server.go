@@ -141,6 +141,12 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	reserve.Use(s.requireAuth)
 	reserve.HandleFunc("", s.reserveHandler).Methods("POST")
 
+	// Coarse publish finalize (ADR-0007): publish a whole build's accumulated
+	// packages in one commit. Authenticated.
+	builds := s.router.PathPrefix("/api/v1/builds").Subrouter()
+	builds.Use(s.requireAuth)
+	builds.HandleFunc("/{id}/finalize", s.finalizeBuild).Methods("POST")
+
 	return s
 }
 

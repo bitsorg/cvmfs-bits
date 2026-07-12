@@ -51,6 +51,11 @@ const (
 	StateLeased State = "leased"
 	// StateCommitting is the final gateway publish stage.
 	StateCommitting State = "committing"
+	// StateAccumulated is a terminal state for a coarse-publish package job
+	// (ADR-0007): its objects are uploaded and its catalog entries recorded into
+	// the build accumulator, awaiting the single end-of-build finalize commit.
+	// The job itself does not commit to the gateway.
+	StateAccumulated State = "accumulated"
 	// StatePublished is the successful terminal state.
 	StatePublished State = "published"
 	// StateAborted is when the job was explicitly cancelled.

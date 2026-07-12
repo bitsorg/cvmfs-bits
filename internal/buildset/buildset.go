@@ -31,6 +31,7 @@ import (
 // entries the pipeline produced (package-relative FullPaths).
 type Member struct {
 	JobID           string               `json:"job_id"`
+	Repo            string               `json:"repo"`             // fully-qualified repo; all members of a build share one
 	Path            string               `json:"path"`             // repo-relative publish path, e.g. "x86_64-el10/Packages/foo/1.0"
 	BitsFingerprint string               `json:"bits_fingerprint"` // package identity (dedup key); the tar SHA-256 today
 	Entries         []cvmfscatalog.Entry `json:"entries"`          // package-relative FullPaths
