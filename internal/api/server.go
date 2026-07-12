@@ -462,6 +462,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		submittedSHA256           string   // caller-supplied; may be empty
 		preloadExe                string   // optional: repo-relative exe path for preload
 		preloadPaths              []string // optional: repo-relative paths opened at startup
+		buildID                   string   // optional: groups a build's packages (ADR-0007)
 	)
 
 	jobID := uuid.New().String()
@@ -484,6 +485,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			TagDescription string   `json:"tag_description"`
 			PreloadExe     string   `json:"preload_exe"`
 			PreloadPaths   []string `json:"preload_paths"`
+			BuildID        string   `json:"build_id"`
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
@@ -558,6 +560,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		tagDescription = req.TagDescription
 		preloadExe = req.PreloadExe
 		preloadPaths = req.PreloadPaths
+		buildID = req.BuildID
 
 	} else {
 		// ── Multipart upload mode (default) ─────────────────────────────────
@@ -581,6 +584,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		tagName = r.FormValue("tag_name")
 		tagDescription = r.FormValue("tag_description")
 		preloadExe = r.FormValue("preload_exe") // optional
+		buildID = r.FormValue("build_id")       // optional (ADR-0007 coarse publish)
 		// preload_paths is a JSON-encoded []string (e.g. '["bin/root","lib/libCore.so"]')
 		if raw := r.FormValue("preload_paths"); raw != "" {
 			if err := json.Unmarshal([]byte(raw), &preloadPaths); err != nil {
@@ -649,6 +653,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 
 	j := job.NewJob(jobID, repo, "", spoolTarPath)
 	j.Path = subPath
+	j.BuildID = buildID
 	j.WebhookURL = webhookURL
 	j.TarSHA256 = submittedSHA256
 	j.TagName = tagName

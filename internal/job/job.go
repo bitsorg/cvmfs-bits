@@ -101,6 +101,12 @@ type Job struct {
 	Path string
 	// PackageName is an optional human-readable package name.
 	PackageName string
+	// BuildID groups the package jobs of one build (ADR-0007 coarse publish).
+	// When non-empty, the orchestrator records this job's catalog entries into
+	// the build-scoped accumulator (internal/buildset) instead of committing
+	// per-package; a single end-of-build finalize then publishes the whole set.
+	// Empty preserves the legacy per-package commit behaviour.
+	BuildID string `json:"build_id,omitempty"`
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string
 	// TarName is the original base filename of the submitted tar (e.g.
