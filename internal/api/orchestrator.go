@@ -62,6 +62,14 @@ type Orchestrator struct {
 	// (e.g. "/cvmfs").  Only used in local publish mode; ignored by the
 	// gateway backend.
 	CVMFSMount string
+	// Ingest* configure the ADR-0007 coarse-publish finalize: one
+	// cvmfs_swissknife ingestsql invocation that publishes a whole build's
+	// accumulated packages in a single commit. Set at startup; used by
+	// FinalizeBuild (the finalize job and the /builds finalize endpoint).
+	// Empty IngestConfigPrefix disables finalize (returns a clear error).
+	IngestSwissknife   string   // path to cvmfs_swissknife (default: "cvmfs_swissknife")
+	IngestConfigPrefix string   // ingestsql -C gateway-client config dir
+	IngestEnv          []string // extra env for ingestsql, e.g. "LD_LIBRARY_PATH=..."
 	// Stratum0URL is the HTTP base URL of the Stratum 0 CAS, used to fetch the
 	// current .cvmfspublished manifest and download the root catalog for the
 	// direct SQLite catalog merge (gateway mode only).
@@ -767,6 +775,36 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	defer span.End()
 
 	logger := o.Obs.Logger.With("job_id", j.ID)
+
+	// ── Coarse-publish finalize job (ADR-0007) ───────────────────────────────
+	// A finalize job carries no payload: it publishes all of BuildID's
+	// accumulated packages in one ingestsql commit. Release the concurrency slot
+	// immediately (no pipeline work) and commit.
+	if j.Finalize {
+		if onStagingComplete != nil {
+			onStagingComplete()
+		}
+		if j.BuildID == "" {
+			return o.abortJob(ctx, j, fmt.Errorf("finalize job requires a build_id"))
+		}
+		if err := o.transition(ctx, j, job.StateCommitting); err != nil {
+			span.RecordError(err)
+			return o.abortJob(ctx, j, err)
+		}
+		res, ferr := o.FinalizeBuild(ctx, j.BuildID)
+		if ferr != nil {
+			if res != nil {
+				logger.Error("build finalize failed", "build_id", j.BuildID,
+					"published", res.Published, "conflicts", len(res.Conflicts))
+			}
+			span.RecordError(ferr)
+			return o.abortJob(ctx, j, fmt.Errorf("finalize build %s: %w", j.BuildID, ferr))
+		}
+		logger.Info("build finalized", "build_id", j.BuildID,
+			"packages", res.Packages, "published", res.Published, "conflicts", len(res.Conflicts))
+		j.PublishedAt = time.Now()
+		return o.transition(ctx, j, job.StatePublished)
+	}
 
 	// Invariant: gateway mode requires a non-nil CAS backend.
 	if o.Lease.NeedsPipeline() && o.CAS == nil {

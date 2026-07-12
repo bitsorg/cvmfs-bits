@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,101 +16,106 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// finalizeBuild handles POST /api/v1/builds/{id}/finalize: it assembles every
-// package accumulated under the build (StateAccumulated jobs) into one ingestsql
-// descriptor and publishes them in a single gateway commit (ADR-0007 coarse
-// publish). The repo and packages come from the accumulated members; the
-// ingestsql runtime parameters (which are deployment-specific) are supplied in
-// the request body: the swissknife binary, the gateway-client config prefix
-// (-C, which carries CVMFS_GATEWAY / CVMFS_STRATUM0 / CVMFS_UPSTREAM_STORAGE and
-// the gateway key), an optional explicit lease path, and any environment such
-// as LD_LIBRARY_PATH.
-func (s *Server) finalizeBuild(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	buildID := mux.Vars(r)["id"]
+// FinalizeResult summarises a coarse-publish finalize.
+type FinalizeResult struct {
+	BuildID   string              `json:"build_id"`
+	Repo      string              `json:"repo"`
+	Packages  int                 `json:"packages"`
+	Published int                 `json:"published"`
+	Conflicts []buildset.Conflict `json:"conflicts"`
+	Output    string              `json:"output,omitempty"`
+}
 
-	var req struct {
-		Swissknife   string   `json:"swissknife"`
-		ConfigPrefix string   `json:"config_prefix"`
-		LeasePath    string   `json:"lease_path"`
-		Env          []string `json:"env"`
+// FinalizeBuild publishes a whole build's accumulated packages (ADR-0007 coarse
+// publish) in one ingestsql commit, using the orchestrator's configured ingest
+// settings. It is invoked both by the finalize job (Orchestrator.Run) and by the
+// /builds/{id}/finalize endpoint. On success the build accumulator is removed.
+func (o *Orchestrator) FinalizeBuild(ctx context.Context, buildID string) (*FinalizeResult, error) {
+	if o.IngestConfigPrefix == "" {
+		return nil, fmt.Errorf("finalize is not configured on this prepub (ingest config prefix unset)")
 	}
-	if r.Body != nil && r.ContentLength != 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeFinalizeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": "invalid JSON body"})
-			return
-		}
-	}
-	if req.ConfigPrefix == "" {
-		writeFinalizeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error": "config_prefix is required (the ingestsql gateway-client config dir)"})
-		return
-	}
-
-	members, err := buildset.Load(s.spoolRoot, buildID)
+	spoolRoot := o.Spool.Root
+	members, err := buildset.Load(spoolRoot, buildID)
 	if err != nil {
-		writeFinalizeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"error": fmt.Sprintf("load build %q: %v", buildID, err)})
-		return
+		return nil, fmt.Errorf("load build %q: %w", buildID, err)
 	}
 	if len(members) == 0 {
-		writeFinalizeJSON(w, http.StatusNotFound, map[string]interface{}{
-			"error": "no accumulated packages for build " + buildID})
-		return
+		return nil, fmt.Errorf("no accumulated packages for build %q", buildID)
 	}
 	repo := members[0].Repo
 	for _, m := range members {
 		if m.Repo != repo {
-			writeFinalizeJSON(w, http.StatusBadRequest, map[string]interface{}{
-				"error": "build spans multiple repositories"})
-			return
+			return nil, fmt.Errorf("build %q spans multiple repositories", buildID)
 		}
 	}
 
-	work, err := os.MkdirTemp(s.spoolRoot, "finalize-")
+	work, err := os.MkdirTemp("", "finalize-"+buildID+"-")
 	if err != nil {
-		writeFinalizeJSON(w, http.StatusInternalServerError, map[string]interface{}{"error": "workdir: " + err.Error()})
-		return
+		return nil, fmt.Errorf("finalize workdir: %w", err)
 	}
 	defer os.RemoveAll(work)
-	tmp := filepath.Join(work, "ingest-tmp")
-	if err := os.MkdirAll(tmp, 0o755); err != nil {
-		writeFinalizeJSON(w, http.StatusInternalServerError, map[string]interface{}{"error": "tmpdir: " + err.Error()})
-		return
+	ingestTmp := filepath.Join(work, "ingest-tmp")
+	if err := os.MkdirAll(ingestTmp, 0o755); err != nil {
+		return nil, fmt.Errorf("finalize tmpdir: %w", err)
 	}
 
+	swissknife := o.IngestSwissknife
+	if swissknife == "" {
+		swissknife = "cvmfs_swissknife"
+	}
 	conflicts, out, ferr := buildset.Finalize(ctx, members, filepath.Join(work, "descriptor.db"),
 		buildset.IngestOptions{
-			Swissknife:   req.Swissknife,
+			Swissknife:   swissknife,
 			Repo:         repo,
-			ConfigPrefix: req.ConfigPrefix,
-			TempDir:      tmp,
-			LeasePath:    req.LeasePath,
-			ExtraEnv:     req.Env,
+			ConfigPrefix: o.IngestConfigPrefix,
+			TempDir:      ingestTmp,
+			ExtraEnv:     o.IngestEnv,
 		})
-
-	resp := map[string]interface{}{
-		"build_id":  buildID,
-		"repo":      repo,
-		"packages":  len(members),
-		"published": len(members) - len(conflicts),
-		"conflicts": conflicts,
-		"output":    out,
+	res := &FinalizeResult{
+		BuildID:   buildID,
+		Repo:      repo,
+		Packages:  len(members),
+		Published: len(members) - len(conflicts),
+		Conflicts: conflicts,
+		Output:    out,
 	}
 	if ferr != nil {
-		resp["error"] = ferr.Error()
-		s.obs.Logger.Error("build finalize failed", "build_id", buildID, "repo", repo, "error", ferr)
-		writeFinalizeJSON(w, http.StatusInternalServerError, resp)
+		return res, ferr
+	}
+	if rmErr := buildset.Remove(spoolRoot, buildID); rmErr != nil {
+		o.Obs.Logger.Warn("finalize: could not remove accumulator", "build_id", buildID, "error", rmErr)
+	}
+	return res, nil
+}
+
+// finalizeBuild handles POST /api/v1/builds/{id}/finalize — an out-of-band way
+// to publish an accumulated build (the primary path is a finalize job). It uses
+// the prepub's configured ingest settings.
+func (s *Server) finalizeBuild(w http.ResponseWriter, r *http.Request) {
+	buildID := mux.Vars(r)["id"]
+	res, err := s.orch.FinalizeBuild(r.Context(), buildID)
+	if err != nil {
+		code := http.StatusInternalServerError
+		if res == nil {
+			code = http.StatusBadRequest // load/validation error, nothing published
+		}
+		body := map[string]interface{}{"build_id": buildID, "error": err.Error()}
+		if res != nil {
+			body["packages"] = res.Packages
+			body["published"] = res.Published
+			body["conflicts"] = res.Conflicts
+			body["output"] = res.Output
+		}
+		s.obs.Logger.Error("build finalize failed", "build_id", buildID, "error", err)
+		writeFinalizeJSON(w, code, body)
 		return
 	}
-
-	// Success: drop the accumulator so the build cannot be re-finalized.
-	if rmErr := buildset.Remove(s.spoolRoot, buildID); rmErr != nil {
-		s.obs.Logger.Warn("build finalize: could not remove accumulator", "build_id", buildID, "error", rmErr)
-	}
-	s.obs.Logger.Info("build finalized", "build_id", buildID, "repo", repo,
-		"packages", len(members), "conflicts", len(conflicts))
-	writeFinalizeJSON(w, http.StatusOK, resp)
+	s.obs.Logger.Info("build finalized", "build_id", buildID, "repo", res.Repo,
+		"packages", res.Packages, "conflicts", len(res.Conflicts))
+	writeFinalizeJSON(w, http.StatusOK, map[string]interface{}{
+		"build_id": res.BuildID, "repo": res.Repo, "packages": res.Packages,
+		"published": res.Published, "conflicts": res.Conflicts,
+	})
 }
 
 func writeFinalizeJSON(w http.ResponseWriter, code int, body map[string]interface{}) {

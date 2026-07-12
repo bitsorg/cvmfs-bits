@@ -14,11 +14,13 @@ import "fmt"
 // repository sub-path with far less contention.
 //
 // New order: incoming → staging → uploading → [distributing →] leased → committing → published
-//                                                  ↑
-//                             uploading → leased  (fast path: no Stratum 1s)
+//
+//	                     ↑
+//	uploading → leased  (fast path: no Stratum 1s)
 var validTransitions = map[State]map[State]bool{
 	StateIncoming: {
-		StateStaging: true, // gateway mode: compress/dedup pipeline starts immediately
+		StateStaging:    true, // gateway mode: compress/dedup pipeline starts immediately
+		StateCommitting: true, // coarse-publish finalize job: no pipeline, commits the build
 		// Local mode fast path: NeedsPipeline()==false → skip staging/uploading and
 		// acquire the cvmfs_server transaction directly.  The orchestrator is
 		// responsible for checking NeedsPipeline() before taking this path; the FSM

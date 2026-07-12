@@ -469,6 +469,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preloadExe                string   // optional: repo-relative exe path for preload
 		preloadPaths              []string // optional: repo-relative paths opened at startup
 		buildID                   string   // optional: groups a build's packages (ADR-0007)
+		finalize                  bool     // coarse-publish finalize job (no tar payload)
 	)
 
 	jobID := uuid.New().String()
@@ -591,6 +592,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		tagDescription = r.FormValue("tag_description")
 		preloadExe = r.FormValue("preload_exe") // optional
 		buildID = r.FormValue("build_id")       // optional (ADR-0007 coarse publish)
+		finalize = r.FormValue("finalize") == "true"
 		// preload_paths is a JSON-encoded []string (e.g. '["bin/root","lib/libCore.so"]')
 		if raw := r.FormValue("preload_paths"); raw != "" {
 			if err := json.Unmarshal([]byte(raw), &preloadPaths); err != nil {
@@ -604,62 +606,71 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		tarFile, _, err := r.FormFile("tar")
-		if err != nil {
-			http.Error(w, `{"error":"tar field is required"}`, http.StatusBadRequest)
-			return
-		}
-		defer tarFile.Close()
-
-		if err := os.MkdirAll(jobDir, 0700); err != nil {
-			span.RecordError(err)
-			http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
-			return
-		}
-
-		spoolTarPath = filepath.Join(jobDir, "payload.tar")
-		spoolFile, err := os.OpenFile(spoolTarPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-		if err != nil {
-			span.RecordError(err)
-			os.RemoveAll(jobDir)
-			http.Error(w, `{"error":"internal error creating tar file"}`, http.StatusInternalServerError)
-			return
-		}
-
-		// Cap incoming tar size and optionally compute SHA-256 as we stream.
-		hasher := sha256.New()
-		dst := io.Writer(spoolFile)
-		if submittedSHA256 != "" {
-			dst = io.MultiWriter(spoolFile, hasher)
-		}
-		n, copyErr := io.Copy(dst, io.LimitReader(tarFile, maxTarSize+1))
-		spoolFile.Close()
-		if copyErr != nil {
-			span.RecordError(copyErr)
-			os.RemoveAll(jobDir)
-			http.Error(w, `{"error":"error writing tar to spool"}`, http.StatusInternalServerError)
-			return
-		}
-		if n > maxTarSize {
-			os.RemoveAll(jobDir)
-			http.Error(w, `{"error":"tar exceeds maximum allowed size"}`, http.StatusRequestEntityTooLarge)
-			return
-		}
-
-		// Verify the optional checksum.
-		if submittedSHA256 != "" {
-			computed := hex.EncodeToString(hasher.Sum(nil))
-			if !strings.EqualFold(computed, submittedSHA256) {
-				os.RemoveAll(jobDir)
-				http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: got %s, expected %s"}`, computed, submittedSHA256), http.StatusBadRequest)
+		if !finalize {
+			tarFile, _, err := r.FormFile("tar")
+			if err != nil {
+				http.Error(w, `{"error":"tar field is required"}`, http.StatusBadRequest)
 				return
 			}
-		}
+			defer tarFile.Close()
+
+			if err := os.MkdirAll(jobDir, 0700); err != nil {
+				span.RecordError(err)
+				http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
+				return
+			}
+
+			spoolTarPath = filepath.Join(jobDir, "payload.tar")
+			spoolFile, err := os.OpenFile(spoolTarPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+			if err != nil {
+				span.RecordError(err)
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"internal error creating tar file"}`, http.StatusInternalServerError)
+				return
+			}
+
+			// Cap incoming tar size and optionally compute SHA-256 as we stream.
+			hasher := sha256.New()
+			dst := io.Writer(spoolFile)
+			if submittedSHA256 != "" {
+				dst = io.MultiWriter(spoolFile, hasher)
+			}
+			n, copyErr := io.Copy(dst, io.LimitReader(tarFile, maxTarSize+1))
+			spoolFile.Close()
+			if copyErr != nil {
+				span.RecordError(copyErr)
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"error writing tar to spool"}`, http.StatusInternalServerError)
+				return
+			}
+			if n > maxTarSize {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"tar exceeds maximum allowed size"}`, http.StatusRequestEntityTooLarge)
+				return
+			}
+
+			// Verify the optional checksum.
+			if submittedSHA256 != "" {
+				computed := hex.EncodeToString(hasher.Sum(nil))
+				if !strings.EqualFold(computed, submittedSHA256) {
+					os.RemoveAll(jobDir)
+					http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: got %s, expected %s"}`, computed, submittedSHA256), http.StatusBadRequest)
+					return
+				}
+			}
+		} // !finalize
+	}
+
+	// A finalize job requires a build_id and carries no payload.
+	if finalize && buildID == "" {
+		http.Error(w, `{"error":"finalize requires build_id"}`, http.StatusBadRequest)
+		return
 	}
 
 	j := job.NewJob(jobID, repo, "", spoolTarPath)
 	j.Path = subPath
 	j.BuildID = buildID
+	j.Finalize = finalize
 	j.WebhookURL = webhookURL
 	j.TarSHA256 = submittedSHA256
 	j.TagName = tagName
@@ -669,9 +680,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 
 	// Record the original filename and size for the console tooltip.
 	// Use Stat on the spool copy since the original may have been moved.
-	j.TarName = filepath.Base(spoolTarPath)
-	if fi, statErr := os.Stat(spoolTarPath); statErr == nil {
-		j.TarSize = fi.Size()
+	// Finalize jobs carry no payload, so there is nothing to stat.
+	if spoolTarPath != "" {
+		j.TarName = filepath.Base(spoolTarPath)
+		if fi, statErr := os.Stat(spoolTarPath); statErr == nil {
+			j.TarSize = fi.Size()
+		}
 	}
 
 	// Extract provenance metadata — from OIDC token (verified) or plain headers.

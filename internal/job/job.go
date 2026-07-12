@@ -112,6 +112,10 @@ type Job struct {
 	// per-package; a single end-of-build finalize then publishes the whole set.
 	// Empty preserves the legacy per-package commit behaviour.
 	BuildID string `json:"build_id,omitempty"`
+	// Finalize marks this job as the coarse-publish finalize for BuildID: instead
+	// of pipelining a tar, the orchestrator publishes all of the build's
+	// accumulated packages in one ingestsql commit. Carries no payload.
+	Finalize bool `json:"finalize,omitempty"`
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string
 	// TarName is the original base filename of the submitted tar (e.g.
