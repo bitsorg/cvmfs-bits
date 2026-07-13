@@ -96,6 +96,13 @@ type Orchestrator struct {
 	// pre-commit pull announce (ADR-0001). nil disables the announce (typical for
 	// local mode); receivers then converge on the post-commit published broadcast.
 	Distribute *distribute.Config
+	// PreWarm gates the pre-commit pull announce (Stratum 1 cache pre-warming).
+	// OFF by default: with no S1 receivers there is nothing to warm and a warm
+	// gate must never block a commit. Enable it (--prewarm) once authoritative S1
+	// receivers exist; the testbed enables it for testing. Post-commit pull
+	// (manifests + the published broadcast) is independent of this and stays on
+	// whenever the broker is configured, so S1 receivers still converge.
+	PreWarm bool
 
 	// BrokerConfig is the MQTT broker configuration used for publishing commit
 	// notifications (PublishedMessage) after a successful catalog commit.  When
@@ -699,6 +706,9 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 // broadcast and the .cvmfspublished backstop poll, so a missed announce only
 // delays warming, it does not lose data.
 func (o *Orchestrator) publishAnnounce(repo, payloadID string, hashes []string, totalBytes int64) {
+	if !o.PreWarm {
+		return // S1 cache pre-warming is opt-in (--prewarm); off by default.
+	}
 	if o.Distribute == nil || o.Distribute.BrokerConfig == nil ||
 		o.Distribute.BrokerConfig.BrokerURL == "" {
 		return

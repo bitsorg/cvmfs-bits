@@ -151,6 +151,7 @@ func main() {
 
 	// ── Stratum 1 distribution flags (publisher) ─────────────────────────────
 	warmQuorum := flag.Float64("warm-quorum", 1.0, "Fraction of authoritative Stratum 1 replicas that must report warm before the catalog commit proceeds (0.5 = majority, 1.0 = all) [publisher]")
+	preWarm := flag.Bool("prewarm", false, "Enable Stratum 1 cache pre-warming: emit the pre-commit pull announce so receivers start pulling before the commit. OFF by default (no S1 receivers => nothing to warm); enable once authoritative receivers exist. Post-commit pull is unaffected [publisher]")
 	// Queue-driven distribution worker flags.
 
 	// Provenance & Rekor transparency log — off by default.
@@ -246,7 +247,7 @@ func main() {
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
 			*chunkMin, *chunkAvg, *chunkMax,
-			*warmQuorum,
+			*warmQuorum, *preWarm,
 			*brokerCACert,
 			*embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
 	case "receiver":
@@ -278,6 +279,7 @@ func runPublisher(
 	pipelineUploadConc, pipelineCompressLevel int,
 	chunkMin, chunkAvg, chunkMax int64,
 	warmQuorum float64,
+	preWarm bool,
 	brokerCACert string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
 	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
@@ -583,6 +585,7 @@ func runPublisher(
 			Obs:           obs,
 		},
 		Distribute:        distCfg,
+		PreWarm:           preWarm,
 		Notify:            notifyBus,
 		Provenance:        provProvider,
 		Obs:               obs,
