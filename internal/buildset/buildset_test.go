@@ -102,8 +102,10 @@ func TestAssembleConflictDifferentFingerprint(t *testing.T) {
 }
 
 // A branching multi-package build must synthesise the intermediate ancestor
-// directories between the common lease root and each package root, so the
-// ingestsql descriptor is self-contained (ingestsql panics otherwise).
+// directories from the lease root down to each package root, so the ingestsql
+// descriptor is self-contained (ingestsql panics otherwise). The lease root is
+// the FIRST path component of the common prefix, so its parent is always the
+// repo root — ingestsql grafts the lease into a parent that must already exist.
 func TestAssembleFillsIntermediateDirs(t *testing.T) {
 	a := Member{Path: "arch/Packages/foo/1.0", BitsFingerprint: "fa", Entries: []cvmfscatalog.Entry{fileEntry("bin/foo")}}
 	b := Member{Path: "arch/Packages/bar/2.0", BitsFingerprint: "fb", Entries: []cvmfscatalog.Entry{fileEntry("bin/bar")}}
@@ -117,19 +119,36 @@ func TestAssembleFillsIntermediateDirs(t *testing.T) {
 			dirs[e.FullPath] = e
 		}
 	}
-	// intermediate package parents + lease root are present as dirs
-	for _, want := range []string{"arch/Packages", "arch/Packages/foo", "arch/Packages/bar"} {
+	// lease root (first component) + all intermediate package parents are present
+	for _, want := range []string{"arch", "arch/Packages", "arch/Packages/foo", "arch/Packages/bar"} {
 		if _, ok := dirs[want]; !ok {
-			t.Errorf("missing intermediate dir %q; have %v", want, keysDir(dirs))
+			t.Errorf("missing dir %q; have %v", want, keysDir(dirs))
 		}
-	}
-	// nothing above the lease root (arch/Packages) is emitted
-	if _, ok := dirs["arch"]; ok {
-		t.Errorf("emitted dir above the lease root: arch")
 	}
 	// package roots kept their nested marking
 	if e := dirs["arch/Packages/foo/1.0"]; !e.IsNestedRoot {
 		t.Errorf("package root not nested: %+v", e)
+	}
+}
+
+// A build whose paths all share a DEEP common prefix (e.g. only Packages/* with
+// no modulefiles => common prefix "arch/Packages/only/1.0") must still root the
+// lease at the first path component "arch", so ingestsql's auto-detected lease
+// has a parent (the repo root) that exists. Otherwise ingestsql aborts grafting
+// into a missing parent directory.
+func TestAssembleLeaseRootIsFirstComponent(t *testing.T) {
+	m := Member{Path: "arch/Packages/only/1.0", BitsFingerprint: "f", Entries: []cvmfscatalog.Entry{fileEntry("bin/x")}}
+	entries, _ := Assemble([]Member{m})
+	dirs := map[string]bool{}
+	for _, e := range entries {
+		if e.Mode.IsDir() {
+			dirs[e.FullPath] = true
+		}
+	}
+	for _, want := range []string{"arch", "arch/Packages", "arch/Packages/only"} {
+		if !dirs[want] {
+			t.Errorf("missing ancestor dir %q for deep-prefix build; have %v", want, dirs)
+		}
 	}
 }
 

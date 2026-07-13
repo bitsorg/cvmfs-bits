@@ -153,10 +153,27 @@ func Assemble(members []Member) (entries []cvmfscatalog.Entry, conflicts []Confl
 	// ingestsql does NOT reliably auto-create intermediate directories for a
 	// branching multi-package tree (it panics "catalog for directory ... cannot
 	// be found" when a package's ancestor dir is missing). Emit every ancestor
-	// directory between the build's common root (the lease path) and each entry
-	// so the descriptor is self-contained.
-	entries = fillAncestorDirs(entries, commonDirPrefix(kept))
+	// directory between the lease root and each entry so the descriptor is
+	// self-contained.
+	//
+	// The lease root is the FIRST path component of the common prefix, not the
+	// full common prefix. ingestsql auto-detects the lease as the shallowest
+	// descriptor path and grafts it into its parent — which must already exist in
+	// the repo. Using the full common prefix breaks when it is deep and its
+	// parent is absent (e.g. a build whose paths are all under Packages/* with no
+	// modulefiles => common prefix ".../Packages", parent ".../" missing =>
+	// ingestsql aborts). A top-level component's parent is always the repo root.
+	entries = fillAncestorDirs(entries, firstComponent(commonDirPrefix(kept)))
 	return entries, conflicts
+}
+
+// firstComponent returns the first path segment of p (e.g. "a/b/c" -> "a", "" -> "").
+func firstComponent(p string) string {
+	p = strings.Trim(p, "/")
+	if i := strings.IndexByte(p, '/'); i >= 0 {
+		return p[:i]
+	}
+	return p
 }
 
 // fillAncestorDirs adds a directory entry for every ancestor path (down to and
