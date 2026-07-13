@@ -132,9 +132,16 @@ func main() {
 	// Pipeline performance tuning.
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
-	chunkMin := flag.Int64("chunk-min", 4<<20, "CVMFS content-defined chunking: minimum chunk size in bytes [publisher]")
-	chunkAvg := flag.Int64("chunk-avg", 8<<20, "CVMFS content-defined chunking: average chunk size in bytes; 0 disables chunking [publisher]")
-	chunkMax := flag.Int64("chunk-max", 16<<20, "CVMFS content-defined chunking: maximum chunk size in bytes [publisher]")
+	// Default to FIXED 24 MiB chunking (min==avg==max): the xor32 chunker then
+	// cuts at fixed 24 MiB boundaries, which coarse publish (ADR-0007, the default
+	// mode) requires — ingestsql assumes 24 MiB chunks and the descriptor emitter
+	// enforces chunk-count == ceil(size/24MiB). Deployments that publish ONLY
+	// per-package (never coarse) and want finer dedup can override with
+	// content-defined sizes, e.g. --chunk-min 4194304 --chunk-avg 8388608
+	// --chunk-max 16777216 (or the config.yaml chunking: block).
+	chunkMin := flag.Int64("chunk-min", 24<<20, "CVMFS chunk size (bytes): minimum. Default fixed 24 MiB (min==avg==max) for coarse-publish/ingestsql compatibility; set content-defined sizes only for per-package-only deployments [publisher]")
+	chunkAvg := flag.Int64("chunk-avg", 24<<20, "CVMFS chunk size (bytes): average; 0 disables chunking. Default fixed 24 MiB (see --chunk-min) [publisher]")
+	chunkMax := flag.Int64("chunk-max", 24<<20, "CVMFS chunk size (bytes): maximum. Default fixed 24 MiB (see --chunk-min) [publisher]")
 
 	// Optional: repository name.  Retained for forward compatibility and to
 	// label publishes; no longer used for dedup seeding (dedup is a direct
