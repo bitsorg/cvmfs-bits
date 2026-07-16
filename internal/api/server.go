@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -52,6 +53,11 @@ type Server struct {
 	obs *observe.Provider
 	// apiToken is the expected bearer token for authenticated routes. Empty disables auth (dev mode).
 	apiToken string
+	// allowedPublishPrefixes are the authorized CVMFS roots (full paths, e.g.
+	// "/cvmfs/sft-nightlies-test.cern.ch/lcg"). A reserve/publish whose target does
+	// not canonicalize under one of these is rejected (containment: a build can only
+	// write inside an authorized group namespace). Empty ⇒ check disabled.
+	allowedPublishPrefixes []string
 	// orch is the orchestrator instance that executes jobs.
 	orch *Orchestrator
 	// sp is the spool manager for persistent job state.
@@ -150,6 +156,35 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	return s
 }
 
+// SetAllowedPublishPrefixes configures the authorized CVMFS roots (full paths).
+// Called once at startup; empty leaves the containment check disabled (so existing
+// single-namespace deployments are unaffected).
+func (s *Server) SetAllowedPublishPrefixes(prefixes []string) {
+	out := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, path.Clean(p))
+		}
+	}
+	s.allowedPublishPrefixes = out
+}
+
+// publishAuthorized reports whether a {repo, subPath} target resolves to a path
+// under an authorized CVMFS root. path.Clean collapses any ".." so a traversal
+// cannot escape the namespace. No configured prefixes ⇒ allowed (check disabled).
+func (s *Server) publishAuthorized(repo, subPath string) bool {
+	if len(s.allowedPublishPrefixes) == 0 {
+		return true
+	}
+	full := path.Clean("/cvmfs/" + repo + "/" + subPath)
+	for _, pre := range s.allowedPublishPrefixes {
+		if full == pre || strings.HasPrefix(full, pre+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // reserveHandler handles POST /api/v1/reserve. Fail-fast namespace check:
 // acquire a single-attempt gateway lease on {"repo","path"} and release it at
 // once. Returns 204 free, 409 taken, 400 bad body, 502 gateway error.
@@ -167,6 +202,15 @@ func (s *Server) reserveHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Repo == "" {
 		http.Error(w, `{"error":"repo is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Containment: the target must be under an authorized CVMFS root, so a build
+	// cannot reserve (and then publish into) another group's namespace.
+	if !s.publishAuthorized(req.Repo, req.Path) {
+		s.obs.Logger.Warn("reserve: target outside authorized namespace",
+			"repo", req.Repo, "path", req.Path)
+		http.Error(w, `{"error":"forbidden: target path is outside this deployment's authorized CVMFS namespace"}`, http.StatusForbidden)
 		return
 	}
 
@@ -664,6 +708,16 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// A finalize job requires a build_id and carries no payload.
 	if finalize && buildID == "" {
 		http.Error(w, `{"error":"finalize requires build_id"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Containment: a payload job must publish inside this deployment's authorized
+	// CVMFS namespace. Finalize carries no path and only commits packages that
+	// already passed this check at submit time, so it is exempt.
+	if !finalize && !s.publishAuthorized(repo, subPath) {
+		os.RemoveAll(jobDir)
+		s.obs.Logger.Warn("submit: target outside authorized namespace", "repo", repo, "path", subPath)
+		http.Error(w, `{"error":"forbidden: target path is outside this deployment's authorized CVMFS namespace"}`, http.StatusForbidden)
 		return
 	}
 

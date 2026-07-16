@@ -159,6 +159,7 @@ func main() {
 	rekorServer := flag.String("rekor-server", provenance.DefaultRekorServer, "Rekor transparency log URL [publisher]")
 	rekorSigningKey := flag.String("rekor-signing-key", "", "Path to Ed25519 private key (PEM/PKCS#8) for signing Rekor entries; auto-generated if absent [publisher]")
 	oidcIssuers := flag.String("oidc-issuers", "", "Comma-separated list of allowed OIDC issuer URLs for CI token validation [publisher]")
+	allowedPublishPrefixes := flag.String("allowed-publish-prefix", "", "Comma-separated CVMFS group-root paths this deployment may publish into, e.g. /cvmfs/repo.cern.ch/lcg,/cvmfs/repo.cern.ch/cms. A reserve/submit whose target falls outside every root is rejected 403. Empty disables the check (publish anywhere) [publisher]")
 
 	// ── Receiver-mode flags ────────────────────────────────────────────────────
 	//
@@ -219,6 +220,7 @@ func main() {
 			sessionTTL, diskHeadroom,
 			nodeID, repos, recvStratum0URL,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
+			allowedPublishPrefixes,
 			gatewayDirectGraft,
 			chunkMin, chunkAvg, chunkMax,
 		)
@@ -244,6 +246,7 @@ func main() {
 		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
+			*allowedPublishPrefixes,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineUploadConc, *pipelineCompressLevel,
 			*chunkMin, *chunkAvg, *chunkMax,
@@ -274,6 +277,7 @@ func runPublisher(
 	ingestSwissknife, ingestConfigPrefix, ingestEnv string,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
+	allowedPublishPrefixes string,
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineUploadConc, pipelineCompressLevel int,
@@ -598,6 +602,10 @@ func runPublisher(
 	}
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
+	if allowedPublishPrefixes != "" {
+		apiServer.SetAllowedPublishPrefixes(strings.Split(allowedPublishPrefixes, ","))
+		obs.Logger.Info("publish namespace containment enabled", "allowed_prefixes", allowedPublishPrefixes)
+	}
 
 	// Control-plane DoS limiter (internet-exposed; no firewall assumed).
 	ctrlRateLimit := credential.NewIPRateLimiter(5, 10, 4096, 100, 200)

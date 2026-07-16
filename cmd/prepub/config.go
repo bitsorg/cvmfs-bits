@@ -141,6 +141,13 @@ type fileConfig struct {
 	RekorSigningKey string   `yaml:"rekor_signing_key"`
 	OIDCIssuers     []string `yaml:"oidc_issuers"`
 
+	// AllowedPublishPrefixes are the CVMFS group-root paths this deployment may
+	// publish into (e.g. "/cvmfs/repo.cern.ch/lcg"). A reserve/submit whose target
+	// falls outside every root is rejected. Empty disables the check. For a group
+	// whose user area is a sibling of releases/ (…/<group>/user vs …/<group>/releases),
+	// list the group ROOT so both are covered. Equivalent to --allowed-publish-prefix.
+	AllowedPublishPrefixes []string `yaml:"allowed_publish_prefixes"`
+
 	// Chunking overrides the CVMFS content-defined (xor32) chunk sizes in
 	// bytes. Zero/omitted fields keep the CLI defaults (4/8/16 MiB).
 	// Equivalent to --chunk-min/--chunk-avg/--chunk-max.
@@ -202,6 +209,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	nodeID, repos, recvStratum0URL *string,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
+	allowedPublishPrefixes *string,
 	gatewayDirectGraft *bool,
 	chunkMin, chunkAvg, chunkMax *int64,
 ) {
@@ -283,6 +291,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("rekor-signing-key", rekorSigningKey, fc.RekorSigningKey)
 	if !has("oidc-issuers") && len(fc.OIDCIssuers) > 0 {
 		*oidcIssuers = strings.Join(fc.OIDCIssuers, ",")
+	}
+	if !has("allowed-publish-prefix") && len(fc.AllowedPublishPrefixes) > 0 {
+		*allowedPublishPrefixes = strings.Join(fc.AllowedPublishPrefixes, ",")
 	}
 
 	// Gateway commit mode.  The flag defaults to true; config can only reaffirm
