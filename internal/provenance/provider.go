@@ -77,6 +77,7 @@ func New(cfg Config, spoolDir string, obs *observe.Provider) (*Provider, error) 
 		"path", keyPath,
 		"rekor", cfg.rekorServer(),
 		"oidc_issuers", cfg.OIDCIssuers,
+		"oidc_audience", cfg.OIDCAudience,
 	)
 	return p, nil
 }
@@ -118,7 +119,7 @@ func (p *Provider) ExtractFromRequest(r *http.Request) *Record {
 
 	if rawToken != "" && p.cfg.oidcEnabled() {
 		claims, err := ValidateOIDCToken(
-			r.Context(), rawToken, p.cfg.OIDCIssuers, p.cfg.httpTimeout(),
+			r.Context(), rawToken, p.cfg.OIDCIssuers, p.cfg.OIDCAudience, p.cfg.httpTimeout(),
 		)
 		if err != nil {
 			p.obs.Logger.Warn("provenance: OIDC token validation failed — using caller-supplied headers",

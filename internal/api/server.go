@@ -196,12 +196,20 @@ func (s *Server) reserveHandler(w http.ResponseWriter, r *http.Request) {
 		Repo string `json:"repo"`
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Cap the body like the submit path (1 MiB): an authenticated client must
+	// not be able to balloon server memory with an arbitrarily large JSON body.
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
 		return
 	}
 	if req.Repo == "" {
 		http.Error(w, `{"error":"repo is required"}`, http.StatusBadRequest)
+		return
+	}
+	// Same repo-name validation as the submit path: nothing malformed may
+	// reach the Stratum0 URL builder or the gateway lease request.
+	if err := broker.ValidateRepo(req.Repo); err != nil {
+		http.Error(w, `{"error":"invalid repo"}`, http.StatusBadRequest)
 		return
 	}
 

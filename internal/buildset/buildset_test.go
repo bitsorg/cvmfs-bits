@@ -5,6 +5,7 @@ package buildset
 
 import (
 	"io/fs"
+	"strings"
 	"testing"
 
 	"cvmfs.io/prepub/pkg/cvmfscatalog"
@@ -166,4 +167,26 @@ func keys(m map[string]cvmfscatalog.Entry) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestSanitizeIDRejectsTraversal verifies that "." / ".." / empty ids cannot
+// escape the builds directory. sanitizeID("..") == ".." would make
+// buildDir(spool, "..") resolve to the spool root, so a publisher could write
+// member records into — and on finalize os.RemoveAll — the whole spool.
+func TestSanitizeIDRejectsTraversal(t *testing.T) {
+	for _, in := range []string{"", ".", "..", "...", "/", "../.."} {
+		got := sanitizeID(in)
+		if got == "" || got == "." || got == ".." || strings.Trim(got, ".") == "" {
+			continue // becomes "_invalid_" or a non-dotty string — acceptable
+		}
+		if got == in && (in == "." || in == "..") {
+			t.Errorf("sanitizeID(%q) = %q — traversal survives", in, got)
+		}
+	}
+	if sanitizeID("..") == ".." {
+		t.Fatal("sanitizeID(\"..\") must not return \"..\"")
+	}
+	if s := sanitizeID("good-id_1.2"); s != "good-id_1.2" {
+		t.Errorf("sanitizeID mangled a legitimate id: %q", s)
+	}
 }

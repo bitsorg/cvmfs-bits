@@ -51,6 +51,12 @@ type Config struct {
 	//   "https://gitlab.example.com"                   — self-hosted GitLab
 	OIDCIssuers []string
 
+	// OIDCAudience, when non-empty, is the audience value CI OIDC tokens must
+	// carry (aud claim). CI issuers are global, so without this any workflow
+	// anywhere can obtain Verified=true; set it to your deployment's URL and
+	// mint tokens with that audience in CI. Empty = not enforced (logged).
+	OIDCAudience string
+
 	// HTTPTimeout caps each outbound HTTP call to Rekor or the OIDC discovery
 	// and JWKS endpoints.  Defaults to 20 s.
 	HTTPTimeout time.Duration

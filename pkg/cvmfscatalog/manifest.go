@@ -14,7 +14,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// defaultClient is the fallback for nil *http.Client parameters: unlike
+// http.DefaultClient it carries a timeout, so a stalled Stratum0/gateway can
+// never hang a caller indefinitely (JobTimeout defaults to disabled).
+var defaultClient = &http.Client{Timeout: 60 * time.Second}
 
 // ErrCatalogNotFound is returned by DownloadCatalog when the server responds
 // with HTTP 404.  Callers use this sentinel to distinguish "catalog missing /
@@ -112,7 +118,7 @@ func ParseManifest(data []byte) (*Manifest, error) {
 // in which case http.DefaultClient is used.
 func FetchManifestRootHash(ctx context.Context, client *http.Client, stratum0URL, repo string) (string, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient
 	}
 	manifestURL := stratum0URL + "/" + repo + "/.cvmfspublished"
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
@@ -161,7 +167,7 @@ func FetchManifestRootHash(ctx context.Context, client *http.Client, stratum0URL
 // in an existing repository so its split rules can be applied to new entries.
 func DownloadObject(ctx context.Context, client *http.Client, stratum0URL, repoName, hashHex string, algo HashAlgo) ([]byte, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient
 	}
 	suffix := HashSuffix(algo)
 	// CVMFS CAS path: data/<first2>/<remaining38>[suffix]
@@ -200,7 +206,7 @@ func DownloadObject(ctx context.Context, client *http.Client, stratum0URL, repoN
 // The result is written to destPath as a plain (decompressed) SQLite file.
 func DownloadCatalog(ctx context.Context, client *http.Client, stratum0URL, repoName, hashHex, destPath string) error {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient
 	}
 
 	// Construct the CAS path: data/<first2>/<remaining38>C

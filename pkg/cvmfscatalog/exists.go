@@ -80,7 +80,7 @@ func (c *Catalog) longestNestedAncestor(absPath string) (mount, hashHex string, 
 // walk descends through ancestor mounts until it can answer authoritatively.
 //
 // Returns (false, nil) when the repository has never been published (no manifest)
-// — nothing exists yet. client may be nil (http.DefaultClient is used).
+// — nothing exists yet. client may be nil (defaultClient is used).
 //
 // This is a best-effort fast-path check for fail-fast reservation: it downloads
 // the root catalog (and any ancestor nested catalogs on the path), so callers

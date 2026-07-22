@@ -40,12 +40,12 @@ type OIDCClaims struct {
 	jwt.RegisteredClaims
 
 	// ── GitHub Actions ────────────────────────────────────────────────────
-	Repository  string `json:"repository,omitempty"`   // "owner/repo"
-	Ref         string `json:"ref,omitempty"`          // "refs/heads/main"
-	SHA         string `json:"sha,omitempty"`          // git commit SHA
-	Actor       string `json:"actor,omitempty"`        // triggering username
-	RunID       string `json:"run_id,omitempty"`       // workflow run ID
-	Workflow    string `json:"workflow,omitempty"`     // workflow name or path
+	Repository  string `json:"repository,omitempty"`  // "owner/repo"
+	Ref         string `json:"ref,omitempty"`         // "refs/heads/main"
+	SHA         string `json:"sha,omitempty"`         // git commit SHA
+	Actor       string `json:"actor,omitempty"`       // triggering username
+	RunID       string `json:"run_id,omitempty"`      // workflow run ID
+	Workflow    string `json:"workflow,omitempty"`    // workflow name or path
 	Environment string `json:"environment,omitempty"` // deployment environment
 
 	// ── GitLab CI ─────────────────────────────────────────────────────────
@@ -67,12 +67,14 @@ type OIDCClaims struct {
 //  4. Fetch the issuer's OIDC discovery document → jwks_uri.
 //  5. Fetch JWKS and locate the key matching kid.
 //  6. Verify the JWT signature using the fetched key.
-//  7. Verify standard claims: exp, nbf.
+//  7. Verify standard claims: exp, nbf; pin the signature algorithm family;
+//     when *audience* is non-empty, require it among the token's aud values.
 //  8. Return the verified OIDCClaims.
 func ValidateOIDCToken(
 	ctx context.Context,
 	rawToken string,
 	allowedIssuers []string,
+	audience string,
 	timeout time.Duration,
 ) (*OIDCClaims, error) {
 	if len(allowedIssuers) == 0 {
@@ -99,10 +101,24 @@ func ValidateOIDCToken(
 	}
 
 	var claims OIDCClaims
-	token, err := jwt.ParseWithClaims(rawToken, &claims, keyFunc,
+	// Pin the accepted signature algorithms to the asymmetric families the
+	// JWKS can actually carry — never HMAC ("alg confusion") or "none" — and
+	// bind the token to OUR audience when one is configured: CI OIDC issuers
+	// are GLOBAL (all of GitHub/GitLab mint from the same issuer), so without
+	// an audience check a token minted for a different relying party verifies
+	// here too (confused deputy).
+	opts := []jwt.ParserOption{
 		jwt.WithIssuedAt(),
 		jwt.WithExpirationRequired(),
-	)
+		jwt.WithValidMethods([]string{
+			"RS256", "RS384", "RS512", "ES256", "ES384", "ES512",
+			"PS256", "PS384", "PS512", "EdDSA",
+		}),
+	}
+	if audience != "" {
+		opts = append(opts, jwt.WithAudience(audience))
+	}
+	token, err := jwt.ParseWithClaims(rawToken, &claims, keyFunc, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("JWT parse/verification failed: %w", err)
 	}

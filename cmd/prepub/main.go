@@ -427,6 +427,9 @@ func runPublisher(
 		RekorServer:    rekorServer,
 		SigningKeyPath: rekorSigningKey,
 		OIDCIssuers:    oidcIssuerList,
+		// Audience binding (env, like PREPUB_API_TOKEN): CI OIDC issuers are
+		// global, so without this any workflow anywhere gets Verified=true.
+		OIDCAudience: os.Getenv("PREPUB_OIDC_AUDIENCE"),
 	}
 	provProvider, err := provenance.New(provCfg, spoolRoot, obs)
 	if err != nil {

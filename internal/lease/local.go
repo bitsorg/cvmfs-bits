@@ -247,6 +247,14 @@ func (b *LocalBackend) cvmfsServerOutput(ctx context.Context, args ...string) (s
 //   - Absolute symlink targets are allowed: CVMFS repositories legitimately
 //     contain symlinks into host paths (e.g. /lib64/ld-linux.so.2).  A
 //     warning is logged so operators can audit if needed.
+//   - LINK-THEN-WRITE is refused: no write ever resolves THROUGH a symlink.
+//     A malicious tar can place a symlink entry (x -> /etc/…) and then a
+//     regular-file/hard-link entry at x or x/file — the lexical prefix check
+//     passes while the actual open() would follow the link and write (or,
+//     for a hard-link source, READ) outside destDir. Every write target and
+//     hard-link source therefore has its path components Lstat-verified to
+//     not be symlinks, and an existing symlink at the final element is
+//     rejected rather than followed.
 //
 // Timestamps: ModTime and AccessTime from the tar header are applied to each
 // regular file and hard-link copy via os.Chtimes.
@@ -282,6 +290,11 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 		if target != destDir && !strings.HasPrefix(target, prefix) {
 			return fmt.Errorf("tar entry %q escapes destination directory", hdr.Name)
 		}
+		// Refuse to operate THROUGH a symlinked path component (see the
+		// link-then-write note in the function doc).
+		if err := rejectSymlinkComponents(destDir, target); err != nil {
+			return fmt.Errorf("tar entry %q: %w", hdr.Name, err)
+		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -292,6 +305,10 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent for %q: %w", target, err)
+			}
+			if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("tar entry %q: refusing to write through an "+
+					"existing symlink", hdr.Name)
 			}
 			if err := writeFile(target, hdr, tr); err != nil {
 				return fmt.Errorf("writing %q: %w", hdr.Name, err)
@@ -306,8 +323,21 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 				return fmt.Errorf("hard link %q source %q escapes destination directory",
 					hdr.Name, hdr.Linkname)
 			}
+			// The SOURCE is read with os.Open (follows symlinks): a symlink
+			// planted at src would copy an arbitrary HOST file into the repo.
+			if err := rejectSymlinkComponents(destDir, src); err != nil {
+				return fmt.Errorf("hard link %q source: %w", hdr.Name, err)
+			}
+			if fi, err := os.Lstat(src); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("hard link %q: source %q is a symlink",
+					hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent for hard link %q: %w", target, err)
+			}
+			if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("hard link %q: refusing to write through an "+
+					"existing symlink", hdr.Name)
 			}
 			if err := copyFile(src, target, hdr); err != nil {
 				return fmt.Errorf("copying hard link %q from %q: %w",
@@ -333,6 +363,37 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 
 		default:
 			// Devices, FIFOs, etc. — skip silently.
+		}
+	}
+	return nil
+}
+
+// rejectSymlinkComponents verifies that no EXISTING path component of target's
+// parent chain below destDir is a symlink.  destDir is fresh per extraction,
+// so any symlink found there was planted by an earlier entry of the same tar —
+// following it would let that entry redirect this one's write (or a hard-link
+// source's read) outside destDir.  Components that do not exist yet are fine:
+// they will be created as real directories by the caller's MkdirAll.
+func rejectSymlinkComponents(destDir, target string) error {
+	rel, err := filepath.Rel(destDir, filepath.Dir(target))
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	cur := destDir
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, part)
+		fi, err := os.Lstat(cur)
+		if os.IsNotExist(err) {
+			return nil // rest of the chain will be created fresh
+		}
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %q is a symlink", cur)
 		}
 	}
 	return nil

@@ -280,8 +280,13 @@ func expand(m Member) []cvmfscatalog.Entry {
 }
 
 // sanitizeID keeps build/job identifiers safe as a single path component.
+// "." and ".." must not survive: sanitizeID("..") == ".." would make
+// buildDir(spool, "..") resolve to the spool root itself — an authenticated
+// publisher could then write member records into (and, on finalize,
+// os.RemoveAll) the whole spool. Empty input is normalised for the same
+// reason (filepath.Join drops it silently).
 func sanitizeID(id string) string {
-	return strings.Map(func(r rune) rune {
+	s := strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
 			r == '-', r == '_', r == '.':
@@ -290,4 +295,8 @@ func sanitizeID(id string) string {
 			return '_'
 		}
 	}, id)
+	if s == "" || strings.Trim(s, ".") == "" {
+		return "_invalid_"
+	}
+	return s
 }
