@@ -275,6 +275,19 @@ func New(cfg Config) (*Receiver, error) {
 		bgCancel: bgCancel,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute, // generous for large CAS objects
+			// A dedicated transport sized for the pull worker pool. The nil
+			// default (http.DefaultTransport) keeps only 2 idle connections
+			// per host, so with N concurrent per-object fetches against the
+			// single S0 host every connection beyond 2 was closed after one
+			// response — a TIME_WAIT flood that exhausted ephemeral ports on
+			// large builds ("dial tcp: cannot assign requested address",
+			// thousands of failed objects per pull transaction).
+			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConns:        128,
+				MaxIdleConnsPerHost: 128, // >= max pull concurrency
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
 	}
 
