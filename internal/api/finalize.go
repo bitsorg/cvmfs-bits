@@ -11,11 +11,84 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"cvmfs.io/prepub/internal/buildset"
+	"cvmfs.io/prepub/internal/job"
+	"cvmfs.io/prepub/internal/lease"
+	"cvmfs.io/prepub/internal/pipeline"
 
 	"github.com/gorilla/mux"
 )
+
+// submitBuildObjects streams this package's newly-staged CAS objects into the
+// repository via a short gateway lease, without committing anything.
+//
+// Coarse publish (ADR-0007) defers the CATALOG to the end-of-build finalize,
+// but the objects must reach the repository as each package arrives —
+// otherwise the finalize commits catalogs referencing content the repository
+// has never seen and every client read fails with EIO. Uploading here (rather
+// than in bulk at finalize) is also the point of the exercise: object transfer
+// for package N overlaps with the build still producing package N+1.
+//
+// The lease is scoped to this package's own path, so concurrent packages take
+// disjoint leases and do not serialise; it is released WITHOUT commit
+// (Release(commit=false)) — gateway payload objects are content-addressed and
+// persist independently of the transaction that carried them, so the single
+// finalize commit later references objects that are already in place.
+// A no-op when the backend needs no pipeline (local mode) or the pipeline
+// produced no new objects (everything deduplicated).
+func (o *Orchestrator) submitBuildObjects(ctx context.Context, j *job.Job,
+	res *pipeline.Result) error {
+	if o.Lease == nil || !o.Lease.NeedsPipeline() || res == nil {
+		return nil
+	}
+	// SubmitPayload is gateway-specific and therefore not part of the Backend
+	// interface; local/dev backends need no object push at all.
+	submitter, ok := o.Lease.(payloadSubmitter)
+	if !ok {
+		return nil
+	}
+	if len(res.NewObjectHashes) == 0 {
+		o.Obs.Logger.InfoContext(ctx, "coarse publish: no new objects to submit",
+			"job_id", j.ID, "build_id", j.BuildID, "path", j.Path)
+		return nil
+	}
+	start := time.Now()
+	token, err := o.Lease.Acquire(ctx, j.Repo, j.Path)
+	if err != nil {
+		return fmt.Errorf("coarse publish: lease for object submission (%s): %w", j.Path, err)
+	}
+	// Always end the lease WITHOUT committing — the finalize owns the single
+	// commit. Abort() is Release(commit=false): the gateway drops the empty
+	// transaction while the uploaded objects, being content-addressed, stay.
+	// context.WithoutCancel so the release still runs if ctx is already done.
+	defer func() {
+		if rerr := o.Lease.Abort(context.WithoutCancel(ctx), token); rerr != nil {
+			o.Obs.Logger.WarnContext(ctx, "coarse publish: releasing object-submission lease",
+				"job_id", j.ID, "path", j.Path, "error", rerr)
+		}
+	}()
+	stopHeartbeat := o.Lease.Heartbeat(ctx, token, 10*time.Second, func() {})
+	defer stopHeartbeat()
+
+	// catalogHash "" — objects only; the catalog is built by the finalize.
+	if err := submitter.SubmitPayload(ctx, token, "", res.NewObjectHashes, o.CAS); err != nil {
+		return fmt.Errorf("coarse publish: submitting %d object(s) for %s: %w",
+			len(res.NewObjectHashes), j.Path, err)
+	}
+	o.Obs.Logger.InfoContext(ctx, "coarse publish: objects submitted to repository",
+		"job_id", j.ID, "build_id", j.BuildID, "path", j.Path,
+		"objects", len(res.NewObjectHashes), "duration", time.Since(start).String())
+	return nil
+}
+
+// payloadSubmitter is the gateway-only part of the lease backend that streams
+// staged CAS objects into the repository's object store.
+type payloadSubmitter interface {
+	SubmitPayload(ctx context.Context, token, catalogHash string,
+		objectHashes []string, store lease.ObjectReader) error
+}
 
 // preflightObjects verifies that a sample of the build's referenced content
 // objects is still present in CAS before the finalize commits catalogs.
