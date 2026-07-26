@@ -985,29 +985,16 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		}
 	}
 
-	// ── Coarse publish (ADR-0007): push objects now, defer only the catalog ──
-	// When the job belongs to a build (BuildID set) we still upload this
-	// package's objects to the repository IMMEDIATELY — concurrently with the
-	// packages still being received — and defer only the catalog: a single
-	// end-of-build finalize (POST /builds/{id}/finalize) publishes the whole
-	// set in one gateway commit via ingestsql. An empty BuildID preserves the
+	// ── Coarse publish (ADR-0007): accumulate entries, defer the commit ──────
+	// When the job belongs to a build (BuildID set), its objects are already in
+	// CAS and pre-warmed to the Stratum 1s above.  Record its catalog entries in
+	// the build-scoped accumulator and finish in StateAccumulated; a single
+	// end-of-build finalize (POST /builds/{id}/finalize) then publishes the whole
+	// set in one gateway commit via ingestsql.  An empty BuildID preserves the
 	// legacy per-package commit path below.
-	//
-	// The object push is what makes the deferred catalog legal. Staging leaves
-	// objects in the prepub's own CAS; only SubmitPayload streams them through
-	// the gateway into the REPOSITORY's object store, which is where clients
-	// fetch them from. Without it the finalize writes perfectly valid catalogs
-	// referencing objects the repository never received, and every client read
-	// fails with EIO ("failed to fetch chunk") — a 174 MB 7-chunk library
-	// exactly like a 2 KB script. That was the ADR-0007 gap: this branch used
-	// to return at StateAccumulated before the lease/SubmitPayload block below.
 	if j.BuildID != "" && pipelineResult != nil && j.Path != "" {
 		if onStagingComplete != nil {
 			onStagingComplete()
-		}
-		if serr := o.submitBuildObjects(ctx, j, pipelineResult); serr != nil {
-			span.RecordError(serr)
-			return o.abortJob(ctx, j, serr)
 		}
 		if recErr := buildset.Record(o.Spool.Root, j.BuildID, buildset.Member{
 			JobID:           j.ID,
