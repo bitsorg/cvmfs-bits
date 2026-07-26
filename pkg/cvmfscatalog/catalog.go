@@ -47,10 +47,26 @@ type Catalog struct {
 	dbPath     string
 	rootPrefix string
 	delta      Statistics // accumulated changes to flush in Finalize
+	// uncompressedSize is the size of the SQLite database as written by
+	// Finalize, before zlib compression.  Set by Finalize; read via
+	// UncompressedSize.
+	uncompressedSize int64
 	// closeOnce ensures that Close() is safe to call from multiple goroutines
 	// simultaneously — only the first call actually closes the underlying DB.
 	closeOnce sync.Once
 }
+
+// UncompressedSize returns the size in bytes of the finalized SQLite database
+// BEFORE compression, or 0 when Finalize has not run.
+//
+// This is the value CVMFS expects in a parent catalog's nested_catalogs.size
+// column: cvmfs_swissknife check downloads the child object, decompresses it,
+// and compares GetFileSize(decompressed) against that column
+// (swissknife_check.cc:726-741) — recording the COMPRESSED object size there
+// makes every nested catalog fail to load with "catalog file size mismatch",
+// which in turn makes the checker's walked statistics fall short of the root
+// catalog's aggregated counters ("statistics counter mismatch").
+func (c *Catalog) UncompressedSize() int64 { return c.uncompressedSize }
 
 // Statistics holds all counter columns from the statistics table.
 // Fields mirror the (counter TEXT PRIMARY KEY, value INTEGER) rows that
@@ -881,8 +897,9 @@ func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 }
 
 // FindNestedMount checks whether absPath is a nested catalog mount point in
-// this catalog.  If found, it returns the compressed catalog hash (hex) and
-// compressed size stored in the nested_catalogs table.
+// this catalog.  If found, it returns the catalog hash (hex, naming the
+// compressed object) and the UNCOMPRESSED database size stored in the
+// nested_catalogs table (see UncompressedSize).
 // Returns found=false (no error) when no row exists for absPath.
 //
 // nested_catalogs uses the CVMFS native schema: path TEXT PRIMARY KEY, sha1 TEXT.
@@ -1010,6 +1027,10 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 	if err != nil {
 		return "", Statistics{}, fmt.Errorf("reading database: %w", err)
 	}
+	// Remember the UNCOMPRESSED database size: that — not the size of the
+	// compressed object — is what a parent catalog's nested_catalogs.size must
+	// hold (see UncompressedSize).
+	c.uncompressedSize = int64(len(raw))
 
 	// Compress with zlib.
 	//

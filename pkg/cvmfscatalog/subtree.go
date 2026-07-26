@@ -375,8 +375,7 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		// node.cat is now closed by Finalize; no further Close needed for this node.
 
 		casFile := filepath.Join(cfg.TempDir, cvmfshash.ObjectPath(hash)+"C")
-		fi, statErr := os.Stat(casFile)
-		if statErr != nil {
+		if _, statErr := os.Stat(casFile); statErr != nil {
 			closeAllSplits()
 			return nil, fmt.Errorf("stat split catalog %s: %w", hash, statErr)
 		}
@@ -390,7 +389,11 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		} else {
 			parentCat = leafCat
 		}
-		if addErr := parentCat.AddNestedMount(sp, hash, fi.Size()); addErr != nil {
+		// nested_catalogs.size is the UNCOMPRESSED database size — CVMFS
+		// decompresses the child object before comparing (see
+		// Catalog.UncompressedSize); passing the compressed object size made
+		// every nested catalog unloadable for cvmfs_swissknife check.
+		if addErr := parentCat.AddNestedMount(sp, hash, node.cat.UncompressedSize()); addErr != nil {
 			closeAllSplits()
 			return nil, fmt.Errorf("adding nested mount %q to parent catalog: %w", sp, addErr)
 		}

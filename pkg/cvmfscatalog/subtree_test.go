@@ -174,6 +174,81 @@ func TestBuildSubtreeWithSplits(t *testing.T) {
 	}
 }
 
+// TestNestedCatalogSizeIsUncompressed pins the CVMFS invariant that a parent
+// catalog's nested_catalogs.size holds the size of the child's UNCOMPRESSED
+// SQLite database.
+//
+// cvmfs_swissknife check downloads the child object, decompresses it, and
+// compares GetFileSize(decompressed) against that column
+// (swissknife_check.cc:726-741). Recording the compressed object size instead
+// made every nested catalog fail with "catalog file size mismatch, expected
+// 1822, got 53248" and, because the checker then cannot walk those subtrees,
+// produced a cascade of "statistics counter mismatch" errors at the root —
+// reproducible on a clean testbed with `make test` alone.
+func TestNestedCatalogSizeIsUncompressed(t *testing.T) {
+	tmpdir := t.TempDir()
+	now := time.Now().Unix()
+
+	entries := []Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Size: 4096, Mtime: now, LinkCount: 2},
+		{FullPath: "sub", Name: "sub", Mode: fs.ModeDir | 0o755, Size: 4096, Mtime: now, LinkCount: 2},
+		{FullPath: "sub/.cvmfscatalog", Name: ".cvmfscatalog", Mode: 0o100644, Size: 0, Mtime: now, LinkCount: 1},
+		{FullPath: "sub/file.txt", Name: "file.txt", Mode: 0o100644, Size: 10, Mtime: now, LinkCount: 1},
+	}
+
+	result, err := BuildSubtree(context.Background(), SubtreeConfig{
+		LeasePath: "pkg/v1",
+		TempDir:   tmpdir,
+	}, entries)
+	if err != nil {
+		t.Fatalf("BuildSubtree: %v", err)
+	}
+
+	// Open the subtree root catalog and read its nested_catalogs row.
+	rootRaw := filepath.Join(tmpdir, "root-decompressed.db")
+	if derr := decompressCatalogCAS(
+		filepath.Join(tmpdir, cvmfshash.ObjectPath(result.CatalogHash)+"C"), rootRaw); derr != nil {
+		t.Fatalf("decompress root catalog: %v", derr)
+	}
+	rootCat, err := Open(rootRaw)
+	if err != nil {
+		t.Fatalf("open root catalog: %v", err)
+	}
+	defer rootCat.Close()
+
+	childHash, recordedSize, found, err := rootCat.FindNestedMount("/pkg/v1/sub")
+	if err != nil || !found {
+		t.Fatalf("nested mount /pkg/v1/sub not found (found=%v, err=%v)", found, err)
+	}
+
+	// What the checker measures: the decompressed child database.
+	childCAS := filepath.Join(tmpdir, cvmfshash.ObjectPath(childHash)+"C")
+	childRaw := filepath.Join(tmpdir, "child-decompressed.db")
+	if derr := decompressCatalogCAS(childCAS, childRaw); derr != nil {
+		t.Fatalf("decompress child catalog: %v", derr)
+	}
+	rawFI, err := os.Stat(childRaw)
+	if err != nil {
+		t.Fatalf("stat decompressed child: %v", err)
+	}
+	compFI, err := os.Stat(childCAS)
+	if err != nil {
+		t.Fatalf("stat compressed child: %v", err)
+	}
+
+	if recordedSize != rawFI.Size() {
+		t.Errorf("nested_catalogs.size = %d, want the UNCOMPRESSED db size %d "+
+			"(compressed object is %d bytes)",
+			recordedSize, rawFI.Size(), compFI.Size())
+	}
+	// Guard against the regression returning: the two sizes must differ here,
+	// otherwise the assertion above would pass for the wrong reason.
+	if compFI.Size() >= rawFI.Size() {
+		t.Skipf("catalog did not compress (%d >= %d); assertion not discriminating",
+			compFI.Size(), rawFI.Size())
+	}
+}
+
 // TestBuildSubtreeContextCancel verifies that a cancelled context returns an error.
 func TestBuildSubtreeContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
