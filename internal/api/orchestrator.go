@@ -804,8 +804,16 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		res, ferr := o.FinalizeBuild(ctx, j.BuildID)
 		if ferr != nil {
 			if res != nil {
+				// Log the tail of the captured ingestsql output: on a crash or
+				// guard abort the actual reason is only in that stderr (the
+				// client-facing job error is sanitized for internal failures).
+				out := res.Output
+				if len(out) > 2000 {
+					out = "…" + out[len(out)-2000:]
+				}
 				logger.Error("build finalize failed", "build_id", j.BuildID,
-					"published", res.Published, "conflicts", len(res.Conflicts))
+					"published", res.Published, "conflicts", len(res.Conflicts),
+					"ingest_output", out)
 			}
 			span.RecordError(ferr)
 			return o.abortJob(ctx, j, fmt.Errorf("finalize build %s: %w", j.BuildID, ferr))

@@ -49,7 +49,12 @@ func (o *Orchestrator) FinalizeBuild(ctx context.Context, buildID string) (*Fina
 		}
 	}
 
-	work, err := os.MkdirTemp("", "finalize-"+buildID+"-")
+	// Scratch under the spool root (the sized, persistent volume), NOT the
+	// container /tmp: the descriptor and ingestsql scratch for a whole build
+	// (87 packages / 170 members for O2) can exceed a small tmpfs, and a full
+	// /tmp surfaced as an ingestsql crash (mkstemp -> ENOSPC) rather than a
+	// clear error.
+	work, err := os.MkdirTemp(spoolRoot, ".finalize-"+buildID+"-")
 	if err != nil {
 		return nil, fmt.Errorf("finalize workdir: %w", err)
 	}
