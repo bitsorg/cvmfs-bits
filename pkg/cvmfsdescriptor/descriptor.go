@@ -72,7 +72,17 @@ var schema = []string{
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL);`,
 	`INSERT INTO properties VALUES ('schema_revision', '4') ON CONFLICT DO NOTHING;`,
+	// chunk_size declares the fixed chunk boundary (bytes) used by the hashes
+	// column, so ingestsql synthesizes offsets on the SAME grid the pipeline
+	// cut on. Without it ingestsql falls back to its built-in constants
+	// (6 MiB internal / 24 MiB external) — wrong for internal entries here.
+	// Kept in lockstep with ExternalChunkSize via fmt.Sprintf below.
+	chunkSizeProperty,
 }
+
+var chunkSizeProperty = fmt.Sprintf(
+	"INSERT INTO properties VALUES ('chunk_size', '%d') ON CONFLICT DO NOTHING;",
+	ExternalChunkSize)
 
 // Write builds the ingestsql descriptor at dbPath from entries. Each entry is
 // classified by mode into the dirs / files / links tables. Regular files
@@ -154,12 +164,24 @@ func insertEntry(tx *sql.Tx, e *cvmfscatalog.Entry) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
-		compressed := 0
+		// ingestsql's compressed-column contract: 1 = UNCOMPRESSED, 2 = zlib,
+		// 0 = default (zlib if internal, none if external). Never rely on 0 —
+		// be explicit. NB the Go enum values are the CVMFS wire values
+		// (CompZlib=0, CompNone=1) and MUST NOT be written raw: an earlier
+		// version wrote `1` for zlib, which ingestsql read as "uncompressed",
+		// publishing catalogs whose files claimed compression=none over
+		// zlib-stored objects (every client read failed with EIO).
+		compressed := 1 // uncompressed
 		if e.CompAlgo == cvmfscatalog.CompZlib {
-			compressed = 1
+			compressed = 2 // zlib
 		}
+		// internal=1: the objects live in the repository's own CAS (data/),
+		// named by the hash of the stored bytes — CVMFS-internal semantics.
+		// internal=0 marks EXTERNAL files, which clients fetch from
+		// CVMFS_EXTERNAL_URL (unconfigured here → EIO), and for which
+		// ingestsql forbids compression.
 		_, err = tx.Exec(
-			"INSERT INTO files(name,mode,mtime,owner,grp,size,hashes,internal,compressed) VALUES(?,?,?,?,?,?,?,0,?)",
+			"INSERT INTO files(name,mode,mtime,owner,grp,size,hashes,internal,compressed) VALUES(?,?,?,?,?,?,?,1,?)",
 			name, posixMode(e.Mode), e.Mtime, e.UID, e.GID, e.Size, hashes, compressed)
 		return err
 	}
