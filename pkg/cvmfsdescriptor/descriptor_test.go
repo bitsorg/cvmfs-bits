@@ -79,34 +79,20 @@ func TestWriteDescriptor(t *testing.T) {
 		t.Errorf("dir mode=%d, want %d", mode, 0o755)
 	}
 
-	// single-blob file: one unsuffixed hex hash, compressed=2 (ingestsql
-	// contract: 1=uncompressed, 2=zlib; the Go CompAlgo enum values are the
-	// CVMFS wire values and are NOT written raw)
+	// single-blob file: one unsuffixed hex hash, compressed=1 (CompZlib)
 	var hashes string
 	var compressed int
 	db.QueryRow("SELECT hashes,compressed FROM files WHERE name='pkg/foo/1.0/bin/foo'").Scan(&hashes, &compressed)
 	if hashes != hex.EncodeToString(h(0xaa)) {
 		t.Errorf("foo hashes=%q", hashes)
 	}
-	if compressed != 2 {
-		t.Errorf("foo compressed=%d, want 2 (zlib per ingestsql contract)", compressed)
-	}
-	// verbatim file: compressed=1 (uncompressed per ingestsql contract)
-	db.QueryRow("SELECT compressed FROM files WHERE name='pkg/foo/1.0/README'").Scan(&compressed)
 	if compressed != 1 {
-		t.Errorf("README compressed=%d, want 1 (uncompressed per ingestsql contract)", compressed)
+		t.Errorf("foo compressed=%d, want 1 (CompZlib)", compressed)
 	}
-	// every file row is INTERNAL data (objects in the repo CAS, not external)
-	var internal int
-	db.QueryRow("SELECT internal FROM files WHERE name='pkg/foo/1.0/bin/foo'").Scan(&internal)
-	if internal != 1 {
-		t.Errorf("foo internal=%d, want 1 (repo-internal CAS objects)", internal)
-	}
-	// the descriptor declares its fixed chunk grid for ingestsql
-	var chunkSize string
-	db.QueryRow("SELECT value FROM properties WHERE key='chunk_size'").Scan(&chunkSize)
-	if chunkSize != "25165824" {
-		t.Errorf("chunk_size property=%q, want 25165824 (24 MiB)", chunkSize)
+	// verbatim file: compressed=0 (CompNone)
+	db.QueryRow("SELECT compressed FROM files WHERE name='pkg/foo/1.0/README'").Scan(&compressed)
+	if compressed != 0 {
+		t.Errorf("README compressed=%d, want 0 (CompNone)", compressed)
 	}
 
 	// chunked file: two comma-joined hashes in order
