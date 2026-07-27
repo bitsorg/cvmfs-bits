@@ -498,3 +498,126 @@ func TestSplitCatalogRootLinkCount(t *testing.T) {
 		t.Errorf("child catalog root linkcount = %d, want 3 (2 + 1 subdir)", got)
 	}
 }
+
+// TestSplitRootMatchesTransitionPoint pins swissknife_check.cc:831, which
+// calls CompareEntries(transition_point, root_entry, compare_names=true,
+// is_transition_point=true): a nested catalog's root entry must be identical
+// to the mountpoint entry in the parent apart from the nested-catalog flags.
+//
+// Create() inserts a placeholder root row (name "", size 4096, mode 0755,
+// synthetic mtime, a hash algo but no hash), which produced:
+//
+//	transition point and root entry differ (/test/smoke.0/nested)
+//	names differ: nested /        sizes differ: 0 / 4096
+//	modes differ: 16893 / 16877   content hashes differ: <h> / <h>-rmd160
+func TestSplitRootMatchesTransitionPoint(t *testing.T) {
+	tmpdir := t.TempDir()
+	const mtime = 1577836800 // fixed, distinct from time.Now()
+
+	entries := []Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Mtime: mtime, LinkCount: 1},
+		// Deliberately unusual mode/uid so a placeholder cannot match by luck.
+		{FullPath: "nested", Name: "nested", Mode: fs.ModeDir | 0o775, Size: 0,
+			Mtime: mtime, UID: 1234, GID: 5678, LinkCount: 1},
+		{FullPath: "nested/" + NestedMarkerName, Name: NestedMarkerName, Mode: 0o644,
+			Size: 0, Mtime: mtime, LinkCount: 1},
+		{FullPath: "nested/sub", Name: "sub", Mode: fs.ModeDir | 0o755, Mtime: mtime, LinkCount: 1},
+	}
+
+	result, err := BuildSubtree(context.Background(), SubtreeConfig{
+		LeasePath: "pkg/v1",
+		TempDir:   tmpdir,
+	}, entries)
+	if err != nil {
+		t.Fatalf("BuildSubtree: %v", err)
+	}
+
+	open := func(hash, name string) *Catalog {
+		t.Helper()
+		raw := filepath.Join(tmpdir, name)
+		if derr := decompressCatalogCAS(
+			filepath.Join(tmpdir, cvmfshash.ObjectPath(hash)+"C"), raw); derr != nil {
+			t.Fatalf("decompress %s: %v", name, derr)
+		}
+		c, oerr := Open(raw)
+		if oerr != nil {
+			t.Fatalf("open %s: %v", name, oerr)
+		}
+		return c
+	}
+
+	parent := open(result.CatalogHash, "parent.db") // subtree root = the parent here
+	defer parent.Close()
+	child := open(result.AllCatalogHashes[0], "child.db")
+	defer child.Close()
+
+	type dirent struct {
+		name             string
+		size, mode       int64
+		mtime, hardlinks int64
+	}
+	read := func(c *Catalog, path string) dirent {
+		t.Helper()
+		p1, p2 := MD5Path(path)
+		var d dirent
+		if qerr := c.db.QueryRow(
+			"SELECT name, size, mode, mtime, hardlinks FROM catalog WHERE md5path_1=? AND md5path_2=?",
+			p1, p2).Scan(&d.name, &d.size, &d.mode, &d.mtime, &d.hardlinks); qerr != nil {
+			t.Fatalf("reading %s: %v", path, qerr)
+		}
+		return d
+	}
+
+	transition := read(parent, "/pkg/v1/nested") // mountpoint entry in the parent
+	root := read(child, "/pkg/v1/nested")        // root entry inside the child
+
+	if transition != root {
+		t.Errorf("transition point and root entry differ:\n  parent: %+v\n  child:  %+v",
+			transition, root)
+	}
+}
+
+// A dirs-only subtree (the mkdir-p path) is merged into the existing catalog,
+// so its lease path is NOT a nested catalog root and must not get a marker:
+// check would report "found abandoned nested catalog marker at /test/...".
+func TestDirsOnlySubtreeHasNoMarker(t *testing.T) {
+	tmpdir := t.TempDir()
+	now := time.Now().Unix()
+
+	entries := []Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+	}
+
+	result, err := BuildSubtree(context.Background(), SubtreeConfig{
+		LeasePath: "test/stress.1",
+		TempDir:   tmpdir,
+		DirsOnly:  true,
+	}, entries)
+	if err != nil {
+		t.Fatalf("BuildSubtree: %v", err)
+	}
+	if result.NeedsMarkerObject {
+		t.Error("NeedsMarkerObject = true for a dirs-only subtree")
+	}
+
+	raw := filepath.Join(tmpdir, "dirsonly.db")
+	if derr := decompressCatalogCAS(
+		filepath.Join(tmpdir, cvmfshash.ObjectPath(result.CatalogHash)+"C"), raw); derr != nil {
+		t.Fatalf("decompress: %v", derr)
+	}
+	cat, err := Open(raw)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cat.Close()
+
+	p1, p2 := MD5Path("/test/stress.1/" + NestedMarkerName)
+	var n int
+	if qerr := cat.db.QueryRow(
+		"SELECT COUNT(*) FROM catalog WHERE md5path_1=? AND md5path_2=?", p1, p2).Scan(&n); qerr != nil {
+		t.Fatalf("query: %v", qerr)
+	}
+	if n != 0 {
+		t.Errorf("dirs-only subtree contains a .cvmfscatalog marker (abandoned marker)")
+	}
+}

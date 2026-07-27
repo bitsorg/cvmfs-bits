@@ -492,6 +492,10 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 	mkdirResult, err := cvmfscatalog.BuildSubtree(ctx, cvmfscatalog.SubtreeConfig{
 		LeasePath: graftPath,
 		TempDir:   tmpDir,
+		// Parent directories only: this subtree is merged into the existing
+		// catalog, so graftPath does not become a nested catalog root and must
+		// not receive a .cvmfscatalog marker.
+		DirsOnly: true,
 	}, dirEntries)
 	if err != nil {
 		return fmt.Errorf("mkdir-p: build subtree for %q: %w", graftPath, err)

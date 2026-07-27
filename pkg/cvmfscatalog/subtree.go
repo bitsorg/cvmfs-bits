@@ -67,6 +67,16 @@ type SubtreeConfig struct {
 	// panics if new_catalog->root_prefix() != nested_root_ps, so the correct
 	// path-valued root_prefix must be present.
 	DirectGraft bool
+	// DirsOnly marks a subtree that only creates intermediate DIRECTORIES
+	// (the mkdir-p path): its entries are merged into the existing catalog by
+	// DiffRec, so LeasePath does NOT become a nested catalog root.
+	//
+	// BuildSubtree therefore must not add a .cvmfscatalog marker for it —
+	// check reports a marker in a directory that is not a nested root as
+	// "found abandoned nested catalog marker at /test/.cvmfscatalog"
+	// (swissknife_check.cc:394). Content publishes leave this false: their
+	// lease path IS grafted as a nested catalog and needs the marker.
+	DirsOnly bool
 }
 
 // SubtreeResult holds the catalog hashes produced by BuildSubtree.
@@ -275,7 +285,7 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	// requires a strict prefix), and the dirtab paths are already split points.
 	markerMtime := time.Now().Unix()
 	needsMarkerObject := false
-	if prefix != "" && !hasMarkerIn(entries, prefix) {
+	if prefix != "" && !cfg.DirsOnly && !hasMarkerIn(entries, prefix) {
 		entries = append(entries, nestedMarkerEntry(prefix, markerMtime))
 		needsMarkerObject = true
 	}
@@ -316,9 +326,10 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		}
 		newCats[sp] = &newCatNode{cat: newCat, path: sp}
 
-		// Create() had to guess LinkCount 1 for this catalog's own root entry;
-		// give it the value computed from the entry list, which is what check
-		// compares against when it walks the child catalog.
+		// Create()'s placeholder root row is replaced below by the real
+		// directory entry (see splitRootEntries). When the entry list has no
+		// entry for this split point, fall back to fixing the one field the
+		// placeholder cannot guess.
 		if lc, ok := dirLinkCounts[sp]; ok {
 			if lcErr := newCat.SetRootLinkCount(lc); lcErr != nil {
 				closeAllSplits()
@@ -347,6 +358,13 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	leafCat := chain[len(chain)-1].cat // = leaseCat (single chain element)
 	batchMap := make(map[*Catalog][]Entry, len(newCats)+1)
 	var leaseCatRootEntry *Entry // tar's "." entry for the lease root catalog, if present
+	// Real directory entries for split points, to replace the placeholder root
+	// row Create() put in each child catalog (see the routing loop below).
+	type splitRootEntry struct {
+		cat   *Catalog
+		entry Entry
+	}
+	var splitRootEntries []splitRootEntry
 	for _, entry := range entries {
 		owner := findOwner(splitPaths, entry.FullPath)
 		var targetCat *Catalog
@@ -384,6 +402,21 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			continue
 		}
 
+		// A split point's own directory entry is routed to its PARENT catalog
+		// (findOwner returns a strict prefix), where it is the mountpoint /
+		// "transition point". The CHILD catalog needs the very same entry as
+		// its root: check calls CompareEntries(transition_point, root_entry,
+		// compare_names=true) and requires them to be identical apart from the
+		// nested-catalog flags (swissknife_check.cc:831). Create()'s
+		// placeholder differs in name, size, mode, mtime and hash, which
+		// surfaced as "transition point and root entry differ
+		// (/test/smoke.0/nested)" once the catalogs became walkable.
+		if child, isSplitRoot := newCats[entry.FullPath]; isSplitRoot {
+			e := entry
+			e.IsNestedRoot = true
+			splitRootEntries = append(splitRootEntries, splitRootEntry{cat: child.cat, entry: e})
+		}
+
 		batchMap[targetCat] = append(batchMap[targetCat], entry)
 	}
 	// Flush remaining batches (all entries except the lease-root "." entry).
@@ -397,6 +430,13 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	if leaseCatRootEntry != nil {
 		if upsertErr := leafCat.Upsert(*leaseCatRootEntry); upsertErr != nil {
 			return nil, fmt.Errorf("upserting lease root entry %q: %w", leaseCatRootEntry.FullPath, upsertErr)
+		}
+	}
+	// Same for every split point: give the child catalog the real directory
+	// entry as its root, so it matches the transition point in the parent.
+	for _, sr := range splitRootEntries {
+		if upsertErr := sr.cat.Upsert(sr.entry); upsertErr != nil {
+			return nil, fmt.Errorf("upserting split root entry %q: %w", sr.entry.FullPath, upsertErr)
 		}
 	}
 
