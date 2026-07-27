@@ -628,19 +628,44 @@ prepubctl abort --job $JOB
 
 In-flight jobs survive a service restart: each state transition is an atomic
 filesystem rename preceded by a WAL journal fsync, so the service picks up where
-it left off. For a zero-downtime upgrade:
+it left off.
+
+### `install.sh update` (recommended)
 
 ```sh
-# 1. Drain — stop accepting new jobs and wait for in-flight ones to complete
-prepubctl drain --wait
+make build                      # produce the new binaries in ./bin/
+sudo ./install.sh update --dry-run   # preview: shows exactly what would change
+sudo ./install.sh update
+```
 
-# 2. Replace the binary
+`update` refuses to run unless the host is already installed, and it never
+writes configuration. Specifically:
+
+| Preserved | Replaced |
+|---|---|
+| `config.yaml`, `env` (secrets), `receiver.yaml`, TLS material | `cvmfs-prepub`, `prepubctl` |
+| spool, CAS, the service account | systemd units **only if their content changed** — the previous file is copied to `<unit>.bak-<timestamp>` first |
+| each unit's enabled/disabled and active/inactive state | |
+
+Services are stopped for the binary swap and restarted **only if they were
+running beforehand**, so an upgrade neither starts a service you deliberately
+stopped nor leaves a publisher down. If this release ships config keys your
+`config.yaml` does not set, `update` lists them (they are optional — flag
+defaults apply) rather than editing the file.
+
+For a drain-first upgrade on a busy publisher:
+
+```sh
+prepubctl drain --wait          # let in-flight jobs finish
+sudo ./install.sh update
+curl -sf http://localhost:8080/api/v1/health | jq .
+```
+
+### Manual equivalent
+
+```sh
 sudo install -m 755 bin/cvmfs-prepub /usr/local/bin/
-
-# 3. Restart
 sudo systemctl restart cvmfs-prepub
-
-# 4. Verify
 curl -sf http://localhost:8080/api/v1/health | jq .
 ```
 
@@ -674,6 +699,9 @@ sudo ./install.sh --purge-legacy
 
 # 5. Install receiver agent on a Stratum-1 node
 sudo ./install.sh --mode receiver
+
+# 6. Upgrade an existing host later — keeps all configuration (see §9)
+sudo ./install.sh update
 ```
 
 After installation, edit the generated config templates before starting the
