@@ -2200,10 +2200,15 @@ gateway:
   heartbeat_interval: 40s     # = lease_ttl / 3
 
 cas:
-  type: s3                    # or: localfs, multi
-  bucket: cvmfs-cas-primary
-  region: us-east-1
-  endpoint: ""                # override for MinIO/GCS
+  type: s3                    # or: localfs   (these two are the only backends)
+  # s3 only: the repository's server.conf, whose CVMFS_UPSTREAM_STORAGE
+  # (S3,<tmpdir>,<alias>@<s3.conf>) supplies alias, bucket, endpoint, region,
+  # credentials and ACL. Defaults to
+  # /etc/cvmfs/repositories.d/<repo_name>/server.conf.
+  # Bucket/endpoint/credentials are NOT set here on purpose: they must not be
+  # able to drift from the storage the repository is actually served from.
+  server_conf: /etc/cvmfs/repositories.d/atlas.cern.ch/server.conf
+  root: /srv/cvmfs/cas        # localfs only
 
 pipeline:
   workers: 0                  # 0 = runtime.NumCPU()

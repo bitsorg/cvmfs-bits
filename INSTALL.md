@@ -191,18 +191,34 @@ repositories:
 environment variable in the systemd unit `EnvironmentFile` (see §7), or inject it
 from a secrets manager.
 
-For S3-compatible CAS replace the `cas:` block with:
+For an S3-backed repository, replace the `cas:` block with:
 
 ```yaml
 cas:
   type: s3
-  bucket: cvmfs-cas-primary
-  region: us-east-1
-  endpoint: ""     # leave empty for AWS; set to e.g. http://minio:9000 for MinIO
+  # The repository's own server.conf. Its CVMFS_UPSTREAM_STORAGE
+  #   S3,<tmpdir>,<repo_alias>@<s3.conf>
+  # supplies the alias, and <s3.conf> supplies CVMFS_S3_HOST / _PORT / _BUCKET /
+  # _ACCESS_KEY / _SECRET_KEY / _REGION / _USE_HTTPS / _DNS_BUCKETS /
+  # _X_AMZ_ACL. Defaults to /etc/cvmfs/repositories.d/<repo_name>/server.conf.
+  server_conf: /etc/cvmfs/repositories.d/atlas.cern.ch/server.conf
 ```
 
-S3 credentials are read from the standard AWS SDK chain (environment variables,
-`~/.aws/credentials`, EC2 instance role, etc.).
+**S3 settings are deliberately NOT configured separately here.** The
+pre-publisher writes objects into the same bucket the repository is served
+from, under the same `<alias>/data/<xx>/<rest>` keys the C++ uploader uses
+(`upload_s3.cc:478`). Re-declaring bucket, endpoint or credentials in this file
+would let them drift from the repository's real storage, and the failure mode is
+brutal: the publish succeeds, the catalogs are internally consistent, and every
+client read fails with `Input/output error` because the objects are not where
+the catalogs say they are. Reading the repository's own configuration makes that
+class of mistake impossible.
+
+Credentials therefore come from the repository's S3 config file, **not** from
+the AWS SDK chain — the service account must be able to read that file. Objects
+are uploaded with the canned ACL from `CVMFS_S3_X_AMZ_ACL`, defaulting to
+`public-read` exactly as CVMFS does; without a readable ACL the objects are
+served as 403 and clients report EIO.
 
 ---
 

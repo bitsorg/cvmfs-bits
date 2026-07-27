@@ -92,8 +92,9 @@ func main() {
 	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
 	ingestEnv := flag.String("ingest-env", "", "Comma-separated extra env for the ingestsql finalize, e.g. 'LD_LIBRARY_PATH=/opt/cvmfs/lib' [publisher]")
 	stratum0URL := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
-	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
+	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or s3 (gateway mode only). s3 reads bucket/endpoint/credentials from the repository's own server.conf — see --cas-server-conf [publisher]")
 	casRoot := flag.String("cas-root", "/var/lib/cvmfs-prepub/cas", "CAS root directory [publisher|receiver]")
+	casServerConf := flag.String("cas-server-conf", "", "For --cas-type s3: path to the repository's server.conf; its CVMFS_UPSTREAM_STORAGE supplies the S3 alias, bucket, endpoint and credentials. Default: /etc/cvmfs/repositories.d/<repo-name>/server.conf [publisher]")
 
 	// Per-job wall-clock timeout (publisher) — prevents any phase from hanging
 	// indefinitely.  0 (default) disables the timeout for backward compatibility.
@@ -223,6 +224,7 @@ func main() {
 		applyFileConfig(fc, explicit,
 			mode, logLevel, devMode,
 			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
+			casServerConf,
 			stratum0URL, repoName,
 			jobTimeout, minConcurrentJobs, maxConcurrentJobs,
 			warmQuorum,
@@ -254,7 +256,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
@@ -284,7 +286,7 @@ func runPublisher(
 	devMode bool,
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
-	cvmfsMount, stratum0URL, repoName, casType, casRoot string,
+	cvmfsMount, stratum0URL, repoName, casType, casRoot, casServerConf string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv string,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
@@ -380,6 +382,34 @@ func runPublisher(
 				os.Exit(1)
 			}
 			casBackend = lfs
+		case "s3":
+			// Settings come from the repository's OWN configuration, never from
+			// a private copy: the prepub writes into the bucket the repository
+			// is served from, so a divergent bucket/alias/credential would
+			// publish catalogs referencing objects no client can fetch.
+			serverConf := casServerConf
+			if serverConf == "" {
+				if repoName == "" {
+					obs.Logger.Error("cas-type s3 requires --cas-server-conf or --repo-name",
+						"hint", "point --cas-server-conf at /etc/cvmfs/repositories.d/<repo>/server.conf")
+					os.Exit(1)
+				}
+				serverConf = "/etc/cvmfs/repositories.d/" + repoName + "/server.conf"
+			}
+			st, err := cas.LoadS3SettingsFromServerConf(serverConf)
+			if err != nil {
+				obs.Logger.Error("failed to load S3 settings", "server_conf", serverConf, "error", err)
+				os.Exit(1)
+			}
+			s3b, err := cas.NewS3(context.Background(), st)
+			if err != nil {
+				obs.Logger.Error("failed to create s3 CAS", "error", err)
+				os.Exit(1)
+			}
+			obs.Logger.Info("CAS backend: s3",
+				"endpoint", s3b.Endpoint(), "bucket", s3b.Bucket(),
+				"alias", s3b.Alias(), "server_conf", serverConf)
+			casBackend = s3b
 		default:
 			obs.Logger.Error("unknown CAS type", "type", casType)
 			os.Exit(1)

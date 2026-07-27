@@ -106,6 +106,13 @@ type fileConfig struct {
 	CAS struct {
 		Type string `yaml:"type"`
 		Root string `yaml:"root"`
+		// ServerConf is the repository's own CVMFS server.conf
+		// (/etc/cvmfs/repositories.d/<repo>/server.conf). For type "s3" the
+		// backend follows its CVMFS_UPSTREAM_STORAGE to the S3 config file and
+		// takes bucket, endpoint, credentials and repository alias from there,
+		// so prepub cannot drift from the storage the repository is served
+		// from. Defaults to the path implied by repo_name.
+		ServerConf string `yaml:"server_conf"`
 	} `yaml:"cas"`
 
 	Distribution struct {
@@ -199,7 +206,8 @@ func loadFileConfig(path string) (*fileConfig, error) {
 func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	mode, logLevel *string,
 	devMode *bool,
-	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot *string,
+	spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
+	casServerConf *string,
 	stratum0URL, repoName *string,
 	jobTimeout *time.Duration,
 	minConcurrentJobs, maxConcurrentJobs *int,
@@ -253,6 +261,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("repo-name", repoName, fc.RepoName)
 	str("cas-type", casType, fc.CAS.Type)
 	str("cas-root", casRoot, fc.CAS.Root)
+	str("cas-server-conf", casServerConf, fc.CAS.ServerConf)
 	dur("job-timeout", jobTimeout, fc.JobTimeout)
 	if !has("min-concurrent-jobs") && fc.MinConcurrentJobs != 0 {
 		*minConcurrentJobs = fc.MinConcurrentJobs

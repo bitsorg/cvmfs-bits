@@ -140,7 +140,7 @@ type applyTestVars struct {
 	mode, logLevel                                          string
 	devMode                                                 bool
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string
-	cvmfsMount, casType, casRoot                            string
+	cvmfsMount, casType, casRoot, casServerConf              string
 	stratum0URL, repoName                                   string
 	jobTimeout                                              time.Duration
 	minConcurrentJobs, maxConcurrentJobs                    int
@@ -173,6 +173,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 	applyFileConfig(fc, explicit,
 		&v.mode, &v.logLevel, &v.devMode,
 		&v.spoolRoot, &v.stagingRoot, &v.listen, &v.publishMode, &v.gatewayURL, &v.cvmfsMount, &v.casType, &v.casRoot,
+		&v.casServerConf,
 		&v.stratum0URL, &v.repoName,
 		&v.jobTimeout, &v.minConcurrentJobs, &v.maxConcurrentJobs,
 		&v.warmQuorum,
