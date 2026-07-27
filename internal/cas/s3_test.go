@@ -508,3 +508,39 @@ func TestSettingsRedactSecret(t *testing.T) {
 		}
 	}
 }
+
+// The permission gate must ALLOW 0640 (root:service-account, group-readable) —
+// that is the documented way to give the service account access to a
+// root-owned config, and the error message itself recommends it. It must still
+// reject world access and group-write.
+func TestS3ConfPermissionGate(t *testing.T) {
+	mk := func(t *testing.T, mode os.FileMode) error {
+		t.Helper()
+		dir := t.TempDir()
+		s3conf := filepath.Join(dir, "s3.conf")
+		if err := os.WriteFile(s3conf, []byte(
+			"CVMFS_S3_HOST=h\nCVMFS_S3_BUCKET=b\nCVMFS_S3_ACCESS_KEY=a\nCVMFS_S3_SECRET_KEY=s\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(s3conf, mode); err != nil {
+			t.Fatal(err)
+		}
+		serverConf := filepath.Join(dir, "server.conf")
+		if err := os.WriteFile(serverConf, []byte("CVMFS_UPSTREAM_STORAGE=S3,/tmp,r@"+s3conf+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadS3SettingsFromServerConf(serverConf)
+		return err
+	}
+
+	for _, mode := range []os.FileMode{0o600, 0o640} {
+		if err := mk(t, mode); err != nil {
+			t.Errorf("mode %#o must be accepted, got: %v", mode, err)
+		}
+	}
+	for _, mode := range []os.FileMode{0o644, 0o660, 0o666, 0o604} {
+		if err := mk(t, mode); err == nil {
+			t.Errorf("mode %#o must be rejected (world access or group-write)", mode)
+		}
+	}
+}

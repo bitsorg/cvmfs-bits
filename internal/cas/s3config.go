@@ -169,13 +169,23 @@ func LoadS3SettingsFromServerConf(serverConfPath string) (S3Settings, error) {
 		return out, fmt.Errorf("reading S3 config %s: %w", s3ConfPath, err)
 	}
 	// The S3 config holds CVMFS_S3_SECRET_KEY. Refuse to read it if it is
-	// group- or world-readable: a leaked publish credential is a repository
+	// exposed beyond owner+group: a leaked publish credential is a repository
 	// takeover, and this is the one moment we can cheaply notice.
-	if fi, serr := os.Stat(s3ConfPath); serr == nil && fi.Mode().Perm()&0o077 != 0 {
-		return out, fmt.Errorf(
-			"S3 config %s is mode %#o: it holds CVMFS_S3_SECRET_KEY and must not be "+
-				"group/world readable (chmod 0640 and set the group to the service account)",
-			s3ConfPath, fi.Mode().Perm())
+	//
+	// GROUP READ IS ALLOWED (0640) — it is how the service account is granted
+	// access to a root-owned file, and is exactly what the error below tells
+	// the operator to do. Rejecting it (perm&0o077) made the documented fix
+	// impossible. What must not happen is any world access, or group WRITE,
+	// which would let the group rewrite the endpoint and redirect publishes.
+	if fi, serr := os.Stat(s3ConfPath); serr == nil {
+		perm := fi.Mode().Perm()
+		if perm&0o007 != 0 || perm&0o020 != 0 {
+			return out, fmt.Errorf(
+				"S3 config %s is mode %#o: it holds CVMFS_S3_SECRET_KEY and must not be "+
+					"world-accessible or group-writable — run: "+
+					"chown root:%s %s && chmod 0640 %s",
+				s3ConfPath, perm, "<service-account>", s3ConfPath, s3ConfPath)
+		}
 	}
 	// Expand @fqrn@/@org@ and reject anything else we do not evaluate.
 	for k, v := range s3kv {

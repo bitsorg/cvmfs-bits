@@ -390,8 +390,14 @@ func runPublisher(
 			serverConf := casServerConf
 			if serverConf == "" {
 				if repoName == "" {
-					obs.Logger.Error("cas-type s3 requires --cas-server-conf or --repo-name",
-						"hint", "point --cas-server-conf at /etc/cvmfs/repositories.d/<repo>/server.conf")
+					// Name the CONFIG-FILE keys, not just the flags: this
+					// service is configured from config.yaml in every real
+					// deployment, and an error naming only flags sends the
+					// operator looking in the wrong file.
+					obs.Logger.Error("cas type s3 needs to know which repository's storage to use",
+						"fix", "in /etc/cvmfs-prepub/config.yaml set cas.server_conf: "+
+							"/etc/cvmfs/repositories.d/<repo>/server.conf  (or set repo_name: <repo> "+
+							"to derive it); equivalently --cas-server-conf / --repo-name")
 					os.Exit(1)
 				}
 				serverConf = "/etc/cvmfs/repositories.d/" + repoName + "/server.conf"
