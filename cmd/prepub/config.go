@@ -149,7 +149,9 @@ type fileConfig struct {
 	AllowedPublishPrefixes []string `yaml:"allowed_publish_prefixes"`
 
 	// Chunking overrides the CVMFS content-defined (xor32) chunk sizes in
-	// bytes. Zero/omitted fields keep the CLI defaults (4/8/16 MiB).
+	// bytes. Zero/omitted fields keep the CLI defaults, which are pinned to a
+	// FIXED cvmfsdescriptor.ChunkGrid (6 MiB, min==avg==max) for coarse-publish
+	// /ingestsql compatibility — override only in per-package-only deployments.
 	// Equivalent to --chunk-min/--chunk-avg/--chunk-max.
 	Chunking struct {
 		Min int64 `yaml:"min"`

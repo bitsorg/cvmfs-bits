@@ -47,6 +47,7 @@ import (
 	"cvmfs.io/prepub/internal/pipeline"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
+	"cvmfs.io/prepub/pkg/cvmfsdescriptor"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
@@ -132,16 +133,26 @@ func main() {
 	// Pipeline performance tuning.
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
-	// Default to FIXED 24 MiB chunking (min==avg==max): the xor32 chunker then
-	// cuts at fixed 24 MiB boundaries, which coarse publish (ADR-0007, the default
-	// mode) requires — ingestsql assumes 24 MiB chunks and the descriptor emitter
-	// enforces chunk-count == ceil(size/24MiB). Deployments that publish ONLY
-	// per-package (never coarse) and want finer dedup can override with
-	// content-defined sizes, e.g. --chunk-min 4194304 --chunk-avg 8388608
-	// --chunk-max 16777216 (or the config.yaml chunking: block).
-	chunkMin := flag.Int64("chunk-min", 24<<20, "CVMFS chunk size (bytes): minimum. Default fixed 24 MiB (min==avg==max) for coarse-publish/ingestsql compatibility; set content-defined sizes only for per-package-only deployments [publisher]")
-	chunkAvg := flag.Int64("chunk-avg", 24<<20, "CVMFS chunk size (bytes): average; 0 disables chunking. Default fixed 24 MiB (see --chunk-min) [publisher]")
-	chunkMax := flag.Int64("chunk-max", 24<<20, "CVMFS chunk size (bytes): maximum. Default fixed 24 MiB (see --chunk-min) [publisher]")
+	// Default to FIXED cvmfsdescriptor.ChunkGrid chunking (min==avg==max): the
+	// xor32 chunker then cuts at fixed grid boundaries, which coarse publish
+	// (ADR-0007, the default mode) requires — ingestsql derives chunk offsets as
+	// i*kChunkSize and the descriptor emitter enforces chunk-count ==
+	// ceil(size/ChunkGrid).
+	//
+	// The grid is 6 MiB, not 24 MiB: ingestsql picks kInternalChunkSize for
+	// internal=1 files (swissknife_ingestsql.cc:1344), and the descriptor always
+	// writes internal=1 so the client fetches content from this repository's CAS
+	// rather than from CVMFS_EXTERNAL_URL. Keep this in lockstep with
+	// cvmfsdescriptor.ChunkGrid — a mismatch trips ingestsql's fatal
+	// "offsets size does not match expected number of chunks" assert.
+	//
+	// Deployments that publish ONLY per-package (never coarse) and want finer
+	// dedup can override with content-defined sizes, e.g. --chunk-min 4194304
+	// --chunk-avg 8388608 --chunk-max 16777216 (or the config.yaml chunking:
+	// block).
+	chunkMin := flag.Int64("chunk-min", cvmfsdescriptor.ChunkGrid, "CVMFS chunk size (bytes): minimum. Default fixed 6 MiB (min==avg==max) for coarse-publish/ingestsql compatibility; set content-defined sizes only for per-package-only deployments [publisher]")
+	chunkAvg := flag.Int64("chunk-avg", cvmfsdescriptor.ChunkGrid, "CVMFS chunk size (bytes): average; 0 disables chunking. Default fixed 6 MiB (see --chunk-min) [publisher]")
+	chunkMax := flag.Int64("chunk-max", cvmfsdescriptor.ChunkGrid, "CVMFS chunk size (bytes): maximum. Default fixed 6 MiB (see --chunk-min) [publisher]")
 
 	// Optional: repository name.  Retained for forward compatibility and to
 	// label publishes; no longer used for dedup seeding (dedup is a direct

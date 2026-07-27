@@ -355,9 +355,24 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (R
 
 // compressEntryCDC compresses a file using CVMFS-compatible content-defined
 // (xor32) chunking. The file is split at det.Cuts boundaries; each chunk is an
-// independent CAS object keyed by SHA-1(zlib(chunk)). A file that yields a
-// single piece (size <= min, or no cut found before EOF) is stored whole,
-// matching CVMFS's sole-piece collapse to a bulk object.
+// independent CAS object keyed by SHA-1(zlib(chunk)).
+//
+// A file that yields a single piece (size <= min, or no cut found before EOF)
+// is NOT collapsed to a bulk object: it becomes a one-chunk file, so its CAS
+// key carries the 'P' (kSuffixPartial) suffix like any other chunk.
+//
+// The sole-piece collapse used to be applied here, and it made the coarse
+// publish path unreadable.  swissknife_ingestsql.cc:1433 calls
+// set_is_chunked_file(true) for EVERY file it ingests, and CVMFS reads chunk
+// hashes back with shash::kSuffixPartial (catalog_sql.cc:688).  A client
+// therefore requests <hash>P for a sole piece too, while the collapse had
+// stored it under the bare <hash> — so every file below the chunk grid (i.e.
+// nearly all of them) returned EIO, "failed to fetch chunk".
+//
+// Emitting one chunk instead keeps a single representation across both publish
+// paths: the upload key, the descriptor's hashes column and the catalog's
+// chunks table all agree.  result.Hash stays the CVMFS bulk hash (SHA-1 of the
+// full uncompressed content) for the catalog's own hash column.
 func compressEntryCDC(entry unpack.FileEntry, det *chunker.Xor32, level int) (Result, error) {
 	result := Result{FileEntry: entry}
 
@@ -368,11 +383,11 @@ func compressEntryCDC(entry unpack.FileEntry, det *chunker.Xor32, level int) (Re
 
 	data := entry.Data
 	cuts := det.Cuts(data)
-	if len(cuts) == 0 {
-		// Single piece -> store whole (CVMFS sole-piece collapse).
-		return compressEntry(entry, 0, level)
-	}
 
+	// bounds always spans the whole file, so len(cuts)==0 yields exactly one
+	// chunk [0,len(data)).  An empty file yields one zero-length chunk, which
+	// is what ingestsql expects: it forces expected_num_chunks to 1 when
+	// size==0 (swissknife_ingestsql.cc:1360).
 	bounds := make([]int64, 0, len(cuts)+2)
 	bounds = append(bounds, 0)
 	bounds = append(bounds, cuts...)

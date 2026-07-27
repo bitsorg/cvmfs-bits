@@ -32,11 +32,11 @@ func TestWriteDescriptor(t *testing.T) {
 		{FullPath: "pkg/foo/1.0/README", Mode: 0o644, Size: 5, Mtime: 100,
 			Hash: h(0xbb), HashAlgo: cvmfscatalog.HashSha256, CompAlgo: cvmfscatalog.CompNone},
 		{FullPath: "pkg/foo/1.0/bin/foo-link", Mode: fs.ModeSymlink | 0o777, Mtime: 100, Symlink: "foo"},
-		{FullPath: "pkg/foo/1.0/big", Mode: 0o644, Size: ExternalChunkSize + 1, Mtime: 100,
+		{FullPath: "pkg/foo/1.0/big", Mode: 0o644, Size: ChunkGrid + 1, Mtime: 100,
 			CompAlgo: cvmfscatalog.CompZlib,
 			Chunks: []cvmfscatalog.ChunkRecord{
-				{Offset: 0, Size: ExternalChunkSize, Hash: h(0x01)},
-				{Offset: ExternalChunkSize, Size: 1, Hash: h(0x02)},
+				{Offset: 0, Size: ChunkGrid, Hash: h(0x01)},
+				{Offset: ChunkGrid, Size: 1, Hash: h(0x02)},
 			}},
 	}
 
@@ -79,20 +79,41 @@ func TestWriteDescriptor(t *testing.T) {
 		t.Errorf("dir mode=%d, want %d", mode, 0o755)
 	}
 
-	// single-blob file: one unsuffixed hex hash, compressed=1 (CompZlib)
+	// single-blob file: one unsuffixed hex hash, compressed=2 (ingestsql's
+	// kZlibDefault code, NOT cvmfscatalog.CompZlib which is 0).
 	var hashes string
 	var compressed int
 	db.QueryRow("SELECT hashes,compressed FROM files WHERE name='pkg/foo/1.0/bin/foo'").Scan(&hashes, &compressed)
 	if hashes != hex.EncodeToString(h(0xaa)) {
 		t.Errorf("foo hashes=%q", hashes)
 	}
-	if compressed != 1 {
-		t.Errorf("foo compressed=%d, want 1 (CompZlib)", compressed)
+	if compressed != 2 {
+		t.Errorf("foo compressed=%d, want 2 (ingestsql kZlibDefault)", compressed)
 	}
-	// verbatim file: compressed=0 (CompNone)
+	// verbatim file: compressed=1 (ingestsql kNoCompression)
 	db.QueryRow("SELECT compressed FROM files WHERE name='pkg/foo/1.0/README'").Scan(&compressed)
-	if compressed != 0 {
-		t.Errorf("README compressed=%d, want 0 (CompNone)", compressed)
+	if compressed != 1 {
+		t.Errorf("README compressed=%d, want 1 (ingestsql kNoCompression)", compressed)
+	}
+
+	// Every file must be internal=1.  internal=0 sets is_external_file_ in
+	// ingestsql, which makes the client fetch content by path from
+	// CVMFS_EXTERNAL_URL instead of this repository's CAS — every non-empty
+	// file then fails to read with EIO.  Regression guard for that bug.
+	rows, err := db.Query("SELECT name,internal FROM files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var internal int
+		if err := rows.Scan(&name, &internal); err != nil {
+			t.Fatal(err)
+		}
+		if internal != 1 {
+			t.Errorf("%s internal=%d, want 1 (external files are unreadable)", name, internal)
+		}
 	}
 
 	// chunked file: two comma-joined hashes in order
@@ -115,7 +136,7 @@ func TestWriteDescriptor(t *testing.T) {
 // path, which ingestsql cannot express.
 func TestWriteRejectsMismatchedChunking(t *testing.T) {
 	entries := []cvmfscatalog.Entry{
-		{FullPath: "pkg/x", Mode: 0o644, Size: ExternalChunkSize + 1,
+		{FullPath: "pkg/x", Mode: 0o644, Size: ChunkGrid + 1,
 			Hash: h(0xcc), HashAlgo: cvmfscatalog.HashSha256, CompAlgo: cvmfscatalog.CompZlib},
 	}
 	err := Write(filepath.Join(t.TempDir(), "bad.db"), entries)

@@ -29,11 +29,25 @@ import (
 // ingestsql derives chunk offsets as i*chunkSize and requires exactly
 // ceil(size/chunkSize) hashes for a file. The prepub's ingestsql path must
 // therefore chunk large files at this fixed size (ADR-0007 decision: align the
-// prepub rather than extend ingestsql). Files <= ExternalChunkSize are a single
+// prepub rather than extend ingestsql). Files <= the grid size are a single
 // blob (one hash) and are unaffected.
+//
+// WHICH grid applies is selected by the files.internal column, not by us:
+//
+//	swissknife_ingestsql.cc:1344
+//	  size_t const kChunkSize = internal ? kInternalChunkSize : kExternalChunkSize;
+//
+// The prepub always writes internal=1 (see insertEntry), so InternalChunkSize
+// is the grid that matters and ChunkGrid returns it. ExternalChunkSize is kept
+// only to document the other branch of that ternary.
 const (
 	ExternalChunkSize = 24 * 1024 * 1024
 	InternalChunkSize = 6 * 1024 * 1024
+
+	// ChunkGrid is the fixed chunk size the prepub must chunk at, matching the
+	// internal=1 branch above. The publisher's --chunk-{min,avg,max} defaults
+	// are pinned to this value.
+	ChunkGrid = InternalChunkSize
 )
 
 // schema is the exact descriptor DDL from ingestsql (schema_revision 4).
@@ -82,9 +96,9 @@ var schema = []string{
 //   - No file xattrs and no hardlinks (hardlinks are converted to symlinks
 //     upstream); only dir POSIX ACLs would be representable, and bits has none,
 //     so acl is always empty.
-//   - Chunked files use fixed ExternalChunkSize boundaries; Write returns an
-//     error if a file's hash count does not match ceil(size/ExternalChunkSize),
-//     which catches content-defined (variable) chunking reaching this path.
+//   - Chunked files use fixed ChunkGrid boundaries; Write returns an error if a
+//     file's hash count does not match ceil(size/ChunkGrid), which catches
+//     content-defined (variable) chunking reaching this path.
 func Write(dbPath string, entries []cvmfscatalog.Entry) (err error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -154,12 +168,29 @@ func insertEntry(tx *sql.Tx, e *cvmfscatalog.Entry) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
-		compressed := 0
-		if e.CompAlgo == cvmfscatalog.CompZlib {
-			compressed = 1
+		// The descriptor's `compressed` column is NOT the CVMFS compression
+		// enum — it is ingestsql's own encoding (swissknife_ingestsql.cc:1444):
+		//
+		//	case 1: kNoCompression    case 2: kZlibDefault
+		//	default: internal ? kZlibDefault : kNoCompression
+		//
+		// cvmfscatalog.CompZlib is 0 and CompNone is 1 (the CVMFS enum), so the
+		// two numberings collide: mapping CompZlib->1 declared every zlib object
+		// as UNCOMPRESSED, and the client then handed the raw deflate stream
+		// back as file content.
+		compressed := 2 // kZlibDefault
+		if e.CompAlgo == cvmfscatalog.CompNone {
+			compressed = 1 // kNoCompression
 		}
+		// internal=1: the object bytes live in this repository's CAS.
+		// internal=0 sets DirectoryEntry::is_external_file_ (ingestsql.cc:1432),
+		// which makes the client fetch the file by PATH from CVMFS_EXTERNAL_URL
+		// instead of from the repository — every non-empty file then fails with
+		// EIO ("failed to fetch chunk") because no external URL serves it.
+		// internal=1 also forbids compressed>=2 being rejected by the assert at
+		// ingestsql.cc:1440, and selects the InternalChunkSize grid (see above).
 		_, err = tx.Exec(
-			"INSERT INTO files(name,mode,mtime,owner,grp,size,hashes,internal,compressed) VALUES(?,?,?,?,?,?,?,0,?)",
+			"INSERT INTO files(name,mode,mtime,owner,grp,size,hashes,internal,compressed) VALUES(?,?,?,?,?,?,?,1,?)",
 			name, posixMode(e.Mode), e.Mtime, e.UID, e.GID, e.Size, hashes, compressed)
 		return err
 	}
@@ -199,17 +230,17 @@ func fileHashes(e *cvmfscatalog.Entry) (string, error) {
 	if want := expectedChunks(e.Size); len(parts) != want {
 		return "", fmt.Errorf(
 			"hash count %d != ceil(size/%dMiB)=%d — ingestsql needs fixed %dMiB chunks",
-			len(parts), ExternalChunkSize/(1024*1024), want, ExternalChunkSize/(1024*1024))
+			len(parts), ChunkGrid/(1024*1024), want, ChunkGrid/(1024*1024))
 	}
 	return strings.Join(parts, ","), nil
 }
 
-// expectedChunks mirrors ingestsql: ceil(size/ExternalChunkSize), minimum 1.
+// expectedChunks mirrors ingestsql: ceil(size/ChunkGrid), minimum 1.
 func expectedChunks(size int64) int {
 	if size <= 0 {
 		return 1
 	}
-	return int(math.Ceil(float64(size) / float64(ExternalChunkSize)))
+	return int(math.Ceil(float64(size) / float64(ChunkGrid)))
 }
 
 // posixMode converts a Go fs.FileMode to the 12-bit POSIX permission mode
