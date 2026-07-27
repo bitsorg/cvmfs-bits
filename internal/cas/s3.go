@@ -325,3 +325,28 @@ func (s *S3) List(ctx context.Context) ([]string, error) {
 	}
 	return hashes, nil
 }
+
+// Probe verifies the endpoint, credentials, addressing style and bucket access
+// with a single read-only request, satisfying cas.Prober.
+//
+// It deliberately does NOT write: the generic write/read/delete probe would
+// deposit a sentinel object in the repository's production bucket on every
+// service restart, and a failed cleanup would leave an object no catalog
+// references — indistinguishable, to an audit, from a real orphan.
+//
+// ListObjectsV2 limited to one key exercises everything a misconfiguration
+// would break: DNS/endpoint reachability, SigV4 signing (wrong key or region
+// fails here), path-vs-virtual-host addressing, and the bucket's existence and
+// readability.
+func (s *S3) Probe(ctx context.Context) error {
+	_, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(s.bucket),
+		Prefix:  aws.String(s.dataPrefix()),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return fmt.Errorf("s3 probe (bucket %q, endpoint %s, alias %q): %w",
+			s.bucket, s.endpoint, s.alias, err)
+	}
+	return nil
+}

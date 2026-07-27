@@ -544,3 +544,30 @@ func TestS3ConfPermissionGate(t *testing.T) {
 		}
 	}
 }
+
+// The startup probe must be read-only on S3: writing a sentinel into a
+// production bucket on every restart leaves objects no catalog references.
+func TestS3ProbeIsReadOnly(t *testing.T) {
+	ctx := context.Background()
+	b, fake := newTestS3(t, "repo.cern.ch")
+
+	var _ Prober = b // must satisfy the interface, or probe.go silently write-probes
+
+	if err := b.Probe(ctx); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if fake.puts != 0 || len(fake.objects) != 0 {
+		t.Errorf("Probe wrote to the bucket: puts=%d objects=%d", fake.puts, len(fake.objects))
+	}
+}
+
+// The probe hash used by the generic write-probe must be a valid CVMFS key,
+// or a validating backend rejects it at startup (a 64-char SHA-256 did).
+func TestProbeHashShapeIsValid(t *testing.T) {
+	if err := validHashKey("e3b0c44298fc1c149afbf4c8996fb92427ae41e4"); err != nil {
+		t.Errorf("the probe hash must be a valid CAS key: %v", err)
+	}
+	if err := validHashKey("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); err == nil {
+		t.Error("a 64-char SHA-256 must be rejected — it is not in the CVMFS hash enum")
+	}
+}
