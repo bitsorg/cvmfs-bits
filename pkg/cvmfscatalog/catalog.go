@@ -911,6 +911,39 @@ func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 	return nil
 }
 
+// SetRootLinkCount fixes the link count of THIS catalog's own root directory
+// entry (the one Create inserted at rootPrefix).
+//
+// A nested catalog's root entry exists twice: as the mountpoint entry in the
+// parent catalog — which BuildSubtree routes from the tar entry list, so
+// normalizeDirLinkCounts already gave it the right value — and as the root
+// entry inside the child catalog itself, which Create synthesizes with
+// LinkCount 1 because it cannot know how many subdirectories will be routed
+// into it. cvmfs_swissknife check inspects the CHILD copy when it walks that
+// catalog (this_directory is the catalog's root entry), so the synthetic 1
+// surfaced as "wrong linkcount for /test/smoke.0/nested; expected 3, got 1".
+//
+// The high 32 bits of the hardlinks column (the hardlink group) are preserved;
+// only the low 32 bits (the count) are replaced.
+func (c *Catalog) SetRootLinkCount(linkCount uint32) error {
+	rootPath := c.rootPrefix // "" for a repo-root catalog
+	p1, p2 := MD5Path(rootPath)
+
+	var current int64
+	if err := c.db.QueryRow(
+		"SELECT hardlinks FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?",
+		p1, p2).Scan(&current); err != nil {
+		return fmt.Errorf("reading root entry of %q: %w", rootPath, err)
+	}
+	updated := (current &^ 0xFFFFFFFF) | int64(linkCount)
+	if _, err := c.db.Exec(
+		"UPDATE catalog SET hardlinks = ? WHERE md5path_1 = ? AND md5path_2 = ?",
+		updated, p1, p2); err != nil {
+		return fmt.Errorf("updating root link count of %q: %w", rootPath, err)
+	}
+	return nil
+}
+
 // FindNestedMount checks whether absPath is a nested catalog mount point in
 // this catalog.  If found, it returns the catalog hash (hex, naming the
 // compressed object) and the UNCOMPRESSED database size stored in the

@@ -290,7 +290,7 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	// Runs after paths are absolute, the synthetic root entry exists and the
 	// markers are in place, so a single rule covers every producer (tar
 	// entries, synthesized roots, mkdir-p parents). See normalizeDirLinkCounts.
-	normalizeDirLinkCounts(entries)
+	dirLinkCounts := normalizeDirLinkCounts(entries)
 
 	// Create a fresh child catalog for each split point.
 	//
@@ -315,6 +315,16 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			return nil, fmt.Errorf("creating new catalog for %q: %w", sp, createErr)
 		}
 		newCats[sp] = &newCatNode{cat: newCat, path: sp}
+
+		// Create() had to guess LinkCount 1 for this catalog's own root entry;
+		// give it the value computed from the entry list, which is what check
+		// compares against when it walks the child catalog.
+		if lc, ok := dirLinkCounts[sp]; ok {
+			if lcErr := newCat.SetRootLinkCount(lc); lcErr != nil {
+				closeAllSplits()
+				return nil, fmt.Errorf("setting root link count for %q: %w", sp, lcErr)
+			}
+		}
 	}
 
 	// ── Route entries to the correct catalog ──────────────────────────────────

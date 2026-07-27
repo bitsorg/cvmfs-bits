@@ -42,7 +42,11 @@ type catalogChainNode struct {
 // rule.  Entries are counted by FullPath parentage, so a directory whose
 // children live in a nested (split) catalog still counts them: the mountpoint
 // entry remains a directory in the parent's listing, exactly as check sees it.
-func normalizeDirLinkCounts(entries []Entry) {
+// It returns the resulting link count per directory path, so callers can apply
+// the same value to a nested catalog's own root entry — that copy is
+// synthesized by Create and never appears in this list (see
+// Catalog.SetRootLinkCount).
+func normalizeDirLinkCounts(entries []Entry) map[string]uint32 {
 	subdirs := make(map[string]uint32, len(entries))
 	for i := range entries {
 		if !entries[i].Mode.IsDir() {
@@ -54,12 +58,15 @@ func normalizeDirLinkCounts(entries []Entry) {
 		}
 		subdirs[parent]++
 	}
+	linkCounts := make(map[string]uint32, len(entries))
 	for i := range entries {
 		if !entries[i].Mode.IsDir() {
 			continue
 		}
 		entries[i].LinkCount = 2 + subdirs[entries[i].FullPath]
+		linkCounts[entries[i].FullPath] = entries[i].LinkCount
 	}
+	return linkCounts
 }
 
 // normalizeLeasePathForNested converts a lease path (e.g. "atlas/24.0") to

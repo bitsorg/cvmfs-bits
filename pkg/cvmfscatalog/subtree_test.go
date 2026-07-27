@@ -439,3 +439,62 @@ func TestExistingMarkerNotDuplicated(t *testing.T) {
 		t.Error("NeedsMarkerObject = true although the tar already provided the marker")
 	}
 }
+
+// TestSplitCatalogRootLinkCount covers the copy of a nested-catalog root that
+// lives INSIDE the child catalog.
+//
+// Create() synthesizes that entry with LinkCount 1 (it cannot know how many
+// subdirectories will be routed in), and it never appears in the entry list —
+// so normalizeDirLinkCounts alone left it wrong. check walks the child catalog
+// and compares its root entry: "wrong linkcount for /test/smoke.0/nested;
+// expected 3, got 1" (the last 4 errors of a 212-error run).
+func TestSplitCatalogRootLinkCount(t *testing.T) {
+	tmpdir := t.TempDir()
+	now := time.Now().Unix()
+
+	// nested/ is a split point (marker) and holds one subdirectory → 2 + 1 = 3.
+	entries := []Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: "nested", Name: "nested", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: "nested/" + NestedMarkerName, Name: NestedMarkerName, Mode: 0o644,
+			Size: 0, Mtime: now, LinkCount: 1},
+		{FullPath: "nested/sub", Name: "sub", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: "nested/sub/file.txt", Name: "file.txt", Mode: 0o644, Size: 3,
+			Mtime: now, LinkCount: 1},
+	}
+
+	result, err := BuildSubtree(context.Background(), SubtreeConfig{
+		LeasePath: "pkg/v1",
+		TempDir:   tmpdir,
+	}, entries)
+	if err != nil {
+		t.Fatalf("BuildSubtree: %v", err)
+	}
+	if len(result.AllCatalogHashes) < 2 {
+		t.Fatalf("expected a split catalog, got %d catalog(s)", len(result.AllCatalogHashes))
+	}
+
+	// The child catalog is every hash except the last (the subtree root).
+	childHash := result.AllCatalogHashes[0]
+	raw := filepath.Join(tmpdir, "child-root-linkcount.db")
+	if derr := decompressCatalogCAS(
+		filepath.Join(tmpdir, cvmfshash.ObjectPath(childHash)+"C"), raw); derr != nil {
+		t.Fatalf("decompress child: %v", derr)
+	}
+	child, err := Open(raw)
+	if err != nil {
+		t.Fatalf("Open child: %v", err)
+	}
+	defer child.Close()
+
+	p1, p2 := MD5Path("/pkg/v1/nested")
+	var hardlinks int64
+	if qerr := child.db.QueryRow(
+		"SELECT hardlinks FROM catalog WHERE md5path_1=? AND md5path_2=?",
+		p1, p2).Scan(&hardlinks); qerr != nil {
+		t.Fatalf("child root entry missing: %v", qerr)
+	}
+	if got := hardlinks & 0xFFFFFFFF; got != 3 {
+		t.Errorf("child catalog root linkcount = %d, want 3 (2 + 1 subdir)", got)
+	}
+}
