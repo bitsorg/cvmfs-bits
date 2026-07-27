@@ -4,6 +4,7 @@
 package cvmfscatalog
 
 import (
+	"bytes"
 	"compress/zlib"
 	"context"
 	"io"
@@ -295,5 +296,146 @@ func TestBuildSubtreeRootLevel(t *testing.T) {
 
 	if cat.rootPrefix != "" {
 		t.Errorf("root_prefix = %q; want empty string for root-level catalog", cat.rootPrefix)
+	}
+}
+
+// TestDirLinkCountsMatchCheckRule pins the rule cvmfs_swissknife check
+// enforces at swissknife_check.cc:652 —
+//
+//	linkcount(dir) == 2 + number of immediate subdirectories
+//
+// Producers used to hardcode LinkCount: 1, which made check report EVERY
+// directory in the repository ("wrong linkcount for /test/smoke.0/simple;
+// expected 2, got 1" — 212 occurrences in one `make test` run).
+func TestDirLinkCountsMatchCheckRule(t *testing.T) {
+	tmpdir := t.TempDir()
+	now := time.Now().Unix()
+
+	// pkg/v1/          → 2 subdirs (bin, share)     → linkcount 4
+	// pkg/v1/bin       → 0 subdirs                  → linkcount 2
+	// pkg/v1/share     → 1 subdir  (share/doc)      → linkcount 3
+	// pkg/v1/share/doc → 0 subdirs                  → linkcount 2
+	entries := []Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: "bin", Name: "bin", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: "bin/tool", Name: "tool", Mode: 0o755, Size: 10, Mtime: now, LinkCount: 1},
+		{FullPath: "share", Name: "share", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: "share/doc", Name: "doc", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+	}
+
+	result, err := BuildSubtree(context.Background(), SubtreeConfig{
+		LeasePath: "pkg/v1",
+		TempDir:   tmpdir,
+	}, entries)
+	if err != nil {
+		t.Fatalf("BuildSubtree: %v", err)
+	}
+
+	raw := filepath.Join(tmpdir, "linkcount.db")
+	if derr := decompressCatalogCAS(
+		filepath.Join(tmpdir, cvmfshash.ObjectPath(result.CatalogHash)+"C"), raw); derr != nil {
+		t.Fatalf("decompress: %v", derr)
+	}
+	cat, err := Open(raw)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cat.Close()
+
+	for path, want := range map[string]int64{
+		"/pkg/v1":           4,
+		"/pkg/v1/bin":       2,
+		"/pkg/v1/share":     3,
+		"/pkg/v1/share/doc": 2,
+	} {
+		p1, p2 := MD5Path(path)
+		var hardlinks int64
+		if qerr := cat.db.QueryRow(
+			"SELECT hardlinks FROM catalog WHERE md5path_1=? AND md5path_2=?",
+			p1, p2).Scan(&hardlinks); qerr != nil {
+			t.Errorf("%s: query: %v", path, qerr)
+			continue
+		}
+		// Low 32 bits of the hardlinks column carry the link count.
+		if got := hardlinks & 0xFFFFFFFF; got != want {
+			t.Errorf("%s: linkcount = %d, want %d (2 + #subdirs)", path, got, want)
+		}
+	}
+}
+
+// TestNestedRootHasMarker pins swissknife_check.cc:643-649: every nested
+// catalog root must contain a .cvmfscatalog file, or check reports "nested
+// catalog without marker at <path>" (28 occurrences in one `make test` run,
+// all at lease-path roots, which tars do not carry a marker for).
+func TestNestedRootHasMarker(t *testing.T) {
+	tmpdir := t.TempDir()
+	now := time.Now().Unix()
+
+	entries := []Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: "file.txt", Name: "file.txt", Mode: 0o644, Size: 4, Mtime: now, LinkCount: 1},
+	}
+
+	result, err := BuildSubtree(context.Background(), SubtreeConfig{
+		LeasePath: "pkg/v1",
+		TempDir:   tmpdir,
+	}, entries)
+	if err != nil {
+		t.Fatalf("BuildSubtree: %v", err)
+	}
+	if !result.NeedsMarkerObject {
+		t.Error("NeedsMarkerObject = false; the caller would never store the marker object")
+	}
+
+	raw := filepath.Join(tmpdir, "marker.db")
+	if derr := decompressCatalogCAS(
+		filepath.Join(tmpdir, cvmfshash.ObjectPath(result.CatalogHash)+"C"), raw); derr != nil {
+		t.Fatalf("decompress: %v", derr)
+	}
+	cat, err := Open(raw)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cat.Close()
+
+	p1, p2 := MD5Path("/pkg/v1/" + NestedMarkerName)
+	var size int64
+	var hash []byte
+	if qerr := cat.db.QueryRow(
+		"SELECT size, hash FROM catalog WHERE md5path_1=? AND md5path_2=?",
+		p1, p2).Scan(&size, &hash); qerr != nil {
+		t.Fatalf("marker entry missing from the nested root catalog: %v", qerr)
+	}
+	if size != 0 {
+		t.Errorf("marker size = %d, want 0", size)
+	}
+	// The marker must reference a real object, not a null hash: check verifies
+	// content availability for regular files with -c.
+	_, wantRaw, _ := NestedMarkerObject()
+	if !bytes.Equal(hash, wantRaw) {
+		t.Errorf("marker hash = %x, want the empty-file object hash %x", hash, wantRaw)
+	}
+}
+
+// A marker already present in the tar must not be duplicated.
+func TestExistingMarkerNotDuplicated(t *testing.T) {
+	tmpdir := t.TempDir()
+	now := time.Now().Unix()
+
+	entries := []Entry{
+		{FullPath: ".", Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 1},
+		{FullPath: NestedMarkerName, Name: NestedMarkerName, Mode: 0o644, Size: 0,
+			Mtime: now, LinkCount: 1, Hash: []byte("existing-marker-hash-bytes--------------")[:20]},
+	}
+
+	result, err := BuildSubtree(context.Background(), SubtreeConfig{
+		LeasePath: "pkg/v1",
+		TempDir:   tmpdir,
+	}, entries)
+	if err != nil {
+		t.Fatalf("BuildSubtree: %v", err)
+	}
+	if result.NeedsMarkerObject {
+		t.Error("NeedsMarkerObject = true although the tar already provided the marker")
 	}
 }

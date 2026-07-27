@@ -7,6 +7,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1073,6 +1074,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	//   • Phase 4 (commit) can read all three regardless of which code path ran.
 	var subtreeResult *cvmfscatalog.SubtreeResult
 	var oldRootHash string
+	// Set when BuildSubtree synthesized a .cvmfscatalog marker: its empty-file
+	// object must be submitted to the gateway alongside the catalogs.
+	var markerObjectHash string
 	if o.Lease.NeedsPipeline() {
 		if err := o.transition(ctx, j, job.StateLeased); err != nil {
 			span.RecordError(err)
@@ -1113,6 +1117,22 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			if buildErr != nil {
 				span.RecordError(buildErr)
 				return o.abortJob(ctx, j, fmt.Errorf("subtree catalog build: %w", buildErr))
+			}
+
+			// A synthesized .cvmfscatalog marker references the empty-file
+			// object, which no tar necessarily contained — store it so the
+			// entry does not point at a missing object (checked by
+			// `cvmfs_swissknife check -c` and fetched by clients like any
+			// other file). Content-addressed and idempotent: at most one
+			// 8-byte object per repository, whoever writes it first wins.
+			if subtreeResult.NeedsMarkerObject && o.CAS != nil {
+				mHash, _, mObj := cvmfscatalog.NestedMarkerObject()
+				if putErr := o.CAS.Put(ctx, mHash, bytes.NewReader(mObj),
+					int64(len(mObj))); putErr != nil {
+					return o.abortJob(ctx, j,
+						fmt.Errorf("storing nested-catalog marker object %s: %w", mHash, putErr))
+				}
+				markerObjectHash = mHash
 			}
 
 			// Upload the subtree catalog file(s) to the local CAS so that
@@ -1250,6 +1270,13 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 				lc := o.Lease.(*lease.Client)
 				var preCatalogHash string
 				var preObjectHashes []string
+				// The marker's empty-file object is a content object, so it
+				// must reach the gateway BEFORE the catalog referencing it
+				// (SubmitPayload sends the catalog last for exactly this
+				// referential-integrity reason).
+				if markerObjectHash != "" {
+					preObjectHashes = append(preObjectHashes, markerObjectHash)
+				}
 				nn := len(subtreeResult.AllCatalogHashes)
 				for i, h := range subtreeResult.AllCatalogHashes {
 					if i < nn-1 {

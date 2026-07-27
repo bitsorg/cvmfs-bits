@@ -83,6 +83,13 @@ type SubtreeResult struct {
 	// Each hash is plain hex without the 'C' suffix.  The caller must append
 	// "C" when uploading these objects to the CAS or the gateway.
 	AllCatalogHashes []string
+	// NeedsMarkerObject is true when BuildSubtree synthesized at least one
+	// .cvmfscatalog marker entry (a nested catalog root that had none).  The
+	// caller MUST then make the empty-file object from NestedMarkerObject()
+	// available in the object store, exactly like any other content object,
+	// or clients (and `cvmfs_swissknife check -c`) will find the marker entry
+	// pointing at a missing object.
+	NeedsMarkerObject bool
 }
 
 // BuildSubtree builds the new subtree catalog for LeasePath and all split
@@ -254,6 +261,37 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	// nested-catalog split point, rooted in its own fresh SQLite database.
 	splitPaths := planSplits(entries, targetAbsPath, dt)
 
+	// ── Ensure every nested-catalog root carries its marker file ─────────────
+	// check requires a .cvmfscatalog inside each nested catalog root
+	// (swissknife_check.cc:643-649). Two roots can lack one:
+	//   * the subtree root itself — it becomes a nested catalog when the
+	//     gateway grafts it at the lease path, and tars rarely contain the
+	//     marker at their top level ("nested catalog without marker at
+	//     /test/smoke.0", 28 occurrences in one `make test` run);
+	//   * a dirtab-driven split, where nothing in the tar marks the directory.
+	// Split points triggered BY a marker already have one, so check first.
+	// Adding the marker here (after planSplits) cannot create new splits: a
+	// marker at the subtree root is not "under" the lease path (isUnderLease
+	// requires a strict prefix), and the dirtab paths are already split points.
+	markerMtime := time.Now().Unix()
+	needsMarkerObject := false
+	if prefix != "" && !hasMarkerIn(entries, prefix) {
+		entries = append(entries, nestedMarkerEntry(prefix, markerMtime))
+		needsMarkerObject = true
+	}
+	for _, sp := range splitPaths {
+		if !hasMarkerIn(entries, sp) {
+			entries = append(entries, nestedMarkerEntry(sp, markerMtime))
+			needsMarkerObject = true
+		}
+	}
+
+	// ── Normalise directory link counts ───────────────────────────────────────
+	// Runs after paths are absolute, the synthetic root entry exists and the
+	// markers are in place, so a single rule covers every producer (tar
+	// entries, synthesized roots, mkdir-p parents). See normalizeDirLinkCounts.
+	normalizeDirLinkCounts(entries)
+
 	// Create a fresh child catalog for each split point.
 	//
 	// Each catalog is closed by its Finalize() call in the finalization loop
@@ -352,7 +390,7 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		}
 	}
 
-	result := &SubtreeResult{}
+	result := &SubtreeResult{NeedsMarkerObject: needsMarkerObject}
 
 	// ── Finalise split catalogs deepest-first ─────────────────────────────────
 	// Sort split paths by descending length so the deepest nested catalogs are

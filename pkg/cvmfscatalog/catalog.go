@@ -418,12 +418,23 @@ func (c *Catalog) trackAdd(info entryTrackInfo) {
 		c.delta.SelfSymlink++
 	case info.flags&FlagFileSpecial != 0:
 		c.delta.SelfSpecial++
+	// NB: file_size covers EVERY regular file. cvmfs_swissknife check adds
+	// entries[i].size() to self.file_size in its `else if (IsRegular())`
+	// branch (swissknife_check.cc:532-534), and then adds the external and
+	// chunked sizes to their own counters in SEPARATE `if` blocks (:566-582).
+	// The counters are cumulative, not mutually exclusive: a chunked file
+	// contributes to file_size AND chunked_file_size. Treating them as
+	// exclusive under-reported file_size by the whole chunked/external volume
+	// ("catalog statistics mismatch: subtree_file_size (expected 1300866854 /
+	// in catalog: 696887078)").
 	case info.flags&FlagFileExternal != 0:
 		c.delta.SelfRegular++
+		c.delta.SelfFileSize += info.size
 		c.delta.SelfExternal++
 		c.delta.SelfExternalFileSize += info.size
 	case info.flags&FlagFileChunk != 0:
 		c.delta.SelfRegular++
+		c.delta.SelfFileSize += info.size
 		c.delta.SelfChunked++
 		c.delta.SelfChunks += int64(info.chunkCount)
 		c.delta.SelfChunkedSize += info.size
@@ -445,12 +456,16 @@ func (c *Catalog) trackRemove(info entryTrackInfo) {
 		c.delta.SelfSymlink--
 	case info.flags&FlagFileSpecial != 0:
 		c.delta.SelfSpecial--
+	// Mirrors trackAdd exactly — including file_size for external and chunked
+	// files, which are regular files and therefore counted there too.
 	case info.flags&FlagFileExternal != 0:
 		c.delta.SelfRegular--
+		c.delta.SelfFileSize -= info.size
 		c.delta.SelfExternal--
 		c.delta.SelfExternalFileSize -= info.size
 	case info.flags&FlagFileChunk != 0:
 		c.delta.SelfRegular--
+		c.delta.SelfFileSize -= info.size
 		c.delta.SelfChunked--
 		c.delta.SelfChunks -= int64(info.chunkCount)
 		c.delta.SelfChunkedSize -= info.size

@@ -1212,9 +1212,15 @@ func TestTrackAdd_FileSizeCounters(t *testing.T) {
 	specialInfo := entryTrackInfo{flags: FlagFile | FlagFileSpecial, size: 0, chunkCount: 0}
 	cat.trackAdd(specialInfo)
 
-	// ── verify plain file counters ────────────────────────────────────────────
-	if cat.delta.SelfFileSize != 1000 {
-		t.Errorf("SelfFileSize want 1000, got %d", cat.delta.SelfFileSize)
+	// ── verify file_size covers EVERY regular file ────────────────────────────
+	// Cumulative, not exclusive: plain 1000 + chunked 2048 + external 512.
+	// cvmfs_swissknife check adds any IsRegular() entry's size to
+	// self.file_size (swissknife_check.cc:532-534) and then adds the external
+	// and chunked sizes to their own counters in separate `if` blocks
+	// (:566-582) — a chunked file counts in BOTH.
+	if cat.delta.SelfFileSize != 3560 {
+		t.Errorf("SelfFileSize want 3560 (1000 plain + 2048 chunked + 512 external), got %d",
+			cat.delta.SelfFileSize)
 	}
 
 	// ── verify chunked-file counters ──────────────────────────────────────────
@@ -1245,8 +1251,9 @@ func TestTrackAdd_FileSizeCounters(t *testing.T) {
 	if err := cat.Remove("/plain.bin"); err != nil {
 		t.Fatalf("Remove plain: %v", err)
 	}
-	if cat.delta.SelfFileSize != 0 {
-		t.Errorf("SelfFileSize after remove want 0, got %d", cat.delta.SelfFileSize)
+	// 3560 − 1000: the chunked and external contributions remain.
+	if cat.delta.SelfFileSize != 2560 {
+		t.Errorf("SelfFileSize after removing plain want 2560, got %d", cat.delta.SelfFileSize)
 	}
 
 	// ── Remove chunked file: chunked counters must decrease ───────────────────
@@ -1261,6 +1268,12 @@ func TestTrackAdd_FileSizeCounters(t *testing.T) {
 	}
 	if cat.delta.SelfChunkedSize != 0 {
 		t.Errorf("SelfChunkedSize after remove want 0, got %d", cat.delta.SelfChunkedSize)
+	}
+	// Removing the chunked file also drops its file_size contribution, leaving
+	// only the external file's 512 — trackRemove must mirror trackAdd exactly.
+	if cat.delta.SelfFileSize != 512 {
+		t.Errorf("SelfFileSize after removing chunked want 512 (external only), got %d",
+			cat.delta.SelfFileSize)
 	}
 }
 
@@ -1303,8 +1316,17 @@ func TestFinalizeFlushesNewCounters(t *testing.T) {
 	})
 
 	// Verify in-memory delta BEFORE Finalize removes the .db.
-	if cat.delta.SelfFileSize != 500 {
-		t.Errorf("pre-Finalize SelfFileSize want 500, got %d", cat.delta.SelfFileSize)
+	//
+	// file_size covers EVERY regular file: 500 (plain) + 800 (chunked) = 1300.
+	// The counters are cumulative, not mutually exclusive — cvmfs_swissknife
+	// check adds size to self.file_size for any IsRegular() entry
+	// (swissknife_check.cc:532-534) and adds the chunked size to
+	// self.chunked_file_size in a SEPARATE if (:580-582). This test previously
+	// asserted 500, encoding the exclusive reading, which under-reported
+	// file_size by the whole chunked volume in published catalogs.
+	if cat.delta.SelfFileSize != 1300 {
+		t.Errorf("pre-Finalize SelfFileSize want 1300 (plain 500 + chunked 800), got %d",
+			cat.delta.SelfFileSize)
 	}
 	if cat.delta.SelfChunked != 1 {
 		t.Errorf("pre-Finalize SelfChunked want 1, got %d", cat.delta.SelfChunked)
@@ -1326,8 +1348,9 @@ func TestFinalizeFlushesNewCounters(t *testing.T) {
 	}
 
 	// The returned delta must carry the correct counters.
-	if delta.SelfFileSize != 500 {
-		t.Errorf("returned delta SelfFileSize want 500, got %d", delta.SelfFileSize)
+	if delta.SelfFileSize != 1300 {
+		t.Errorf("returned delta SelfFileSize want 1300 (plain 500 + chunked 800), got %d",
+			delta.SelfFileSize)
 	}
 	if delta.SelfChunked != 1 {
 		t.Errorf("returned delta SelfChunked want 1, got %d", delta.SelfChunked)
