@@ -423,8 +423,18 @@ func compressEntryCDC(entry unpack.FileEntry, det *chunker.Xor32, level int) (Re
 			return result, fmt.Errorf("zlib close for chunk at offset %d: %w", start, err)
 		}
 		compressedSize := int64(compBuf.Len())
-		compressed := make([]byte, compressedSize)
-		copy(compressed, compBuf.Bytes())
+		var compressed []byte
+		if len(bounds) == 2 {
+			// Sole piece: compBuf is function-local and not reused across
+			// iterations, so hand the buffer off directly. This is now the
+			// common case (every file below the grid), and the make+copy below
+			// would be pure overhead on the hot path the sha1/zlib pools exist
+			// to keep allocation-free.
+			compressed = compBuf.Bytes()
+		} else {
+			compressed = make([]byte, compressedSize)
+			copy(compressed, compBuf.Bytes())
+		}
 		chunkHash := hex.EncodeToString(h.Sum(nil))
 		sha1Pool.Put(h)
 
@@ -435,6 +445,10 @@ func compressEntryCDC(entry unpack.FileEntry, det *chunker.Xor32, level int) (Re
 			Compressed:       compressed,
 			CompressedSize:   compressedSize,
 		})
+		// Accumulate so Result.CompressedSize is the total across chunks.
+		// Without this the PipelineBytesCompressed metric only ever added 0
+		// once every file became chunked.
+		result.CompressedSize += compressedSize
 	}
 
 	result.Hash = bulkHash

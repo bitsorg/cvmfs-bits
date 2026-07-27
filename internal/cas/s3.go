@@ -29,17 +29,21 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"cvmfs.io/prepub/pkg/cvmfshash"
 )
 
 // S3 is a CAS backend backed by an S3-compatible object store.
 type S3 struct {
-	client   *s3.Client
-	bucket   string
-	alias    string
-	acl      string // canned ACL, or "" to omit the header
-	settings S3Settings
+	client *s3.Client
+	bucket string
+	alias  string
+	acl    string // canned ACL, or "" to omit the header
+	// endpoint is kept for logging; the full S3Settings (which holds the
+	// secret key) is deliberately NOT retained on the backend.
+	endpoint      string
+	peekBeforePut bool
 }
 
 // NewS3 builds an S3 CAS backend from resolved settings.
@@ -64,9 +68,20 @@ func NewS3(ctx context.Context, st S3Settings) (*S3, error) {
 	endpoint := st.Endpoint()
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
-		// Ceph RGW and MinIO are path-style; CVMFS_S3_DNS_BUCKETS opts into
-		// virtual-host addressing explicitly.
+		// CVMFS_S3_DNS_BUCKETS (default on) selects virtual-host addressing;
+		// path-style is used only when it is explicitly "false".
 		o.UsePathStyle = !st.DNSBuckets
+		// Send a plain signed PUT, as upload_s3.cc does.
+		//
+		// The SDK otherwise defaults to WhenSupported, which over HTTPS
+		// rewrites every PutObject into Content-Encoding: aws-chunked with a
+		// trailing checksum. An S3-compatible store that does not implement
+		// the unsigned-trailer encoding (older Ceph RGW, older MinIO) then
+		// stores the chunk FRAMING as the object body: Put returns success and
+		// the corruption only surfaces as a hash mismatch on a CVMFS client.
+		// It also makes non-seekable bodies fail outright over plain HTTP,
+		// which is the CVMFS default transport.
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	})
 
 	acl := st.ACL
@@ -74,16 +89,17 @@ func NewS3(ctx context.Context, st S3Settings) (*S3, error) {
 		acl = ""
 	}
 	return &S3{
-		client:   client,
-		bucket:   st.Bucket,
-		alias:    st.RepoAlias,
-		acl:      acl,
-		settings: st,
+		client:        client,
+		bucket:        st.Bucket,
+		alias:         st.RepoAlias,
+		acl:           acl,
+		endpoint:      endpoint,
+		peekBeforePut: st.PeekBeforePut,
 	}, nil
 }
 
 // Endpoint returns the resolved S3 endpoint (for startup logging).
-func (s *S3) Endpoint() string { return s.settings.Endpoint() }
+func (s *S3) Endpoint() string { return s.endpoint }
 
 // Bucket returns the bucket name (for startup logging).
 func (s *S3) Bucket() string { return s.bucket }
@@ -97,6 +113,7 @@ func (s *S3) Alias() string { return s.alias }
 func (s *S3) ExistsIsNative() bool { return false }
 
 // key returns the full object key for a hash: "<alias>/data/<xx>/<rest>".
+// Callers must have validated the hash with validHashKey first.
 func (s *S3) key(hash string) string {
 	return s.alias + "/" + cvmfshash.ObjectPath(hash)
 }
@@ -106,7 +123,13 @@ func (s *S3) dataPrefix() string {
 	return s.alias + "/data/"
 }
 
-// isNotFound reports whether an S3 error means "no such key".
+// isNotFound reports whether an S3 error means "no such key" — and ONLY that.
+//
+// It must not swallow NoSuchBucket, AccessDenied or a redirect, all of which
+// can also arrive as 404/4xx: mapping those to "object absent" would classify
+// an entire misconfigured repository as new (re-uploading everything), make
+// Delete report success while doing nothing, and hide the real fault until a
+// later, unrelated error.
 func isNotFound(err error) bool {
 	var nsk *types.NoSuchKey
 	if errors.As(err, &nsk) {
@@ -116,8 +139,18 @@ func isNotFound(err error) bool {
 	if errors.As(err, &nf) {
 		return true
 	}
-	// HeadObject returns a bare 404 with no typed body on several
-	// S3-compatible implementations.
+	// Several S3-compatible stores return a bare 404 for HeadObject with no
+	// typed body. Accept that only when the error carries no API error code,
+	// or the code is explicitly key-not-found.
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "NoSuchKey", "NotFound", "404":
+			return true
+		default:
+			return false // NoSuchBucket, AccessDenied, PermanentRedirect, …
+		}
+	}
 	var re interface{ HTTPStatusCode() int }
 	if errors.As(err, &re) && re.HTTPStatusCode() == 404 {
 		return true
@@ -125,8 +158,35 @@ func isNotFound(err error) bool {
 	return false
 }
 
+// validHashKey guards the one input that becomes an object key. S3 keys have no
+// root to be confined to, so a hash containing "/" or ".." would escape the
+// "<alias>/data/" prefix entirely — writing, for instance, the repository's
+// .cvmfspublished manifest. Callers currently validate, but the Backend
+// contract does not promise it and the blast radius here is the whole
+// repository.
+func validHashKey(hash string) error {
+	if len(hash) < 40 || len(hash) > 50 {
+		return fmt.Errorf("invalid CAS hash %q: implausible length %d", hash, len(hash))
+	}
+	for i := 0; i < len(hash); i++ {
+		c := hash[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+			continue
+		case i == len(hash)-1 && ((c >= 'A' && c <= 'Z') || (c >= 'g' && c <= 'z')):
+			continue // single trailing content-type suffix (C, P, …)
+		default:
+			return fmt.Errorf("invalid CAS hash %q: illegal character %q at %d", hash, c, i)
+		}
+	}
+	return nil
+}
+
 // Exists reports whether the object is already in the store.
 func (s *S3) Exists(ctx context.Context, hash string) (bool, error) {
+	if err := validHashKey(hash); err != nil {
+		return false, err
+	}
 	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key(hash)),
@@ -142,6 +202,9 @@ func (s *S3) Exists(ctx context.Context, hash string) (bool, error) {
 
 // Size returns the stored size in bytes.
 func (s *S3) Size(ctx context.Context, hash string) (int64, error) {
+	if err := validHashKey(hash); err != nil {
+		return 0, err
+	}
 	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key(hash)),
@@ -160,14 +223,22 @@ func (s *S3) Size(ctx context.Context, hash string) (int64, error) {
 // identical content, and re-uploading only risks disturbing an object a
 // published catalog already references.
 func (s *S3) Put(ctx context.Context, hash string, r io.Reader, size int64) error {
-	key := s.key(hash)
-
-	exists, err := s.Exists(ctx, hash)
-	if err != nil {
+	if err := validHashKey(hash); err != nil {
 		return err
 	}
-	if exists {
-		return nil // already in CAS — idempotent, and we must not rewrite it
+	key := s.key(hash)
+
+	// CVMFS_S3_PEEK_BEFORE_PUT (default on, as in C++). The pipeline already
+	// runs its own CAS.Exists before calling Put, so this is a second HEAD per
+	// new object; operators can disable it to halve the round trips.
+	if s.peekBeforePut {
+		exists, err := s.Exists(ctx, hash)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil // already in CAS — idempotent, and we must not rewrite it
+		}
 	}
 
 	in := &s3.PutObjectInput{
@@ -189,6 +260,9 @@ func (s *S3) Put(ctx context.Context, hash string, r io.Reader, size int64) erro
 
 // Get retrieves an object. The caller must close the returned reader.
 func (s *S3) Get(ctx context.Context, hash string) (io.ReadCloser, error) {
+	if err := validHashKey(hash); err != nil {
+		return nil, err
+	}
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key(hash)),
@@ -201,6 +275,9 @@ func (s *S3) Get(ctx context.Context, hash string) (io.ReadCloser, error) {
 
 // Delete removes an object.
 func (s *S3) Delete(ctx context.Context, hash string) error {
+	if err := validHashKey(hash); err != nil {
+		return err
+	}
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key(hash)),

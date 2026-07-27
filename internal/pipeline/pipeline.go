@@ -843,11 +843,16 @@ func runFromSortedEntries(
 				continue
 			}
 			if len(fm.chunks) > 0 {
-				// Chunked file: the actual CAS objects are the chunk hashes.
+				// Chunked file: the actual CAS objects are the chunk hashes,
+				// stored under the 'P' (kSuffixPartial) suffix — the same key
+				// the uploader used at the SubmitPayload site above. Emitting
+				// the bare hash here named an object that does not exist, so
+				// every entry in the generated .cvmfspreload file was a 404.
 				for _, ch := range fm.chunks {
-					if _, ok := hashSeen[ch.hash]; !ok {
-						hashSeen[ch.hash] = struct{}{}
-						preloadHashes = append(preloadHashes, ch.hash)
+					key := ch.hash + "P"
+					if _, ok := hashSeen[key]; !ok {
+						hashSeen[key] = struct{}{}
+						preloadHashes = append(preloadHashes, key)
 					}
 				}
 			} else if fm.bulkHash != "" {

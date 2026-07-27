@@ -78,7 +78,7 @@ CVMFS_S3_USE_HTTPS=yes
 		t.Fatalf("LoadS3SettingsFromServerConf: %v", err)
 	}
 	if st.RepoAlias != "alias.cern.ch" || st.Bucket != "my-bucket" || st.SecretKey != "sekrit" {
-		t.Errorf("bad settings: %+v", st)
+		t.Errorf("bad settings: %s", st) // String() redacts the secret
 	}
 	if got := st.Endpoint(); got != "https://s3.cern.ch:8080" {
 		t.Errorf("Endpoint() = %q, want https://s3.cern.ch:8080", got)
@@ -91,9 +91,12 @@ CVMFS_S3_USE_HTTPS=yes
 	if st.ACL != "public-read" {
 		t.Errorf("ACL default = %q, want public-read (upload_s3.cc:60)", st.ACL)
 	}
-	// DNS buckets unset => path-style addressing.
-	if st.DNSBuckets {
-		t.Error("DNSBuckets should default to false (path-style) for Ceph/RGW")
+	// DNS buckets unset => virtual-host, exactly as upload_s3.cc:49 defaults.
+	if !st.DNSBuckets {
+		t.Error("DNSBuckets must default to TRUE, mirroring upload_s3.cc:49")
+	}
+	if !st.PeekBeforePut {
+		t.Error("PeekBeforePut must default to TRUE, mirroring upload_s3.cc:54")
 	}
 }
 
@@ -197,13 +200,16 @@ func newTestS3(t *testing.T, alias string) (*S3, *fakeS3) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	st := S3Settings{
-		RepoAlias: alias,
-		Host:      host,
-		Bucket:    "cvmfs-bucket",
-		Region:    "us-east-1",
-		AccessKey: "key",
-		SecretKey: "secret",
-		ACL:       "public-read",
+		RepoAlias:     alias,
+		Host:          host,
+		Bucket:        "cvmfs-bucket",
+		Region:        "us-east-1",
+		AccessKey:     "key",
+		SecretKey:     "secret",
+		ACL:           "public-read",
+		PeekBeforePut: true,
+		// The fake serves /<bucket>/<key>; DNSBuckets=false selects path-style.
+		DNSBuckets: false,
 	}
 	b, err := NewS3(context.Background(), st)
 	if err != nil {
@@ -353,5 +359,152 @@ func TestS3ExistsIsNotNative(t *testing.T) {
 	b, _ := newTestS3(t, "repo.cern.ch")
 	if b.ExistsIsNative() {
 		t.Error("S3.ExistsIsNative() must be false — every Exists is a network round trip")
+	}
+}
+
+// ── regression guards from the review ─────────────────────────────────────────
+
+// A hash must never be able to escape the "<alias>/data/" prefix. S3 keys have
+// no root, so an unvalidated "../" would let a caller write the repository
+// manifest itself.
+func TestS3RejectsHashEscapingThePrefix(t *testing.T) {
+	ctx := context.Background()
+	b, fake := newTestS3(t, "repo.cern.ch")
+
+	evil := []string{
+		"aa/../../repo.cern.ch/.cvmfspublished",
+		"../../../etc/passwd",
+		"aabbccddeeff00112233445566778899aabbcc/d/",
+		"",
+		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+	}
+	for _, h := range evil {
+		if err := b.Put(ctx, h, strings.NewReader("x"), 1); err == nil {
+			t.Errorf("Put(%q) was accepted; must be rejected", h)
+		}
+		if _, err := b.Exists(ctx, h); err == nil {
+			t.Errorf("Exists(%q) was accepted; must be rejected", h)
+		}
+	}
+	if len(fake.objects) != 0 {
+		t.Errorf("a rejected hash still wrote objects: %v", fake.objects)
+	}
+}
+
+// CVMFS_S3_PORT that does not parse must be a hard error, never a silent
+// fallback to port 80 (a different service entirely).
+func TestBadPortIsFatal(t *testing.T) {
+	dir := t.TempDir()
+	s3conf := filepath.Join(dir, "s3.conf")
+	if err := os.WriteFile(s3conf, []byte(
+		"CVMFS_S3_HOST=h\nCVMFS_S3_BUCKET=b\nCVMFS_S3_ACCESS_KEY=a\nCVMFS_S3_SECRET_KEY=s\nCVMFS_S3_PORT=80x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serverConf := filepath.Join(dir, "server.conf")
+	if err := os.WriteFile(serverConf, []byte("CVMFS_UPSTREAM_STORAGE=S3,/tmp,a@"+s3conf+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadS3SettingsFromServerConf(serverConf); err == nil {
+		t.Fatal("a non-numeric CVMFS_S3_PORT must be fatal")
+	}
+}
+
+// CVMFS templates @fqrn@/@org@ appear in real configs; reading them literally
+// would point prepub at a bucket that does not exist. Shell constructs we do
+// not evaluate must fail loudly rather than be used verbatim.
+func TestTemplateExpansionAndShellRejection(t *testing.T) {
+	write := func(t *testing.T, bucket string) (string, error) {
+		t.Helper()
+		dir := t.TempDir()
+		s3conf := filepath.Join(dir, "s3.conf")
+		if err := os.WriteFile(s3conf, []byte(
+			"export CVMFS_S3_HOST=h  # inline comment\nCVMFS_S3_BUCKET="+bucket+
+				"\nCVMFS_S3_ACCESS_KEY=a\nCVMFS_S3_SECRET_KEY=s\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		serverConf := filepath.Join(dir, "server.conf")
+		if err := os.WriteFile(serverConf,
+			[]byte("CVMFS_UPSTREAM_STORAGE=S3,/tmp,atlas.cern.ch@"+s3conf+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		st, err := LoadS3SettingsFromServerConf(serverConf)
+		return st.Bucket, err
+	}
+
+	got, err := write(t, "@fqrn@-data")
+	if err != nil {
+		t.Fatalf("template config rejected: %v", err)
+	}
+	if got != "atlas.cern.ch-data" {
+		t.Errorf("bucket = %q, want atlas.cern.ch-data (@fqrn@ expanded)", got)
+	}
+
+	got, err = write(t, "@org@-data")
+	if err != nil {
+		t.Fatalf("@org@ config rejected: %v", err)
+	}
+	if got != "atlas-data" {
+		t.Errorf("bucket = %q, want atlas-data (@org@ expanded)", got)
+	}
+
+	if _, err := write(t, "${REPO}-data"); err == nil {
+		t.Error("a shell-expanded value must be rejected, not used literally")
+	}
+}
+
+// "export KEY=value" and inline comments are common in these files.
+func TestExportPrefixAndInlineComment(t *testing.T) {
+	dir := t.TempDir()
+	s3conf := filepath.Join(dir, "s3.conf")
+	if err := os.WriteFile(s3conf, []byte(
+		"export CVMFS_S3_HOST=s3.example.org\nCVMFS_S3_PORT=8080  # rgw\n"+
+			"CVMFS_S3_BUCKET=b\nCVMFS_S3_ACCESS_KEY=a\nCVMFS_S3_SECRET_KEY=s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serverConf := filepath.Join(dir, "server.conf")
+	if err := os.WriteFile(serverConf, []byte("CVMFS_UPSTREAM_STORAGE=S3,/tmp,r@"+s3conf+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := LoadS3SettingsFromServerConf(serverConf)
+	if err != nil {
+		t.Fatalf("LoadS3SettingsFromServerConf: %v", err)
+	}
+	if st.Host != "s3.example.org" {
+		t.Errorf("Host = %q — 'export ' prefix not stripped", st.Host)
+	}
+	if st.Port != 8080 {
+		t.Errorf("Port = %d — inline comment not stripped", st.Port)
+	}
+}
+
+// A host that already carries a scheme must not produce "http://https://…".
+func TestEndpointHandlesSchemeAndIPv6(t *testing.T) {
+	cases := []struct {
+		in   S3Settings
+		want string
+	}{
+		{S3Settings{Host: "https://s3.example.org"}, "https://s3.example.org"},
+		{S3Settings{Host: "s3.example.org", Port: 8080}, "http://s3.example.org:8080"},
+		{S3Settings{Host: "s3.example.org:9000", Port: 8080}, "http://s3.example.org:9000"},
+		{S3Settings{Host: "[::1]", Port: 9000}, "http://[::1]:9000"},
+		{S3Settings{Host: "[::1]:9000", Port: 8080}, "http://[::1]:9000"},
+		{S3Settings{Host: "s3.example.org", UseHTTPS: true}, "https://s3.example.org"},
+	}
+	for _, c := range cases {
+		if got := c.in.Endpoint(); got != c.want {
+			t.Errorf("Endpoint(%q) = %q, want %q", c.in.Host, got, c.want)
+		}
+	}
+}
+
+// The secret key must not appear in any formatted representation.
+func TestSettingsRedactSecret(t *testing.T) {
+	st := S3Settings{RepoAlias: "r", Host: "h", Bucket: "b", AccessKey: "AK", SecretKey: "TOPSECRET"}
+	for _, rendered := range []string{
+		fmt.Sprintf("%v", st), fmt.Sprintf("%+v", st), fmt.Sprintf("%s", st),
+	} {
+		if strings.Contains(rendered, "TOPSECRET") {
+			t.Errorf("secret key leaked into %q", rendered)
+		}
 	}
 }
