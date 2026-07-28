@@ -140,7 +140,7 @@ type applyTestVars struct {
 	mode, logLevel                                          string
 	devMode                                                 bool
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string
-	cvmfsMount, casType, casRoot, casServerConf              string
+	cvmfsMount, casType, casRoot, casServerConf             string
 	stratum0URL, repoName                                   string
 	jobTimeout                                              time.Duration
 	minConcurrentJobs, maxConcurrentJobs                    int
@@ -155,6 +155,7 @@ type applyTestVars struct {
 	allowedPublishPrefixes                                  string
 	gatewayDirectGraft                                      bool
 	chunkMin, chunkAvg, chunkMax                            int64
+	pipelineWorkers, pipelineUploadConc                     int
 }
 
 func defaultApplyVars() *applyTestVars {
@@ -185,6 +186,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.allowedPublishPrefixes,
 		&v.gatewayDirectGraft,
 		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
+		&v.pipelineWorkers, &v.pipelineUploadConc,
 	)
 }
 
@@ -223,5 +225,33 @@ func TestApplyFileConfig_WarmQuorum(t *testing.T) {
 
 	if v.warmQuorum != 0.5 {
 		t.Errorf("warmQuorum = %v; want 0.5 (copied from config)", v.warmQuorum)
+	}
+}
+
+// TestApplyFileConfig_PipelineWorkers guards the memory lever: peak RSS scales
+// with the compress worker count (each worker holds a whole file plus its
+// compressed chunks), so a constrained host must be able to lower it from the
+// config file, and an explicit flag must still win.
+func TestApplyFileConfig_PipelineWorkers(t *testing.T) {
+	fc := &fileConfig{}
+	fc.Pipeline.Workers = 1
+	fc.Pipeline.UploadConcurrency = 2
+
+	v := defaultApplyVars()
+	v.pipelineWorkers, v.pipelineUploadConc = 4, 4
+	v.apply(fc, map[string]bool{})
+	if v.pipelineWorkers != 1 {
+		t.Errorf("pipeline.workers = %d; want 1 from config", v.pipelineWorkers)
+	}
+	if v.pipelineUploadConc != 2 {
+		t.Errorf("pipeline.upload_concurrency = %d; want 2 from config", v.pipelineUploadConc)
+	}
+
+	// An explicitly-set flag must not be overridden by the file.
+	v = defaultApplyVars()
+	v.pipelineWorkers = 8
+	v.apply(fc, map[string]bool{"pipeline-workers": true})
+	if v.pipelineWorkers != 8 {
+		t.Errorf("explicit --pipeline-workers was overridden: %d", v.pipelineWorkers)
 	}
 }

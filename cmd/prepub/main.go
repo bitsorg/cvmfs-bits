@@ -133,6 +133,14 @@ func main() {
 
 	// Pipeline performance tuning.
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
+	// PEAK MEMORY IS DRIVEN BY THIS. unpack reads each file whole into RAM
+	// (unpack.go io.ReadAll) and every compress worker holds one file plus its
+	// compressed chunks, so resident size scales with
+	//   workers x (largest file + its compressed form).
+	// A host publishing large trees (Clang, Python-modules) on limited RAM —
+	// especially one also running the gateway — should lower this. Observed:
+	// 4 workers reached 6.7 GB RSS and were OOM-killed on an 8 GB node.
+	pipelineWorkers := flag.Int("pipeline-workers", 4, "Concurrent compress workers per job. Peak memory scales with this: each worker holds one whole file plus its compressed chunks. Lower it (1-2) on memory-constrained hosts [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
 	// Default to FIXED cvmfsdescriptor.ChunkGrid chunking (min==avg==max): the
 	// xor32 chunker then cuts at fixed grid boundaries, which coarse publish
@@ -236,6 +244,7 @@ func main() {
 			allowedPublishPrefixes,
 			gatewayDirectGraft,
 			chunkMin, chunkAvg, chunkMax,
+			pipelineWorkers, pipelineUploadConc,
 		)
 	}
 
@@ -261,7 +270,7 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
-			*pipelineUploadConc, *pipelineCompressLevel,
+			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel,
 			*chunkMin, *chunkAvg, *chunkMax,
 			*warmQuorum, *preWarm,
 			*brokerCACert,
@@ -293,7 +302,7 @@ func runPublisher(
 	allowedPublishPrefixes string,
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
-	pipelineUploadConc, pipelineCompressLevel int,
+	pipelineWorkers, pipelineUploadConc, pipelineCompressLevel int,
 	chunkMin, chunkAvg, chunkMax int64,
 	warmQuorum float64,
 	preWarm bool,
@@ -628,7 +637,7 @@ func runPublisher(
 		JobTimeout:         jobTimeout,
 		BrokerConfig:       publishBrokerCfg,
 		Pipeline: pipeline.Config{
-			Workers:       4,
+			Workers:       pipelineWorkers,
 			UploadConc:    pipelineUploadConc,
 			CompressLevel: pipelineCompressLevel,
 			ChunkMin:      chunkMin,

@@ -165,6 +165,15 @@ type fileConfig struct {
 		Avg int64 `yaml:"avg"`
 		Max int64 `yaml:"max"`
 	} `yaml:"chunking"`
+
+	// Pipeline tunes the compress/upload stages. Workers is the memory lever:
+	// each compress worker holds one whole file plus its compressed chunks, so
+	// peak RSS scales with workers x largest-file. Zero/omitted keeps the CLI
+	// default. Equivalent to --pipeline-workers / --pipeline-upload-conc.
+	Pipeline struct {
+		Workers           int `yaml:"workers"`
+		UploadConcurrency int `yaml:"upload_concurrency"`
+	} `yaml:"pipeline"`
 }
 
 // yamlDuration allows duration strings like "30s", "10m", "1h" in YAML.
@@ -222,6 +231,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	allowedPublishPrefixes *string,
 	gatewayDirectGraft *bool,
 	chunkMin, chunkAvg, chunkMax *int64,
+	pipelineWorkers, pipelineUploadConc *int,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -235,6 +245,11 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		}
 	}
 	flt := func(flag string, dst *float64, val float64) {
+		if !has(flag) && val != 0 {
+			*dst = val
+		}
+	}
+	i := func(flag string, dst *int, val int) {
 		if !has(flag) && val != 0 {
 			*dst = val
 		}
@@ -262,6 +277,8 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("cas-type", casType, fc.CAS.Type)
 	str("cas-root", casRoot, fc.CAS.Root)
 	str("cas-server-conf", casServerConf, fc.CAS.ServerConf)
+	i("pipeline-workers", pipelineWorkers, fc.Pipeline.Workers)
+	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)
 	dur("job-timeout", jobTimeout, fc.JobTimeout)
 	if !has("min-concurrent-jobs") && fc.MinConcurrentJobs != 0 {
 		*minConcurrentJobs = fc.MinConcurrentJobs

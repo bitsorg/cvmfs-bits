@@ -608,6 +608,15 @@ ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/config.yaml
 Restart=on-failure
 RestartSec=5s
 EnvironmentFile=${CONFIG_DIR}/env
+# Memory containment. Peak RSS scales with --pipeline-workers x largest-file,
+# because each compress worker holds a whole file plus its compressed chunks.
+# Without a cap the KERNEL picks the OOM victim, and on a host shared with
+# cvmfs_gateway that victim may be the gateway rather than this service.
+# MemoryHigh throttles and reclaims first; MemoryMax is the hard stop.
+# Tune both to the host (these suit an 8 GB node shared with the gateway) and
+# lower pipeline.workers if publishes of large trees still hit the ceiling.
+MemoryHigh=2G
+MemoryMax=3G
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
