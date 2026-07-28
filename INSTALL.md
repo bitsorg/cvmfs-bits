@@ -408,10 +408,15 @@ The publisher does not have to run on the gateway host, and taking it off gives
 the gateway back its memory. Everything it needs from that host is either
 reachable over the network or a file you copy once. Two things change materially:
 
-- **The gateway URL must be HTTPS.** Plaintext is accepted only for loopback
-  (`main.go` rejects anything else at startup unless `--dev`), which was the
-  colocated case. If the gateway has no TLS listener, put one in front of it
-  before moving.
+- **The gateway hop stops being loopback.** Plaintext is accepted without
+  question only for loopback, which was the colocated case. Off-node you either
+  use HTTPS or opt in explicitly with `--gateway-allow-plaintext` (config
+  `gateway.allow_plaintext: true`). The latter is defensible on a trusted
+  internal network: gateway requests are HMAC-SHA256 signed and the secret never
+  transits, so plaintext does not expose the credential — it exposes what is
+  being published and lets an on-path attacker forge gateway responses. Do NOT
+  reach for `--dev` to achieve this; it also disables the gateway-secret and
+  API-token requirements.
 - **The build accumulator is local state.** A sealed build's members live in
   `/var/spool/cvmfs-prepub/builds/<id>/` on the host that received them. Moving
   hosts mid-build strands it. Drain first.
@@ -455,7 +460,8 @@ or group-writable credential files.
 ```yaml
 # /etc/cvmfs-prepub/config.yaml
 gateway:
-  url: https://<gateway-host>:4929     # HTTPS is now mandatory
+  url: http://<gateway-host>:4929      # https://, or http:// with allow_plaintext
+  allow_plaintext: true                # trusted internal network; auth is HMAC-signed
   key_id: <key-id>
   key_secret_env: CVMFS_GATEWAY_SECRET
 
@@ -490,10 +496,13 @@ volume for concurrent payload tars plus their compression spill and `tmp/`.
 | prepub | Stratum 0 HTTP | `.cvmfspublished` + catalog fetch |
 | GitLab runners | prepub `:8080` | job submission |
 
-Note what this exposes: the runner → prepub hop now crosses the network carrying
-`PREPUB_API_TOKEN` in clear text, where before it was often loopback. Restrict
-`:8080` to the runner network at the firewall. ADR-0008 D3 covers the real fix
-and is not yet decided.
+Note the asymmetry between the two hops. Gateway requests are HMAC-signed, so
+the credential never appears on the wire and plaintext costs only
+confidentiality. The runner → prepub hop is different: `PREPUB_API_TOKEN` is a
+BEARER token, so it must travel to be used, and anyone who observes it once holds
+publish rights to a production repository until it is rotated. Restrict `:8080`
+to the runner network at the firewall. ADR-0008 D3 (option T1) covers turning
+that token into an HMAC key so it stops travelling; it is not yet decided.
 
 ### Step 6 — cut over, then remove the old service
 

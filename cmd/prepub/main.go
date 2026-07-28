@@ -88,6 +88,7 @@ func main() {
 	listen := flag.String("listen", ":8080", "HTTP listen address for the API server [publisher]")
 	publishMode := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
 	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
+	gatewayAllowPlaintext := flag.Bool("gateway-allow-plaintext", false, "Permit a plaintext http:// gateway URL on a trusted network. Gateway requests are HMAC-SHA256 signed and the secret never transits, so the credential is safe without TLS; what plaintext gives up is confidentiality of the publish and authenticity of gateway responses. Loopback needs no flag. Prefer this over --dev, which also disables the gateway-secret and API-token requirements [publisher]")
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
@@ -246,7 +247,7 @@ func main() {
 			nodeID, repos, recvStratum0URL,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			allowedPublishPrefixes,
-			gatewayDirectGraft,
+			gatewayDirectGraft, gatewayAllowPlaintext,
 			ingestPublish, ingestPublishOwner,
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc,
@@ -270,7 +271,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
@@ -300,6 +301,7 @@ func runPublisher(
 	devMode bool,
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
+	gatewayAllowPlaintext bool,
 	cvmfsMount string,
 	ingestPublish bool,
 	ingestPublishOwner string,
@@ -371,18 +373,11 @@ func runPublisher(
 
 	switch publishMode {
 	case "gateway":
-		// Enforce HTTPS for gateway communication (loopback is accepted as-is
-		// because cvmfs_gateway typically listens on http://localhost:4929).
-		isLoopback := strings.HasPrefix(gatewayURL, "http://localhost") ||
-			strings.HasPrefix(gatewayURL, "http://127.0.0.1") ||
-			strings.HasPrefix(gatewayURL, "http://[::1]")
-		if !strings.HasPrefix(gatewayURL, "https://") && !isLoopback {
-			if devMode {
-				obs.Logger.Warn("SECURITY: gateway URL is not HTTPS — development mode only, NEVER use in production", "url", gatewayURL)
-			} else {
-				obs.Logger.Error("gateway URL must use HTTPS (or http://localhost for local gateway); use --dev to override", "url", gatewayURL)
-				os.Exit(1)
-			}
+		if warn, err := checkGatewayURL(gatewayURL, gatewayAllowPlaintext, devMode); err != nil {
+			obs.Logger.Error(err.Error(), "url", gatewayURL)
+			os.Exit(1)
+		} else if warn != "" {
+			obs.Logger.Warn(warn, "url", gatewayURL)
 		}
 
 		gatewaySecret := os.Getenv("CVMFS_GATEWAY_SECRET")
@@ -1086,6 +1081,54 @@ func parseLogLevel(s string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
+	}
+}
+
+// checkGatewayURL decides whether prepub may talk to the gateway at this URL.
+// It returns a warning to log (possibly empty) or an error that must abort
+// startup.
+//
+// HTTPS is the default requirement, but plaintext is a defensible choice on a
+// trusted network and this is why: every gateway request is signed with
+// HMAC-SHA256 over a canonical string, and the shared secret NEVER travels — so
+// unlike a bearer token, an observer of the wire cannot replay or steal the
+// credential. What plaintext costs is confidentiality of what is being
+// published (paths, sizes, hashes, and the catalog objects streamed on commit)
+// and authenticity of the gateway's RESPONSES, which an on-path attacker could
+// forge. That is a site decision, not something this service can make.
+//
+// Loopback is accepted without any flag: cvmfs_gateway conventionally listens
+// on http://localhost:4929 and there is no network to observe.
+//
+// The opt-in is deliberately separate from --dev. --dev also drops the
+// gateway-secret and API-token requirements, so using it to permit a plaintext
+// gateway would silently disable authentication as well — the opposite of what
+// a site making an informed transport choice wants.
+func checkGatewayURL(gatewayURL string, allowPlaintext, devMode bool) (warn string, err error) {
+	if strings.HasPrefix(gatewayURL, "https://") {
+		return "", nil
+	}
+	isLoopback := strings.HasPrefix(gatewayURL, "http://localhost") ||
+		strings.HasPrefix(gatewayURL, "http://127.0.0.1") ||
+		strings.HasPrefix(gatewayURL, "http://[::1]")
+	if isLoopback {
+		return "", nil
+	}
+	switch {
+	case allowPlaintext:
+		return "gateway URL is not HTTPS — permitted by --gateway-allow-plaintext. " +
+			"Requests are HMAC-SHA256 signed and the secret never transits, so the " +
+			"credential is not exposed; what is exposed is the content of the publish " +
+			"(paths, sizes, hashes, catalog objects) and the authenticity of gateway " +
+			"responses. Ensure this hop stays on a trusted network", nil
+	case devMode:
+		return "SECURITY: gateway URL is not HTTPS — development mode only, NEVER use in production", nil
+	default:
+		return "", fmt.Errorf("gateway URL must use HTTPS (loopback is exempt). " +
+			"If this hop is on a trusted internal network, set --gateway-allow-plaintext " +
+			"(config gateway.allow_plaintext) — gateway auth is HMAC-signed and does not " +
+			"depend on TLS. Do NOT use --dev for this: it also disables the gateway-secret " +
+			"and API-token requirements")
 	}
 }
 

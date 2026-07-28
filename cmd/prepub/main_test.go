@@ -154,6 +154,7 @@ type applyTestVars struct {
 	rekorServer, rekorSigningKey, oidcIssuers               string
 	allowedPublishPrefixes                                  string
 	gatewayDirectGraft                                      bool
+	gatewayAllowPlaintext                                   bool
 	ingestPublish                                           bool
 	ingestPublishOwner                                      string
 	chunkMin, chunkAvg, chunkMax                            int64
@@ -186,7 +187,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.nodeID, &v.repos, &v.recvStratum0URL,
 		&v.provenanceEnabled, &v.rekorServer, &v.rekorSigningKey, &v.oidcIssuers,
 		&v.allowedPublishPrefixes,
-		&v.gatewayDirectGraft,
+		&v.gatewayDirectGraft, &v.gatewayAllowPlaintext,
 		&v.ingestPublish, &v.ingestPublishOwner,
 		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
 		&v.pipelineWorkers, &v.pipelineUploadConc,

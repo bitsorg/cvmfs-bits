@@ -108,6 +108,13 @@ type fileConfig struct {
 		// case the standard DiffRec path is required for correctness.
 		// Can be overridden at runtime with --gateway-direct-graft=false.
 		DirectGraft bool `yaml:"direct_graft"`
+		// AllowPlaintext permits a plaintext http:// gateway URL. Gateway
+		// requests are HMAC-SHA256 signed and the secret never transits, so
+		// plaintext does not expose the credential; it exposes what is being
+		// published and lets an on-path attacker forge gateway responses.
+		// Reasonable on a trusted internal network, and deliberately separate
+		// from `dev`, which also disables authentication requirements.
+		AllowPlaintext bool `yaml:"allow_plaintext"`
 	} `yaml:"gateway"`
 
 	CAS struct {
@@ -237,6 +244,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
 	allowedPublishPrefixes *string,
 	gatewayDirectGraft *bool,
+	gatewayAllowPlaintext *bool,
 	ingestPublish *bool,
 	ingestPublishOwner *string,
 	chunkMin, chunkAvg, chunkMax *int64,
@@ -338,6 +346,13 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	// To disable direct-graft use --gateway-direct-graft=false on the CLI.
 	if !has("gateway-direct-graft") && fc.Gateway.DirectGraft {
 		*gatewayDirectGraft = true
+	}
+
+	// Same bool caveat as direct-graft: YAML cannot express "explicitly false",
+	// so config can only turn plaintext ON; use --gateway-allow-plaintext=false
+	// on the CLI to override a config that enables it.
+	if !has("gateway-allow-plaintext") && fc.Gateway.AllowPlaintext {
+		*gatewayAllowPlaintext = true
 	}
 
 	// Optional publish paths.  Same bool caveat as direct-graft: YAML cannot
