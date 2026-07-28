@@ -8,6 +8,7 @@ package pipeline
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/hex"
@@ -525,6 +526,19 @@ func runFromSortedEntries(
 	_, span := cfg.Obs.Tracer.Start(ctx, "pipeline.stages")
 	defer span.End()
 
+	// Compressed chunks are spilled here while they wait to be uploaded. Each
+	// file is removed as soon as its object reaches CAS; this directory only
+	// catches the remainder if a job dies mid-flight.
+	chunkSpillDir, cserr := newSpillDir(cfg.SpoolDir)
+	if cserr != nil {
+		return nil, cserr
+	}
+	defer func() {
+		if chunkSpillDir != "" {
+			_ = os.RemoveAll(chunkSpillDir)
+		}
+	}()
+
 	// Channels for pipeline stages.
 	compressChan := make(chan unpack.FileEntry, 64)
 	catalogChan := make(chan unpack.FileEntry, 64)
@@ -559,6 +573,9 @@ func runFromSortedEntries(
 	eg.Go(func() error {
 		defer close(compressOut)
 		return compress.Run(egCtx, compressChan, compressOut, compress.Config{
+			// Chunks are written here and removed as soon as they reach CAS,
+			// so neither the file nor its compressed form is ever resident.
+			SpillDir:      chunkSpillDir,
 			Workers:       cfg.Workers,
 			ChunkSize:     cfg.ChunkSize,
 			ChunkMin:      cfg.ChunkMin,
@@ -649,7 +666,7 @@ func runFromSortedEntries(
 	// concurrent workers never attempt to upload the same object.
 	// compressedData and compressedSize refer to the object bytes to upload;
 	// they may be nil/0 for objects that are already confirmed dedup hits.
-	processHash := func(workerCtx context.Context, hash string, compressedData []byte, compressedSize int64) error {
+	processHash := func(workerCtx context.Context, hash string, open func() (io.ReadCloser, error), compressedSize int64) error {
 		isDup, err := checkExists(workerCtx, hash)
 		if err != nil {
 			return fmt.Errorf("dedup check %s: %w", hash, err)
@@ -671,8 +688,10 @@ func runFromSortedEntries(
 			return nil
 		}
 
-		// New object: upload to CAS.
-		if err := upload.PutWithRetry(workerCtx, cfg.CAS, hash, compressedData, compressedSize); err != nil {
+		// New object: upload to CAS. When the compressor streamed the chunk to
+		// disk, open re-reads it per attempt so the compressed bytes are never
+		// held in memory; otherwise it reads from the in-memory slice.
+		if err := upload.PutStreamWithRetry(workerCtx, cfg.CAS, hash, open, compressedSize); err != nil {
 			return fmt.Errorf("cas put %s: %w", hash, err)
 		}
 		if err := uploadLog.Record(hash); err != nil {
@@ -743,7 +762,8 @@ func runFromSortedEntries(
 			// to ObjectHashes immediately without spawning a worker.
 			type uploadTask struct {
 				hash           string
-				compressed     []byte
+				open           func() (io.ReadCloser, error)
+				path           string // spill file to remove once uploaded ("" = in memory)
 				compressedSize int64
 			}
 			var tasks []uploadTask
@@ -760,10 +780,12 @@ func runFromSortedEntries(
 						cfg.Obs.Metrics.PipelineDedupHits.Inc()
 					} else {
 						seenHashes[chunk.Hash+"P"] = true
+						ch := chunk // capture: Open() is called later, per attempt
 						tasks = append(tasks, uploadTask{
-							hash:           chunk.Hash + "P",
-							compressed:     chunk.Compressed,
-							compressedSize: chunk.CompressedSize,
+							hash:           ch.Hash + "P",
+							open:           ch.Open,
+							path:           ch.Path,
+							compressedSize: ch.CompressedSize,
 						})
 					}
 				}
@@ -775,9 +797,10 @@ func runFromSortedEntries(
 						cfg.Obs.Metrics.PipelineDedupHits.Inc()
 					} else {
 						seenHashes[hash] = true
+						data := compResult.Compressed
 						tasks = append(tasks, uploadTask{
 							hash:           hash,
-							compressed:     compResult.Compressed,
+							open:           func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil },
 							compressedSize: compResult.CompressedSize,
 						})
 					}
@@ -795,9 +818,16 @@ func runFromSortedEntries(
 				}
 				inner.Go(func() error {
 					defer uploadSem.Release(1)
-					if err := processHash(innerCtx, task.hash, task.compressed, task.compressedSize); err != nil {
+					if err := processHash(innerCtx, task.hash, task.open, task.compressedSize); err != nil {
 						uspan.RecordError(err)
 						return err
+					}
+					// The compressed chunk is in CAS (or was a dedup hit); drop
+					// its spill file now rather than at job end, so a large
+					// package does not accumulate its whole compressed form on
+					// disk while it uploads.
+					if task.path != "" {
+						_ = os.Remove(task.path)
 					}
 					return nil
 				})

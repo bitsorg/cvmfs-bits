@@ -13,8 +13,11 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -70,15 +73,45 @@ type Config struct {
 	// Use zlib.BestSpeed (1) to roughly halve CPU time for CPU-bound publishes
 	// at the cost of slightly larger objects.
 	CompressLevel int
+
+	// SpillDir enables the streaming path: the entry is read one grid block at
+	// a time and each compressed chunk is written here instead of being held
+	// in memory, so peak memory per worker is bounded by the grid size rather
+	// than by the file size. Empty keeps the in-memory path.
+	//
+	// Only used when the chunk grid is FIXED (ChunkMin == ChunkAvg == ChunkMax):
+	// content-defined boundaries need a rolling window over the whole buffer,
+	// whereas a fixed grid cuts at known offsets and streams trivially.
+	SpillDir string
 }
 
 // Chunk represents a single compressed chunk of a larger file.
+//
+// Exactly one of Compressed / Path carries the data. Path is used by the
+// streaming path: holding every chunk's Compressed bytes meant a Result for a
+// multi-GB file pinned the whole compressed file in memory, which is what kept
+// the service at 2 GB RSS after the unpack spill landed.
 type Chunk struct {
 	Offset           int64  // byte offset in the uncompressed file
 	UncompressedSize int64  // size of this chunk's uncompressed data
 	Hash             string // hex SHA-1 of compressed chunk bytes (= CAS key)
-	Compressed       []byte // zlib-compressed chunk data
-	CompressedSize   int64  // size of Compressed in bytes
+	Compressed       []byte // zlib-compressed chunk data (nil when Path is set)
+	Path             string // spill file holding the compressed bytes
+	CompressedSize   int64  // size of the compressed data in bytes
+}
+
+// Open returns a reader over the chunk's compressed bytes, from memory or from
+// its spill file. Callers that retry must call Open again rather than reusing
+// a consumed reader.
+func (c Chunk) Open() (io.ReadCloser, error) {
+	if c.Path == "" {
+		return io.NopCloser(bytes.NewReader(c.Compressed)), nil
+	}
+	f, err := os.Open(c.Path)
+	if err != nil {
+		return nil, fmt.Errorf("opening compressed chunk %s: %w", c.Hash, err)
+	}
+	return f, nil
 }
 
 // Result carries a processed file entry alongside its compressed form and hash.
@@ -127,6 +160,16 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 		workers = maxSane
 	}
 
+	// Stream when the grid is fixed and a spill dir is configured: peak memory
+	// then depends on the grid, not on the largest file in the tree.
+	streaming := cfg.SpillDir != "" && cfg.ChunkAvg > 0 &&
+		cfg.ChunkMin == cfg.ChunkAvg && cfg.ChunkAvg == cfg.ChunkMax
+	if streaming {
+		obs.Logger.InfoContext(ctx, "compress: streaming mode",
+			"grid_bytes", cfg.ChunkAvg, "workers", workers)
+	}
+	var chunkSeq int64
+
 	eg, egCtx := errgroup.WithContext(ctx)
 	sem := semaphore.NewWeighted(int64(workers))
 
@@ -153,10 +196,13 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 
 			var result Result
 			var err error
-			if cfg.ChunkAvg > 0 {
+			switch {
+			case streaming:
+				result, err = compressEntryStreaming(entry, cfg.ChunkAvg, cfg.CompressLevel, cfg.SpillDir, &chunkSeq)
+			case cfg.ChunkAvg > 0:
 				det := chunker.NewXor32(uint64(cfg.ChunkMin), uint64(cfg.ChunkAvg), uint64(cfg.ChunkMax))
 				result, err = compressEntryCDC(entry, det, cfg.CompressLevel)
-			} else {
+			default:
 				result, err = compressEntry(entry, cfg.ChunkSize, cfg.CompressLevel)
 			}
 			if err != nil {
@@ -190,6 +236,119 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 		return err
 	}
 	return semErr
+}
+
+// compressEntryStreaming compresses an entry WITHOUT ever holding the whole
+// file, or the whole compressed file, in memory.
+//
+// It reads one fixed grid block at a time from the entry, compresses it,
+// writes the compressed bytes to a spill file, and keeps only the chunk's hash
+// and size. Peak memory per worker is therefore
+//
+//	one grid block + one compressed block  (~2 x grid)
+//
+// independent of file size, where the previous path cost
+//
+//	whole file + every compressed chunk
+//
+// which pinned ~2 GB for a large Clang binary.
+//
+// Requires a FIXED grid (min == avg == max). Content-defined chunking needs a
+// rolling window over the buffer and is left on the in-memory path.
+func compressEntryStreaming(entry unpack.FileEntry, grid int64, level int, spillDir string, seq *int64) (Result, error) {
+	result := Result{FileEntry: entry}
+
+	if !entry.Mode.IsRegular() {
+		result.Hash = "0000000000000000000000000000000000000000"
+		return result, nil
+	}
+
+	rc, err := entry.Open()
+	if err != nil {
+		return result, err
+	}
+	defer rc.Close() //nolint:errcheck // read-only
+
+	effectiveLevel := zlibLevel(level)
+	pool := getZlibWriterPool(effectiveLevel)
+	w := pool.Get().(*zlib.Writer)
+	defer pool.Put(w)
+
+	bulkH := sha1Pool.Get().(hash.Hash) //nolint:gosec
+	bulkH.Reset()
+	defer sha1Pool.Put(bulkH)
+
+	buf := make([]byte, grid)
+	var compBuf bytes.Buffer
+	var chunks []Chunk
+	var offset int64
+
+	for {
+		n, rerr := io.ReadFull(rc, buf)
+		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+			return result, fmt.Errorf("reading %s: %w", entry.Path, rerr)
+		}
+		// Emit a chunk for every block read, and exactly one zero-length chunk
+		// for an empty file (ingestsql forces expected_num_chunks to 1 when
+		// size == 0, swissknife_ingestsql.cc:1360).
+		if n == 0 && offset > 0 {
+			break
+		}
+		block := buf[:n]
+		bulkH.Write(block)
+
+		h := sha1Pool.Get().(hash.Hash) //nolint:gosec
+		h.Reset()
+		compBuf.Reset()
+		w.Reset(io.MultiWriter(&compBuf, h))
+		if _, werr := w.Write(block); werr != nil {
+			sha1Pool.Put(h)
+			return result, fmt.Errorf("zlib write at offset %d: %w", offset, werr)
+		}
+		if cerr := w.Close(); cerr != nil {
+			sha1Pool.Put(h)
+			return result, fmt.Errorf("zlib close at offset %d: %w", offset, cerr)
+		}
+		chunkHash := hex.EncodeToString(h.Sum(nil))
+		sha1Pool.Put(h)
+
+		path, perr := writeChunkSpill(spillDir, seq, compBuf.Bytes())
+		if perr != nil {
+			return result, perr
+		}
+		size := int64(compBuf.Len())
+		chunks = append(chunks, Chunk{
+			Offset:           offset,
+			UncompressedSize: int64(n),
+			Hash:             chunkHash,
+			Path:             path,
+			CompressedSize:   size,
+		})
+		result.CompressedSize += size
+		offset += int64(n)
+
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			break
+		}
+	}
+
+	result.Hash = hex.EncodeToString(bulkH.Sum(nil))
+	result.Chunks = chunks
+	return result, nil
+}
+
+// writeChunkSpill writes one compressed chunk to the spill directory. Names are
+// sequence-based so nothing derived from tar content reaches the filesystem.
+func writeChunkSpill(dir string, seq *int64, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("creating chunk spill dir: %w", err)
+	}
+	n := atomic.AddInt64(seq, 1)
+	path := filepath.Join(dir, fmt.Sprintf("c%012d.z", n))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", fmt.Errorf("writing compressed chunk: %w", err)
+	}
+	return path, nil
 }
 
 // zlibLevel converts a pipeline compress level (0 = default) to a zlib level constant.

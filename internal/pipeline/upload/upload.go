@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -47,6 +48,43 @@ func PutWithRetry(ctx context.Context, casBackend cas.Backend, hash string, data
 			return nil
 		}
 		// Do not retry on context cancellation / deadline exceeded.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("upload failed after %d attempts: %w", maxUploadAttempts, lastErr)
+}
+
+// PutStreamWithRetry is PutWithRetry for content that is NOT held in memory:
+// open yields a fresh reader for each attempt, so a retry re-reads from the
+// source rather than replaying a consumed one.
+//
+// This is what lets a multi-GB file be uploaded chunk by chunk without the
+// compressed bytes ever being resident.
+func PutStreamWithRetry(ctx context.Context, casBackend cas.Backend, hash string,
+	open func() (io.ReadCloser, error), size int64) error {
+	var lastErr error
+	delay := 100 * time.Millisecond
+	for attempt := 0; attempt < maxUploadAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+				delay *= 2
+			}
+		}
+		rc, oerr := open()
+		if oerr != nil {
+			lastErr = oerr
+			continue
+		}
+		err := casBackend.Put(ctx, hash, rc, size)
+		_ = rc.Close()
+		if err == nil {
+			return nil
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
