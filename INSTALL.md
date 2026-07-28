@@ -118,6 +118,11 @@ sudo install -m 755 bin/prepubctl     /usr/local/bin/
 
 ```sh
 # Spool directory — owned by the service account, mode 0700
+# SIZING: besides job state, the spool holds spilled tar content while a job
+# runs — entries larger than 64 KiB are written here instead of being held in
+# memory, so peak RAM no longer scales with package size. Allow room for the
+# largest package you publish (plus concurrent jobs); the directory is removed
+# when each job finishes.
 sudo mkdir -p /var/spool/cvmfs-prepub
 sudo chown cvmfs-prepub:cvmfs-prepub /var/spool/cvmfs-prepub
 sudo chmod 0700 /var/spool/cvmfs-prepub

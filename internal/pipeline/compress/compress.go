@@ -211,7 +211,11 @@ func compressEntry(entry unpack.FileEntry, chunkSize int64, level int) (Result, 
 	}
 
 	// Check if we should chunk this file (before compression, based on raw size).
-	if chunkSize > 0 && int64(len(entry.Data)) > chunkSize {
+	entryData, derr := entry.Bytes()
+	if derr != nil {
+		return Result{}, derr
+	}
+	if chunkSize > 0 && int64(len(entryData)) > chunkSize {
 		return compressEntryChunked(entry, chunkSize, level)
 	}
 
@@ -237,7 +241,7 @@ func compressEntry(entry unpack.FileEntry, chunkSize int64, level int) (Result, 
 	var compBuf bytes.Buffer
 	w.Reset(io.MultiWriter(&compBuf, h))
 
-	if _, err := w.Write(entry.Data); err != nil {
+	if _, err := w.Write(entryData); err != nil {
 		return result, fmt.Errorf("zlib write: %w", err)
 	}
 	if err := w.Close(); err != nil {
@@ -261,7 +265,10 @@ func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (R
 
 	result := Result{FileEntry: entry}
 
-	data := entry.Data
+	data, derr := entry.Bytes()
+	if derr != nil {
+		return Result{}, derr
+	}
 	var chunks []Chunk
 	offset := int64(0)
 
@@ -381,7 +388,10 @@ func compressEntryCDC(entry unpack.FileEntry, det *chunker.Xor32, level int) (Re
 		return result, nil
 	}
 
-	data := entry.Data
+	data, derr := entry.Bytes()
+	if derr != nil {
+		return Result{}, derr
+	}
 	cuts := det.Cuts(data)
 
 	// bounds always spans the whole file, so len(cuts)==0 yields exactly one

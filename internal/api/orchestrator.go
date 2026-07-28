@@ -332,7 +332,11 @@ func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 
 	go func() {
 		defer f.Close()
-		result, err := pipeline.PrefetchFromReader(ctx, f, o.Obs)
+		// Spill large entries under the spool dir. Without this the prefetch
+		// holds the ENTIRE uncompressed package in memory until the job runs,
+		// which is what OOM-killed the service on an 8 GB host. Read from the
+		// handle opened above, not the path, to keep the stable inode reference.
+		result, err := pipeline.PrefetchFromReaderWithSpill(ctx, f, o.Pipeline.SpoolDir, o.Obs)
 		if err != nil {
 			o.Obs.Logger.Warn("prefetch failed — Run() will fall back to pipeline.Run()",
 				"job_id", j.ID, "error", err)
@@ -876,6 +880,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			logger.Info("using prefetched tar entries (phase 0 already done)",
 				"entries", len(prefetch.SortedEntries))
 			pipelineResult, err = pipeline.RunFromPrefetch(ctx, prefetch, jobPipelineCfg)
+			// Release spilled content as soon as the pipeline is done with it;
+			// otherwise a failed job leaves the package on disk until restart.
+			prefetch.Cleanup()
 		} else {
 			pipelineResult, err = pipeline.Run(ctx, j.TarPath, jobPipelineCfg)
 		}

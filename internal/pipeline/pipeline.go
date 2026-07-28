@@ -128,6 +128,33 @@ func Run(ctx context.Context, tarPath string, cfg Config) (*Result, error) {
 type PrefetchResult struct {
 	SortedEntries []unpack.FileEntry
 	DirtabContent []byte
+	// SpillDir holds the on-disk content of large entries. The sorted entry
+	// list keeps only metadata plus small inline files, so a package no longer
+	// has to fit in memory to be published. Call Cleanup when done.
+	SpillDir string
+}
+
+// Cleanup removes the spill directory. Safe to call more than once, and on a
+// PrefetchResult that never spilled.
+func (p *PrefetchResult) Cleanup() {
+	if p == nil || p.SpillDir == "" {
+		return
+	}
+	_ = os.RemoveAll(p.SpillDir)
+	p.SpillDir = ""
+}
+
+// newSpillDir creates a unique spill directory under root. An empty root
+// disables spilling (everything stays in memory, the pre-existing behaviour).
+func newSpillDir(root string) (string, error) {
+	if root == "" {
+		return "", nil
+	}
+	dir, err := os.MkdirTemp(root, "unpack-spill-")
+	if err != nil {
+		return "", fmt.Errorf("creating spill dir under %q: %w", root, err)
+	}
+	return dir, nil
 }
 
 // Prefetch performs Phase 0 only (collect + validate + sort) from a tar file.
@@ -139,22 +166,55 @@ type PrefetchResult struct {
 // tar from scratch.  A non-nil *PrefetchResult is always valid and ready to
 // pass to RunFromPrefetch.
 func Prefetch(ctx context.Context, tarPath string, obs *observe.Provider) (*PrefetchResult, error) {
+	return PrefetchWithSpill(ctx, tarPath, "", obs)
+}
+
+// PrefetchWithSpill is Prefetch with a spill root: entries larger than
+// unpack.DefaultInlineMaxSize are written under spillRoot instead of being held
+// in memory. An empty spillRoot keeps everything in memory.
+func PrefetchWithSpill(ctx context.Context, tarPath, spillRoot string, obs *observe.Provider) (*PrefetchResult, error) {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening tar for prefetch %q: %w", tarPath, err)
 	}
 	defer f.Close()
-	return PrefetchFromReader(ctx, f, obs)
+	return prefetchFromReader(ctx, f, spillRoot, obs)
 }
 
 // PrefetchFromReader performs Phase 0 from an io.Reader.
 // It is the same collect+validate+sort logic used by RunFromReader, extracted
 // so it can run before the concurrency slot is acquired.
 func PrefetchFromReader(ctx context.Context, r io.Reader, obs *observe.Provider) (*PrefetchResult, error) {
+	return prefetchFromReader(ctx, r, "", obs)
+}
+
+// PrefetchFromReaderWithSpill is PrefetchFromReader with a spill root, for
+// callers that already hold an open handle on the tar (preserving a stable
+// inode reference across a concurrent rename) and still want large entries
+// written to disk rather than held in memory.
+func PrefetchFromReaderWithSpill(ctx context.Context, r io.Reader, spillRoot string, obs *observe.Provider) (*PrefetchResult, error) {
+	return prefetchFromReader(ctx, r, spillRoot, obs)
+}
+
+func prefetchFromReader(ctx context.Context, r io.Reader, spillRoot string, obs *observe.Provider) (*PrefetchResult, error) {
+	spillDir, serr := newSpillDir(spillRoot)
+	if serr != nil {
+		return nil, serr
+	}
+	// Any error path below must not leave spilled content behind: the caller
+	// gets no PrefetchResult and therefore no handle to Cleanup with.
+	ok := false
+	defer func() {
+		if !ok && spillDir != "" {
+			_ = os.RemoveAll(spillDir)
+		}
+	}()
+
 	collectChan := make(chan unpack.FileEntry, 256)
 	collectErrCh := make(chan error, 1)
 	go func() {
-		collectErrCh <- unpack.Extract(ctx, r, collectChan)
+		collectErrCh <- unpack.ExtractWithOptions(ctx, r, collectChan,
+			unpack.Options{SpillDir: spillDir})
 		close(collectChan)
 	}()
 
@@ -169,9 +229,13 @@ func PrefetchFromReader(ctx context.Context, r io.Reader, obs *observe.Provider)
 			return nil, fmt.Errorf("duplicate path %q in tar — each path must appear exactly once", entry.Path)
 		}
 		seenPaths[entry.Path] = struct{}{}
-		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && len(entry.Data) > 0 {
-			capturedDirtab = make([]byte, len(entry.Data))
-			copy(capturedDirtab, entry.Data)
+		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && entry.Size > 0 {
+			b, derr := entry.Bytes()
+			if derr != nil {
+				return nil, fmt.Errorf("reading .cvmfsdirtab: %w", derr)
+			}
+			capturedDirtab = make([]byte, len(b))
+			copy(capturedDirtab, b)
 		}
 		sortedEntries = append(sortedEntries, entry)
 	}
@@ -188,9 +252,11 @@ func PrefetchFromReader(ctx context.Context, r io.Reader, obs *observe.Provider)
 			"entries", len(sortedEntries))
 	}
 
+	ok = true
 	return &PrefetchResult{
 		SortedEntries: sortedEntries,
 		DirtabContent: capturedDirtab,
+		SpillDir:      spillDir,
 	}, nil
 }
 
@@ -269,9 +335,13 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 		}
 		seenPaths[entry.Path] = struct{}{}
 
-		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && len(entry.Data) > 0 {
-			capturedDirtab = make([]byte, len(entry.Data))
-			copy(capturedDirtab, entry.Data)
+		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && entry.Size > 0 {
+			b, derr := entry.Bytes()
+			if derr != nil {
+				return nil, fmt.Errorf("reading .cvmfsdirtab: %w", derr)
+			}
+			capturedDirtab = make([]byte, len(b))
+			copy(capturedDirtab, b)
 		}
 
 		sortedEntries = append(sortedEntries, entry)
@@ -411,9 +481,13 @@ func RunFromArchiveList(ctx context.Context, archives []ArchiveSource, cfg Confi
 				break
 			}
 			seenPaths[entry.Path] = struct{}{}
-			if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && len(entry.Data) > 0 {
-				capturedDirtab = make([]byte, len(entry.Data))
-				copy(capturedDirtab, entry.Data)
+			if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && entry.Size > 0 {
+				b, derr := entry.Bytes()
+				if derr != nil {
+					return nil, fmt.Errorf("reading .cvmfsdirtab: %w", derr)
+				}
+				capturedDirtab = make([]byte, len(b))
+				copy(capturedDirtab, b)
 			}
 			archEntries = append(archEntries, entry)
 		}
