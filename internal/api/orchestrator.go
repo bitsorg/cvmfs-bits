@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -51,9 +52,24 @@ type Orchestrator struct {
 	// CAS is the content-addressable storage backend (gateway mode only;
 	// unused when Lease.NeedsPipeline() returns false).
 	CAS cas.Backend
-	// Lease is the publish transaction backend.  Use lease.NewClient for
-	// gateway mode or lease.NewLocalBackend for single-host mode.
+	// Lease is the DEFAULT publish transaction backend.  Use lease.NewClient
+	// for gateway mode or lease.NewLocalBackend for single-host mode.  A job
+	// that does not name a publish path is published through this one.
 	Lease lease.Backend
+	// PublishPaths maps a publish-path name to the backend that serves it,
+	// letting a producer choose how its package reaches the repository:
+	//
+	//	"prepub" — the default: compress/dedup/CAS pipeline, then a gateway
+	//	           commit; supports pre-warming and coarse (whole-build) publish.
+	//	"ingest" — relay: hand the tar to `cvmfs_server ingest` and let the
+	//	           gateway do the work (ADR-0008 D7).
+	//
+	// The map is populated at startup from the deployment's configuration, so
+	// a path a node cannot serve simply is not there and jobs asking for it are
+	// rejected rather than silently published a different way.  This is also
+	// the registry that ADR-0008 D1 needs for per-repository backends: the key
+	// becomes (repo, path) when one instance serves several repositories.
+	PublishPaths map[string]lease.Backend
 	// JobTimeout is the maximum wall-clock duration a single job may run
 	// before its context is cancelled and the job is failed.  A value of
 	// zero disables the per-job timeout (backward-compatible default).
@@ -320,8 +336,54 @@ func (o *Orchestrator) waitForManifestPropagation(ctx context.Context, repo, pat
 // goroutine) before launching the background goroutine.  An open fd holds a
 // kernel inode reference that survives directory renames, so the goroutine
 // can read all content through the fd even after the rename completes.
+// DefaultPublishPath is the publish path used when a job does not name one.
+const DefaultPublishPath = "prepub"
+
+// leaseFor returns the publish backend for a job.  A job that names a publish
+// path gets the backend registered for it; everything else gets the default.
+//
+// An unknown or unconfigured path falls back to the default rather than
+// panicking, because this is on the failure path too (abortJob must be able to
+// release a lease for a job whose configuration has since changed). Submission
+// is where an unserviceable path is rejected — see Server.publishPathAvailable
+// — and Run re-checks before doing any work.
+func (o *Orchestrator) leaseFor(j *job.Job) lease.Backend {
+	if j != nil && j.PublishPath != "" && j.PublishPath != DefaultPublishPath {
+		if b, ok := o.PublishPaths[j.PublishPath]; ok && b != nil {
+			return b
+		}
+	}
+	return o.Lease
+}
+
+// HasPublishPath reports whether this deployment can serve a publish path.
+// The empty name and the default always resolve to the default backend.
+func (o *Orchestrator) HasPublishPath(name string) bool {
+	if name == "" || name == DefaultPublishPath {
+		return o.Lease != nil
+	}
+	b, ok := o.PublishPaths[name]
+	return ok && b != nil
+}
+
+// PublishPathNames lists the publish paths this deployment can serve, for
+// startup logging and error messages.
+func (o *Orchestrator) PublishPathNames() []string {
+	names := make([]string, 0, len(o.PublishPaths)+1)
+	if o.Lease != nil {
+		names = append(names, DefaultPublishPath)
+	}
+	for name, b := range o.PublishPaths {
+		if b != nil && name != DefaultPublishPath {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
-	if !o.Lease.NeedsPipeline() {
+	if !o.leaseFor(j).NeedsPipeline() {
 		return // local mode: no pipeline, no prefetch
 	}
 	if j.TarPath == "" {
@@ -415,7 +477,7 @@ func (o *Orchestrator) takePrefetch(ctx context.Context, jobID string) *pipeline
 // Phase 2.7 (leaf lease acquisition), so that no overlapping path leases
 // exist when the parent lease is acquired.
 func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
-	if o.Stratum0URL == "" || j.Path == "" || !o.Lease.NeedsPipeline() {
+	if o.Stratum0URL == "" || j.Path == "" || !o.leaseFor(j).NeedsPipeline() {
 		return nil
 	}
 
@@ -545,7 +607,7 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 	if o.GatewayQueue != nil {
 		mkdirToken, leaseErr = o.GatewayQueue.Acquire(ctx, j.Repo, graftPath, 0)
 	} else {
-		mkdirToken, leaseErr = o.Lease.Acquire(ctx, j.Repo, graftPath)
+		mkdirToken, leaseErr = o.leaseFor(j).Acquire(ctx, j.Repo, graftPath)
 	}
 	if leaseErr != nil {
 		return fmt.Errorf("mkdir-p: acquire lease for %q: %w", graftPath, leaseErr)
@@ -559,14 +621,14 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 	// Fetch current root hash from .cvmfspublished (~200-byte HTTP GET).
 	mkdirOldRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, j.Repo)
 	if fetchErr != nil {
-		_ = o.Lease.Abort(ctx, mkdirToken)
+		_ = o.leaseFor(j).Abort(ctx, mkdirToken)
 		return fmt.Errorf("mkdir-p: fetch manifest: %w", fetchErr)
 	}
 
 	// Commit the directory-only subtree catalog.
 	// Lease.Commit handles SubmitPayload + commit POST.  On failure, abort the
 	// lease so the gateway releases it promptly instead of waiting for expiry.
-	commitErr := o.Lease.Commit(ctx, lease.CommitRequest{
+	commitErr := o.leaseFor(j).Commit(ctx, lease.CommitRequest{
 		Token:               mkdirToken,
 		OldRootHash:         mkdirOldRoot,
 		NewRootHashSuffixed: mkdirResult.CatalogHashSuffixed,
@@ -575,7 +637,7 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 		// ObjectHashes intentionally empty: no data objects in a dir-only catalog.
 	})
 	if commitErr != nil {
-		_ = o.Lease.Abort(ctx, mkdirToken)
+		_ = o.leaseFor(j).Abort(ctx, mkdirToken)
 		return fmt.Errorf("mkdir-p: commit for %q: %w", graftPath, commitErr)
 	}
 
@@ -712,6 +774,20 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 		"new_root_hash", newRootHash)
 }
 
+// preWarmFor reports whether this job should pre-warm Stratum 1 caches.
+//
+// The job's own request wins when it made one; otherwise the node default
+// (--prewarm, off) applies. Pre-warming is expensive for the receivers and
+// pointless for a package nobody will read soon, so it is opt-in at both
+// levels — but a producer that knows a release is about to be used everywhere
+// can ask for it per build without the node having to enable it globally.
+func (o *Orchestrator) preWarmFor(j *job.Job) bool {
+	if j != nil && j.PreWarm != nil {
+		return *j.PreWarm
+	}
+	return o.PreWarm
+}
+
 // publishAnnounce broadcasts the pre-commit AnnounceMessage directly on the
 // control-plane broker so Stratum 1 receivers begin pulling the transaction's
 // objects before the catalog flips (ADR-0001 pull mode). It mirrors
@@ -724,9 +800,9 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 // fails the publish. Receivers also converge on the post-commit published
 // broadcast and the .cvmfspublished backstop poll, so a missed announce only
 // delays warming, it does not lose data.
-func (o *Orchestrator) publishAnnounce(repo, payloadID string, hashes []string, totalBytes int64) {
-	if !o.PreWarm {
-		return // S1 cache pre-warming is opt-in (--prewarm); off by default.
+func (o *Orchestrator) publishAnnounce(j *job.Job, repo, payloadID string, hashes []string, totalBytes int64) {
+	if !o.preWarmFor(j) {
+		return // S1 cache pre-warming is opt-in; off by default.
 	}
 	if o.Distribute == nil || o.Distribute.BrokerConfig == nil ||
 		o.Distribute.BrokerConfig.BrokerURL == "" {
@@ -805,6 +881,17 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 
 	logger := o.Obs.Logger.With("job_id", j.ID)
 
+	// The publish path is checked at submission, but a job can also arrive here
+	// from crash recovery after the deployment's configuration changed. Publish
+	// it a different way than the producer asked for and the build would look
+	// fine while having taken a path with different dedup, pre-warming and
+	// commit-granularity properties — so fail instead.
+	if !o.HasPublishPath(j.PublishPath) {
+		return o.abortJob(ctx, j, fmt.Errorf(
+			"publish path %q is not configured on this prepub (available: %s)",
+			j.PublishPath, strings.Join(o.PublishPathNames(), ", ")))
+	}
+
 	// ── Coarse-publish finalize job (ADR-0007) ───────────────────────────────
 	// A finalize job carries no payload: it publishes all of BuildID's
 	// accumulated packages in one ingestsql commit. Release the concurrency slot
@@ -844,7 +931,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	}
 
 	// Invariant: gateway mode requires a non-nil CAS backend.
-	if o.Lease.NeedsPipeline() && o.CAS == nil {
+	if o.leaseFor(j).NeedsPipeline() && o.CAS == nil {
 		err := fmt.Errorf("misconfiguration: gateway mode requires a non-nil CAS backend")
 		span.RecordError(err)
 		return o.abortJob(ctx, j, err)
@@ -857,7 +944,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// ── Phase 1 + 2: pipeline + distribution (gateway mode only) ─────────────
 	var pipelineResult *pipeline.Result
 
-	if o.Lease.NeedsPipeline() {
+	if o.leaseFor(j).NeedsPipeline() {
 		logger.Info("staging", "tar", j.TarPath)
 		if err := o.transition(ctx, j, job.StateStaging); err != nil {
 			span.RecordError(err)
@@ -992,7 +1079,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// means receivers converge on the post-commit published broadcast.
 			if o.Distribute != nil && o.Distribute.BrokerConfig != nil &&
 				o.Distribute.BrokerConfig.BrokerURL != "" {
-				o.publishAnnounce(j.Repo, j.ID,
+				o.publishAnnounce(j, j.Repo, j.ID,
 					append([]string(nil), pipelineResult.NewObjectHashes...),
 					pipelineResult.NBytesComp)
 			}
@@ -1099,7 +1186,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// Set when BuildSubtree synthesized a .cvmfscatalog marker: its empty-file
 	// object must be submitted to the gateway alongside the catalogs.
 	var markerObjectHash string
-	if o.Lease.NeedsPipeline() {
+	if o.leaseFor(j).NeedsPipeline() {
 		if err := o.transition(ctx, j, job.StateLeased); err != nil {
 			span.RecordError(err)
 			return o.abortJob(ctx, j, err)
@@ -1283,13 +1370,13 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 
 				// Start heartbeat — monitoring-only (gateway HTTP 405 on renewal).
 				leaseCtx, leaseCancel = context.WithCancel(ctx)
-				cancelHeartbeat = o.Lease.Heartbeat(ctx, token, 10*time.Second, leaseCancel)
+				cancelHeartbeat = o.leaseFor(j).Heartbeat(ctx, token, 10*time.Second, leaseCancel)
 
 				// Upload the subtree catalog(s) to the gateway before the mutex.
 				// Split catalogs first, subtree root last — gateway referential integrity.
 				// Type-assertion to *lease.Client is safe: GatewayQueue != nil implies
 				// gateway mode.
-				lc := o.Lease.(*lease.Client)
+				lc := o.leaseFor(j).(*lease.Client)
 				var preCatalogHash string
 				var preObjectHashes []string
 				// The marker's empty-file object is a content object, so it
@@ -1350,13 +1437,35 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// For subtree publishes in gateway mode (preMutexLease == true), the lease
 	// was already acquired and the heartbeat already started in Phase 2.7.
 	// Skip acquisition here to avoid a redundant gateway round-trip.
-	if !o.Lease.NeedsPipeline() {
-		// Local mode: job skipped all pipeline states and is still StateIncoming.
-		// Transition to StateLeased here so the FSM is consistent before Commit.
+	if !o.leaseFor(j).NeedsPipeline() {
+		// No-pipeline backends (local extraction, ingest relay) skipped every
+		// pipeline state and are still StateIncoming. They also skipped the
+		// per-repo commit lock taken inside the pipeline branch above — which
+		// mattered little when such a backend was the only one on a node, but a
+		// node can now serve both paths at once, and two backends committing to
+		// one repository concurrently is the stale-root-hash race the lock
+		// exists to prevent.
+		if !commitLockHeld {
+			unlockCommit, lockErr := o.acquireCommitLock(ctx, j.Repo)
+			if lockErr != nil {
+				span.RecordError(lockErr)
+				return o.abortJob(ctx, j, lockErr)
+			}
+			releaseCommit = unlockCommit
+			commitLockHeld = true
+			logger.Info("acquired per-repo commit serialisation lock", "repo", j.Repo)
+		}
+
+		// Transition to StateLeased so the FSM is consistent before Commit.
+		// This RENAMES the job directory, so the tar path recorded at
+		// submission no longer resolves — refresh it before Commit reads it.
 		j.LeasedAt = time.Now()
 		if err := o.transition(ctx, j, job.StateLeased); err != nil {
 			span.RecordError(err)
 			return o.abortJob(ctx, j, err)
+		}
+		if j.TarPath != "" {
+			j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
 		}
 	}
 
@@ -1371,10 +1480,16 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		logger.Info("acquiring lease", "repo", j.Repo, "path", j.Path)
 		j.LeasedAt = time.Now()
 		var leaseErr error
-		if o.GatewayQueue != nil {
+		// The GatewayQueue fronts the GATEWAY lease client only. A job on a
+		// backend that does not use the pipeline (local extraction, or the
+		// ingest relay) manages its own serialisation and must not be handed a
+		// gateway lease token: it would hold a real lease on the very path its
+		// own publish is about to lease, and the token would then be fed to a
+		// backend that cannot release it.
+		if o.GatewayQueue != nil && o.leaseFor(j).NeedsPipeline() {
 			token, leaseErr = o.GatewayQueue.Acquire(ctx, j.Repo, j.Path, 0)
 		} else {
-			token, leaseErr = o.Lease.Acquire(ctx, j.Repo, j.Path)
+			token, leaseErr = o.leaseFor(j).Acquire(ctx, j.Repo, j.Path)
 		}
 		if leaseErr != nil {
 			span.RecordError(leaseErr)
@@ -1391,7 +1506,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		// fail (gateway mode only; the no-op heartbeat never calls onExpire in
 		// local mode).
 		leaseCtx, leaseCancel = context.WithCancel(ctx)
-		cancelHeartbeat = o.Lease.Heartbeat(ctx, token, 10*time.Second, leaseCancel)
+		cancelHeartbeat = o.leaseFor(j).Heartbeat(ctx, token, 10*time.Second, leaseCancel)
 	} else {
 		logger.Info("using pre-acquired gateway lease (Phase 2.7)",
 			"repo", j.Repo, "path", j.Path)
@@ -1493,10 +1608,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	if preMutexLease {
 		// Catalog already uploaded in Phase 2.7.  Only the commit POST remains.
 		// Type-assertion is safe: preMutexLease is only set when o.GatewayQueue != nil.
-		lc := o.Lease.(*lease.Client)
+		lc := o.leaseFor(j).(*lease.Client)
 		commitErr = lc.CommitFinalizeOnly(ctx, req)
 	} else {
-		commitErr = o.Lease.Commit(ctx, req)
+		commitErr = o.leaseFor(j).Commit(ctx, req)
 	}
 
 	if commitErr != nil {
@@ -1534,6 +1649,13 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		}
 	}
 	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("commit").Observe(time.Since(commitPhaseStart).Seconds())
+
+	// The lease/slot is gone once Commit returns — every backend releases it,
+	// successfully or not. Clearing the token stops crash recovery from later
+	// "releasing" it again: Recover aborts any job it finds carrying a token,
+	// and for a slot-based backend that abort would free whichever job holds
+	// the slot at that moment, not this long-finished one.
+	j.LeaseToken = ""
 
 	// Notify the gateway queue that this repo's lease has been released so any
 	// goroutine waiting in GatewayQueue.Acquire wakes up immediately instead of
@@ -1674,7 +1796,7 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job) error {
 	// Release any stale transaction.  The token may have already been
 	// released or expired — Abort is idempotent and errors are non-fatal here.
 	if j.LeaseToken != "" {
-		if releaseErr := o.Lease.Abort(ctx, j.LeaseToken); releaseErr != nil {
+		if releaseErr := o.leaseFor(j).Abort(ctx, j.LeaseToken); releaseErr != nil {
 			logger.Warn("failed to abort stale transaction during recovery (ignoring)",
 				"token", j.LeaseToken, "error", releaseErr)
 		}
@@ -1726,7 +1848,7 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	defer cleanupCancel()
 
 	if j.LeaseToken != "" {
-		if abortErr := o.Lease.Abort(cleanupCtx, j.LeaseToken); abortErr != nil {
+		if abortErr := o.leaseFor(j).Abort(cleanupCtx, j.LeaseToken); abortErr != nil {
 			// Log at ERROR so operators know the gateway lease was NOT released.
 			// The lease will eventually expire on the gateway (max_lease_time),
 			// but until then new jobs for the same repo/path will get path_busy.

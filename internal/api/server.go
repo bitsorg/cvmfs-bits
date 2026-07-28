@@ -550,6 +550,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		buildID                   string   // optional: groups a build's packages (ADR-0007)
 		buildExpect               int      // optional: package count → auto-finalize when reached
 		finalize                  bool     // coarse-publish finalize job (no tar payload)
+		publishPath               string   // optional: "prepub" (default) or "ingest"
+		preWarm                   *bool    // optional: nil = node default
 	)
 
 	jobID := uuid.New().String()
@@ -574,6 +576,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			PreloadPaths   []string `json:"preload_paths"`
 			BuildID        string   `json:"build_id"`
 			BuildExpect    int      `json:"build_expect"`
+			PublishPath    string   `json:"publish_path"`
+			PreWarm        *bool    `json:"prewarm"`
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
@@ -650,6 +654,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preloadPaths = req.PreloadPaths
 		buildID = req.BuildID
 		buildExpect = req.BuildExpect
+		publishPath = req.PublishPath
+		preWarm = req.PreWarm
 
 	} else {
 		// ── Multipart upload mode (default) ─────────────────────────────────
@@ -816,6 +822,18 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 			buildExpect = n
 		}
+		publishPath = field("publish_path")
+		// prewarm is tri-state: absent means "use the node default", so an
+		// unset field must NOT be read as false.
+		if raw := field("prewarm"); raw != "" {
+			v, convErr := strconv.ParseBool(strings.TrimSpace(raw))
+			if convErr != nil {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"prewarm must be a boolean"}`, http.StatusBadRequest)
+				return
+			}
+			preWarm = &v
+		}
 
 		if repo == "" {
 			os.RemoveAll(jobDir)
@@ -879,6 +897,44 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The publish path must be one this deployment can actually serve.  Failing
+	// here — rather than falling back to the default — is deliberate: the paths
+	// differ in where content is chunked and deduped, whether it can be
+	// pre-warmed, and whether the commit is per package or per build.  A job
+	// that quietly took the other one would look identical and be wrong.
+	publishPath = strings.TrimSpace(publishPath)
+	if !s.orch.HasPublishPath(publishPath) {
+		os.RemoveAll(jobDir)
+		s.obs.Logger.Warn("submit: unsupported publish path",
+			"publish_path", publishPath, "available", s.orch.PublishPathNames())
+		http.Error(w, fmt.Sprintf(`{"error":"publish path %q is not configured on this prepub (available: %s)"}`,
+			jsonEscape(publishPath), jsonEscape(strings.Join(s.orch.PublishPathNames(), ", "))),
+			http.StatusBadRequest)
+		return
+	}
+	if publishPath != "" && publishPath != DefaultPublishPath {
+		// Pre-warming is a property of the prepub pipeline: the ingest path
+		// commits through the gateway, so there is no window in which the
+		// objects exist and the catalog has not yet flipped. Accepting the
+		// request and ignoring it would be worse than saying so.
+		if preWarm != nil && *preWarm {
+			os.RemoveAll(jobDir)
+			http.Error(w, fmt.Sprintf(`{"error":"publish path %q cannot pre-warm Stratum 1 caches; drop prewarm or use the %q path"}`,
+				jsonEscape(publishPath), DefaultPublishPath), http.StatusBadRequest)
+			return
+		}
+		// Likewise coarse publish: an alternative path commits each package as
+		// it arrives, so there is nothing to accumulate and a finalize would
+		// never fire. Silently dropping build_id would leave the producer
+		// waiting on a build that can never complete.
+		if buildID != "" {
+			os.RemoveAll(jobDir)
+			http.Error(w, fmt.Sprintf(`{"error":"publish path %q commits each package on arrival and cannot take part in a coarse build; drop build_id or use the %q path"}`,
+				jsonEscape(publishPath), DefaultPublishPath), http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Record the build's expected package count before the job can accumulate,
 	// so that the last package to finish sees a complete declaration and can
 	// trigger the finalize itself.  Every package of the build carries the same
@@ -903,6 +959,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.TagDescription = tagDescription
 	j.PreloadExe = preloadExe
 	j.PreloadPaths = preloadPaths
+	j.PublishPath = publishPath
+	j.PreWarm = preWarm
 
 	// Record the original filename and size for the console tooltip.
 	// Use Stat on the spool copy since the original may have been moved.
@@ -1703,7 +1761,19 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	_, span := s.obs.Tracer.Start(r.Context(), "api.health")
 	defer span.End()
 
+	// Advertise the publish paths this node serves. A producer otherwise finds
+	// out only by uploading a package and getting a 400 for every job — the
+	// console's per-community toggle can be enabled for a node that was never
+	// started with the corresponding backend.
+	body := struct {
+		Status       string   `json:"status"`
+		PublishPaths []string `json:"publish_paths"`
+	}{Status: "healthy"}
+	if s.orch != nil {
+		body.PublishPaths = s.orch.PublishPathNames()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"healthy"}`)
+	_ = json.NewEncoder(w).Encode(body)
 }

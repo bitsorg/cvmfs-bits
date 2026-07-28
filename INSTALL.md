@@ -182,9 +182,9 @@ cas:
   root: /srv/cvmfs/cas
 
 pipeline:
-  workers: 0            # 0 = runtime.NumCPU()
+  workers: 2            # peak RSS scales with workers x largest file
   compression: zlib
-  upload_concurrency: 16
+  upload_concurrency: 4
 
 repositories:
   - name: atlas.cern.ch
@@ -305,9 +305,9 @@ cas:
   root: /srv/cvmfs/cas
 
 pipeline:
-  workers: 0
+  workers: 2
   compression: zlib
-  upload_concurrency: 16
+  upload_concurrency: 4
 
 repositories:
   - name: atlas.cern.ch
@@ -325,6 +325,58 @@ cvmfs-prepub \
 **Probe** — on startup (and via the health endpoint) the service verifies that
 `cvmfs_server` is reachable on `PATH`. The health check reports an error if the
 binary is missing before any job is submitted.
+
+### Offering the ingest publish path
+
+`publish_mode` selects the DEFAULT backend. A deployment can additionally offer
+the **ingest** path, which a job asks for per package with `publish_path=ingest`:
+the tar is handed to `cvmfs_server ingest` and the gateway does the chunking,
+dedup, storage and catalogs (ADR-0008 D7).
+
+```yaml
+ingest_publish: true             # offer the "ingest" publish path
+ingest_publish_owner: cvmfs      # optional: cvmfs_server ingest -u <owner>
+```
+
+or `--ingest-publish [--ingest-publish-owner cvmfs]`.
+
+Prerequisites on the prepub host, once per repository:
+
+```sh
+mkdir -p /etc/cvmfs/keys
+echo "plain_text <KEY_ID> <KEY_SECRET>" > /etc/cvmfs/keys/<repo>.gw
+cvmfs_server connect-gw -P -K \
+    -u http://<gateway>:4929/api/v1 \
+    -w <stratum0-url>/<repo> \
+    -o <owner> <repo>
+```
+
+`-P` is mountless publisher mode: no FUSE mount, no overlay, no privileged
+container. Where `/etc/cvmfs/<repo>.s3.conf` also exists, data chunks go straight
+to S3 and only catalogs pass through the gateway.
+
+What the ingest path gives up, and why the API refuses rather than ignores:
+
+- **No coarse publish.** Each package commits on arrival, so `build_id` is
+  rejected — a producer sealing such a build would wait for a finalize that can
+  never fire.
+- **No pre-warming.** The commit goes through the gateway, so there is no window
+  in which the objects exist and the catalog has not flipped; `prewarm=true` is
+  rejected.
+- **No local dedup**, and one gateway transaction per package rather than one
+  per build. This is not the faster path — it is the one that releases the build
+  node and keeps CVMFS format logic out of prepub.
+
+The startup log lists which paths the node serves; a job naming one it does not
+have is rejected at submission with 400.
+
+### Cache pre-warming
+
+`--prewarm` (off by default) is the NODE default. A job may override it per
+package with the `prewarm` form field: absent inherits the node default, `true`
+asks the Stratum 1 replicas to pull the build's objects before the catalog
+flips, `false` declines. Pre-warming also needs a configured control-plane
+broker (`--embedded-broker-ws-addr`); without one the announce is a no-op.
 
 **Lease window** — in local mode there is no server-side lease expiry. The
 service holds a per-repository in-process lock (fail-fast on conflict) for the

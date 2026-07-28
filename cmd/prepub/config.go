@@ -75,6 +75,13 @@ type fileConfig struct {
 	MaxConcurrentJobs int    `yaml:"max_concurrent_jobs"`
 	CVMFSMount        string `yaml:"cvmfs_mount"`
 
+	// IngestPublish offers the "ingest" publish path in addition to the default
+	// selected by publish_mode: a job may ask for its tar to be handed to
+	// `cvmfs_server ingest` so the gateway does the chunking, dedup and
+	// catalogs (ADR-0008 D7).  IngestPublishOwner maps to `ingest -u`.
+	IngestPublish      bool   `yaml:"ingest_publish"`
+	IngestPublishOwner string `yaml:"ingest_publish_owner"`
+
 	// Stratum0URL is the base URL of the Stratum 0 CVMFS server
 	// (e.g. "http://stratum0/cvmfs").  Required in gateway mode so the
 	// orchestrator can fetch the existing root catalog for merging.
@@ -230,6 +237,8 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
 	allowedPublishPrefixes *string,
 	gatewayDirectGraft *bool,
+	ingestPublish *bool,
+	ingestPublishOwner *string,
 	chunkMin, chunkAvg, chunkMax *int64,
 	pipelineWorkers, pipelineUploadConc *int,
 ) {
@@ -330,6 +339,14 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	if !has("gateway-direct-graft") && fc.Gateway.DirectGraft {
 		*gatewayDirectGraft = true
 	}
+
+	// Optional publish paths.  Same bool caveat as direct-graft: YAML cannot
+	// express "explicitly false", so config can only turn the path ON; use
+	// --ingest-publish=false on the CLI to override a config that enables it.
+	if !has("ingest-publish") && fc.IngestPublish {
+		*ingestPublish = true
+	}
+	str("ingest-publish-owner", ingestPublishOwner, fc.IngestPublishOwner)
 
 	// Content-defined chunking sizes (xor32); zero/omitted -> CLI default.
 	i64("chunk-min", chunkMin, fc.Chunking.Min)

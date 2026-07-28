@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -89,6 +90,8 @@ func main() {
 	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
+	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
+	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
 	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
 	ingestEnv := flag.String("ingest-env", "", "Comma-separated extra env for the ingestsql finalize, e.g. 'LD_LIBRARY_PATH=/opt/cvmfs/lib' [publisher]")
@@ -244,6 +247,7 @@ func main() {
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			allowedPublishPrefixes,
 			gatewayDirectGraft,
+			ingestPublish, ingestPublishOwner,
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc,
 		)
@@ -266,7 +270,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
@@ -296,7 +300,10 @@ func runPublisher(
 	devMode bool,
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
-	cvmfsMount, stratum0URL, repoName, casType, casRoot, casServerConf string,
+	cvmfsMount string,
+	ingestPublish bool,
+	ingestPublishOwner string,
+	stratum0URL, repoName, casType, casRoot, casServerConf string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv string,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
@@ -466,6 +473,34 @@ func runPublisher(
 		os.Exit(1)
 	}
 
+	// ── Optional publish paths ────────────────────────────────────────────────
+	//
+	// --publish-mode selects the DEFAULT backend; a deployment can additionally
+	// offer alternative paths that a job may name. Today there is one: "ingest",
+	// which hands the tar to `cvmfs_server ingest` so the gateway does the
+	// chunking, dedup and catalogs (ADR-0008 D7).
+	//
+	// The registry is keyed by path name now and becomes (repo, path) when one
+	// instance serves several repositories (ADR-0008 D1).
+	publishPaths := map[string]lease.Backend{}
+	if ingestPublish {
+		ib := lease.NewIngestBackend(lease.IngestOptions{
+			CVMFSMount: cvmfsMount,
+			// A nested catalog per published package keeps the root catalog
+			// small and is what lets ingest publish into a path that already
+			// holds nested sub-catalogs.
+			NestedCatalog: true,
+			Owner:         ingestPublishOwner,
+		}, obs)
+		if err := ib.Probe(context.Background()); err != nil {
+			obs.Logger.Error("--ingest-publish requested but the ingest backend is unusable", "error", err)
+			os.Exit(1)
+		}
+		publishPaths["ingest"] = ib
+		obs.Logger.Info("publish path available: ingest (cvmfs_server ingest — gateway does chunking/dedup/catalogs)",
+			"cvmfs_mount", cvmfsMount, "owner", ingestPublishOwner)
+	}
+
 	// Startup probe: confirm backends are reachable before accepting jobs.
 	obs.Logger.Info("running startup probe")
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -476,6 +511,15 @@ func runPublisher(
 	}
 	probeCancel()
 	obs.Logger.Info("startup probe passed")
+	// Say plainly which publish paths this node offers: a job naming one that is
+	// absent is rejected at submission, so an operator debugging a rejected
+	// build should be able to read the answer out of the startup log.
+	pathNames := []string{api.DefaultPublishPath + " (default, " + publishMode + " mode)"}
+	for name := range publishPaths {
+		pathNames = append(pathNames, name)
+	}
+	sort.Strings(pathNames)
+	obs.Logger.Info("publish paths available", "paths", strings.Join(pathNames, ", "))
 
 	notifyBus := notify.NewBus()
 
@@ -662,6 +706,7 @@ func runPublisher(
 			SpoolDir:      spoolRoot,
 			Obs:           obs,
 		},
+		PublishPaths:      publishPaths,
 		Distribute:        distCfg,
 		PreWarm:           preWarm,
 		Notify:            notifyBus,

@@ -181,6 +181,22 @@ type Job struct {
 	// startup run.  Only paths present in the submitted tar produce CAS hashes.
 	PreloadPaths []string `json:"preload_paths,omitempty"`
 
+	// PublishPath selects how this package reaches the repository:
+	//
+	//	"" / "prepub" — compress + dedup + CAS, then a gateway commit. Supports
+	//	                pre-warming and coarse (whole-build) publish.
+	//	"ingest"      — hand the tar to `cvmfs_server ingest` and let the gateway
+	//	                do the chunking, dedup and catalogs (ADR-0008 D7).
+	//
+	// The name must resolve to a backend the deployment actually has; a job
+	// naming an unserviceable path is rejected at submission.
+	PublishPath string `json:"publish_path,omitempty"`
+	// PreWarm requests (or declines) Stratum 1 cache pre-warming for this job.
+	// Nil means "use the node's default" (--prewarm), which is off. Only the
+	// prepub publish path can pre-warm — the ingest path commits through the
+	// gateway, so there is nothing to announce before the catalog flip.
+	PreWarm *bool `json:"prewarm,omitempty"`
+
 	// ── Per-stage timestamps (gateway/bits path only) ─────────────────────────
 	// All times are zero-value when the stage was not reached or not applicable.
 	// Callers can compute per-phase duration from successive timestamps.

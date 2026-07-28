@@ -3339,6 +3339,18 @@ of the canonical cvmfs catalog code.
   **no tar**. The prepub assembles all of the build's accumulated packages into
   one descriptor and publishes them in a single commit, finishing in `published`.
   (`POST /api/v1/builds/{id}/finalize` does the same out-of-band.)
+- **Publish path** — `POST /api/v1/jobs` with a `publish_path` form field:
+  `prepub` (default, may be omitted) runs the pipeline described here;
+  `ingest` hands the tar to `cvmfs_server ingest` so the gateway does the
+  chunking, dedup and catalogs (ADR-0008 D7). The ingest path commits each
+  package on arrival, so it accepts neither `build_id` nor `prewarm` — both are
+  rejected with 400 rather than silently ignored. A path the deployment does not
+  offer is rejected at submission; `--ingest-publish` (config `ingest_publish`)
+  is what adds `ingest`, and the startup log lists what the node serves.
+- **Pre-warming** — `POST /api/v1/jobs` with `prewarm=true|false`. Absent means
+  "use the node default" (`--prewarm`, off). Pre-warming asks the Stratum 1
+  replicas to pull the objects before the catalog flips; it needs a configured
+  control-plane broker, and only the `prepub` path can do it.
 - **Seal** — `POST /api/v1/builds/{id}/seal` with `{"expect": N}`, where N is the
   number of jobs submitted for the build. The prepub then runs the finalize
   ITSELF once N jobs have finished, so the producer can exit right after its last
