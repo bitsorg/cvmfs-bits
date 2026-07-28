@@ -370,6 +370,22 @@ What the ingest path gives up, and why the API refuses rather than ignores:
 The startup log lists which paths the node serves; a job naming one it does not
 have is rejected at submission with 400.
 
+**Running both paths on one service** — `--publish-mode local --ingest-publish`
+is supported and is the straightforward way to exercise both against a single
+service:
+
+```sh
+cvmfs-prepub --config /etc/cvmfs-prepub/config.yaml \
+    --publish-mode local --ingest-publish
+```
+
+Each publish still uses exactly one path — the two never mix within a job. Two
+jobs on the SAME repository are kept apart by the orchestrator's per-repo commit
+lock, which is backend-agnostic; neither backend's own lock (LocalBackend's
+fail-fast semaphore, the ingest backend's slot queue) can see the other's, so
+that lock is what makes the combination safe. Jobs on different repositories
+still run in parallel.
+
 ### Cache pre-warming
 
 `--prewarm` (off by default) is the NODE default. A job may override it per

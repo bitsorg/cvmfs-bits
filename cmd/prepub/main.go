@@ -499,6 +499,17 @@ func runPublisher(
 		publishPaths["ingest"] = ib
 		obs.Logger.Info("publish path available: ingest (cvmfs_server ingest — gateway does chunking/dedup/catalogs)",
 			"cvmfs_mount", cvmfsMount, "owner", ingestPublishOwner)
+
+		if publishMode == "local" {
+			// Supported, and the natural way to exercise both paths against one
+			// service. Each publish still uses exactly one path; two jobs on one
+			// repository are kept apart by the orchestrator's per-repo commit
+			// lock, which is backend-agnostic — neither backend's own lock can
+			// see the other's.
+			obs.Logger.Info("both publish paths run cvmfs_server on this node " +
+				"(local + ingest): publishes to one repository are serialised by " +
+				"the per-repo commit lock, different repositories still run in parallel")
+		}
 	}
 
 	// Startup probe: confirm backends are reachable before accepting jobs.
