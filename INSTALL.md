@@ -496,13 +496,21 @@ volume for concurrent payload tars plus their compression spill and `tmp/`.
 | prepub | Stratum 0 HTTP | `.cvmfspublished` + catalog fetch |
 | GitLab runners | prepub `:8080` | job submission |
 
-Note the asymmetry between the two hops. Gateway requests are HMAC-signed, so
-the credential never appears on the wire and plaintext costs only
-confidentiality. The runner → prepub hop is different: `PREPUB_API_TOKEN` is a
-BEARER token, so it must travel to be used, and anyone who observes it once holds
-publish rights to a production repository until it is rotated. Restrict `:8080`
-to the runner network at the firewall. ADR-0008 D3 (option T1) covers turning
-that token into an HMAC key so it stops travelling; it is not yet decided.
+Note the asymmetry between the two hops, and close it. Gateway requests are
+HMAC-signed, so that credential never appears on the wire. `PREPUB_API_TOKEN`
+was a BEARER token — it had to travel, and anyone who observed it once held
+publish rights until it was rotated. It can now be used as an HMAC key instead:
+
+```yaml
+server:
+  auth_mode: both     # accept either while publishers migrate
+```
+
+Roll it out in that order — `both`, confirm the pipeline signs (the publish log
+says so, and `GET /api/v1/health` reports `auth_mode`), then `hmac`, then rotate
+the token once, since until that point it had been on the wire. Restrict `:8080`
+to the runner network at the firewall regardless: signing authenticates the
+request, it does not encrypt it.
 
 ### Step 6 — cut over, then remove the old service
 

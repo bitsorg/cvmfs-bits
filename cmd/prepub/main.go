@@ -91,6 +91,7 @@ func main() {
 	gatewayAllowPlaintext := flag.Bool("gateway-allow-plaintext", false, "Permit a plaintext http:// gateway URL on a trusted network. Gateway requests are HMAC-SHA256 signed and the secret never transits, so the credential is safe without TLS; what plaintext gives up is confidentiality of the publish and authenticity of gateway responses. Loopback needs no flag. Prefer this over --dev, which also disables the gateway-secret and API-token requirements [publisher]")
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
+	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels). See ADR-0008 D3 [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
@@ -248,6 +249,7 @@ func main() {
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			allowedPublishPrefixes,
 			gatewayDirectGraft, gatewayAllowPlaintext,
+			authMode,
 			ingestPublish, ingestPublishOwner,
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc,
@@ -271,7 +273,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
@@ -302,6 +304,7 @@ func runPublisher(
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
 	gatewayAllowPlaintext bool,
+	authMode string,
 	cvmfsMount string,
 	ingestPublish bool,
 	ingestPublishOwner string,
@@ -727,6 +730,25 @@ func runPublisher(
 	}
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
+	// Which credentials the API accepts (ADR-0008 D3). Parsed here rather than
+	// inside the server so a typo fails at startup instead of silently falling
+	// back to the most permissive setting.
+	am, amErr := api.ParseAuthMode(authMode)
+	if amErr != nil {
+		obs.Logger.Error("invalid --auth-mode", "error", amErr)
+		os.Exit(1)
+	}
+	apiServer.SetAuthMode(am)
+	switch am {
+	case api.AuthHMAC:
+		obs.Logger.Info("API auth: signed requests only — the shared secret does not travel")
+	case api.AuthBearer:
+		obs.Logger.Warn("API auth: bearer only — the shared secret travels on every request; " +
+			"anyone who observes one holds publish rights until it is rotated")
+	default:
+		obs.Logger.Warn("API auth: bearer or signed (migration setting) — the bearer path still " +
+			"puts the shared secret on the wire; switch to auth_mode=hmac once publishers sign, then rotate the token")
+	}
 	if allowedPublishPrefixes != "" {
 		apiServer.SetAllowedPublishPrefixes(strings.Split(allowedPublishPrefixes, ","))
 		obs.Logger.Info("publish namespace containment enabled", "allowed_prefixes", allowedPublishPrefixes)

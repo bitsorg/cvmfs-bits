@@ -155,6 +155,7 @@ type applyTestVars struct {
 	allowedPublishPrefixes                                  string
 	gatewayDirectGraft                                      bool
 	gatewayAllowPlaintext                                   bool
+	authMode                                                string
 	ingestPublish                                           bool
 	ingestPublishOwner                                      string
 	chunkMin, chunkAvg, chunkMax                            int64
@@ -188,6 +189,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.provenanceEnabled, &v.rekorServer, &v.rekorSigningKey, &v.oidcIssuers,
 		&v.allowedPublishPrefixes,
 		&v.gatewayDirectGraft, &v.gatewayAllowPlaintext,
+		&v.authMode,
 		&v.ingestPublish, &v.ingestPublishOwner,
 		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
 		&v.pipelineWorkers, &v.pipelineUploadConc,

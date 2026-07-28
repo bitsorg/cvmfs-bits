@@ -98,6 +98,8 @@ type fileConfig struct {
 		Listen  string `yaml:"listen"`
 		TLSCert string `yaml:"tls_cert"`
 		TLSKey  string `yaml:"tls_key"`
+		// AuthMode: bearer | both | hmac. See ADR-0008 D3. Empty = both.
+		AuthMode string `yaml:"auth_mode"`
 	} `yaml:"server"`
 
 	Gateway struct {
@@ -245,6 +247,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	allowedPublishPrefixes *string,
 	gatewayDirectGraft *bool,
 	gatewayAllowPlaintext *bool,
+	authMode *string,
 	ingestPublish *bool,
 	ingestPublishOwner *string,
 	chunkMin, chunkAvg, chunkMax *int64,
@@ -294,6 +297,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("cas-type", casType, fc.CAS.Type)
 	str("cas-root", casRoot, fc.CAS.Root)
 	str("cas-server-conf", casServerConf, fc.CAS.ServerConf)
+	str("auth-mode", authMode, fc.Server.AuthMode)
 	i("pipeline-workers", pipelineWorkers, fc.Pipeline.Workers)
 	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)
 	dur("job-timeout", jobTimeout, fc.JobTimeout)

@@ -9,7 +9,6 @@ package api
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -33,6 +32,7 @@ import (
 
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/buildset"
+	"cvmfs.io/prepub/internal/httpsig"
 	"cvmfs.io/prepub/internal/job"
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
@@ -66,8 +66,25 @@ type Server struct {
 	router *mux.Router
 	// obs provides logging, tracing, and metrics.
 	obs *observe.Provider
-	// apiToken is the expected bearer token for authenticated routes. Empty disables auth (dev mode).
+	// apiToken is the shared secret for authenticated routes. Empty disables
+	// auth (dev mode). It is used two ways depending on authMode: as a bearer
+	// token compared directly, and/or as the HMAC key for a signed request.
 	apiToken string
+	// authMode selects which credentials are accepted:
+	//
+	//	AuthBearer — legacy only: the token travels on every request.
+	//	AuthBoth   — either; the migration setting, and the default.
+	//	AuthHMAC   — signed requests only; the token stops travelling.
+	//
+	// See ADR-0008 D3. The point of AuthHMAC is that observing a request no
+	// longer yields a reusable credential.
+	authMode AuthMode
+	// nonces prevents a captured signature from being replayed.
+	nonces *httpsig.NonceCache
+	// signSkew bounds the accepted clock difference for signed requests.
+	signSkew time.Duration
+	// stopNonceSweeper ages the replay cache on a quiet service.
+	stopNonceSweeper func()
 	// allowedPublishPrefixes are the authorized CVMFS roots (full paths, e.g.
 	// "/cvmfs/sft-nightlies-test.cern.ch/lcg"). A reserve/publish whose target does
 	// not canonicalize under one of these is rejected (containment: a build can only
@@ -112,6 +129,9 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 		router:      router,
 		obs:         obs,
 		apiToken:    apiToken,
+		authMode:    AuthBoth,
+		nonces:      httpsig.NewNonceCache(0, 0),
+		signSkew:    httpsig.DefaultSkew,
 		orch:        orch,
 		sp:          sp,
 		notifyBus:   nb,
@@ -128,6 +148,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 			IdleTimeout:       120 * time.Second,
 		},
 	}
+	s.stopNonceSweeper = s.nonces.StartSweeper()
 	if minConcurrentJobs > 0 {
 		s.dynaSem = NewDynamicSemaphore(minConcurrentJobs, maxConcurrentJobs, obs.Logger)
 		obs.Logger.Info("server: dynamic job concurrency enabled",
@@ -303,34 +324,6 @@ func (s *Server) MountDiscovery(h http.Handler) {
 
 // requireAuth is a middleware that validates the Authorization: Bearer <token> header.
 // If the server was created with an empty token, auth is skipped (dev mode).
-func (s *Server) requireAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.apiToken == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		authHeader := r.Header.Get("Authorization")
-		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == authHeader || token == "" {
-			http.Error(w, `{"error":"missing or malformed Authorization header"}`, http.StatusUnauthorized)
-			return
-		}
-
-		if subtle.ConstantTimeCompare([]byte(token), []byte(s.apiToken)) != 1 {
-			s.obs.Logger.Warn("rejected request with invalid API token",
-				"remote_addr", r.RemoteAddr,
-				"method", r.Method,
-				"path", r.URL.Path,
-			)
-			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
 // ListenAndServe starts the HTTP server on addr and blocks until the server
 // exits (either due to an error or a call to Shutdown).
 // maxConnections caps concurrent accepted connections so a connection flood
@@ -358,6 +351,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// with the graceful drain below.
 	if s.dynaSem != nil {
 		s.dynaSem.Stop()
+	}
+	if s.stopNonceSweeper != nil {
+		s.stopNonceSweeper()
 	}
 
 	httpErr := s.httpServer.Shutdown(ctx)
@@ -792,14 +788,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// r.FormValue merged URL query parameters with form fields; keep that
-		// so a caller passing e.g. ?repo=... is not silently rejected.
-		field := func(k string) string {
-			if v, ok := fields[k]; ok {
-				return v
-			}
-			return r.URL.Query().Get(k)
-		}
+		// Form fields ONLY. r.FormValue used to merge URL query parameters, and
+		// an earlier version of this handler preserved that for compatibility —
+		// but the signature covers the form fields, so a query parameter was a
+		// way to set webhook_url, finalize, build_expect, tag_name or
+		// publish_path on a request whose MAC still verified. Nothing sends
+		// these as query parameters, so the compatibility was worth strictly
+		// less than the hole it opened.
+		field := func(k string) string { return fields[k] }
 
 		repo = field("repo")
 		subPath = field("path")
@@ -859,6 +855,36 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// ── Second half of signature verification ────────────────────────────
+		// The middleware checked the MAC before any body was read; only now are
+		// the fields and the payload known, so only now can we confirm they are
+		// the ones the signature committed to. A signed request that skipped
+		// this would be authenticated in name only — the header would be
+		// genuine while the body had been replaced in flight.
+		computed := hex.EncodeToString(hasher.Sum(nil))
+		if sig := signatureFrom(r); sig != nil {
+			bodyHash := computed
+			if !sawTar {
+				bodyHash = "" // Bound() normalises this to the no-payload marker
+			}
+			if err := requireSignatureBinding(r, fields, bodyHash); err != nil {
+				os.RemoveAll(jobDir)
+				s.obs.Logger.Warn("signed submission does not match its signature",
+					"remote_addr", r.RemoteAddr, "error", err)
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusUnauthorized)
+				return
+			}
+			// The signature binds the payload only through tar_sha256, so a
+			// submission that omits it is not covered even though the MAC
+			// verified. Insist on it rather than accept a signature that
+			// attests to nothing about the content.
+			if sawTar && submittedSHA256 == "" {
+				os.RemoveAll(jobDir)
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, errSignedWithoutDigest.Error()), http.StatusBadRequest)
+				return
+			}
+		}
+
 		switch {
 		case finalize:
 			// A finalize job carries no payload.  If the client sent one
@@ -872,7 +898,6 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"tar field is required"}`, http.StatusBadRequest)
 			return
 		case submittedSHA256 != "":
-			computed := hex.EncodeToString(hasher.Sum(nil))
 			if !strings.EqualFold(computed, submittedSHA256) {
 				os.RemoveAll(jobDir)
 				http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: got %s, expected %s"}`, computed, submittedSHA256), http.StatusBadRequest)
@@ -1765,10 +1790,22 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	// out only by uploading a package and getting a 400 for every job — the
 	// console's per-community toggle can be enabled for a node that was never
 	// started with the corresponding backend.
+	nonces, rejectedFull := s.nonces.Stats()
 	body := struct {
 		Status       string   `json:"status"`
 		PublishPaths []string `json:"publish_paths"`
-	}{Status: "healthy"}
+		AuthMode     string   `json:"auth_mode"`
+		// ReplayCache surfaces the fail-closed counter: a non-zero
+		// rejected_full means signed requests are being refused for capacity
+		// reasons, which looks like an auth problem from the client side and
+		// is invisible otherwise.
+		ReplayCache struct {
+			Entries      int    `json:"entries"`
+			RejectedFull uint64 `json:"rejected_full"`
+		} `json:"replay_cache"`
+	}{Status: "healthy", AuthMode: string(s.authMode)}
+	body.ReplayCache.Entries = nonces
+	body.ReplayCache.RejectedFull = rejectedFull
 	if s.orch != nil {
 		body.PublishPaths = s.orch.PublishPathNames()
 	}

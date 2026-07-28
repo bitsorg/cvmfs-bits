@@ -3339,6 +3339,39 @@ of the canonical cvmfs catalog code.
   **no tar**. The prepub assembles all of the build's accumulated packages into
   one descriptor and publishes them in a single commit, finishing in `published`.
   (`POST /api/v1/builds/{id}/finalize` does the same out-of-band.)
+### Request authentication
+
+`PREPUB_API_TOKEN` can be used two ways, selected by `--auth-mode`
+(config `server.auth_mode`):
+
+- `bearer` — the legacy `Authorization: Bearer <token>`. The token travels on
+  every request, so anyone who observes one holds publish rights until it is
+  rotated.
+- `hmac` — the token becomes an HMAC key and stops travelling. Requests carry
+  `X-Bits-Auth: v1 key_id=… ts=… nonce=… fd=… bh=… mac=…` where the MAC covers
+  the method, the full request URI (including any query string), a digest of the
+  form fields, and a digest of the payload.
+- `both` — either is accepted. The default, and the migration setting; switch to
+  `hmac` once every publisher signs, then rotate the token once because until
+  then it has been on the wire.
+
+A signature is single-use (nonce), expires (±2 min, and only 15 s of future
+skew), and is bound to one request: a captured one cannot be replayed, retargeted
+at another endpoint or method, or have its fields, query string or payload
+changed. It does NOT provide confidentiality or authenticate the server's
+responses — for those, put TLS or WireGuard underneath; the two compose.
+
+A signed multipart submission must carry `tar_sha256`: that field is what binds
+the signature to the tar, so a submission without it is refused rather than
+accepted as if the payload were covered. Everything else the server reads comes
+from form fields only — URL query parameters are ignored, because they would be
+a way to set fields the signature does not cover.
+
+The client signer is `.gitlab/prepub-sign.py` in bits-console; the Go test
+`TestSigner_FieldsDigestMatches` executes that file so the two implementations
+cannot drift apart. `GET /api/v1/health` reports the active `auth_mode` and the
+replay cache's `rejected_full` counter.
+
 - **Publish path** — `POST /api/v1/jobs` with a `publish_path` form field:
   `prepub` (default, may be omitted) runs the pipeline described here;
   `ingest` hands the tar to `cvmfs_server ingest` so the gateway does the
