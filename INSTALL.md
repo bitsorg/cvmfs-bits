@@ -8,6 +8,7 @@
 4. [Configuration](#4-configuration)
 5. [Option A — Single-Node Deployment](#5-option-a--single-node-deployment)
    - [5.1 Local Mode (no cvmfs\_gateway)](#51-local-mode-no-cvmfs_gateway)
+   - [5.2 Moving prepub off the gateway node](#52-moving-prepub-off-the-gateway-node)
 6. [Option B — Distributed Deployment with Stratum 1 Pre-Warming](#6-option-b--distributed-deployment-with-stratum-1-pre-warming)
    - [6.3 MQTT Control Plane (optional)](#63-mqtt-control-plane-optional)
 7. [Systemd Setup](#7-systemd-setup)
@@ -398,6 +399,114 @@ broker (`--embedded-broker-ws-addr`); without one the announce is a no-op.
 service holds a per-repository in-process lock (fail-fast on conflict) for the
 duration of the `cvmfs_server publish` call only, keeping the exclusive window
 as short as possible.
+
+---
+
+## 5.2 Moving prepub off the gateway node
+
+The publisher does not have to run on the gateway host, and taking it off gives
+the gateway back its memory. Everything it needs from that host is either
+reachable over the network or a file you copy once. Two things change materially:
+
+- **The gateway URL must be HTTPS.** Plaintext is accepted only for loopback
+  (`main.go` rejects anything else at startup unless `--dev`), which was the
+  colocated case. If the gateway has no TLS listener, put one in front of it
+  before moving.
+- **The build accumulator is local state.** A sealed build's members live in
+  `/var/spool/cvmfs-prepub/builds/<id>/` on the host that received them. Moving
+  hosts mid-build strands it. Drain first.
+
+### Step 1 — drain the old host
+
+```sh
+# Nothing accumulating, nothing sealed-but-unfinalized:
+ls /var/spool/cvmfs-prepub/builds/          # expect empty
+curl -s -H "Authorization: Bearer $TOK" \
+     http://<old-host>:8080/api/v1/jobs | jq '[.[] | select(.state|IN("published","failed","aborted","accumulated")|not)]'
+```
+
+Leave the service running until the new one is live — the CI keeps using it
+until you change `PREPUB_URL`.
+
+### Step 2 — prepare the new host
+
+Packages: `cvmfs-server` if you want the ingest publish path or the coarse
+finalize (which runs `cvmfs_swissknife ingestsql` — it needs the
+*spooler-follows-upstream* build, plus its shared libraries on
+`LD_LIBRARY_PATH`).
+
+```sh
+sudo ./install.sh                    # publisher mode
+```
+
+Then copy from the gateway host, because prepub reads these directly:
+
+| What | Where | Why |
+|---|---|---|
+| `/etc/cvmfs/repositories.d/<repo>/server.conf` | same path | `cas.server_conf` follows `CVMFS_UPSTREAM_STORAGE` from here |
+| the `s3.conf` that `CVMFS_UPSTREAM_STORAGE` points at | same path | S3 endpoint, bucket and credentials |
+| the ingestsql config prefix `<dir>/<repo>/{config,gatewaykey,pubkey}` | any path | coarse-publish finalize |
+
+Ownership `root:cvmfs-prepub`, mode `0640` — the service rejects world-readable
+or group-writable credential files.
+
+### Step 3 — configure
+
+```yaml
+# /etc/cvmfs-prepub/config.yaml
+gateway:
+  url: https://<gateway-host>:4929     # HTTPS is now mandatory
+  key_id: <key-id>
+  key_secret_env: CVMFS_GATEWAY_SECRET
+
+stratum0_url: http://<stratum0-host>/cvmfs   # catalog fetch, must be reachable
+
+cas:
+  type: s3
+  server_conf: /etc/cvmfs/repositories.d/<repo>/server.conf
+```
+
+Secrets go in `/etc/cvmfs-prepub/env` (`EnvironmentFile`, never the YAML):
+`CVMFS_GATEWAY_SECRET` and `PREPUB_API_TOKEN`. No inline comments in that file —
+systemd does not strip them, and a trailing `# ...` becomes part of the value.
+
+For the ingest publish path, register this host with the gateway once per
+repository (see *Offering the ingest publish path* above) — `connect-gw` state is
+per publisher, so it does not transfer with the config.
+
+### Step 4 — re-tune for a node of its own
+
+The shipped `MemoryHigh=2G` / `MemoryMax=3G` and `pipeline.workers: 2` were
+chosen for an 8 GB host shared with the gateway. On a dedicated node, raise them
+together — peak RSS scales with workers × largest file — and size the spool
+volume for concurrent payload tars plus their compression spill and `tmp/`.
+
+### Step 5 — network
+
+| From | To | Why |
+|---|---|---|
+| prepub | gateway `:4929` (HTTPS) | leases and commits |
+| prepub | S3 endpoint | object upload |
+| prepub | Stratum 0 HTTP | `.cvmfspublished` + catalog fetch |
+| GitLab runners | prepub `:8080` | job submission |
+
+Note what this exposes: the runner → prepub hop now crosses the network carrying
+`PREPUB_API_TOKEN` in clear text, where before it was often loopback. Restrict
+`:8080` to the runner network at the firewall. ADR-0008 D3 covers the real fix
+and is not yet decided.
+
+### Step 6 — cut over, then remove the old service
+
+```sh
+curl -s http://<new-host>:8080/api/v1/health     # publish_paths lists what it serves
+# smoke-test one package, then:
+#   update the PREPUB_URL CI/CD variable in bits-console
+#   run one real build through it
+sudo ./install.sh uninstall --keep-spool         # on the gateway host
+```
+
+`--keep-spool` leaves the old job history and any surviving accumulator in place;
+delete it once you are satisfied nothing was in flight.
 
 ---
 
