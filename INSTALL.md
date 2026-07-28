@@ -8,7 +8,7 @@
 4. [Configuration](#4-configuration)
 5. [Option A — Single-Node Deployment](#5-option-a--single-node-deployment)
    - [5.1 Local Mode (no cvmfs\_gateway)](#51-local-mode-no-cvmfs_gateway)
-   - [5.2 Moving prepub off the gateway node](#52-moving-prepub-off-the-gateway-node)
+   - [5.2 Setting up a new prepub node](#52-setting-up-a-new-prepub-node)
 6. [Option B — Distributed Deployment with Stratum 1 Pre-Warming](#6-option-b--distributed-deployment-with-stratum-1-pre-warming)
    - [6.3 MQTT Control Plane (optional)](#63-mqtt-control-plane-optional)
 7. [Systemd Setup](#7-systemd-setup)
@@ -402,130 +402,192 @@ as short as possible.
 
 ---
 
-## 5.2 Moving prepub off the gateway node
+## 5.2 Setting up a new prepub node
 
-The publisher does not have to run on the gateway host, and taking it off gives
-the gateway back its memory. Everything it needs from that host is either
-reachable over the network or a file you copy once. Two things change materially:
+A complete runbook for standing up a publisher on its own host — the usual case
+being to take it off the gateway node and give the gateway its memory back.
+
+Two things about a non-colocated publisher are not obvious:
 
 - **The gateway hop stops being loopback.** Plaintext is accepted without
-  question only for loopback, which was the colocated case. Off-node you either
-  use HTTPS or opt in explicitly with `--gateway-allow-plaintext` (config
-  `gateway.allow_plaintext: true`). The latter is defensible on a trusted
-  internal network: gateway requests are HMAC-SHA256 signed and the secret never
-  transits, so plaintext does not expose the credential — it exposes what is
-  being published and lets an on-path attacker forge gateway responses. Do NOT
-  reach for `--dev` to achieve this; it also disables the gateway-secret and
-  API-token requirements.
-- **The build accumulator is local state.** A sealed build's members live in
-  `/var/spool/cvmfs-prepub/builds/<id>/` on the host that received them. Moving
-  hosts mid-build strands it. Drain first.
+  question only for loopback. Off-node, either use HTTPS or opt in with
+  `gateway.allow_plaintext` — defensible on a trusted internal network, because
+  gateway requests are HMAC-signed and the secret never transits (see step 4).
+- **The build accumulator is local state.** A sealed build's members live in the
+  spool of the host that received them. Moving hosts mid-build strands a build
+  that nothing will ever finalize, and since the producer has already exited,
+  nobody notices. Drain first (step 1).
 
-### Step 1 — drain the old host
+### Step 1 — drain the old node (skip for a first-ever install)
 
 ```sh
-# Nothing accumulating, nothing sealed-but-unfinalized:
-ls /var/spool/cvmfs-prepub/builds/          # expect empty
-curl -s -H "Authorization: Bearer $TOK" \
-     http://<old-host>:8080/api/v1/jobs | jq '[.[] | select(.state|IN("published","failed","aborted","accumulated")|not)]'
+ls /var/spool/cvmfs-prepub/builds/      # expect empty: nothing accumulating
 ```
 
-Leave the service running until the new one is live — the CI keeps using it
-until you change `PREPUB_URL`.
+Leave the old service running until the new one is live; the CI keeps using it
+until you change `PREPUB_URL` in step 9.
 
-### Step 2 — prepare the new host
-
-Packages: `cvmfs-server` if you want the ingest publish path or the coarse
-finalize (which runs `cvmfs_swissknife ingestsql` — it needs the
-*spooler-follows-upstream* build, plus its shared libraries on
-`LD_LIBRARY_PATH`).
+### Step 2 — packages
 
 ```sh
-sudo ./install.sh                    # publisher mode
+# Only if this node will offer the ingest publish path, or run the
+# coarse-publish finalize (which shells out to cvmfs_swissknife):
+sudo dnf install -y cvmfs-server
 ```
 
-Then copy from the gateway host, because prepub reads these directly:
+The finalize needs a `cvmfs_swissknife` built with the *spooler-follows-upstream*
+patch plus its shared libraries; note where they are for `--ingest-env`.
 
-| What | Where | Why |
-|---|---|---|
-| `/etc/cvmfs/repositories.d/<repo>/server.conf` | same path | `cas.server_conf` follows `CVMFS_UPSTREAM_STORAGE` from here |
-| the `s3.conf` that `CVMFS_UPSTREAM_STORAGE` points at | same path | S3 endpoint, bucket and credentials |
-| the ingestsql config prefix `<dir>/<repo>/{config,gatewaykey,pubkey}` | any path | coarse-publish finalize |
+### Step 3 — build and install
 
-Ownership `root:cvmfs-prepub`, mode `0640` — the service rejects world-readable
-or group-writable credential files.
+```sh
+git clone <cvmfs-bits> && cd cvmfs-bits
+make build                  # -> bin/cvmfs-prepub, bin/prepubctl
+sudo ./install.sh --dry-run # preview
+sudo ./install.sh           # publisher mode
+```
 
-### Step 3 — configure
+This creates the `cvmfs-prepub` system user, `/var/spool/cvmfs-prepub` (0700)
+with its `tmp/` subdirectory, `/etc/cvmfs-prepub/{config.yaml,env}`, and the
+systemd unit. It does not overwrite an existing config.
+
+### Step 4 — copy the repository's own credentials from the gateway node
+
+prepub reads these files directly, so they must exist on this host:
+
+| File | Why |
+|---|---|
+| `/etc/cvmfs/repositories.d/<repo>/server.conf` | `cas.server_conf` follows its `CVMFS_UPSTREAM_STORAGE` to find S3 |
+| the `s3.conf` that variable points at | endpoint, bucket, credentials, repository alias |
+| the ingestsql config prefix `<dir>/<repo>/{config,gatewaykey,pubkey}` | coarse-publish finalize |
+
+```sh
+sudo chown root:cvmfs-prepub /etc/cvmfs/keys/<repo>.s3.conf
+sudo chmod 0640              /etc/cvmfs/keys/<repo>.s3.conf
+```
+
+The service refuses world-readable or group-writable credential files.
+
+### Step 5 — configure
 
 ```yaml
 # /etc/cvmfs-prepub/config.yaml
+server:
+  listen: ":8080"
+  auth_mode: both              # see step 6
+
+spool_root: /var/spool/cvmfs-prepub
+
+publish_mode: gateway
 gateway:
-  url: http://<gateway-host>:4929      # https://, or http:// with allow_plaintext
-  allow_plaintext: true                # trusted internal network; auth is HMAC-signed
+  url: http://<gateway-host>:4929
+  allow_plaintext: true        # trusted network; gateway auth is HMAC-signed
   key_id: <key-id>
   key_secret_env: CVMFS_GATEWAY_SECRET
 
-stratum0_url: http://<stratum0-host>/cvmfs   # catalog fetch, must be reachable
+stratum0_url: http://<stratum0-host>/cvmfs
 
 cas:
   type: s3
   server_conf: /etc/cvmfs/repositories.d/<repo>/server.conf
+
+pipeline:
+  workers: 2                   # peak RSS ~ workers x largest file
+  upload_concurrency: 4
+
+allowed_publish_prefixes:
+  - /cvmfs/<repo>/<group>      # containment: publishes may not escape this
 ```
 
-Secrets go in `/etc/cvmfs-prepub/env` (`EnvironmentFile`, never the YAML):
-`CVMFS_GATEWAY_SECRET` and `PREPUB_API_TOKEN`. No inline comments in that file —
-systemd does not strip them, and a trailing `# ...` becomes part of the value.
+Add `ingest_publish: true` to also offer the gateway ingest path (step 8).
 
-For the ingest publish path, register this host with the gateway once per
-repository (see *Offering the ingest publish path* above) — `connect-gw` state is
-per publisher, so it does not transfer with the config.
+Raise `pipeline.workers` and the unit's `MemoryHigh`/`MemoryMax` together on a
+dedicated node — the shipped values suit an 8 GB host shared with a gateway.
 
-### Step 4 — re-tune for a node of its own
+### Step 6 — secrets
 
-The shipped `MemoryHigh=2G` / `MemoryMax=3G` and `pipeline.workers: 2` were
-chosen for an 8 GB host shared with the gateway. On a dedicated node, raise them
-together — peak RSS scales with workers × largest file — and size the spool
-volume for concurrent payload tars plus their compression spill and `tmp/`.
+```sh
+sudo tee /etc/cvmfs-prepub/env >/dev/null <<'EOF'
+CVMFS_GATEWAY_SECRET=<gateway hmac secret>
+PREPUB_API_TOKEN=<shared secret for the publish API>
+EOF
+sudo chown root:cvmfs-prepub /etc/cvmfs-prepub/env && sudo chmod 0600 /etc/cvmfs-prepub/env
+```
 
-### Step 5 — network
+**No inline comments in this file.** systemd's `EnvironmentFile` does not strip
+them, so `GOMEMLIMIT=3GiB  # note` makes the value `3GiB  # note` and the
+service fails to start.
+
+`auth_mode` decides how `PREPUB_API_TOKEN` is used: `bearer` sends it on every
+request, `hmac` uses it as an HMAC key so it never travels, `both` accepts
+either. Start at `both`, switch to `hmac` once the pipeline signs, then rotate
+the token — until that point it had been on the wire.
+
+### Step 7 — network
 
 | From | To | Why |
 |---|---|---|
-| prepub | gateway `:4929` (HTTPS) | leases and commits |
+| prepub | gateway `:4929` | leases and commits |
 | prepub | S3 endpoint | object upload |
 | prepub | Stratum 0 HTTP | `.cvmfspublished` + catalog fetch |
 | GitLab runners | prepub `:8080` | job submission |
 
-Note the asymmetry between the two hops, and close it. Gateway requests are
-HMAC-signed, so that credential never appears on the wire. `PREPUB_API_TOKEN`
-was a BEARER token — it had to travel, and anyone who observed it once held
-publish rights until it was rotated. It can now be used as an HMAC key instead:
+Restrict `:8080` to the runner network. Signing authenticates a request; it does
+not encrypt it.
+
+### Step 8 — optional: the ingest publish path
+
+Per repository, once, on this host:
+
+```sh
+mkdir -p /etc/cvmfs/keys
+echo "plain_text <KEY_ID> <KEY_SECRET>" > /etc/cvmfs/keys/<repo>.gw
+cvmfs_server connect-gw -P -K \
+    -u http://<gateway>:4929/api/v1 \
+    -w <stratum0-url>/<repo> \
+    -o <owner> <repo>
+```
+
+`connect-gw` state is per publisher and does not travel with the config.
+
+### Step 9 — start, verify, cut over
+
+```sh
+sudo systemctl enable --now cvmfs-prepub
+journalctl -u cvmfs-prepub -n 50 --no-pager
+```
+
+The startup log states the publish paths on offer, the auth mode, and the temp
+root. Then:
+
+```sh
+curl -s http://<new-host>:8080/api/v1/health | jq
+# {"status":"healthy","publish_paths":["prepub"],"auth_mode":"both", ...}
+```
+
+Publish one package end to end before switching anything. Then set `PREPUB_URL`
+in the bits-console CI/CD variables to the new host, run one real build, and
+only then:
+
+```sh
+sudo ./install.sh uninstall --keep-spool     # on the old node
+```
+
+`--keep-spool` preserves the job history and any surviving accumulator; delete
+it once you are satisfied nothing was in flight.
+
+### Step 10 — tighten
+
+Once the pipeline signs (the publish log says so, and `auth_mode` is visible in
+`/api/v1/health`):
 
 ```yaml
 server:
-  auth_mode: both     # accept either while publishers migrate
+  auth_mode: hmac
 ```
 
-Roll it out in that order — `both`, confirm the pipeline signs (the publish log
-says so, and `GET /api/v1/health` reports `auth_mode`), then `hmac`, then rotate
-the token once, since until that point it had been on the wire. Restrict `:8080`
-to the runner network at the firewall regardless: signing authenticates the
-request, it does not encrypt it.
+then rotate `PREPUB_API_TOKEN` on both sides.
 
-### Step 6 — cut over, then remove the old service
-
-```sh
-curl -s http://<new-host>:8080/api/v1/health     # publish_paths lists what it serves
-# smoke-test one package, then:
-#   update the PREPUB_URL CI/CD variable in bits-console
-#   run one real build through it
-sudo ./install.sh uninstall --keep-spool         # on the gateway host
-```
-
-`--keep-spool` leaves the old job history and any surviving accumulator in place;
-delete it once you are satisfied nothing was in flight.
-
----
 
 ## 6. Option B — Distributed Deployment with Stratum 1 Pre-Warming
 

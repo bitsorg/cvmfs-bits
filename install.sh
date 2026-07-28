@@ -578,7 +578,12 @@ EOF
 # Gateway secret (gateway publish mode only)
 # CVMFS_GATEWAY_SECRET=
 
-# API bearer token (clients authenticate with Authorization: Bearer <token>)
+# Shared secret for the publish API. Used as a bearer token, or as the HMAC
+# key for signed requests, depending on server.auth_mode (see ADR-0008 D3):
+#   bearer — the token travels on every request
+#   both   — either is accepted (default; use while publishers migrate)
+#   hmac   — signed requests only, so the token stops travelling
+# After switching to hmac, ROTATE this value once: until then it was on the wire.
 # PREPUB_API_TOKEN=
 
 # S3 credentials (S3 CAS backend only)
