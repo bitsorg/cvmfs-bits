@@ -3339,6 +3339,22 @@ of the canonical cvmfs catalog code.
   **no tar**. The prepub assembles all of the build's accumulated packages into
   one descriptor and publishes them in a single commit, finishing in `published`.
   (`POST /api/v1/builds/{id}/finalize` does the same out-of-band.)
+- **Seal** — `POST /api/v1/builds/{id}/seal` with `{"expect": N}`, where N is the
+  number of jobs submitted for the build. The prepub then runs the finalize
+  ITSELF once N jobs have finished, so the producer can exit right after its last
+  upload instead of polling every job. `202 Accepted` returns the build status;
+  `409 Conflict` means the count is below what has already finished or below a
+  previous seal (a seal may never shrink a build). Package jobs may also carry a
+  `build_expect` field for producers that know the count in advance.
+- **Status** — `GET /api/v1/builds/{id}` returns
+  `{expect, accumulated, failed[], finalizing, result}` — one call in place of
+  polling every job. `result` persists after the accumulator is removed.
+
+If any of the build's jobs FAILS, the build is not auto-published: the failure
+counts towards `expect` (so the build still reaches a decision rather than
+waiting forever), the accumulator is kept for inspection, and the reason is
+recorded in `result.error`. Publishing the subset that succeeded requires an
+explicit `POST /builds/{id}/finalize`.
 
 Dedup/conflict is keyed on the package **bits fingerprint** (the tar SHA-256):
 same path + same fingerprint is idempotent; a differing fingerprint at the same

@@ -22,6 +22,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"cvmfs.io/prepub/internal/broker"
+	"cvmfs.io/prepub/internal/buildset"
 	"cvmfs.io/prepub/internal/job"
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
@@ -41,6 +43,19 @@ import (
 
 // maxTarSize is the maximum accepted tar body (10 GiB).
 const maxTarSize = 10 << 30
+
+// Limits for streamed multipart submissions.  ParseMultipartForm applied its
+// own implicit bounds; since submitJob now reads the parts itself, the bounds
+// are explicit.
+const (
+	// maxFormFieldSize caps any single non-payload form field.  The largest
+	// legitimate field is preload_paths (a JSON array of repo-relative paths).
+	maxFormFieldSize = 1 << 20
+	// maxMultipartParts caps the number of parts in one submission.  The API
+	// defines ten fields plus the payload; the limit leaves room for growth
+	// while still bounding the loop.
+	maxMultipartParts = 64
+)
 
 // Server is the HTTP API server for job submission, status queries, and event streaming.
 // It enforces bearer token authentication and manages background job goroutines.
@@ -152,6 +167,13 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	builds := s.router.PathPrefix("/api/v1/builds").Subrouter()
 	builds.Use(s.requireAuth)
 	builds.HandleFunc("/{id}/finalize", s.finalizeBuild).Methods("POST")
+	// Seal: "I have submitted N jobs for this build" — prepub finalizes on its
+	// own once N have accumulated, so the producer need not poll.
+	builds.HandleFunc("/{id}/seal", s.sealBuild).Methods("POST")
+	// Build status: one cheap call that tells a producer whether its build has
+	// accumulated, is being finalized, or has finished — the alternative to
+	// polling every package job to a terminal state.
+	builds.HandleFunc("/{id}", s.buildStatus).Methods("GET")
 
 	return s
 }
@@ -345,6 +367,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		s.jobWg.Wait()
+		// Auto-finalize runs detached from the job that triggered it, so it is
+		// not covered by jobWg.  Waiting here is what stops a restart from
+		// SIGKILLing an ingestsql commit mid-flight — the claim marker would
+		// then keep auto-finalize off for that build permanently.
+		s.orch.finalizeWg.Wait()
 		s.orch.webhookWg.Wait()
 		close(done)
 	}()
@@ -521,6 +548,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preloadExe                string   // optional: repo-relative exe path for preload
 		preloadPaths              []string // optional: repo-relative paths opened at startup
 		buildID                   string   // optional: groups a build's packages (ADR-0007)
+		buildExpect               int      // optional: package count → auto-finalize when reached
 		finalize                  bool     // coarse-publish finalize job (no tar payload)
 	)
 
@@ -545,6 +573,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			PreloadExe     string   `json:"preload_exe"`
 			PreloadPaths   []string `json:"preload_paths"`
 			BuildID        string   `json:"build_id"`
+			BuildExpect    int      `json:"build_expect"`
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
@@ -620,97 +649,218 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preloadExe = req.PreloadExe
 		preloadPaths = req.PreloadPaths
 		buildID = req.BuildID
+		buildExpect = req.BuildExpect
 
 	} else {
 		// ── Multipart upload mode (default) ─────────────────────────────────
-		if err := r.ParseMultipartForm(32 << 20); err != nil {
+		//
+		// The payload is streamed part-by-part instead of going through
+		// r.ParseMultipartForm.  ParseMultipartForm spools everything beyond
+		// its in-memory threshold to a temporary file, which the handler then
+		// copies into the spool: every tar is written to disk twice, and the
+		// producer waits for both writes before it receives a job_id.  Reading
+		// the parts ourselves writes the payload exactly once, straight into
+		// the job directory.
+		//
+		// Parts are processed in transmission order and field values are not
+		// available until their part arrives, so validation that depends on
+		// them happens after the loop.  A rejected submission removes jobDir,
+		// exactly as before — and ParseMultipartForm would have written the
+		// whole body to disk before rejecting it anyway, so nothing regresses.
+		// Bound the whole body.  ParseMultipartForm inherited no such bound
+		// either, but it is worth adding here: the per-part LimitReader below
+		// stops us from STORING more than maxTarSize, while multipart.Part.Close
+		// drains whatever remains, so without this a client could make the
+		// server read an unbounded stream after the limit had already tripped.
+		r.Body = http.MaxBytesReader(w, r.Body, maxTarSize+maxFormFieldSize*maxMultipartParts)
+
+		mr, mrErr := r.MultipartReader()
+		if mrErr != nil {
 			http.Error(w, `{"error":"invalid multipart form"}`, http.StatusBadRequest)
 			return
 		}
 
-		repo = r.FormValue("repo")
-		if repo == "" {
-			http.Error(w, `{"error":"repo field is required"}`, http.StatusBadRequest)
-			return
-		}
-		if err := broker.ValidateRepo(repo); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
-			return
-		}
-		subPath = r.FormValue("path")
-		webhookURL = r.FormValue("webhook_url")
-		submittedSHA256 = r.FormValue("tar_sha256") // optional
-		tagName = r.FormValue("tag_name")
-		tagDescription = r.FormValue("tag_description")
-		preloadExe = r.FormValue("preload_exe") // optional
-		buildID = r.FormValue("build_id")       // optional (ADR-0007 coarse publish)
-		finalize = r.FormValue("finalize") == "true"
-		// preload_paths is a JSON-encoded []string (e.g. '["bin/root","lib/libCore.so"]')
-		if raw := r.FormValue("preload_paths"); raw != "" {
-			if err := json.Unmarshal([]byte(raw), &preloadPaths); err != nil {
-				http.Error(w, `{"error":"preload_paths must be a JSON array of strings"}`, http.StatusBadRequest)
-				return
+		// First value wins, matching r.FormValue's behaviour for duplicated
+		// fields.
+		fields := make(map[string]string, maxMultipartParts)
+		setField := func(k, v string) {
+			if _, dup := fields[k]; !dup {
+				fields[k] = v
 			}
 		}
+		hasher := sha256.New()
+		sawTar := false
 
-		if err := job.ValidateTagName(tagName); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
-			return
-		}
-
-		if !finalize {
-			tarFile, _, err := r.FormFile("tar")
-			if err != nil {
-				http.Error(w, `{"error":"tar field is required"}`, http.StatusBadRequest)
+		for i := 0; ; i++ {
+			part, partErr := mr.NextPart()
+			if errors.Is(partErr, io.EOF) {
+				break
+			}
+			if partErr != nil {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"invalid multipart form"}`, http.StatusBadRequest)
 				return
 			}
-			defer tarFile.Close()
+			// Bound the part count so a malicious client cannot keep the
+			// handler (and a spool job directory) alive indefinitely.
+			if i >= maxMultipartParts {
+				part.Close()
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"too many multipart parts"}`, http.StatusBadRequest)
+				return
+			}
+
+			// The payload is the part named "tar" that carries a filename.
+			// r.FormFile required one (returning ErrMissingFile otherwise), so a
+			// plain text field called "tar" must stay a field, not become a
+			// package.
+			if part.FormName() != "tar" || part.FileName() == "" {
+				// Ordinary form field: small, safe to buffer, but still capped.
+				v, readErr := io.ReadAll(io.LimitReader(part, maxFormFieldSize+1))
+				name := part.FormName()
+				part.Close()
+				if readErr != nil {
+					os.RemoveAll(jobDir)
+					http.Error(w, `{"error":"invalid multipart form"}`, http.StatusBadRequest)
+					return
+				}
+				if int64(len(v)) > maxFormFieldSize {
+					os.RemoveAll(jobDir)
+					http.Error(w, fmt.Sprintf(`{"error":"form field %q exceeds %d bytes"}`, name, maxFormFieldSize), http.StatusRequestEntityTooLarge)
+					return
+				}
+				setField(name, string(v))
+				continue
+			}
+
+			// ── The payload ──────────────────────────────────────────────
+			if sawTar {
+				part.Close()
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"duplicate tar part"}`, http.StatusBadRequest)
+				return
+			}
+			sawTar = true
 
 			if err := os.MkdirAll(jobDir, 0700); err != nil {
+				part.Close()
 				span.RecordError(err)
 				http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
 				return
 			}
-
 			spoolTarPath = filepath.Join(jobDir, "payload.tar")
-			spoolFile, err := os.OpenFile(spoolTarPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-			if err != nil {
-				span.RecordError(err)
+			spoolFile, openErr := os.OpenFile(spoolTarPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+			if openErr != nil {
+				part.Close()
+				span.RecordError(openErr)
 				os.RemoveAll(jobDir)
 				http.Error(w, `{"error":"internal error creating tar file"}`, http.StatusInternalServerError)
 				return
 			}
 
-			// Cap incoming tar size and optionally compute SHA-256 as we stream.
-			hasher := sha256.New()
-			dst := io.Writer(spoolFile)
-			if submittedSHA256 != "" {
-				dst = io.MultiWriter(spoolFile, hasher)
-			}
-			n, copyErr := io.Copy(dst, io.LimitReader(tarFile, maxTarSize+1))
-			spoolFile.Close()
-			if copyErr != nil {
-				span.RecordError(copyErr)
-				os.RemoveAll(jobDir)
-				http.Error(w, `{"error":"error writing tar to spool"}`, http.StatusInternalServerError)
-				return
-			}
+			// Always hash: tar_sha256 may not have been seen yet (field order
+			// is the client's choice), and hashing a stream we are already
+			// writing costs far less than a second pass over the file.
+			n, copyErr := io.Copy(io.MultiWriter(spoolFile, hasher), io.LimitReader(part, maxTarSize+1))
+			closeErr := spoolFile.Close()
+			// Reject an oversized payload BEFORE part.Close(), which drains the
+			// remainder of the part — otherwise the server reads the entire
+			// body it has just decided to refuse.
 			if n > maxTarSize {
 				os.RemoveAll(jobDir)
 				http.Error(w, `{"error":"tar exceeds maximum allowed size"}`, http.StatusRequestEntityTooLarge)
 				return
 			}
-
-			// Verify the optional checksum.
-			if submittedSHA256 != "" {
-				computed := hex.EncodeToString(hasher.Sum(nil))
-				if !strings.EqualFold(computed, submittedSHA256) {
-					os.RemoveAll(jobDir)
-					http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: got %s, expected %s"}`, computed, submittedSHA256), http.StatusBadRequest)
+			part.Close()
+			if copyErr != nil || closeErr != nil {
+				os.RemoveAll(jobDir)
+				// A client that disconnects mid-upload is not a server fault;
+				// ParseMultipartForm surfaced this as a 400 and so do we.
+				if closeErr == nil {
+					http.Error(w, `{"error":"upload interrupted"}`, http.StatusBadRequest)
 					return
 				}
+				span.RecordError(errors.Join(copyErr, closeErr))
+				http.Error(w, `{"error":"error writing tar to spool"}`, http.StatusInternalServerError)
+				return
 			}
-		} // !finalize
+		}
+
+		// r.FormValue merged URL query parameters with form fields; keep that
+		// so a caller passing e.g. ?repo=... is not silently rejected.
+		field := func(k string) string {
+			if v, ok := fields[k]; ok {
+				return v
+			}
+			return r.URL.Query().Get(k)
+		}
+
+		repo = field("repo")
+		subPath = field("path")
+		webhookURL = field("webhook_url")
+		submittedSHA256 = field("tar_sha256") // optional
+		tagName = field("tag_name")
+		tagDescription = field("tag_description")
+		preloadExe = field("preload_exe") // optional
+		buildID = field("build_id")       // optional (ADR-0007 coarse publish)
+		finalize = field("finalize") == "true"
+		// build_expect: how many packages this build will contain.  When set,
+		// prepub finalizes the build itself once that many have accumulated,
+		// so the producer can exit after its last upload.
+		if raw := field("build_expect"); raw != "" {
+			n, convErr := strconv.Atoi(strings.TrimSpace(raw))
+			if convErr != nil || n < 0 {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"build_expect must be a non-negative integer"}`, http.StatusBadRequest)
+				return
+			}
+			buildExpect = n
+		}
+
+		if repo == "" {
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"repo field is required"}`, http.StatusBadRequest)
+			return
+		}
+		if err := broker.ValidateRepo(repo); err != nil {
+			os.RemoveAll(jobDir)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		// preload_paths is a JSON-encoded []string (e.g. '["bin/root","lib/libCore.so"]')
+		if raw := fields["preload_paths"]; raw != "" {
+			if err := json.Unmarshal([]byte(raw), &preloadPaths); err != nil {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"preload_paths must be a JSON array of strings"}`, http.StatusBadRequest)
+				return
+			}
+		}
+		if err := job.ValidateTagName(tagName); err != nil {
+			os.RemoveAll(jobDir)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+
+		switch {
+		case finalize:
+			// A finalize job carries no payload.  If the client sent one
+			// anyway, drop it rather than leaving an orphan in the spool.
+			if sawTar {
+				os.RemoveAll(jobDir)
+				spoolTarPath = ""
+			}
+		case !sawTar:
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"tar field is required"}`, http.StatusBadRequest)
+			return
+		case submittedSHA256 != "":
+			computed := hex.EncodeToString(hasher.Sum(nil))
+			if !strings.EqualFold(computed, submittedSHA256) {
+				os.RemoveAll(jobDir)
+				http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: got %s, expected %s"}`, computed, submittedSHA256), http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	// A finalize job requires a build_id and carries no payload.
@@ -727,6 +877,20 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.obs.Logger.Warn("submit: target outside authorized namespace", "repo", repo, "path", subPath)
 		http.Error(w, `{"error":"forbidden: target path is outside this deployment's authorized CVMFS namespace"}`, http.StatusForbidden)
 		return
+	}
+
+	// Record the build's expected package count before the job can accumulate,
+	// so that the last package to finish sees a complete declaration and can
+	// trigger the finalize itself.  Every package of the build carries the same
+	// value; the write is atomic and idempotent.  A finalize job never declares
+	// (it IS the finalize).
+	if buildID != "" && buildExpect > 0 && !finalize {
+		if err := buildset.SetExpect(s.spoolRoot, buildID, buildExpect); err != nil {
+			span.RecordError(err)
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"internal error recording build expectation"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	j := job.NewJob(jobID, repo, "", spoolTarPath)

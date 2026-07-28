@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -335,6 +336,20 @@ func runPublisher(
 		obs.Logger.Error("failed to create spool", "error", err)
 		os.Exit(1)
 	}
+
+	// Keep every temporary file inside the spool filesystem. /tmp is small on a
+	// production node (and with systemd PrivateTmp it can be a tmpfs, i.e. RAM),
+	// yet the publish path writes potentially large temporaries there: catalog
+	// downloads (cvmfscatalog.PathExists), mkdir-p subtree catalogs, buildset
+	// finalize work dirs, and the pipeline's compress spill. Setting TMPDIR
+	// redirects os.MkdirTemp("")/os.CreateTemp("") for this process AND for the
+	// child processes we exec (cvmfs_swissknife, cvmfs_server), which inherit
+	// the environment.
+	if err := setTempRoot(spoolRoot); err != nil {
+		obs.Logger.Error("failed to prepare spool temp directory", "error", err)
+		os.Exit(1)
+	}
+	obs.Logger.Info("temp root", "tmpdir", os.TempDir())
 
 	// ── Publish backend selection ─────────────────────────────────────────────
 	//
@@ -1016,6 +1031,43 @@ func parseLogLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// setTempRoot points TMPDIR at <spoolRoot>/tmp so that no temporary file lands
+// on the (small, possibly tmpfs-backed) system /tmp. It is deliberately called
+// after spool.New so the spool root is known to exist and be writable.
+//
+// An operator-supplied TMPDIR is honoured: if it is already set to a usable
+// directory we leave it alone, so a deployment can put temporaries on a
+// dedicated volume.
+func setTempRoot(spoolRoot string) error {
+	if cur := os.Getenv("TMPDIR"); cur != "" {
+		// Must be a directory we can actually write to: an unwritable TMPDIR
+		// fails every os.MkdirTemp at publish time instead of here at startup.
+		if fi, err := os.Stat(cur); err == nil && fi.IsDir() {
+			probe, perr := os.CreateTemp(cur, ".prepub-probe-")
+			if perr == nil {
+				name := probe.Name()
+				probe.Close()
+				os.Remove(name)
+				return nil
+			}
+		}
+		// Fall through and use the spool: an unusable TMPDIR is worse than
+		// useless, and silently ignoring it is better than refusing to start.
+	}
+	dir := filepath.Join(spoolRoot, "tmp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+	// The spool may have been created with a laxer umask by a previous version.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("chmod %s: %w", dir, err)
+	}
+	if err := os.Setenv("TMPDIR", dir); err != nil {
+		return fmt.Errorf("setting TMPDIR: %w", err)
+	}
+	return nil
 }
 
 // splitCSV splits a comma-separated flag value into a slice, trimming spaces and

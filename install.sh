@@ -430,6 +430,10 @@ install_dirs() {
     case "$MODE" in
         publisher|all)
             ensure_dir "$SPOOL_DIR"   "${SERVICE_USER}:${SERVICE_USER}" "0700"
+            # Temporaries live on the spool volume, never on /tmp: catalog
+            # downloads and finalize work dirs are far larger than a typical
+            # /tmp, which under systemd PrivateTmp may even be RAM-backed.
+            ensure_dir "${SPOOL_DIR}/tmp" "${SERVICE_USER}:${SERVICE_USER}" "0700"
             ensure_dir "$CONFIG_DIR"  "root:${SERVICE_USER}"            "0750"
             ensure_dir "${CONFIG_DIR}/tls" "root:${SERVICE_USER}"       "0750"
             ensure_dir "$DEFAULT_CAS_PUB" "${SERVICE_USER}:${SERVICE_USER}" "0750"
@@ -499,9 +503,13 @@ cas:
   # region: us-east-1
 
 pipeline:
-  workers: 0            # 0 = runtime.NumCPU()
+  # These are now READ by the service. Earlier versions shipped this block while
+  # the config parser ignored it, so an upgrade makes whatever is written here
+  # take effect — keep the values conservative and matched to MemoryMax in the
+  # unit file. Peak RSS scales with workers x largest-file.
+  workers: 2            # unset/0 keeps the built-in default (4)
   compression: zlib
-  upload_concurrency: 16
+  upload_concurrency: 4
 
 repositories:
   - name: your-repo.example.org   # replace with your CVMFS repository name
@@ -607,14 +615,22 @@ Group=${SERVICE_USER}
 ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/config.yaml
 Restart=on-failure
 RestartSec=5s
+# Keep temporaries off /tmp (small, and RAM-backed when PrivateTmp is on).
+# Set BEFORE EnvironmentFile so an operator can still override TMPDIR there;
+# systemd applies these in unit order and the last assignment wins. The service
+# also sets it itself at startup, which covers child processes we exec.
+Environment=TMPDIR=${SPOOL_DIR}/tmp
 EnvironmentFile=${CONFIG_DIR}/env
 # Memory containment. Peak RSS scales with --pipeline-workers x largest-file,
 # because each compress worker holds a whole file plus its compressed chunks.
 # Without a cap the KERNEL picks the OOM victim, and on a host shared with
 # cvmfs_gateway that victim may be the gateway rather than this service.
 # MemoryHigh throttles and reclaims first; MemoryMax is the hard stop.
-# Tune both to the host (these suit an 8 GB node shared with the gateway) and
-# lower pipeline.workers if publishes of large trees still hit the ceiling.
+# Tune both to the host (these suit an 8 GB node shared with the gateway).
+# IMPORTANT: this cap only holds with a matching pipeline.workers in
+# config.yaml — the generated template sets 2. At the built-in default of 4 the
+# observed peak was 6.7 GB, i.e. above MemoryMax, which turns an occasional
+# kernel OOM into a systemd SIGKILL on every large publish.
 MemoryHigh=2G
 MemoryMax=3G
 NoNewPrivileges=true

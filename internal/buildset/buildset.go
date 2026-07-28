@@ -21,7 +21,9 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"cvmfs.io/prepub/pkg/cvmfscatalog"
 )
@@ -101,6 +103,257 @@ func Load(spoolRoot, buildID string) ([]Member, error) {
 // Remove deletes a build's accumulator directory (after a successful finalize).
 func Remove(spoolRoot, buildID string) error {
 	return os.RemoveAll(buildDir(spoolRoot, buildID))
+}
+
+// ── Deferred finalize ────────────────────────────────────────────────────────
+//
+// A producer that must not block cannot poll every package job to a terminal
+// state and only then request the finalize.  Instead it declares, on each
+// package submission, how many packages the build will contain; prepub counts
+// the accumulated members and runs the finalize itself when the last one lands.
+//
+// The control files (_expect, _finalizing, <job>.failed) live alongside the
+// member JSONs and are named so that Load and Count — which only accept
+// "*.json" — ignore them.  The finalize Result is deliberately NOT one of them:
+// it is a sibling of the directory (see resultPath) so that it survives the
+// Remove that a successful finalize performs.
+
+const (
+	expectFile     = "_expect"
+	finalizingFile = "_finalizing"
+	failedSuffix   = ".failed"
+)
+
+// MarkFailed records that a job belonging to this build reached a terminal
+// failure.  Without it a build whose 87th package fails would never reach its
+// declared member count, so the deferred finalize would never fire and the
+// build would sit in the spool forever with nobody watching — the producer has
+// already exited.  Counting failures as terminal outcomes lets the build reach
+// a decision, and Failures() makes that decision "refuse to publish" rather
+// than "publish the 86 that worked".
+func MarkFailed(spoolRoot, buildID, jobID, reason string) error {
+	if buildID == "" || jobID == "" {
+		return fmt.Errorf("buildset.MarkFailed: buildID and JobID are required")
+	}
+	dir := buildDir(spoolRoot, buildID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("buildset: mkdir %s: %w", dir, err)
+	}
+	final := filepath.Join(dir, sanitizeID(jobID)+failedSuffix)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, []byte(reason), 0o644); err != nil {
+		return fmt.Errorf("buildset: write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return fmt.Errorf("buildset: rename %s: %w", final, err)
+	}
+	return nil
+}
+
+// Failures returns the job IDs recorded as failed for this build.
+func Failures(spoolRoot, buildID string) []string {
+	ents, err := os.ReadDir(buildDir(spoolRoot, buildID))
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, e := range ents {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), failedSuffix) {
+			ids = append(ids, strings.TrimSuffix(e.Name(), failedSuffix))
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// Terminal returns how many of the build's jobs have finished, successfully or
+// not.  This — not Count — is what the declared expectation is compared
+// against, so that a failed package still lets the build reach a decision.
+func Terminal(spoolRoot, buildID string) int {
+	return Count(spoolRoot, buildID) + len(Failures(spoolRoot, buildID))
+}
+
+// SetExpect records how many members build buildID is expected to accumulate.
+// It is written by every package submission of the build, so a late-arriving
+// (or corrected) count wins; writes are atomic, and a count of zero or less is
+// treated as "not declared" and clears any previous declaration.
+func SetExpect(spoolRoot, buildID string, n int) error {
+	if buildID == "" {
+		return fmt.Errorf("buildset.SetExpect: buildID is required")
+	}
+	dir := buildDir(spoolRoot, buildID)
+	if n <= 0 {
+		err := os.Remove(filepath.Join(dir, expectFile))
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("buildset: clear expect: %w", err)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("buildset: mkdir %s: %w", dir, err)
+	}
+	final := filepath.Join(dir, expectFile)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.Itoa(n)), 0o644); err != nil {
+		return fmt.Errorf("buildset: write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return fmt.Errorf("buildset: rename %s: %w", final, err)
+	}
+	return nil
+}
+
+// Expect returns the declared member count, or 0 when the build has no
+// declaration (the caller then waits for an explicit finalize request).
+func Expect(spoolRoot, buildID string) int {
+	data, err := os.ReadFile(filepath.Join(buildDir(spoolRoot, buildID), expectFile))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// Count returns the number of members recorded for a build without decoding
+// them — Load reads and unmarshals every member, which is wasteful when all we
+// need is "have they all arrived yet?".
+func Count(spoolRoot, buildID string) int {
+	ents, err := os.ReadDir(buildDir(spoolRoot, buildID))
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range ents {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			n++
+		}
+	}
+	return n
+}
+
+// ClaimFinalize atomically claims the right to finalize a build, returning
+// false when another caller already holds the claim.  O_EXCL makes this safe
+// across the concurrent job goroutines that may all observe the last member
+// arriving at the same moment.
+//
+// The claim deliberately survives a crash: if prepub dies mid-finalize the
+// marker remains, auto-finalize stays off for that build, and an operator
+// resolves it with POST /builds/{id}/finalize (which does not consult the
+// claim).  Silently re-running a half-finished ingestsql commit would be the
+// more dangerous behaviour.
+func ClaimFinalize(spoolRoot, buildID string) (bool, error) {
+	dir := buildDir(spoolRoot, buildID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, fmt.Errorf("buildset: mkdir %s: %w", dir, err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, finalizingFile),
+		os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("buildset: claim finalize: %w", err)
+	}
+	_, _ = f.WriteString(time.Now().UTC().Format(time.RFC3339))
+	if cerr := f.Close(); cerr != nil {
+		return false, fmt.Errorf("buildset: claim finalize: %w", cerr)
+	}
+	return true, nil
+}
+
+// ReleaseFinalize drops the claim so that a later attempt can be made.  It is
+// called only when the finalize failed *before* changing repository state; a
+// failure during the commit keeps the claim.
+func ReleaseFinalize(spoolRoot, buildID string) error {
+	err := os.Remove(filepath.Join(buildDir(spoolRoot, buildID), finalizingFile))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// Finalizing reports whether a build's finalize has been claimed.
+func Finalizing(spoolRoot, buildID string) bool {
+	_, err := os.Stat(filepath.Join(buildDir(spoolRoot, buildID), finalizingFile))
+	return err == nil
+}
+
+// Status is the observable state of a build, for GET /builds/{id}.
+type Status struct {
+	BuildID     string   `json:"build_id"`
+	Expect      int      `json:"expect"`      // 0 = no declaration; finalize must be requested
+	Accumulated int      `json:"accumulated"` // members recorded so far
+	Failed      []string `json:"failed,omitempty"`
+	Finalizing  bool     `json:"finalizing"` // finalize claimed (running, done, or crashed)
+	Result      *Result  `json:"result,omitempty"`
+}
+
+// Result is the outcome of a finalize, persisted outside the accumulator
+// directory so that it survives Remove and can still be read afterwards.
+type Result struct {
+	BuildID   string    `json:"build_id"`
+	Repo      string    `json:"repo,omitempty"`
+	Packages  int       `json:"packages"`
+	Published int       `json:"published"`
+	Error     string    `json:"error,omitempty"`
+	At        time.Time `json:"at"`
+}
+
+// resultPath is a sibling of the accumulator directory, so a successful
+// finalize (which removes the directory) does not erase the record.
+func resultPath(spoolRoot, buildID string) string {
+	return buildDir(spoolRoot, buildID) + ".result.json"
+}
+
+// WriteResult persists the finalize outcome atomically.
+func WriteResult(spoolRoot string, res Result) error {
+	if res.BuildID == "" {
+		return fmt.Errorf("buildset.WriteResult: BuildID is required")
+	}
+	data, err := json.Marshal(&res)
+	if err != nil {
+		return fmt.Errorf("buildset: marshal result: %w", err)
+	}
+	final := resultPath(spoolRoot, res.BuildID)
+	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+		return fmt.Errorf("buildset: mkdir %s: %w", filepath.Dir(final), err)
+	}
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("buildset: write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return fmt.Errorf("buildset: rename %s: %w", final, err)
+	}
+	return nil
+}
+
+// ReadResult returns the persisted finalize outcome, or nil when none exists.
+func ReadResult(spoolRoot, buildID string) *Result {
+	data, err := os.ReadFile(resultPath(spoolRoot, buildID))
+	if err != nil {
+		return nil
+	}
+	var res Result
+	if err := json.Unmarshal(data, &res); err != nil {
+		return nil
+	}
+	return &res
+}
+
+// GetStatus assembles the observable state of a build.
+func GetStatus(spoolRoot, buildID string) Status {
+	return Status{
+		BuildID:     buildID,
+		Expect:      Expect(spoolRoot, buildID),
+		Accumulated: Count(spoolRoot, buildID),
+		Failed:      Failures(spoolRoot, buildID),
+		Finalizing:  Finalizing(spoolRoot, buildID),
+		Result:      ReadResult(spoolRoot, buildID),
+	}
 }
 
 // Conflict records a package excluded from the assembled build.

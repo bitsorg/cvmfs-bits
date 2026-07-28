@@ -140,6 +140,16 @@ type Orchestrator struct {
 	runningMu sync.Mutex
 	running   map[string]context.CancelFunc
 
+	// finalizeWg tracks in-flight auto-finalize goroutines.  They are detached
+	// from the job goroutine that spawned them (an ingestsql commit outlives the
+	// job whose accumulation triggered it), so without this Shutdown would let
+	// systemd SIGKILL a commit half-way through.
+	finalizeWg sync.WaitGroup
+	// finalizeMu serialises FinalizeBuild per build_id across its three entry
+	// points (finalize job, /builds/{id}/finalize, auto-finalize).
+	// map[buildID]*sync.Mutex; entries are not evicted — one mutex per build is
+	// negligible next to the build's spool footprint.
+	finalizeMu sync.Map
 	// webhookWg tracks in-flight webhook delivery goroutines so Server.Shutdown
 	// can wait for them to finish before the process exits.
 	webhookWg sync.WaitGroup
@@ -1026,6 +1036,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		logger.Info("accumulated into build (deferred publish)",
 			"build_id", j.BuildID, "path", j.Path,
 			"entries", len(pipelineResult.CatalogEntries))
+		o.maybeAutoFinalize(j.BuildID)
 		return nil
 	}
 
@@ -1741,6 +1752,18 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 		_ = o.Spool.Transition(cleanupCtx, j, job.StateFailed)
 	}
 	_ = o.Spool.WriteManifest(j)
+
+	// Coarse publish: tell the build that one of its jobs is terminal, so a
+	// sealed build can still reach a decision.  Without this the declared count
+	// is never met and the build waits forever for a package that will never
+	// arrive — with the producer long gone, nobody would notice.
+	if j.BuildID != "" && !j.Finalize {
+		if mErr := buildset.MarkFailed(o.Spool.Root, j.BuildID, j.ID, ClassOf(err).String()); mErr != nil {
+			o.Obs.Logger.Warn("could not mark build member failed",
+				"build_id", j.BuildID, "job_id", j.ID, "error", mErr)
+		}
+		o.maybeAutoFinalize(j.BuildID)
+	}
 
 	if o.Notify != nil {
 		o.Notify.Publish(notify.Event{
