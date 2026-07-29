@@ -82,6 +82,17 @@ type fileConfig struct {
 	IngestPublish      bool   `yaml:"ingest_publish"`
 	IngestPublishOwner string `yaml:"ingest_publish_owner"`
 
+	// Coarse-publish finalize (ADR-0007): one cvmfs_swissknife ingestsql
+	// invocation commits a whole build. Without IngestConfigPrefix the finalize
+	// is DISABLED, and since a sealed build finalizes server-side, that failure
+	// is silent from the producer's side — packages upload, the pipeline goes
+	// green, and nothing is ever committed. These had no config keys at all
+	// until now: the unit passes only --config, so a stock install could not
+	// configure the finalize without editing the unit file.
+	IngestSwissknife   string   `yaml:"ingest_swissknife"`
+	IngestConfigPrefix string   `yaml:"ingest_config_prefix"`
+	IngestEnv          []string `yaml:"ingest_env"`
+
 	// Stratum0URL is the base URL of the Stratum 0 CVMFS server
 	// (e.g. "http://stratum0/cvmfs").  Required in gateway mode so the
 	// orchestrator can fetch the existing root catalog for merging.
@@ -250,6 +261,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	authMode *string,
 	ingestPublish *bool,
 	ingestPublishOwner *string,
+	ingestSwissknife, ingestConfigPrefix, ingestEnv *string,
 	chunkMin, chunkAvg, chunkMax *int64,
 	pipelineWorkers, pipelineUploadConc *int,
 ) {
@@ -366,6 +378,11 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		*ingestPublish = true
 	}
 	str("ingest-publish-owner", ingestPublishOwner, fc.IngestPublishOwner)
+	str("ingest-swissknife", ingestSwissknife, fc.IngestSwissknife)
+	str("ingest-config-prefix", ingestConfigPrefix, fc.IngestConfigPrefix)
+	if !has("ingest-env") && len(fc.IngestEnv) > 0 {
+		*ingestEnv = strings.Join(fc.IngestEnv, ",")
+	}
 
 	// Content-defined chunking sizes (xor32); zero/omitted -> CLI default.
 	i64("chunk-min", chunkMin, fc.Chunking.Min)

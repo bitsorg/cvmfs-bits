@@ -265,10 +265,10 @@ func TestSubmitJob_InvalidTagName_JSON(t *testing.T) {
 	}
 
 	reqBody, _ := json.Marshal(map[string]interface{}{
-		"repo":        "software.cern.ch",
-		"tar_path":    tarPath,
-		"tar_sha256":  tarSHA256,
-		"tag_name":    "v1/bad", // slash → invalid
+		"repo":       "software.cern.ch",
+		"tar_path":   tarPath,
+		"tar_sha256": tarSHA256,
+		"tag_name":   "v1/bad", // slash → invalid
 	})
 	req := httptest.NewRequest("POST", "/api/v1/jobs", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")

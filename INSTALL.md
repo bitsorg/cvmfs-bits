@@ -491,6 +491,16 @@ cas:
   type: s3
   server_conf: /etc/cvmfs/repositories.d/<repo>/server.conf
 
+# Coarse-publish finalize (ADR-0007). REQUIRED whenever publishers use
+# build_id, which the bits-console pipeline does by default: a sealed build is
+# finalized here, so without this every package uploads, the pipeline reports
+# success, and nothing is ever committed. GET /api/v1/health reports
+# finalize_ready, and startup warns when it is unset.
+ingest_config_prefix: /etc/cvmfs-prepub/ingest   # <dir>/<repo>/{config,gatewaykey,pubkey}
+ingest_swissknife: /usr/bin/cvmfs_swissknife
+ingest_env:
+  - LD_LIBRARY_PATH=/usr/lib/cvmfs
+
 pipeline:
   workers: 2                   # peak RSS ~ workers x largest file
   upload_concurrency: 4
@@ -562,7 +572,8 @@ root. Then:
 
 ```sh
 curl -s http://<new-host>:8080/api/v1/health | jq
-# {"status":"healthy","publish_paths":["prepub"],"auth_mode":"both", ...}
+# {"status":"healthy","publish_paths":["prepub"],"auth_mode":"both",
+#  "finalize_ready":true, ...}      <- finalize_ready MUST be true for coarse publish
 ```
 
 Publish one package end to end before switching anything. Then set `PREPUB_URL`

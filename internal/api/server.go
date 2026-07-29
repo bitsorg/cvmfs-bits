@@ -1795,6 +1795,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		Status       string   `json:"status"`
 		PublishPaths []string `json:"publish_paths"`
 		AuthMode     string   `json:"auth_mode"`
+		// FinalizeReady reports whether a sealed coarse build can actually be
+		// published here. False means uploads succeed and the commit never
+		// happens, which is invisible to a producer that has already exited.
+		FinalizeReady bool `json:"finalize_ready"`
 		// ReplayCache surfaces the fail-closed counter: a non-zero
 		// rejected_full means signed requests are being refused for capacity
 		// reasons, which looks like an auth problem from the client side and
@@ -1808,6 +1812,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	body.ReplayCache.RejectedFull = rejectedFull
 	if s.orch != nil {
 		body.PublishPaths = s.orch.PublishPathNames()
+		body.FinalizeReady = s.orch.IngestConfigPrefix != ""
 	}
 
 	w.Header().Set("Content-Type", "application/json")

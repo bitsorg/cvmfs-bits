@@ -137,8 +137,8 @@ func TestAcquire_LargestJobGetsSlotFirst(t *testing.T) {
 	for _, sz := range sizes {
 		sz := sz
 		go func() {
-			started.Done()                         // signal that goroutine is running
-			time.Sleep(10 * time.Millisecond)      // give all goroutines time to start
+			started.Done()                    // signal that goroutine is running
+			time.Sleep(10 * time.Millisecond) // give all goroutines time to start
 			parked.Add(1)
 			if err := ds.Acquire(ctx, sz); err != nil {
 				t.Errorf("Acquire(priority=%d): %v", sz, err)

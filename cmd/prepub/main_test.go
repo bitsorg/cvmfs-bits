@@ -158,6 +158,7 @@ type applyTestVars struct {
 	authMode                                                string
 	ingestPublish                                           bool
 	ingestPublishOwner                                      string
+	ingestSwissknife, ingestConfigPrefix, ingestEnv         string
 	chunkMin, chunkAvg, chunkMax                            int64
 	pipelineWorkers, pipelineUploadConc                     int
 }
@@ -191,6 +192,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.gatewayDirectGraft, &v.gatewayAllowPlaintext,
 		&v.authMode,
 		&v.ingestPublish, &v.ingestPublishOwner,
+		&v.ingestSwissknife, &v.ingestConfigPrefix, &v.ingestEnv,
 		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
 		&v.pipelineWorkers, &v.pipelineUploadConc,
 	)

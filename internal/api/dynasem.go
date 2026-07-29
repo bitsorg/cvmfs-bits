@@ -52,8 +52,8 @@ const (
 
 // waiter represents a single Acquire call blocked waiting for a slot.
 type waiter struct {
-	priority int64        // TarSize in bytes — larger = higher priority
-	index    int          // position in the heap (maintained by heap.Interface)
+	priority int64         // TarSize in bytes — larger = higher priority
+	index    int           // position in the heap (maintained by heap.Interface)
 	ready    chan struct{} // closed by Release() when the slot is granted
 	ctx      context.Context
 }
@@ -61,7 +61,7 @@ type waiter struct {
 // waiterHeap implements heap.Interface as a max-heap ordered by priority.
 type waiterHeap []*waiter
 
-func (h waiterHeap) Len() int            { return len(h) }
+func (h waiterHeap) Len() int           { return len(h) }
 func (h waiterHeap) Less(i, j int) bool { return h[i].priority > h[j].priority } // max-heap
 func (h waiterHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]

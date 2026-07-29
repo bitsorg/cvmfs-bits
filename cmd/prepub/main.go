@@ -251,6 +251,7 @@ func main() {
 			gatewayDirectGraft, gatewayAllowPlaintext,
 			authMode,
 			ingestPublish, ingestPublishOwner,
+			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc,
 		)
@@ -529,6 +530,23 @@ func runPublisher(
 	}
 	sort.Strings(pathNames)
 	obs.Logger.Info("publish paths available", "paths", strings.Join(pathNames, ", "))
+
+	// Say whether the coarse-publish finalize can run. This is the one setting
+	// whose absence is invisible from the producer's side: with coarse publish
+	// on (the default) a sealed build is finalized HERE, so an unset config
+	// prefix means every package uploads, the pipeline reports success, and
+	// nothing is ever committed. Silence about it was how that went unnoticed
+	// once already.
+	if ingestConfigPrefix == "" {
+		obs.Logger.Warn("coarse-publish finalize is NOT configured (ingest_config_prefix unset) — " +
+			"builds submitted with a build_id will accumulate and then FAIL to publish, " +
+			"with nothing to tell the producer, which has already exited. Set " +
+			"ingest_config_prefix in config.yaml, or publish with PREPUB_COARSE=false")
+	} else {
+		obs.Logger.Info("coarse-publish finalize configured",
+			"config_prefix", ingestConfigPrefix, "swissknife", ingestSwissknife,
+			"extra_env", len(splitCSV(ingestEnv)))
+	}
 
 	notifyBus := notify.NewBus()
 
