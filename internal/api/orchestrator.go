@@ -43,6 +43,11 @@ import (
 // moved to the failed state so a human can inspect them.
 const MaxRecoveries = 3
 
+// MaxInterrupts is the ceiling on resets caused by a CLEAN service restart.
+// These are not the job's fault, so the limit is loose — it exists only so a
+// restart loop cannot re-run the same job forever.
+const MaxInterrupts = 20
+
 // Orchestrator manages the end-to-end lifecycle of a publish job.
 // It coordinates pipeline stages, distribution to Stratum 1 endpoints,
 // transaction/lease acquisition, and commit operations via a pluggable
@@ -1842,21 +1847,40 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 // Recover attempts to re-process a job found in a non-terminal state at
 // service startup.  Stale transactions are aborted before the job is reset.
 // After MaxRecoveries attempts, jobs are moved to StateFailed.
-func (o *Orchestrator) Recover(ctx context.Context, j *job.Job) error {
+//
+// afterCleanShutdown distinguishes the two cases. False (a crash) counts the
+// attempt against MaxRecoveries, so a job that kills the service is eventually
+// failed instead of crash-looping. True (an operator restart) does not: the job
+// was interrupted, which is not evidence of anything wrong with it. Conflating
+// them meant three routine `systemctl restart`s during one debugging session
+// terminally failed every in-flight job of a 174-package build.
+func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdown bool) error {
 	ctx, span := o.Obs.Tracer.Start(ctx, "orchestrator.recover")
 	defer span.End()
 
-	logger := o.Obs.Logger.With("job_id", j.ID, "state", j.State, "recovery_count", j.RecoveryCount)
+	logger := o.Obs.Logger.With("job_id", j.ID, "state", j.State,
+		"recovery_count", j.RecoveryCount, "interrupt_count", j.InterruptCount)
 
-	if j.RecoveryCount >= MaxRecoveries {
+	if !afterCleanShutdown && j.RecoveryCount >= MaxRecoveries {
 		err := fmt.Errorf("job %s has reached the maximum recovery limit (%d attempts)", j.ID, MaxRecoveries)
 		span.RecordError(err)
 		logger.Error("job exceeded max recovery attempts — marking as failed")
 		_ = o.abortJob(ctx, j, err)
 		return err
 	}
+	if afterCleanShutdown && j.InterruptCount >= MaxInterrupts {
+		err := fmt.Errorf("job %s has been interrupted by a service restart %d times", j.ID, MaxInterrupts)
+		span.RecordError(err)
+		logger.Error("job interrupted too many times — marking as failed")
+		_ = o.abortJob(ctx, j, err)
+		return err
+	}
 
-	logger.Info("recovering job")
+	if afterCleanShutdown {
+		logger.Info("recovering job interrupted by a clean restart (not counted as a failed attempt)")
+	} else {
+		logger.Info("recovering job")
+	}
 
 	// Release any stale transaction.  The token may have already been
 	// released or expired — Abort is idempotent and errors are non-fatal here.
@@ -1868,7 +1892,7 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job) error {
 		j.LeaseToken = ""
 	}
 
-	if err := o.Spool.ResetForRecovery(j); err != nil {
+	if err := o.Spool.ResetForRecovery(j, !afterCleanShutdown); err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("resetting job for recovery: %w", err)
 	}

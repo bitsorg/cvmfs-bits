@@ -3420,6 +3420,22 @@ matter because the failure is silent without them:
   store that accepts a request and never answers blocks until TCP keepalive
   gives up, over two hours later.
 
+**Restarting the service does not fail in-flight jobs.** At startup prepub
+re-processes every job found in a non-terminal state. Whether that counts
+against `MaxRecoveries` (3) depends on how the previous instance exited:
+
+- Unclean (crash, OOM, `SIGKILL`) — counted. The job may be what killed the
+  service, so after three attempts it is failed rather than crash-looping.
+- Clean (`SIGTERM`, `systemctl restart`) — not counted. The job was interrupted
+  by an operator, which is no evidence against it. A separate `interrupt_count`
+  is tracked with a much looser ceiling (20) so a restart loop still terminates.
+
+The two are distinguished by a `.clean-shutdown` marker written in the spool
+root as the last act of a graceful shutdown and consumed once at startup. Before
+this, three routine restarts during one debugging session terminally failed
+every in-flight job of a 174-package build — and a build with failed members is
+never auto-published, so the whole publish was lost.
+
 **Phase 0 is bounded separately from the job semaphore.** The tar scan runs
 BEFORE a job competes for a concurrency slot, so that its compress workers can
 start the moment it gets one — which means the job semaphore does not cover it.

@@ -873,6 +873,22 @@ func runPublisher(
 		os.Exit(1)
 	}
 
+	// Consumed exactly once, before any job is looked at: was the previous exit
+	// graceful? Jobs interrupted by an operator restart must not be charged a
+	// recovery attempt, or restarting the service during a large publish
+	// destroys it — three restarts terminally failed a 174-package build.
+	afterCleanShutdown := sp.TakeCleanShutdown()
+	if len(inProgressJobs) > 0 {
+		if afterCleanShutdown {
+			obs.Logger.Info("previous shutdown was clean — in-flight jobs resume without "+
+				"counting a failed attempt", "jobs", len(inProgressJobs))
+		} else {
+			obs.Logger.Warn("previous exit was NOT clean — in-flight jobs are recovered and "+
+				"the attempt is counted; a job that keeps killing the service will be failed",
+				"jobs", len(inProgressJobs), "max_recoveries", api.MaxRecoveries)
+		}
+	}
+
 	var recoveryWg sync.WaitGroup
 	for _, j := range inProgressJobs {
 		j := j
@@ -880,7 +896,7 @@ func runPublisher(
 		recoveryWg.Add(1)
 		go func() {
 			defer recoveryWg.Done()
-			if err := orch.Recover(recoverCtx, j); err != nil {
+			if err := orch.Recover(recoverCtx, j, afterCleanShutdown); err != nil {
 				obs.Logger.Error("job recovery failed", "job_id", j.ID, "error", err)
 			}
 		}()
@@ -923,6 +939,16 @@ func runPublisher(
 		obs.Logger.Info("all recovery goroutines finished")
 	case <-shutdownCtx.Done():
 		obs.Logger.Warn("timed out waiting for recovery goroutines")
+	}
+
+	// LAST, deliberately: the marker means "we got all the way through a clean
+	// shutdown". Written earlier, a crash partway through would leave it behind
+	// and the interrupted jobs would get a free pass they had not earned. If
+	// this write fails the next start simply treats the exit as a crash, which
+	// is the safe direction.
+	if err := sp.MarkCleanShutdown(); err != nil {
+		obs.Logger.Warn("could not record a clean shutdown — in-flight jobs will be "+
+			"charged a recovery attempt on the next start", "error", err)
 	}
 
 	obs.Logger.Info("shutdown complete")

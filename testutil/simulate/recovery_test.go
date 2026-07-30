@@ -106,7 +106,7 @@ func TestRecovery_FromIncoming(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j); err != nil {
+	if err := orch.Recover(ctx, j, false); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -140,7 +140,7 @@ func TestRecovery_FromLeased(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j); err != nil {
+	if err := orch.Recover(ctx, j, false); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -174,7 +174,7 @@ func TestRecovery_FromStaging(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j); err != nil {
+	if err := orch.Recover(ctx, j, false); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -206,7 +206,7 @@ func TestRecovery_FromUploading(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j); err != nil {
+	if err := orch.Recover(ctx, j, false); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestRecovery_CountIncremented(t *testing.T) {
 			t.Fatalf("attempt %d WriteManifest: %v", attempt, err)
 		}
 
-		if err := orch.Recover(ctx, j); err != nil {
+		if err := orch.Recover(ctx, j, false); err != nil {
 			t.Fatalf("attempt %d Recover: %v", attempt, err)
 		}
 
@@ -270,7 +270,7 @@ func TestRecovery_MaxRecoveries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := orch.Recover(ctx, j)
+	err := orch.Recover(ctx, j, false)
 	if err == nil {
 		t.Fatal("expected Recover to return an error when recovery limit is reached")
 	}

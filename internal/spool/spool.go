@@ -324,7 +324,14 @@ func (s *Spool) findJobDir(id string, hintState job.State) string {
 // ResetForRecovery increments RecoveryCount, clears the lease token and error message,
 // and moves the job directory back to incoming. The caller is responsible for releasing
 // any stale gateway lease before invoking this method.
-func (s *Spool) ResetForRecovery(j *job.Job) error {
+// ResetForRecovery returns a job to StateIncoming so it can be re-processed.
+//
+// countAttempt distinguishes the two reasons a job is found mid-flight at
+// startup. After a crash it is true: the job may be what killed the service, so
+// the attempt counts towards MaxRecoveries and a poisonous job is eventually
+// failed rather than crash-looping. After a clean shutdown it is false — the
+// job was interrupted by an operator, which says nothing about the job.
+func (s *Spool) ResetForRecovery(j *job.Job, countAttempt bool) error {
 	if job.IsTerminal(j.State) {
 		return fmt.Errorf("cannot reset terminal job %s in state %s", j.ID, j.State)
 	}
@@ -339,7 +346,11 @@ func (s *Spool) ResetForRecovery(j *job.Job) error {
 		return fmt.Errorf("resetting job for recovery: cannot find on-disk directory for job %s (state=%s)", j.ID, j.State)
 	}
 
-	j.RecoveryCount++
+	if countAttempt {
+		j.RecoveryCount++
+	} else {
+		j.InterruptCount++
+	}
 	j.State = job.StateIncoming
 	j.LeaseToken = ""
 	j.Error = ""
@@ -514,4 +525,42 @@ func (s *Spool) IncomingBySize(ctx context.Context) ([]*job.Job, error) {
 // or directory already exists.  os.IsExist does not unwrap, so we check both.
 func isErrExist(err error) bool {
 	return os.IsExist(err) || errors.Is(err, os.ErrExist)
+}
+
+// ── Clean-shutdown marker ────────────────────────────────────────────────────
+//
+// The spool cannot otherwise tell "the service was restarted under this job"
+// from "this job killed the service", and the two deserve opposite treatment: a
+// crash-looping job must eventually be failed, while an operator restart must
+// cost a job nothing. A marker written on the way out, and consumed once on the
+// way in, is enough to distinguish them.
+//
+// It is written at the very END of a graceful shutdown, so a crash partway
+// through leaves no marker and the conservative (counted) path is taken.
+
+// cleanShutdownMarker is the sentinel file name in the spool root.
+const cleanShutdownMarker = ".clean-shutdown"
+
+// MarkCleanShutdown records that the service is exiting on purpose.
+func (s *Spool) MarkCleanShutdown() error {
+	path := filepath.Join(s.Root, cleanShutdownMarker)
+	return os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
+}
+
+// TakeCleanShutdown reports whether the previous exit was graceful, and clears
+// the marker so it is honoured exactly once. A crash after this point is a
+// crash, and the jobs it interrupts are counted.
+func (s *Spool) TakeCleanShutdown() bool {
+	path := filepath.Join(s.Root, cleanShutdownMarker)
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	if err := os.Remove(path); err != nil {
+		// Could not clear it: refuse the free pass rather than grant it on
+		// every restart forever.
+		s.obs.Logger.Warn("cannot clear the clean-shutdown marker; treating this start as a crash",
+			"path", path, "error", err)
+		return false
+	}
+	return true
 }

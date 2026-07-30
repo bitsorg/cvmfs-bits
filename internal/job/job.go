@@ -156,6 +156,16 @@ type Job struct {
 	FailedAtState string `json:"failed_at_state,omitempty"`
 	// RecoveryCount is the number of times this job has been reset for recovery.
 	RecoveryCount int `json:"recovery_count,omitempty"`
+	// InterruptCount is the number of times this job was reset because the
+	// SERVICE was restarted cleanly under it, as opposed to failing.
+	//
+	// These are counted apart from RecoveryCount because they are not evidence
+	// of anything wrong with the job. A `systemctl restart` during a large
+	// publish interrupts every in-flight job, and counting that as a failed
+	// attempt meant three routine restarts during one debugging session
+	// terminally failed an entire 174-package build. Tracked anyway, so a
+	// restart loop cannot re-run a job forever.
+	InterruptCount int `json:"interrupt_count,omitempty"`
 	// WebhookURL is an optional URL to POST when the job reaches a terminal state.
 	WebhookURL string `json:"webhook_url,omitempty"`
 	// TagName is the optional CVMFS snapshot tag to create for this publish.

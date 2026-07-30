@@ -340,3 +340,123 @@ func TestIncomingBySize_EmptyDir(t *testing.T) {
 		t.Errorf("expected 0 jobs; got %d", len(got))
 	}
 }
+
+// stagedJob writes a job to the spool in StateStaging, which is where a restart
+// most often catches one.
+func stagedJob(t *testing.T, s *Spool) *job.Job {
+	t.Helper()
+	j := &job.Job{ID: "interrupted-job", Repo: "r.example.org", Path: "p", State: job.StateIncoming}
+	if err := s.WriteManifest(j); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	if err := os.Rename(s.JobDir(j), stagingDirFor(s, j)); err != nil {
+		t.Fatalf("staging the job: %v", err)
+	}
+	j.State = job.StateStaging
+	if err := s.WriteManifest(j); err != nil {
+		t.Fatalf("WriteManifest (staged): %v", err)
+	}
+	return j
+}
+
+// stagingDirFor is the job's directory as it would be under StateStaging.
+func stagingDirFor(s *Spool, j *job.Job) string {
+	staged := *j
+	staged.State = job.StateStaging
+	return s.JobDir(&staged)
+}
+
+// ── Clean-shutdown marker ────────────────────────────────────────────────────
+//
+// A job found mid-flight at startup has two possible histories, and they
+// deserve opposite treatment: it may have killed the service (count it, so a
+// poisonous job is eventually failed instead of crash-looping), or an operator
+// may have restarted the service under it (count nothing — the job did nothing
+// wrong). Without this distinction, three routine restarts during one debugging
+// session terminally failed every in-flight job of a 174-package build.
+
+func TestCleanShutdownMarker_AbsentByDefault(t *testing.T) {
+	s := newTestSpool(t)
+	if s.TakeCleanShutdown() {
+		t.Error("a spool that was never marked must report an unclean previous exit")
+	}
+}
+
+func TestCleanShutdownMarker_RoundTrip(t *testing.T) {
+	s := newTestSpool(t)
+	if err := s.MarkCleanShutdown(); err != nil {
+		t.Fatalf("MarkCleanShutdown: %v", err)
+	}
+	if !s.TakeCleanShutdown() {
+		t.Fatal("a marked shutdown must be reported as clean")
+	}
+}
+
+// TestCleanShutdownMarker_IsConsumedOnce is the property that keeps the free
+// pass honest: a crash AFTER a clean start must be treated as a crash.
+func TestCleanShutdownMarker_IsConsumedOnce(t *testing.T) {
+	s := newTestSpool(t)
+	if err := s.MarkCleanShutdown(); err != nil {
+		t.Fatalf("MarkCleanShutdown: %v", err)
+	}
+	if !s.TakeCleanShutdown() {
+		t.Fatal("first take must report clean")
+	}
+	if s.TakeCleanShutdown() {
+		t.Error("the marker was honoured twice — a later crash would go uncounted forever")
+	}
+}
+
+// TestResetForRecovery_CountsTheRightCounter: an interruption must not consume
+// a recovery attempt, and a crash must not consume an interrupt allowance.
+func TestResetForRecovery_CountsTheRightCounter(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		countAttempt           bool
+		wantRecovery, wantIntr int
+	}{
+		{"after a crash", true, 1, 0},
+		{"after a clean restart", false, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSpool(t)
+			j := stagedJob(t, s)
+
+			if err := s.ResetForRecovery(j, tc.countAttempt); err != nil {
+				t.Fatalf("ResetForRecovery: %v", err)
+			}
+			if j.RecoveryCount != tc.wantRecovery {
+				t.Errorf("RecoveryCount = %d, want %d", j.RecoveryCount, tc.wantRecovery)
+			}
+			if j.InterruptCount != tc.wantIntr {
+				t.Errorf("InterruptCount = %d, want %d", j.InterruptCount, tc.wantIntr)
+			}
+			if j.State != job.StateIncoming {
+				t.Errorf("state = %s, want %s", j.State, job.StateIncoming)
+			}
+		})
+	}
+}
+
+// TestResetForRecovery_RestartsDoNotExhaustRecoveries is the regression in one
+// assertion: restarting the service more times than MaxRecoveries must leave
+// the job's recovery budget untouched.
+func TestResetForRecovery_RestartsDoNotExhaustRecoveries(t *testing.T) {
+	s := newTestSpool(t)
+	j := stagedJob(t, s)
+
+	for i := 0; i < 5; i++ { // more than MaxRecoveries (3)
+		if err := s.ResetForRecovery(j, false); err != nil {
+			t.Fatalf("reset %d: %v", i, err)
+		}
+		// The job is picked up again and interrupted again by the next restart.
+		if err := os.Rename(s.JobDir(j), stagingDirFor(s, j)); err != nil {
+			t.Fatalf("re-stage %d: %v", i, err)
+		}
+		j.State = job.StateStaging
+	}
+	if j.RecoveryCount != 0 {
+		t.Errorf("RecoveryCount = %d after 5 clean restarts, want 0 — "+
+			"operator restarts must not consume a job's failure budget", j.RecoveryCount)
+	}
+}
