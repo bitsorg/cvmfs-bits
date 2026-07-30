@@ -413,3 +413,88 @@ func TestAuth_QueryStringIsSigned(t *testing.T) {
 		t.Error("query parameters were appended to a signed request and still verified")
 	}
 }
+
+// TestAuth_ContentTypeCannotDisableBinding pins the fix for a real bypass.
+//
+// The middleware used to skip its body binding for any request whose
+// Content-Type began with "multipart/", on the theory that such a request was
+// the streamed upload and would bind itself in submitJob. Content-Type is
+// client-supplied and is NOT part of the canonical string, so it verifies no
+// matter what it says — and only submitJob ever binds. Rewriting the header on
+// a captured request to any other route therefore left the body completely
+// unauthenticated while the MAC still verified.
+//
+// The exemption now comes from the method and path, which the server decides.
+func TestAuth_ContentTypeCannotDisableBinding(t *testing.T) {
+	for _, route := range []string{
+		"/api/v1/reserve",
+		"/api/v1/builds/b-1/seal",
+		"/api/v1/builds/b-1/finalize",
+	} {
+		t.Run(route, func(t *testing.T) {
+			srv, _ := authTestServer(t, AuthBoth)
+
+			signedBody := `{"repo":"software.cern.ch","path":"pkg/1.0","expect":1}`
+			header := httpsig.Sign([]byte(testToken), "prepub", "POST", route,
+				httpsig.NoFields, httpsig.BodyDigest([]byte(signedBody)),
+				time.Now(), randomNonce(t))
+
+			// The attacker keeps the MAC, swaps the body, and claims multipart.
+			req := httptest.NewRequest("POST", route,
+				strings.NewReader(`{"repo":"attacker.cern.ch","path":"pkg/1.0","expect":99}`))
+			req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+			req.Header.Set(httpsig.HeaderName, header)
+
+			rec, reached := serveThroughAuth(srv, req)
+			if reached {
+				t.Fatalf("a rewritten body reached the handler by claiming to be multipart (status %d)", rec.Code)
+			}
+		})
+	}
+}
+
+// TestAuth_MultipartOnlyExemptOnTheSubmitRoute is the other half: the exemption
+// must still apply where it is needed, and must not apply anywhere else — not
+// even for the same path under a different method.
+func TestAuth_MultipartOnlyExemptOnTheSubmitRoute(t *testing.T) {
+	for _, tc := range []struct {
+		method, path string
+		want         bool
+	}{
+		{"POST", "/api/v1/jobs", true},
+		{"GET", "/api/v1/jobs", false},
+		{"PUT", "/api/v1/jobs", false},
+		{"POST", "/api/v1/jobs/", false},
+		{"POST", "/api/v1/jobs/abc", false},
+		{"POST", "/api/v1/reserve", false},
+		{"POST", "/api/v1/builds/b/seal", false},
+	} {
+		r := httptest.NewRequest(tc.method, tc.path, nil)
+		if got := isStreamingRoute(r); got != tc.want {
+			t.Errorf("isStreamingRoute(%s %s) = %v, want %v", tc.method, tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestAuth_JSONSubmissionIsBound covers the branch that shares the streaming
+// route: a tar_path submission is JSON, so the middleware defers to the
+// handler — which must bind it, or the exemption becomes the bypass again.
+func TestAuth_JSONSubmissionIsBound(t *testing.T) {
+	srv, _ := authTestServer(t, AuthBoth)
+	srv.stagingRoot = t.TempDir()
+
+	signedBody := `{"repo":"software.cern.ch","path":"pkg/1.0","tar_path":"ok.tar"}`
+	header := httpsig.Sign([]byte(testToken), "prepub", "POST", "/api/v1/jobs",
+		httpsig.NoFields, httpsig.BodyDigest([]byte(signedBody)), time.Now(), randomNonce(t))
+
+	req := httptest.NewRequest("POST", "/api/v1/jobs",
+		strings.NewReader(`{"repo":"software.cern.ch","path":"pkg/1.0","tar_path":"../../etc/passwd"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(httpsig.HeaderName, header)
+
+	rec := httptest.NewRecorder()
+	srv.requireAuth(http.HandlerFunc(srv.submitJob)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a rewritten tar_path submission returned %d, want 401\n%s", rec.Code, rec.Body.String())
+	}
+}

@@ -68,10 +68,24 @@ func ParseAuthMode(s string) (AuthMode, error) {
 func (s *Server) SetAuthMode(m AuthMode) { s.authMode = m }
 
 // SetSignatureSkew overrides the accepted clock difference for signed requests.
+// Called at startup, before the listener is up.
+//
+// The replay cache is rebuilt to match. Its retention and the skew are one
+// setting wearing two hats: a nonce must be remembered for at least as long as
+// a signature bearing it can still be inside the clock window, or the cache
+// forgets first and the replay it exists to stop succeeds. Widening the skew
+// without widening the retention reopens exactly that gap, silently.
 func (s *Server) SetSignatureSkew(d time.Duration) {
-	if d > 0 {
-		s.signSkew = d
+	if d <= 0 {
+		return
 	}
+	s.signSkew = d
+	if s.stopNonceSweeper != nil {
+		s.stopNonceSweeper()
+	}
+	s.nonces = httpsig.NewNonceCache(2*d, 0)
+	s.nonces.SetPressureHook(s.noncePressure)
+	s.stopNonceSweeper = s.nonces.StartSweeper()
 }
 
 // signatureContextKey is the request-context key under which a verified
@@ -110,7 +124,18 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 				s.rejectAuth(w, r, "signature rejected: "+err.Error())
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(withSignature(r, sig)))
+			st := &bindingState{deferred: isStreamingRoute(r)}
+			ctx := context.WithValue(withSignature(r, sig), bindingStateKey{}, st)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			// Backstop for the one case the allowlist cannot prevent: a new
+			// streaming route that never binds. The response has already been
+			// written so this cannot be turned into a 401, but it must not pass
+			// silently — an unbound signature authenticates nothing.
+			if st.deferred && !st.done {
+				s.obs.Logger.Error("BUG: signed request finished without binding its body — "+
+					"the signature authenticated nothing. Add the binding call to this handler.",
+					"method", r.Method, "path", r.URL.Path)
+			}
 			return
 		}
 
@@ -176,8 +201,8 @@ func (s *Server) verifySignature(r *http.Request, raw string) (*httpsig.Signatur
 // exception — its body is the multi-gigabyte tar the server deliberately
 // streams — and it does its own binding in submitJob.
 func (s *Server) bindNonStreamingBody(r *http.Request, sig *httpsig.Signature) error {
-	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
-		return nil // bound in submitJob against the streamed payload
+	if isStreamingRoute(r) {
+		return nil // bound by submitJob, which sees the parsed fields and payload
 	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxSignedBodySize+1))
 	r.Body.Close()
@@ -208,10 +233,63 @@ func (s *Server) bindNonStreamingBody(r *http.Request, sig *httpsig.Signature) e
 	return nil
 }
 
-// maxSignedBodySize caps a buffered, signed non-multipart body. Every such
+// requireSignedJSONBody binds a signed request on a STREAMING route whose body
+// turned out to be small JSON after all — the tar_path submission, which shares
+// POST /api/v1/jobs with the multipart upload. The middleware deferred binding
+// for the whole route, so this branch has to do it.
+func requireSignedJSONBody(r *http.Request, raw []byte) error {
+	sig := signatureFrom(r)
+	if sig == nil {
+		return nil
+	}
+	if !strings.EqualFold(sig.FieldsHash, httpsig.NoFields) {
+		return fmt.Errorf("%w: a JSON submission binds its whole body, not a field set",
+			httpsig.ErrBindingMismatch)
+	}
+	if !strings.EqualFold(sig.BodyHash, httpsig.BodyDigest(raw)) {
+		return fmt.Errorf("%w: request body differs from the signed digest",
+			httpsig.ErrBindingMismatch)
+	}
+	if st := bindingStateFrom(r); st != nil {
+		st.done = true
+	}
+	return nil
+}
+
+// maxSignedBodySize caps a buffered, signed non-streaming body. Every such
 // endpoint takes a small JSON document; the largest legitimate one is a job
 // submission by tar_path.
 const maxSignedBodySize = 1 << 20
+
+// isStreamingRoute reports whether a request goes to the one route whose body
+// the server refuses to buffer — the job submission, whose payload is a
+// multi-gigabyte tar — and which therefore binds its own body in the handler.
+//
+// This is deliberately a METHOD+PATH allowlist and not a Content-Type test.
+// An earlier version skipped the middleware binding for anything whose
+// Content-Type began with "multipart/", which is a client-supplied header that
+// is NOT part of the canonical string: rewriting it on a captured request made
+// the middleware skip its binding while the handler (which only binds on the
+// submit route) never ran one, leaving the body entirely unauthenticated with
+// the MAC still verifying. The exemption must derive from something the server
+// decides, i.e. which handler is about to run.
+//
+// Adding another streaming route means adding it here AND binding it in its
+// handler; the deferred-binding check below shouts if only the first is done.
+func isStreamingRoute(r *http.Request) bool {
+	return r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs"
+}
+
+// bindingState tracks, for a signed request whose binding was deferred to the
+// handler, whether the handler actually performed it.
+type bindingState struct{ deferred, done bool }
+
+type bindingStateKey struct{}
+
+func bindingStateFrom(r *http.Request) *bindingState {
+	st, _ := r.Context().Value(bindingStateKey{}).(*bindingState)
+	return st
+}
 
 // signingKeyID is the key identifier this deployment expects. A fixed value is
 // enough while there is one shared secret; the field exists so that adding a
@@ -229,7 +307,12 @@ func (s *Server) rejectAuth(w http.ResponseWriter, r *http.Request, reason strin
 		"path", r.URL.Path,
 		"reason", reason,
 	)
-	http.Error(w, fmt.Sprintf(`{"error":%q}`, reason), http.StatusUnauthorized)
+	// http.Error would label this text/plain, so every client that parses the
+	// error field has to sniff the body instead of trusting the header.
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusUnauthorized)
+	fmt.Fprintf(w, "{\"error\":%q}\n", reason)
 }
 
 // requireSignatureBinding is the post-parse half of the check: the fields the
@@ -247,8 +330,30 @@ func requireSignatureBinding(r *http.Request, fields map[string]string, bodyHash
 	if err := sig.Bound(fields, bodyHash); err != nil {
 		return err
 	}
+	if st := bindingStateFrom(r); st != nil {
+		st.done = true
+	}
 	return nil
 }
 
 var errSignedWithoutDigest = errors.New(
 	"a signed submission must carry tar_sha256 so the signature binds the payload")
+
+// noncePressure is called when the replay cache passes its high-water mark.
+//
+// The cache fails CLOSED at its cap — a request whose nonce cannot be
+// remembered is refused, because admitting it would silently stop preventing
+// replays. That is the right call and a bad first symptom: the operator would
+// see legitimate publishers getting 401s with no warning. So the approach is
+// announced while raising the cap is still a calm decision.
+//
+// Reaching it is not normal. A 100-package build makes a few hundred requests
+// over its lifetime; filling 50 000 entries inside the retention window means
+// either a much larger fleet than this cap was sized for, or someone minting
+// nonces with a secret they should not have.
+func (s *Server) noncePressure(entries, maxSize int) {
+	s.obs.Logger.Warn("replay cache is filling up; at capacity, signed requests are REFUSED",
+		"entries", entries, "max", maxSize,
+		"retention", (2 * s.signSkew).String(),
+		"action", "raise the cap, shorten --signature-skew, or find out who is minting nonces")
+}

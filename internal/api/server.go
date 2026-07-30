@@ -148,6 +148,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 			IdleTimeout:       120 * time.Second,
 		},
 	}
+	s.nonces.SetPressureHook(s.noncePressure)
 	s.stopNonceSweeper = s.nonces.StartSweeper()
 	if minConcurrentJobs > 0 {
 		s.dynaSem = NewDynamicSemaphore(minConcurrentJobs, maxConcurrentJobs, obs.Logger)
@@ -580,6 +581,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
 			return
 		}
+		// This route is exempt from the middleware's body binding because it is
+		// shared with the multi-gigabyte multipart upload, so the JSON branch
+		// binds its own body — BEFORE a single field is looked at, so that no
+		// part of the handler acts on bytes the signature has not committed to.
+		if err := requireSignedJSONBody(r, body); err != nil {
+			s.rejectAuth(w, r, "signature rejected: "+err.Error())
+			return
+		}
 		if err := json.Unmarshal(body, &req); err != nil {
 			http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
 			return
@@ -795,6 +804,42 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		// publish_path on a request whose MAC still verified. Nothing sends
 		// these as query parameters, so the compatibility was worth strictly
 		// less than the hole it opened.
+		// ── Second half of signature verification ────────────────────────────
+		// The middleware checked the MAC before any body was read; only now are
+		// the fields and the payload known, so only now can we confirm they are
+		// the ones the signature committed to. A signed request that skipped
+		// this would be authenticated in name only — the header would be
+		// genuine while the body had been replaced in flight.
+		//
+		// This runs BEFORE the fields are interpreted or validated. Doing it
+		// afterwards still refuses the request, but it first lets an attacker
+		// who cannot forge a MAC learn — from whether the reply is a 400 about
+		// a specific field or the generic 401 — which of his substitutions
+		// would have been well-formed. Unbound input gets no answers at all.
+		computed := hex.EncodeToString(hasher.Sum(nil))
+		if sig := signatureFrom(r); sig != nil {
+			bodyHash := computed
+			if !sawTar {
+				bodyHash = "" // Bound() normalises this to the no-payload marker
+			}
+			if err := requireSignatureBinding(r, fields, bodyHash); err != nil {
+				os.RemoveAll(jobDir)
+				s.obs.Logger.Warn("signed submission does not match its signature",
+					"remote_addr", r.RemoteAddr, "error", err)
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusUnauthorized)
+				return
+			}
+			// The signature binds the payload only through tar_sha256, so a
+			// submission that omits it is not covered even though the MAC
+			// verified. Insist on it rather than accept a signature that
+			// attests to nothing about the content.
+			if sawTar && fields["tar_sha256"] == "" {
+				os.RemoveAll(jobDir)
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, errSignedWithoutDigest.Error()), http.StatusBadRequest)
+				return
+			}
+		}
+
 		field := func(k string) string { return fields[k] }
 
 		repo = field("repo")
@@ -853,36 +898,6 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			os.RemoveAll(jobDir)
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
-		}
-
-		// ── Second half of signature verification ────────────────────────────
-		// The middleware checked the MAC before any body was read; only now are
-		// the fields and the payload known, so only now can we confirm they are
-		// the ones the signature committed to. A signed request that skipped
-		// this would be authenticated in name only — the header would be
-		// genuine while the body had been replaced in flight.
-		computed := hex.EncodeToString(hasher.Sum(nil))
-		if sig := signatureFrom(r); sig != nil {
-			bodyHash := computed
-			if !sawTar {
-				bodyHash = "" // Bound() normalises this to the no-payload marker
-			}
-			if err := requireSignatureBinding(r, fields, bodyHash); err != nil {
-				os.RemoveAll(jobDir)
-				s.obs.Logger.Warn("signed submission does not match its signature",
-					"remote_addr", r.RemoteAddr, "error", err)
-				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusUnauthorized)
-				return
-			}
-			// The signature binds the payload only through tar_sha256, so a
-			// submission that omits it is not covered even though the MAC
-			// verified. Insist on it rather than accept a signature that
-			// attests to nothing about the content.
-			if sawTar && submittedSHA256 == "" {
-				os.RemoveAll(jobDir)
-				http.Error(w, fmt.Sprintf(`{"error":%q}`, errSignedWithoutDigest.Error()), http.StatusBadRequest)
-				return
-			}
 		}
 
 		switch {

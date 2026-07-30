@@ -57,7 +57,17 @@ type NonceCache struct {
 	// service is under attack; both want looking at, so it is reported rather
 	// than only logged.
 	rejectedFull uint64
+	// onPressure, when set, is called the first time occupancy crosses
+	// pressureRatio, and again after a rotation drops it back below. Failing
+	// closed at the cap is correct but abrupt — the operator's first symptom
+	// would be authenticated publishers getting 401s — so the approach is
+	// announced while there is still room to raise the cap.
+	onPressure    func(entries, maxSize int)
+	underPressure bool
 }
+
+// pressureRatio is the occupancy at which onPressure fires.
+const pressureRatio = 0.8
 
 // DefaultMaxNonces caps the cache. At ~100 bytes per entry this is a few MB,
 // far above any legitimate rate: a 100-package build makes ~200 requests.
@@ -100,13 +110,35 @@ func (c *NonceCache) Use(sig *Signature, now time.Time) error {
 		return ErrReplay
 	}
 
-	if len(c.current)+len(c.previous) >= c.maxSize {
+	n := len(c.current) + len(c.previous)
+	if n >= c.maxSize {
 		c.rejectedFull++
 		return ErrCacheFull
 	}
 
 	c.current[key] = struct{}{}
+	c.checkPressureLocked(n + 1)
 	return nil
+}
+
+// checkPressureLocked reports crossing the high-water mark, once per crossing.
+// Callers hold c.mu; the callback runs under it, so it must not block.
+func (c *NonceCache) checkPressureLocked(n int) {
+	over := float64(n) >= pressureRatio*float64(c.maxSize)
+	if over == c.underPressure {
+		return
+	}
+	c.underPressure = over
+	if over && c.onPressure != nil {
+		c.onPressure(n, c.maxSize)
+	}
+}
+
+// SetPressureHook installs the high-water callback. Call before serving.
+func (c *NonceCache) SetPressureHook(fn func(entries, maxSize int)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onPressure = fn
 }
 
 // rotateLocked ages out the older generation once per ttl. Callers hold c.mu.
@@ -123,6 +155,7 @@ func (c *NonceCache) rotateLocked(now time.Time) {
 	}
 	c.current = make(map[string]struct{})
 	c.rotated = now
+	c.checkPressureLocked(len(c.current) + len(c.previous))
 }
 
 // Sweep ages the cache without a request arriving, so a quiet service does not

@@ -3367,10 +3367,34 @@ accepted as if the payload were covered. Everything else the server reads comes
 from form fields only — URL query parameters are ignored, because they would be
 a way to set fields the signature does not cover.
 
-The client signer is `.gitlab/prepub-sign.py` in bits-console; the Go test
-`TestSigner_FieldsDigestMatches` executes that file so the two implementations
-cannot drift apart. `GET /api/v1/health` reports the active `auth_mode` and the
-replay cache's `rejected_full` counter.
+**What is signed is the request-target the server sees**, so a deployment under
+a path prefix (`https://host/prepub`, or a reverse proxy that does not strip
+one) must sign `/prepub/api/v1/jobs`, not `/api/v1/jobs`. Both clients derive
+the URI from the URL they are about to fetch, so this is handled; a third-party
+client that hardcodes the API path will 401 on every request behind a prefix,
+with nothing in either log to explain it.
+
+Body binding is decided by METHOD AND PATH, never by `Content-Type`. Every route
+except `POST /api/v1/jobs` has a small body, which the auth middleware buffers
+and checks against `bh` before the handler runs — a handler cannot forget the
+check, because it never had to make it. `POST /api/v1/jobs` is the exception (its
+body is the tar), and it binds itself in both branches: against the parsed fields
+and streamed payload for multipart, against the whole document for `tar_path`
+JSON. `Content-Type` is client-supplied and is not covered by the MAC, so it must
+never be what selects between "bound" and "not bound".
+
+Clients must not let an HTTP library retry a signed request: a replay carries the
+same nonce and is refused, so a transient 5xx would surface as an inexplicable
+401. Retry by re-signing (`bits_helpers.prepub.submit_job` does; `poll_job`
+signs every attempt).
+
+The client signers are `.gitlab/prepub-sign.py` in bits-console and
+`bits_helpers/httpsig.py` in bits; the Go tests `TestSigner_FieldsDigestMatches`
+and `TestBitsHelpers_FieldsDigestMatches` execute those files, so the three
+implementations cannot drift apart. `GET /api/v1/health` reports the active
+`auth_mode` and the replay cache's `rejected_full` counter; the service also logs
+a warning when that cache passes 80% of its cap, since at 100% signed requests
+are refused.
 
 - **Publish path** — `POST /api/v1/jobs` with a `publish_path` form field:
   `prepub` (default, may be omitted) runs the pipeline described here;
