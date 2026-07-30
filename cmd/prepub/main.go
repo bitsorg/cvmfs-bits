@@ -156,6 +156,7 @@ func main() {
 	leaseRetryMax := flag.Duration("lease-retry-max", 0, "Maximum time to retry lease acquisition when path_busy; 0 = 12 min default (should exceed gateway max_lease_time) [publisher]")
 
 	// Pipeline performance tuning.
+	prefetchLimit := flag.Int("prefetch-limit", 8, "Maximum concurrent tar scans (pipeline phase 0). This runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Beyond this limit phase 0 runs inline under the job's own slot instead [publisher]")
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	// PEAK MEMORY IS DRIVEN BY THIS. unpack reads each file whole into RAM
 	// (unpack.go io.ReadAll) and every compress worker holds one file plus its
@@ -273,7 +274,7 @@ func main() {
 			ingestPublish, ingestPublishOwner,
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
-			pipelineWorkers, pipelineUploadConc,
+			pipelineWorkers, pipelineUploadConc, prefetchLimit,
 		)
 	}
 
@@ -306,7 +307,7 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
-			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel,
+			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit,
 			*chunkMin, *chunkAvg, *chunkMax,
 			*warmQuorum, *preWarm,
 			*brokerCACert,
@@ -345,6 +346,7 @@ func runPublisher(
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineWorkers, pipelineUploadConc, pipelineCompressLevel int,
+	prefetchLimit int,
 	chunkMin, chunkAvg, chunkMax int64,
 	warmQuorum float64,
 	preWarm bool,
@@ -773,7 +775,15 @@ func runPublisher(
 
 	if jobTimeout > 0 {
 		obs.Logger.Info("per-job timeout enabled", "job_timeout", jobTimeout)
+	} else {
+		obs.Logger.Warn("per-job timeout DISABLED (--job-timeout 0) — a job that blocks " +
+			"will hold its concurrency slot for the life of the process")
 	}
+
+	orch.SetPrefetchLimit(prefetchLimit)
+	obs.Logger.Info("tar prefetch (pipeline phase 0) bounded",
+		"limit", prefetchLimit,
+		"note", "beyond this, phase 0 runs inline under the job's own concurrency slot")
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
 	// Which credentials the API accepts (ADR-0008 D3). Parsed here rather than

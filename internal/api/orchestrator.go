@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/buildset"
 	"cvmfs.io/prepub/internal/cas"
@@ -198,6 +200,17 @@ type Orchestrator struct {
 	// a full re-read because at worst both overlap briefly).  On prefetch
 	// failure the channel receives nil and Run() falls back to pipeline.Run().
 	prefetchResults sync.Map // map[string]chan *pipeline.PrefetchResult
+
+	// prefetchSem bounds concurrent tar scans. Phase 0 runs outside the job
+	// concurrency semaphore by design (so a job's compress workers can start the
+	// moment it gets a slot), which means it needs a limit of its own or a
+	// burst of submissions starts one scan per package at once.
+	prefetchSem   *semaphore.Weighted
+	prefetchLimit int
+	prefetchOnce  sync.Once
+	// prefetchHook, when set, runs inside the scan goroutine while it holds a
+	// slot. Tests use it to make concurrency observable; nil in production.
+	prefetchHook func()
 
 	// knownPaths caches "repo!pathComponent" keys for CVMFS path components
 	// confirmed to exist in the repository.  ensureParentDirs uses this to
@@ -382,6 +395,47 @@ func (o *Orchestrator) PublishPathNames() []string {
 	return names
 }
 
+// SetPrefetchLimit bounds how many tar scans may run at once. Call at startup.
+// n <= 0 restores the default.
+func (o *Orchestrator) SetPrefetchLimit(n int) {
+	if n <= 0 {
+		n = defaultPrefetchLimit
+	}
+	o.prefetchSem = semaphore.NewWeighted(int64(n))
+	o.prefetchLimit = n
+}
+
+// defaultPrefetchLimit is used when SetPrefetchLimit was never called.
+const defaultPrefetchLimit = 8
+
+func (o *Orchestrator) prefetchSlots() *semaphore.Weighted {
+	o.prefetchOnce.Do(func() {
+		if o.prefetchSem == nil {
+			o.prefetchSem = semaphore.NewWeighted(defaultPrefetchLimit)
+			o.prefetchLimit = defaultPrefetchLimit
+		}
+	})
+	return o.prefetchSem
+}
+
+// StartPrefetch begins phase 0 — reading and sorting the tar's entries — before
+// the job competes for a concurrency slot, so the compress workers can start
+// immediately once it gets one.
+//
+// It is BOUNDED, and that bound is the point. This is called from submitJob,
+// once per job, at submission time. A producer that uploads a whole build in one
+// burst therefore used to start one tar scan per package simultaneously — a
+// 174-package build meant 174 concurrent scans, each reading an archive and
+// spilling its large entries to the spool. The job semaphore did not help: it
+// bounds the pipeline, while the expensive part ran outside it. The result was a
+// publisher at 0% CPU with every job in I/O wait, taking four minutes to do
+// sixteen seconds of pipeline work, and getting worse the more work it was given.
+//
+// When no slot is free the prefetch is SKIPPED rather than queued. Queueing
+// would just move the contention and delay the job that is actually running;
+// skipping falls through to takePrefetch returning nil, and pipeline.Run does
+// phase 0 inline under the job's own slot — correct, already exercised, and
+// self-limiting because it is gated by the job semaphore.
 func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 	if !o.leaseFor(j).NeedsPipeline() {
 		return // local mode: no pipeline, no prefetch
@@ -389,11 +443,18 @@ func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 	if j.TarPath == "" {
 		return
 	}
+	sem := o.prefetchSlots()
+	if !sem.TryAcquire(1) {
+		o.Obs.Logger.Debug("prefetch skipped — all scan slots busy; phase 0 will run inline",
+			"job_id", j.ID, "limit", o.prefetchLimit)
+		return // no channel stored → takePrefetch returns nil → inline fallback
+	}
 
 	// Open the file synchronously to obtain a stable inode reference before
 	// any directory rename can occur.
 	f, err := os.Open(j.TarPath)
 	if err != nil {
+		sem.Release(1)
 		o.Obs.Logger.Warn("prefetch: cannot open tar — will fall back to pipeline.Run()",
 			"job_id", j.ID, "path", j.TarPath, "error", err)
 		return // no channel stored → takePrefetch returns nil → fallback
@@ -404,6 +465,10 @@ func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 
 	go func() {
 		defer f.Close()
+		defer sem.Release(1)
+		if o.prefetchHook != nil {
+			o.prefetchHook()
+		}
 		// Spill large entries under the spool dir. Without this the prefetch
 		// holds the ENTIRE uncompressed package in memory until the job runs,
 		// which is what OOM-killed the service on an 8 GB host. Read from the

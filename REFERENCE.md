@@ -3420,6 +3420,22 @@ matter because the failure is silent without them:
   store that accepts a request and never answers blocks until TCP keepalive
   gives up, over two hours later.
 
+**Phase 0 is bounded separately from the job semaphore.** The tar scan runs
+BEFORE a job competes for a concurrency slot, so that its compress workers can
+start the moment it gets one — which means the job semaphore does not cover it.
+`StartPrefetch` is called once per job at submission, so a producer that uploads
+a whole build in one burst would otherwise start one tar scan per package at the
+same instant: on a 174-package build, 174 concurrent archive reads all spilling
+to the spool. The symptom is a publisher at 0% CPU with every job in I/O wait,
+spending minutes of wall clock on seconds of pipeline work, and getting worse
+the more work it is given — the job durations show it directly, as a large gap
+between "job acquired concurrency slot" and "pipeline starting".
+
+`--prefetch-limit` (config `pipeline.prefetch_limit`, default 8) caps it. Over
+the limit the prefetch is SKIPPED rather than queued, and phase 0 runs inline
+under the job's own slot: queueing would only relocate the contention and delay
+the job that is actually running.
+
 Throughput note: dedup is one `CAS.Exists` per object — an `os.Stat` for a local
 CAS, a **HEAD request** for S3 — run `--pipeline-upload-conc` at a time
 (default 4). Against a remote object store that round trip dominates a publish

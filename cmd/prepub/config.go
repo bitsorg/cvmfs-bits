@@ -209,6 +209,9 @@ type fileConfig struct {
 	Pipeline struct {
 		Workers           int `yaml:"workers"`
 		UploadConcurrency int `yaml:"upload_concurrency"`
+		// PrefetchLimit bounds concurrent tar scans (phase 0), which run
+		// before a job takes a concurrency slot and so are not covered by it.
+		PrefetchLimit int `yaml:"prefetch_limit"`
 	} `yaml:"pipeline"`
 }
 
@@ -274,7 +277,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	ingestPublishOwner *string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv *string,
 	chunkMin, chunkAvg, chunkMax *int64,
-	pipelineWorkers, pipelineUploadConc *int,
+	pipelineWorkers, pipelineUploadConc, prefetchLimit *int,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -325,6 +328,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	dur("signature-skew", signatureSkew, fc.Server.SignatureSkew)
 	i("pipeline-workers", pipelineWorkers, fc.Pipeline.Workers)
 	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)
+	i("prefetch-limit", prefetchLimit, fc.Pipeline.PrefetchLimit)
 	dur("job-timeout", jobTimeout, fc.JobTimeout)
 	if !has("min-concurrent-jobs") && fc.MinConcurrentJobs != 0 {
 		*minConcurrentJobs = fc.MinConcurrentJobs
