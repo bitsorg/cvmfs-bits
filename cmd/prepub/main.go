@@ -156,7 +156,7 @@ func main() {
 	leaseRetryMax := flag.Duration("lease-retry-max", 0, "Maximum time to retry lease acquisition when path_busy; 0 = 12 min default (should exceed gateway max_lease_time) [publisher]")
 
 	// Pipeline performance tuning.
-	prefetchLimit := flag.Int("prefetch-limit", 8, "Maximum concurrent tar scans (pipeline phase 0). This runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Beyond this limit phase 0 runs inline under the job's own slot instead [publisher]")
+	prefetchLimit := flag.Int("prefetch-limit", 8, "Budget for concurrent tar scans (pipeline phase 0), in units of 128 MiB. This runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Each scan is charged by its tar size, so N ordinary packages or one N×128 MiB package may run at once; over budget, phase 0 runs inline under the job's own slot instead [publisher]")
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	// PEAK MEMORY IS DRIVEN BY THIS. unpack reads each file whole into RAM
 	// (unpack.go io.ReadAll) and every compress worker holds one file plus its

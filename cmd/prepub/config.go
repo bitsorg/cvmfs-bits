@@ -209,8 +209,11 @@ type fileConfig struct {
 	Pipeline struct {
 		Workers           int `yaml:"workers"`
 		UploadConcurrency int `yaml:"upload_concurrency"`
-		// PrefetchLimit bounds concurrent tar scans (phase 0), which run
-		// before a job takes a concurrency slot and so are not covered by it.
+		// PrefetchLimit is the budget for concurrent tar scans (phase 0),
+		// in units of 128 MiB. Phase 0 runs before a job takes a concurrency
+		// slot and so is not covered by it. Each scan is charged by tar size:
+		// a flat count treats a 4 KiB modulefile and a 600 MiB ROOT tar as
+		// equivalent, which holds up until several large packages coincide.
 		PrefetchLimit int `yaml:"prefetch_limit"`
 	} `yaml:"pipeline"`
 }

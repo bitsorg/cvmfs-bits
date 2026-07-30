@@ -3447,8 +3447,19 @@ spending minutes of wall clock on seconds of pipeline work, and getting worse
 the more work it is given — the job durations show it directly, as a large gap
 between "job acquired concurrency slot" and "pipeline starting".
 
-`--prefetch-limit` (config `pipeline.prefetch_limit`, default 8) caps it. Over
-the limit the prefetch is SKIPPED rather than queued, and phase 0 runs inline
+`--prefetch-limit` (config `pipeline.prefetch_limit`, default 8) caps it. The
+unit is **128 MiB of archive, not one scan**: each scan is charged
+`ceil(tar_bytes / 128 MiB)`, clamped to at least 1 and at most the whole budget.
+So a budget of 4 admits four ordinary packages, or one 512 MiB package, or any
+mixture summing to 4 — and an archive larger than the entire budget still runs
+when the system is idle rather than being permanently denied a prefetch.
+
+Counting scans rather than bytes is the obvious first implementation and it
+misleads: a 4 KiB modulefile tar and a 600 MiB ROOT tar are not interchangeable.
+A count tuned so ordinary packages flow freely admits far too much work at the
+one moment it matters, when several large packages arrive together.
+
+Over budget the prefetch is SKIPPED rather than queued, and phase 0 runs inline
 under the job's own slot: queueing would only relocate the contention and delay
 the job that is actually running.
 

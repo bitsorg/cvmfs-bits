@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,15 +39,25 @@ func (p *pipelineBackend) NeedsPipeline() bool { return true }
 var _ lease.Backend = (*pipelineBackend)(nil)
 
 // writeTar puts a minimal, valid tar where the job expects its payload.
-func writeTar(t *testing.T, dir string) string {
+func writeTar(t *testing.T, dir string) string { return writeTarOfSize(t, dir, 1024) }
+
+// writeTarOfSize writes a sparse file of the requested size, so a "large
+// package" costs the test a few microseconds rather than hundreds of megabytes.
+func writeTarOfSize(t *testing.T, dir string, size int64) string {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	p := filepath.Join(dir, "payload.tar")
-	// two zero blocks = a valid empty archive
-	if err := os.WriteFile(p, make([]byte, 1024), 0o644); err != nil {
-		t.Fatalf("write tar: %v", err)
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatalf("create tar: %v", err)
+	}
+	if err := f.Truncate(size); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 	return p
 }
@@ -154,5 +165,121 @@ func TestSetPrefetchLimit_Defaults(t *testing.T) {
 			t.Errorf("SetPrefetchLimit(%d) = %d, want the default %d",
 				n, orch.prefetchLimit, defaultPrefetchLimit)
 		}
+	}
+}
+
+// ── Size-weighted budget ─────────────────────────────────────────────────────
+//
+// A flat per-scan count is the wrong meter: what a scan consumes is disk
+// bandwidth and memory, and both scale with the archive. A limit tuned so that
+// ordinary packages flow freely admits far too much work the moment several
+// large ones coincide — observed directly with a limit of 4, which ran well
+// until the big tars arrived together.
+
+func TestPrefetchWeight(t *testing.T) {
+	const limit = 4
+	for _, tc := range []struct {
+		name string
+		size int64
+		want int64
+	}{
+		{"empty", 0, 1},
+		{"tiny modulefile tar", 4 << 10, 1},
+		{"just under one unit", prefetchUnitBytes - 1, 1},
+		{"exactly one unit", prefetchUnitBytes, 1},
+		{"just over one unit", prefetchUnitBytes + 1, 2},
+		{"two units", 2 * prefetchUnitBytes, 2},
+		{"the whole budget", limit * prefetchUnitBytes, limit},
+		// Clamped: an archive bigger than the entire budget must still be
+		// admissible when idle, or the largest packages could NEVER prefetch.
+		{"larger than the budget", 100 * prefetchUnitBytes, limit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := prefetchWeight(tc.size, limit); got != tc.want {
+				t.Errorf("prefetchWeight(%d, %d) = %d, want %d", tc.size, limit, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStartPrefetch_LargeTarsDoNotAllRunAtOnce is the behaviour asked for: with
+// a budget of 4, four large archives must NOT scan concurrently the way four
+// small ones may.
+func TestStartPrefetch_LargeTarsDoNotAllRunAtOnce(t *testing.T) {
+	_, _, orch := newTestServer(t)
+	orch.Lease = &pipelineBackend{}
+
+	const limit = 4
+	orch.SetPrefetchLimit(limit)
+
+	var live, peak int64
+	var mu sync.Mutex
+	release := make(chan struct{})
+	defer close(release)
+	orch.prefetchHook = func() {
+		n := atomic.AddInt64(&live, 1)
+		mu.Lock()
+		if n > peak {
+			peak = n
+		}
+		mu.Unlock()
+		<-release
+		atomic.AddInt64(&live, -1)
+	}
+
+	// Each of these weighs the entire budget, so they must serialise.
+	for i := 0; i < 6; i++ {
+		j := &job.Job{ID: "big-" + strconv.Itoa(i), Repo: "r"}
+		j.TarPath = writeTarOfSize(t, filepath.Join(t.TempDir(), j.ID), limit*prefetchUnitBytes)
+		orch.StartPrefetch(context.Background(), j)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	got := peak
+	mu.Unlock()
+	if got > 1 {
+		t.Errorf("%d large tars scanned at once; each weighs the whole budget, so only "+
+			"one may run — this is the case a flat per-scan count got wrong", got)
+	}
+}
+
+// TestStartPrefetch_SmallTarsStillRunConcurrently is the other half: weighting
+// must not throttle ordinary packages, which is the common case by far.
+func TestStartPrefetch_SmallTarsStillRunConcurrently(t *testing.T) {
+	_, _, orch := newTestServer(t)
+	orch.Lease = &pipelineBackend{}
+
+	const limit = 4
+	orch.SetPrefetchLimit(limit)
+
+	var live, peak int64
+	var mu sync.Mutex
+	release := make(chan struct{})
+	defer close(release)
+	orch.prefetchHook = func() {
+		n := atomic.AddInt64(&live, 1)
+		mu.Lock()
+		if n > peak {
+			peak = n
+		}
+		mu.Unlock()
+		<-release
+		atomic.AddInt64(&live, -1)
+	}
+
+	for i := 0; i < 10; i++ {
+		j := &job.Job{ID: "small-" + strconv.Itoa(i), Repo: "r"}
+		j.TarPath = writeTar(t, filepath.Join(t.TempDir(), j.ID))
+		orch.StartPrefetch(context.Background(), j)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	got := peak
+	mu.Unlock()
+	if got != limit {
+		t.Errorf("peak concurrency %d with a budget of %d — small packages must still "+
+			"fill the budget, or weighting has made the common case slower", got, limit)
 	}
 }

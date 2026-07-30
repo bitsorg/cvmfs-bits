@@ -400,8 +400,12 @@ func (o *Orchestrator) PublishPathNames() []string {
 	return names
 }
 
-// SetPrefetchLimit bounds how many tar scans may run at once. Call at startup.
+// SetPrefetchLimit sets the concurrent-scan budget. Call at startup.
 // n <= 0 restores the default.
+//
+// The unit is a SMALL-TAR EQUIVALENT, not a goroutine: see prefetchWeight. A
+// limit of 4 admits four ordinary packages at once, or one package four times
+// prefetchUnitBytes, or any mixture summing to the budget.
 func (o *Orchestrator) SetPrefetchLimit(n int) {
 	if n <= 0 {
 		n = defaultPrefetchLimit
@@ -412,6 +416,42 @@ func (o *Orchestrator) SetPrefetchLimit(n int) {
 
 // defaultPrefetchLimit is used when SetPrefetchLimit was never called.
 const defaultPrefetchLimit = 8
+
+// prefetchUnitBytes is one unit of scan budget.
+//
+// A flat per-scan count is the wrong meter. What a scan actually consumes is
+// disk bandwidth and memory, and both scale with the size of the archive: a
+// 4 KiB modulefile tar and a 600 MiB ROOT tar are not interchangeable, but a
+// count treats them as identical. In practice a limit tuned so that ordinary
+// packages flow freely is far too loose the moment several large ones coincide
+// — which is exactly when the contention matters, and exactly what was observed
+// with a limit of 4.
+//
+// 128 MiB is chosen so that the overwhelming majority of packages weigh 1 and
+// the handful of genuinely large ones are charged in proportion.
+const prefetchUnitBytes = 128 << 20
+
+// prefetchWeight converts a tar size into scan-budget units.
+//
+// Clamped at both ends. At least 1, so a tiny tar still occupies the budget it
+// really does cost (an open, a scan, a spill directory). At most the whole
+// budget, so an archive larger than the entire budget is still admissible when
+// the system is idle — otherwise TryAcquire could never succeed for it and the
+// largest packages would be permanently denied a prefetch, which is precisely
+// backwards.
+func prefetchWeight(size int64, limit int) int64 {
+	if limit < 1 {
+		limit = 1
+	}
+	units := (size + prefetchUnitBytes - 1) / prefetchUnitBytes // ceil
+	if units < 1 {
+		units = 1
+	}
+	if units > int64(limit) {
+		units = int64(limit)
+	}
+	return units
+}
 
 func (o *Orchestrator) prefetchSlots() *semaphore.Weighted {
 	o.prefetchOnce.Do(func() {
@@ -436,11 +476,16 @@ func (o *Orchestrator) prefetchSlots() *semaphore.Weighted {
 // publisher at 0% CPU with every job in I/O wait, taking four minutes to do
 // sixteen seconds of pipeline work, and getting worse the more work it was given.
 //
-// When no slot is free the prefetch is SKIPPED rather than queued. Queueing
-// would just move the contention and delay the job that is actually running;
-// skipping falls through to takePrefetch returning nil, and pipeline.Run does
-// phase 0 inline under the job's own slot — correct, already exercised, and
-// self-limiting because it is gated by the job semaphore.
+// The budget is charged BY SIZE (prefetchWeight), not per scan. Disk bandwidth
+// and memory are what a scan consumes, and both scale with the archive; a count
+// tuned to let ordinary packages flow admits far too much work the moment
+// several large ones arrive together.
+//
+// When the budget is exhausted the prefetch is SKIPPED rather than queued.
+// Queueing would just move the contention and delay the job that is actually
+// running; skipping falls through to takePrefetch returning nil, and
+// pipeline.Run does phase 0 inline under the job's own slot — correct, already
+// exercised, and self-limiting because it is gated by the job semaphore.
 func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 	if !o.leaseFor(j).NeedsPipeline() {
 		return // local mode: no pipeline, no prefetch
@@ -448,21 +493,30 @@ func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 	if j.TarPath == "" {
 		return
 	}
-	sem := o.prefetchSlots()
-	if !sem.TryAcquire(1) {
-		o.Obs.Logger.Debug("prefetch skipped — all scan slots busy; phase 0 will run inline",
-			"job_id", j.ID, "limit", o.prefetchLimit)
-		return // no channel stored → takePrefetch returns nil → inline fallback
-	}
 
 	// Open the file synchronously to obtain a stable inode reference before
-	// any directory rename can occur.
+	// any directory rename can occur. Opened BEFORE the budget is charged so
+	// the size can be taken from the handle rather than the path — the
+	// directory may be renamed underneath us at any moment.
 	f, err := os.Open(j.TarPath)
 	if err != nil {
-		sem.Release(1)
 		o.Obs.Logger.Warn("prefetch: cannot open tar — will fall back to pipeline.Run()",
 			"job_id", j.ID, "path", j.TarPath, "error", err)
 		return // no channel stored → takePrefetch returns nil → fallback
+	}
+
+	var size int64
+	if fi, serr := f.Stat(); serr == nil {
+		size = fi.Size()
+	} // a failed stat weighs 1: cheap to admit, and the scan still bounds itself
+
+	sem := o.prefetchSlots()
+	weight := prefetchWeight(size, o.prefetchLimit)
+	if !sem.TryAcquire(weight) {
+		f.Close()
+		o.Obs.Logger.Debug("prefetch skipped — scan budget exhausted; phase 0 will run inline",
+			"job_id", j.ID, "tar_bytes", size, "weight", weight, "budget", o.prefetchLimit)
+		return // no channel stored → takePrefetch returns nil → inline fallback
 	}
 
 	ch := make(chan *pipeline.PrefetchResult, 1)
@@ -470,7 +524,7 @@ func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 
 	go func() {
 		defer f.Close()
-		defer sem.Release(1)
+		defer sem.Release(weight)
 		if o.prefetchHook != nil {
 			o.prefetchHook()
 		}
