@@ -156,7 +156,8 @@ func main() {
 	leaseRetryMax := flag.Duration("lease-retry-max", 0, "Maximum time to retry lease acquisition when path_busy; 0 = 12 min default (should exceed gateway max_lease_time) [publisher]")
 
 	// Pipeline performance tuning.
-	prefetchLimit := flag.Int("prefetch-limit", 8, "Budget for concurrent tar scans (pipeline phase 0), in units of 128 MiB. This runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Each scan is charged by its tar size, so N ordinary packages or one N×128 MiB package may run at once; over budget, phase 0 runs inline under the job's own slot instead [publisher]")
+	prefetch := flag.Bool("prefetch", true, "Run pipeline phase 0 (the tar scan) ahead of the job's concurrency slot. Turn OFF on I/O-bound storage: the look-ahead spills the unpacked tar to disk and the pipeline reads it back, which doubles I/O on the resource that is already the bottleneck to buy overlap nothing is waiting for. Off, each archive is read exactly once, inline [publisher]")
+	prefetchLimit := flag.Int("prefetch-limit", 8, "Budget for concurrent tar scans (pipeline phase 0), in units of 128 MiB. Phase 0 runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Each scan is charged by its tar size, so N ordinary packages or one N*128 MiB package may run at once; over budget, phase 0 runs inline under the job's own slot [publisher]")
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
 	// PEAK MEMORY IS DRIVEN BY THIS. unpack reads each file whole into RAM
 	// (unpack.go io.ReadAll) and every compress worker holds one file plus its
@@ -274,7 +275,7 @@ func main() {
 			ingestPublish, ingestPublishOwner,
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
-			pipelineWorkers, pipelineUploadConc, prefetchLimit,
+			pipelineWorkers, pipelineUploadConc, prefetchLimit, prefetch,
 		)
 	}
 
@@ -307,7 +308,7 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
-			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit,
+			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *prefetch,
 			*chunkMin, *chunkAvg, *chunkMax,
 			*warmQuorum, *preWarm,
 			*brokerCACert,
@@ -347,6 +348,7 @@ func runPublisher(
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineWorkers, pipelineUploadConc, pipelineCompressLevel int,
 	prefetchLimit int,
+	prefetch bool,
 	chunkMin, chunkAvg, chunkMax int64,
 	warmQuorum float64,
 	preWarm bool,
@@ -781,9 +783,15 @@ func runPublisher(
 	}
 
 	orch.SetPrefetchLimit(prefetchLimit)
-	obs.Logger.Info("tar prefetch (pipeline phase 0) bounded",
-		"limit", prefetchLimit,
-		"note", "beyond this, phase 0 runs inline under the job's own concurrency slot")
+	orch.SetPrefetchEnabled(prefetch)
+	if orch.PrefetchEnabled() {
+		obs.Logger.Info("tar prefetch (pipeline phase 0) bounded",
+			"budget_units", prefetchLimit, "unit_bytes", 128<<20,
+			"note", "over budget, phase 0 runs inline under the job's own concurrency slot")
+	} else {
+		obs.Logger.Info("tar prefetch (pipeline phase 0) DISABLED — every job scans its own " +
+			"tar inline, so each archive is read exactly once and nothing is spilled ahead")
+	}
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
 	// Which credentials the API accepts (ADR-0008 D3). Parsed here rather than

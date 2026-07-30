@@ -213,6 +213,10 @@ type Orchestrator struct {
 	prefetchSem   *semaphore.Weighted
 	prefetchLimit int
 	prefetchOnce  sync.Once
+	// prefetchDisabled turns phase 0 look-ahead off entirely, so every job
+	// scans its own tar inline under its concurrency slot and each archive is
+	// read exactly once. See SetPrefetchLimit.
+	prefetchDisabled bool
 	// prefetchHook, when set, runs inside the scan goroutine while it holds a
 	// slot. Tests use it to make concurrency observable; nil in production.
 	prefetchHook func()
@@ -401,18 +405,40 @@ func (o *Orchestrator) PublishPathNames() []string {
 }
 
 // SetPrefetchLimit sets the concurrent-scan budget. Call at startup.
-// n <= 0 restores the default.
 //
-// The unit is a SMALL-TAR EQUIVALENT, not a goroutine: see prefetchWeight. A
-// limit of 4 admits four ordinary packages at once, or one package four times
-// prefetchUnitBytes, or any mixture summing to the budget.
+// The unit is 128 MiB of archive, not one goroutine: see prefetchWeight. A
+// budget of 4 admits four ordinary packages at once, or one 512 MiB package, or
+// any mixture summing to the budget.
+//
+// n <= 0 uses the default budget. Whether the look-ahead runs AT ALL is a
+// separate, explicit setting — see SetPrefetchEnabled — rather than a sentinel
+// value of this one: "off" and "how much" are different questions, and encoding
+// both in a single integer makes the config unreadable at the point of use.
 func (o *Orchestrator) SetPrefetchLimit(n int) {
+	o.prefetchOnce.Do(func() {}) // claim the lazy init; explicit config wins
 	if n <= 0 {
 		n = defaultPrefetchLimit
 	}
 	o.prefetchSem = semaphore.NewWeighted(int64(n))
 	o.prefetchLimit = n
 }
+
+// SetPrefetchEnabled turns the phase-0 look-ahead on or off. Call at startup.
+//
+// Disabling is the right choice on I/O-bound storage. The look-ahead reads the
+// whole tar and spills the unpacked entries back to disk, and the pipeline then
+// reads the spill: on fast storage that is a good trade, because phase 0
+// overlaps the wait for a concurrency slot. On a volume doing single-digit MB/s
+// it roughly doubles the I/O on the one resource that is already saturated, to
+// buy overlap that is worthless when nothing is waiting on CPU. Off, each tar is
+// read exactly once, inline, under the job's own concurrency slot.
+func (o *Orchestrator) SetPrefetchEnabled(on bool) {
+	o.prefetchOnce.Do(func() {})
+	o.prefetchDisabled = !on
+}
+
+// PrefetchEnabled reports whether phase 0 runs ahead of the concurrency slot.
+func (o *Orchestrator) PrefetchEnabled() bool { return !o.prefetchDisabled }
 
 // defaultPrefetchLimit is used when SetPrefetchLimit was never called.
 const defaultPrefetchLimit = 8
@@ -492,6 +518,9 @@ func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 	}
 	if j.TarPath == "" {
 		return
+	}
+	if o.prefetchDisabled {
+		return // phase 0 runs inline: one read per tar, no spill round trip
 	}
 
 	// Open the file synchronously to obtain a stable inode reference before

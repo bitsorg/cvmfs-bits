@@ -156,15 +156,17 @@ func TestStartPrefetch_SkipsRatherThanQueues(t *testing.T) {
 	}
 }
 
-// TestSetPrefetchLimit_Defaults guards against a zero limit disabling the bound.
+// TestSetPrefetchLimit_Defaults guards against an unset limit silently
+// removing the bound.
 func TestSetPrefetchLimit_Defaults(t *testing.T) {
 	_, _, orch := newTestServer(t)
-	for _, n := range []int{0, -1} {
-		orch.SetPrefetchLimit(n)
-		if orch.prefetchLimit != defaultPrefetchLimit {
-			t.Errorf("SetPrefetchLimit(%d) = %d, want the default %d",
-				n, orch.prefetchLimit, defaultPrefetchLimit)
-		}
+	orch.SetPrefetchLimit(0)
+	if orch.prefetchLimit != defaultPrefetchLimit {
+		t.Errorf("SetPrefetchLimit(0) = %d, want the default %d",
+			orch.prefetchLimit, defaultPrefetchLimit)
+	}
+	if !orch.PrefetchEnabled() {
+		t.Error("an unset limit must not disable the look-ahead")
 	}
 }
 
@@ -281,5 +283,67 @@ func TestStartPrefetch_SmallTarsStillRunConcurrently(t *testing.T) {
 	if got != limit {
 		t.Errorf("peak concurrency %d with a budget of %d — small packages must still "+
 			"fill the budget, or weighting has made the common case slower", got, limit)
+	}
+}
+
+// ── Disabling the look-ahead entirely ────────────────────────────────────────
+//
+// The prefetch reads a whole tar and spills the unpacked entries to disk; the
+// pipeline then reads the spill. On fast storage that is a good trade, because
+// phase 0 overlaps the wait for a concurrency slot. On a volume measured at
+// 4.4 MB/s it roughly doubles the I/O on the one saturated resource to buy
+// overlap nothing is waiting for. Off, each archive is read exactly once.
+
+func TestSetPrefetchEnabled_FalseSkipsTheScan(t *testing.T) {
+	_, _, orch := newTestServer(t)
+	orch.Lease = &pipelineBackend{}
+	orch.SetPrefetchEnabled(false)
+
+	if orch.PrefetchEnabled() {
+		t.Fatal("SetPrefetchEnabled(false) must disable the look-ahead")
+	}
+
+	ran := make(chan struct{}, 1)
+	orch.prefetchHook = func() { ran <- struct{}{} }
+
+	j := &job.Job{ID: "disabled", Repo: "r"}
+	j.TarPath = writeTar(t, filepath.Join(t.TempDir(), "disabled"))
+	orch.StartPrefetch(context.Background(), j)
+
+	select {
+	case <-ran:
+		t.Error("a scan started even though the prefetch is disabled")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// No stored result is what makes the pipeline do phase 0 inline.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if got := orch.takePrefetch(ctx, j.ID); got != nil {
+		t.Error("disabled prefetch must leave no result, so Run falls back to the inline scan")
+	}
+}
+
+// TestSetPrefetchLimit_IsIndependentOfEnabled: "how much" and "whether" are
+// separate questions, so no value of the budget may turn the look-ahead off.
+func TestSetPrefetchLimit_IsIndependentOfEnabled(t *testing.T) {
+	_, _, orch := newTestServer(t)
+	for _, n := range []int{-1, 0, 1, 64} {
+		orch.SetPrefetchLimit(n)
+		if !orch.PrefetchEnabled() {
+			t.Errorf("SetPrefetchLimit(%d) disabled the look-ahead; only "+
+				"SetPrefetchEnabled(false) may do that", n)
+		}
+	}
+}
+
+// TestSetPrefetchLimit_ReEnables covers going back the other way, so the
+// disabled flag cannot latch.
+func TestSetPrefetchEnabled_ReEnables(t *testing.T) {
+	_, _, orch := newTestServer(t)
+	orch.SetPrefetchEnabled(false)
+	orch.SetPrefetchEnabled(true)
+	if !orch.PrefetchEnabled() {
+		t.Error("the disabled flag latched; it must be settable both ways")
 	}
 }

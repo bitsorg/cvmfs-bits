@@ -3463,6 +3463,25 @@ Over budget the prefetch is SKIPPED rather than queued, and phase 0 runs inline
 under the job's own slot: queueing would only relocate the contention and delay
 the job that is actually running.
 
+**`prefetch: false` (flag `--prefetch=false`) turns the look-ahead off entirely,
+and that is the right setting on I/O-bound storage.** The look-ahead reads the
+whole tar and spills the unpacked entries back to disk; the pipeline then reads
+the spill. Where the device is fast that is a good trade, because phase 0
+overlaps the wait for a concurrency slot. Where it is not — a volume measured at
+4.4 MB/s sequential, `wa` at 85%, `%util` pinned — it roughly doubles the I/O on
+the one saturated resource to buy overlap that nothing is waiting for. Off, each
+archive is read exactly once, inline, under the job's own slot.
+
+Whether it runs and how much it may run are deliberately separate settings:
+`prefetch` answers the first, `prefetch_limit` the second. The YAML key is a
+pointer internally so that an absent key ("use the default") stays
+distinguishable from an explicit `prefetch: false`.
+
+Before tuning any of this, check whether the spool device is the ceiling —
+`vmstat 1` (`b` counts processes blocked on I/O, `wa` is I/O wait) and
+`iostat -x 1` (`r_await`, `%util`). If `wa` is high and CPU is idle, no
+concurrency setting will help and raising one makes it worse.
+
 Throughput note: dedup is one `CAS.Exists` per object — an `os.Stat` for a local
 CAS, a **HEAD request** for S3 — run `--pipeline-upload-conc` at a time
 (default 4). Against a remote object store that round trip dominates a publish

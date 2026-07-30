@@ -214,7 +214,14 @@ type fileConfig struct {
 		// slot and so is not covered by it. Each scan is charged by tar size:
 		// a flat count treats a 4 KiB modulefile and a 600 MiB ROOT tar as
 		// equivalent, which holds up until several large packages coincide.
+		//
 		PrefetchLimit int `yaml:"prefetch_limit"`
+		// Prefetch turns the phase-0 look-ahead on or off. A POINTER so that an
+		// absent key (nil, meaning "use the default") is distinguishable from
+		// an explicit `prefetch: false`. Disabling is right on I/O-bound
+		// storage: the look-ahead spills the unpacked tar and the pipeline
+		// reads it back, doubling I/O on the resource that is the bottleneck.
+		Prefetch *bool `yaml:"prefetch"`
 	} `yaml:"pipeline"`
 }
 
@@ -281,6 +288,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv *string,
 	chunkMin, chunkAvg, chunkMax *int64,
 	pipelineWorkers, pipelineUploadConc, prefetchLimit *int,
+	prefetch *bool,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -332,6 +340,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	i("pipeline-workers", pipelineWorkers, fc.Pipeline.Workers)
 	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)
 	i("prefetch-limit", prefetchLimit, fc.Pipeline.PrefetchLimit)
+	if !has("prefetch") && fc.Pipeline.Prefetch != nil {
+		*prefetch = *fc.Pipeline.Prefetch
+	}
 	dur("job-timeout", jobTimeout, fc.JobTimeout)
 	if !has("min-concurrent-jobs") && fc.MinConcurrentJobs != 0 {
 		*minConcurrentJobs = fc.MinConcurrentJobs
