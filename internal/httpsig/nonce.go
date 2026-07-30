@@ -62,6 +62,10 @@ type NonceCache struct {
 	// closed at the cap is correct but abrupt — the operator's first symptom
 	// would be authenticated publishers getting 401s — so the approach is
 	// announced while there is still room to raise the cap.
+	//
+	// It is invoked with the mutex RELEASED. It is operator-supplied and ends
+	// up in a log sink, and a sink that blocks while holding this lock would
+	// stall every authenticated request on the service.
 	onPressure    func(entries, maxSize int)
 	underPressure bool
 }
@@ -98,40 +102,53 @@ func NewNonceCache(ttl time.Duration, maxSize int) *NonceCache {
 func (c *NonceCache) Use(sig *Signature, now time.Time) error {
 	key := sig.cacheKey()
 
+	// Unlocked explicitly rather than by defer: the pressure notification must
+	// run with the lock released (see onPressure), and unlocking, notifying and
+	// re-locking just to satisfy a defer would open a window in which another
+	// goroutine mutates the cache between the two halves of one operation.
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	c.rotateLocked(now)
 
 	if _, dup := c.current[key]; dup {
+		c.mu.Unlock()
 		return ErrReplay
 	}
 	if _, dup := c.previous[key]; dup {
+		c.mu.Unlock()
 		return ErrReplay
 	}
 
 	n := len(c.current) + len(c.previous)
 	if n >= c.maxSize {
 		c.rejectedFull++
+		c.mu.Unlock()
 		return ErrCacheFull
 	}
 
 	c.current[key] = struct{}{}
-	c.checkPressureLocked(n + 1)
+	notify := c.pressureCrossedLocked(n + 1)
+	c.mu.Unlock()
+
+	if notify != nil {
+		notify()
+	}
 	return nil
 }
 
-// checkPressureLocked reports crossing the high-water mark, once per crossing.
-// Callers hold c.mu; the callback runs under it, so it must not block.
-func (c *NonceCache) checkPressureLocked(n int) {
+// pressureCrossedLocked records a crossing of the high-water mark and returns
+// the notification to run once the lock is released, or nil. Callers hold c.mu.
+func (c *NonceCache) pressureCrossedLocked(n int) func() {
 	over := float64(n) >= pressureRatio*float64(c.maxSize)
 	if over == c.underPressure {
-		return
+		return nil
 	}
 	c.underPressure = over
-	if over && c.onPressure != nil {
-		c.onPressure(n, c.maxSize)
+	if !over || c.onPressure == nil {
+		return nil
 	}
+	fn, max := c.onPressure, c.maxSize
+	return func() { fn(n, max) }
 }
 
 // SetPressureHook installs the high-water callback. Call before serving.
@@ -155,7 +172,9 @@ func (c *NonceCache) rotateLocked(now time.Time) {
 	}
 	c.current = make(map[string]struct{})
 	c.rotated = now
-	c.checkPressureLocked(len(c.current) + len(c.previous))
+	// A rotation only ever drops the count, so this can clear the flag but
+	// never raise it — no notification is possible and none is returned.
+	c.pressureCrossedLocked(len(c.current) + len(c.previous))
 }
 
 // Sweep ages the cache without a request arriving, so a quiet service does not

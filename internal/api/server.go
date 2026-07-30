@@ -829,10 +829,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusUnauthorized)
 				return
 			}
-			// The signature binds the payload only through tar_sha256, so a
-			// submission that omits it is not covered even though the MAC
-			// verified. Insist on it rather than accept a signature that
-			// attests to nothing about the content.
+			// bh already binds the payload directly, so this is not about
+			// coverage — it closes a cross-branch replay. A signature made for
+			// a JSON submission has fd=NoFields and bh=sha256(document); resend
+			// it as a multipart carrying zero form fields and that document as
+			// the tar part and Bound() is satisfied exactly. Requiring
+			// tar_sha256 makes such a request impossible to construct, since
+			// the JSON signature's empty field set cannot contain it.
 			if sawTar && fields["tar_sha256"] == "" {
 				os.RemoveAll(jobDir)
 				http.Error(w, fmt.Sprintf(`{"error":%q}`, errSignedWithoutDigest.Error()), http.StatusBadRequest)

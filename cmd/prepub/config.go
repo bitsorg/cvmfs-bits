@@ -111,6 +111,12 @@ type fileConfig struct {
 		TLSKey  string `yaml:"tls_key"`
 		// AuthMode: bearer | both | hmac. See ADR-0008 D3. Empty = both.
 		AuthMode string `yaml:"auth_mode"`
+		// SignatureSkew is how far a signed request's timestamp may lag before
+		// it is refused; the replay cache retains nonces for twice this. Empty
+		// = the built-in default (2m). Raise it only if the fleet's clocks are
+		// genuinely that far apart — every second of it is a second longer a
+		// captured signature stays usable.
+		SignatureSkew yamlDuration `yaml:"signature_skew"`
 	} `yaml:"server"`
 
 	Gateway struct {
@@ -259,6 +265,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	gatewayDirectGraft *bool,
 	gatewayAllowPlaintext *bool,
 	authMode *string,
+	signatureSkew *time.Duration,
 	ingestPublish *bool,
 	ingestPublishOwner *string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv *string,
@@ -310,6 +317,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("cas-root", casRoot, fc.CAS.Root)
 	str("cas-server-conf", casServerConf, fc.CAS.ServerConf)
 	str("auth-mode", authMode, fc.Server.AuthMode)
+	dur("signature-skew", signatureSkew, fc.Server.SignatureSkew)
 	i("pipeline-workers", pipelineWorkers, fc.Pipeline.Workers)
 	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)
 	dur("job-timeout", jobTimeout, fc.JobTimeout)

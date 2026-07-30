@@ -126,15 +126,23 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			}
 			st := &bindingState{deferred: isStreamingRoute(r)}
 			ctx := context.WithValue(withSignature(r, sig), bindingStateKey{}, st)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			// The status is recorded so the backstop below can tell "the
+			// handler forgot to bind" from "the handler rejected the request
+			// before it got that far", which submitJob does on a dozen ordinary
+			// paths — a missing --staging-root, a malformed part, a client that
+			// drops mid-upload. Logging those at ERROR would make the warning
+			// routine, and a routine warning is one nobody reads.
+			sw := &statusWriter{ResponseWriter: w}
+			next.ServeHTTP(sw, r.WithContext(ctx))
 			// Backstop for the one case the allowlist cannot prevent: a new
 			// streaming route that never binds. The response has already been
-			// written so this cannot be turned into a 401, but it must not pass
-			// silently — an unbound signature authenticates nothing.
-			if st.deferred && !st.done {
-				s.obs.Logger.Error("BUG: signed request finished without binding its body — "+
+			// written so this cannot be turned into a 401, but a SUCCESSFUL
+			// request that was never bound must not pass silently — the
+			// signature authenticated nothing.
+			if st.deferred && !st.done && sw.status < 300 {
+				s.obs.Logger.Error("BUG: signed request succeeded without binding its body — "+
 					"the signature authenticated nothing. Add the binding call to this handler.",
-					"method", r.Method, "path", r.URL.Path)
+					"method", r.Method, "path", r.URL.Path, "status", sw.status)
 			}
 			return
 		}
@@ -204,13 +212,14 @@ func (s *Server) bindNonStreamingBody(r *http.Request, sig *httpsig.Signature) e
 	if isStreamingRoute(r) {
 		return nil // bound by submitJob, which sees the parsed fields and payload
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxSignedBodySize+1))
+	limit := maxSignedBody(r)
+	raw, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	r.Body.Close()
 	if err != nil {
 		return fmt.Errorf("reading request body: %w", err)
 	}
-	if int64(len(raw)) > maxSignedBodySize {
-		return fmt.Errorf("request body exceeds %d bytes", maxSignedBodySize)
+	if int64(len(raw)) > limit {
+		return fmt.Errorf("request body exceeds %d bytes", limit)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
@@ -256,14 +265,37 @@ func requireSignedJSONBody(r *http.Request, raw []byte) error {
 	return nil
 }
 
-// maxSignedBodySize caps a buffered, signed non-streaming body. Every such
-// endpoint takes a small JSON document; the largest legitimate one is a job
-// submission by tar_path.
+// maxSignedBodySize caps a buffered, signed non-streaming body. Almost every
+// such endpoint takes a small JSON document; the largest is a job submission by
+// tar_path.
 const maxSignedBodySize = 1 << 20
+
+// maxSignedManifestSize is the cap for the distribution manifest ingest, whose
+// handler accepts up to 256 MiB of NDJSON — a manifest for a large build runs
+// to thousands of object references and is nowhere near "a small JSON
+// document". Binding it means buffering it, and buffering 256 MiB per request
+// would be a fine denial of service if anyone could ask for it; only a holder
+// of the signing key can, because the MAC is verified first, and such a caller
+// can already submit a 10 GiB tar. Left at the handler's own limit so that a
+// manifest which the handler would accept is never refused by the auth layer
+// instead — which is what happened before, as an unexplained 401.
+const maxSignedManifestSize = 256 << 20
+
+// maxSignedBody returns the buffered-body cap for a route.
+func maxSignedBody(r *http.Request) int64 {
+	if strings.HasPrefix(r.URL.Path, "/api/v1/distribute/manifests") {
+		return maxSignedManifestSize
+	}
+	return maxSignedBodySize
+}
 
 // isStreamingRoute reports whether a request goes to the one route whose body
 // the server refuses to buffer — the job submission, whose payload is a
 // multi-gigabyte tar — and which therefore binds its own body in the handler.
+//
+// Every other authenticated route, including the distribution manifest ingest
+// (which is large but bounded — see maxSignedManifestSize), is buffered and
+// bound by the middleware.
 //
 // This is deliberately a METHOD+PATH allowlist and not a Content-Type test.
 // An earlier version skipped the middleware binding for anything whose
@@ -278,6 +310,29 @@ const maxSignedBodySize = 1 << 20
 // handler; the deferred-binding check below shouts if only the first is done.
 func isStreamingRoute(r *http.Request) bool {
 	return r.Method == http.MethodPost && r.URL.Path == "/api/v1/jobs"
+}
+
+// statusWriter records the status code so the deferred-binding backstop can
+// distinguish a handler that forgot to bind from one that rejected the request.
+// It deliberately implements nothing else: it wraps only the streaming submit
+// route, which neither flushes nor hijacks.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK // implicit 200 on first write
+	}
+	return w.ResponseWriter.Write(b)
 }
 
 // bindingState tracks, for a signed request whose binding was deferred to the
@@ -355,5 +410,5 @@ func (s *Server) noncePressure(entries, maxSize int) {
 	s.obs.Logger.Warn("replay cache is filling up; at capacity, signed requests are REFUSED",
 		"entries", entries, "max", maxSize,
 		"retention", (2 * s.signSkew).String(),
-		"action", "raise the cap, shorten --signature-skew, or find out who is minting nonces")
+		"action", "raise the cap, shorten the signature skew, or find out who is minting nonces")
 }

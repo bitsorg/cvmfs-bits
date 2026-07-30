@@ -498,3 +498,92 @@ func TestAuth_JSONSubmissionIsBound(t *testing.T) {
 		t.Fatalf("a rewritten tar_path submission returned %d, want 401\n%s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestAuth_ManifestIngestIsNotCappedAtOneMiB pins the cap for the one
+// authenticated route whose body is legitimately large.
+//
+// Binding means buffering, and the buffered cap was a flat 1 MiB — right for
+// every route that takes a small JSON document, wrong for the distribution
+// manifest ingest, whose handler accepts 256 MiB of NDJSON. A manifest for a
+// real build is thousands of object references, so signing it produced
+// "request body exceeds 1048576 bytes" as a 401: a size limit surfacing as an
+// authentication failure, which is about the least diagnosable pairing there
+// is.
+func TestAuth_ManifestIngestIsNotCappedAtOneMiB(t *testing.T) {
+	srv, _ := authTestServer(t, AuthBoth)
+
+	const route = "/api/v1/distribute/manifests"
+	body := bytes.Repeat([]byte("x"), 4<<20) // 4 MiB, over the old cap
+
+	req := httptest.NewRequest("POST", route, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	req.Header.Set(httpsig.HeaderName, httpsig.Sign([]byte(testToken), "prepub",
+		"POST", route, httpsig.NoFields, httpsig.BodyDigest(body),
+		time.Now(), randomNonce(t)))
+
+	rec, reached := serveThroughAuth(srv, req)
+	if !reached {
+		t.Fatalf("a 4 MiB signed manifest was refused by the auth layer: %d %s",
+			rec.Code, rec.Body.String())
+	}
+
+	// The cap still exists, and a tampered large body is still refused.
+	req2 := httptest.NewRequest("POST", route, bytes.NewReader(body))
+	req2.Header.Set(httpsig.HeaderName, httpsig.Sign([]byte(testToken), "prepub",
+		"POST", route, httpsig.NoFields, httpsig.BodyDigest([]byte("something else")),
+		time.Now(), randomNonce(t)))
+	if _, reached := serveThroughAuth(srv, req2); reached {
+		t.Error("a manifest body that does not match its digest was accepted")
+	}
+
+	// Every other route keeps the small cap.
+	small := bytes.Repeat([]byte("y"), 2<<20)
+	req3 := httptest.NewRequest("POST", "/api/v1/reserve", bytes.NewReader(small))
+	req3.Header.Set(httpsig.HeaderName, httpsig.Sign([]byte(testToken), "prepub",
+		"POST", "/api/v1/reserve", httpsig.NoFields, httpsig.BodyDigest(small),
+		time.Now(), randomNonce(t)))
+	if _, reached := serveThroughAuth(srv, req3); reached {
+		t.Error("a 2 MiB body was buffered for a route that takes a small JSON document")
+	}
+}
+
+// TestAuth_BackstopIgnoresRejectedRequests: the deferred-binding backstop logs
+// at ERROR, so it must fire only when a request SUCCEEDED without being bound.
+// submitJob returns before its binding call on a dozen ordinary paths — no
+// --staging-root, a malformed part, a client that drops mid-upload. Logging
+// those would make the warning routine, and a routine warning is one nobody
+// reads.
+func TestAuth_BackstopIgnoresRejectedRequests(t *testing.T) {
+	srv, _ := authTestServer(t, AuthBoth)
+
+	for _, tc := range []struct {
+		name     string
+		status   int
+		wantWarn bool
+	}{
+		{"handler rejected the request", http.StatusBadRequest, false},
+		{"handler accepted it unbound", http.StatusAccepted, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := signedRequest(t, map[string]string{"repo": "r"}, nil, nil)
+			var st *bindingState
+			h := srv.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				st = bindingStateFrom(r) // never binds
+				w.WriteHeader(tc.status)
+			}))
+			sw := &statusWriter{ResponseWriter: httptest.NewRecorder()}
+			h.ServeHTTP(sw, req)
+
+			if st == nil || !st.deferred {
+				t.Fatal("the submit route must defer its binding")
+			}
+			if st.done {
+				t.Fatal("this handler binds nothing; done must stay false")
+			}
+			// Same condition the middleware uses.
+			if got := !st.done && sw.status < 300; got != tc.wantWarn {
+				t.Errorf("would warn = %v, want %v (status %d)", got, tc.wantWarn, sw.status)
+			}
+		})
+	}
+}

@@ -44,6 +44,7 @@ import (
 	"cvmfs.io/prepub/internal/distribute/credential"
 	"cvmfs.io/prepub/internal/distribute/receiver"
 	"cvmfs.io/prepub/internal/distribute/serve"
+	"cvmfs.io/prepub/internal/httpsig"
 	"cvmfs.io/prepub/internal/lease"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/pipeline"
@@ -92,6 +93,7 @@ func main() {
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
 	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels). See ADR-0008 D3 [publisher]")
+	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
@@ -250,6 +252,7 @@ func main() {
 			allowedPublishPrefixes,
 			gatewayDirectGraft, gatewayAllowPlaintext,
 			authMode,
+			signatureSkew,
 			ingestPublish, ingestPublishOwner,
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
@@ -274,7 +277,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *signatureSkew, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
@@ -306,6 +309,7 @@ func runPublisher(
 	gatewayDirectGraft bool,
 	gatewayAllowPlaintext bool,
 	authMode string,
+	signatureSkew time.Duration,
 	cvmfsMount string,
 	ingestPublish bool,
 	ingestPublishOwner string,
@@ -757,6 +761,12 @@ func runPublisher(
 		os.Exit(1)
 	}
 	apiServer.SetAuthMode(am)
+	// Before the listener is up: this rebuilds the replay cache to match.
+	if signatureSkew != httpsig.DefaultSkew {
+		apiServer.SetSignatureSkew(signatureSkew)
+		obs.Logger.Info("API auth: signature skew overridden",
+			"skew", signatureSkew.String(), "nonce_retention", (2 * signatureSkew).String())
+	}
 	switch am {
 	case api.AuthHMAC:
 		obs.Logger.Info("API auth: signed requests only — the shared secret does not travel")

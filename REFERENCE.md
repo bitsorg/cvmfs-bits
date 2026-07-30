@@ -3375,13 +3375,26 @@ client that hardcodes the API path will 401 on every request behind a prefix,
 with nothing in either log to explain it.
 
 Body binding is decided by METHOD AND PATH, never by `Content-Type`. Every route
-except `POST /api/v1/jobs` has a small body, which the auth middleware buffers
-and checks against `bh` before the handler runs — a handler cannot forget the
+except `POST /api/v1/jobs` is buffered by the auth middleware and checked against
+`bh` before the handler runs — a handler cannot forget the
 check, because it never had to make it. `POST /api/v1/jobs` is the exception (its
 body is the tar), and it binds itself in both branches: against the parsed fields
 and streamed payload for multipart, against the whole document for `tar_path`
 JSON. `Content-Type` is client-supplied and is not covered by the MAC, so it must
 never be what selects between "bound" and "not bound".
+
+The buffered cap is 1 MiB, which fits every endpoint that takes a small JSON
+document. `POST|PUT /api/v1/distribute/manifests` is the exception at 256 MiB,
+matching its own handler's limit — a manifest for a large build is thousands of
+object references, and capping it lower would surface a size limit as a 401.
+Buffering that much is gated on a verified MAC, so only a key holder can ask for
+it, and such a caller can already submit a 10 GiB tar.
+
+`--signature-skew` (config `server.signature_skew`, default 2m) sets how far a
+signed request's timestamp may LAG the server clock; future-dated requests get a
+fixed 15 s regardless. The replay cache retains nonces for twice the skew, and
+the flag moves both — they are one setting, since a nonce forgotten while a
+signature bearing it is still valid is a replay window.
 
 Clients must not let an HTTP library retry a signed request: a replay carries the
 same nonce and is refused, so a transient 5xx would surface as an inexplicable
