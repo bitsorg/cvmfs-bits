@@ -22,9 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -33,6 +37,36 @@ import (
 
 	"cvmfs.io/prepub/pkg/cvmfshash"
 )
+
+// Transport bounds for the object store. Deliberately generous: the object
+// store is on the same site and these exist to convert "hung forever" into "one
+// failed job", not to police latency.
+const (
+	dialTimeout           = 10 * time.Second
+	tlsHandshakeTimeout   = 10 * time.Second
+	expectContinueTimeout = 5 * time.Second
+	idleConnTimeout       = 90 * time.Second
+
+	// responseHeaderTimeout bounds the wait between "request fully sent" and
+	// "first byte of the response". A large PUT can legitimately take minutes to
+	// transfer, but once it is sent the store answers promptly or not at all.
+	responseHeaderTimeout = 2 * time.Minute
+
+	// opTimeout is the per-operation ceiling applied by withTimeout. It covers
+	// the whole call including the body transfer and any SDK retries, so it must
+	// accommodate the largest single object at the slowest tolerable rate.
+	opTimeout = 15 * time.Minute
+)
+
+// withTimeout bounds a single CAS operation.
+//
+// The transport timeouts above catch a store that stops answering; this catches
+// everything else — a body that trickles, a retry loop that will not converge,
+// a proxy holding the connection open. A caller that already has a shorter
+// deadline keeps it: context.WithTimeout never extends an existing one.
+func withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, opTimeout)
+}
 
 // S3 is a CAS backend backed by an S3-compatible object store.
 type S3 struct {
@@ -54,6 +88,29 @@ func NewS3(ctx context.Context, st S3Settings) (*S3, error) {
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(st.EffectiveRegion()),
+		// Bound the transport. The SDK's default client sets no response-header
+		// timeout and no overall deadline, so a connection that establishes and
+		// then goes quiet blocks until the OS gives up on TCP keepalive — over
+		// two hours. That is not a theoretical concern: it took the service
+		// down. The pipeline's upload workers hold the errgroup, the errgroup
+		// holds the job's concurrency slot, and every other stage blocks behind
+		// the one that never returns, at zero CPU, with nothing in the log.
+		//
+		// ResponseHeaderTimeout is the one that matters — it fires when the
+		// request has been sent and no status line comes back, which is exactly
+		// the observed failure. It does NOT bound the body transfer, so a slow
+		// but progressing upload is unaffected.
+		awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTransportOptions(
+			func(tr *http.Transport) {
+				tr.DialContext = (&net.Dialer{
+					Timeout:   dialTimeout,
+					KeepAlive: 30 * time.Second,
+				}).DialContext
+				tr.TLSHandshakeTimeout = tlsHandshakeTimeout
+				tr.ResponseHeaderTimeout = responseHeaderTimeout
+				tr.ExpectContinueTimeout = expectContinueTimeout
+				tr.IdleConnTimeout = idleConnTimeout
+			})),
 		// Credentials come from the repository's own S3 config, NOT from the
 		// ambient AWS chain: the prepub must authenticate as the identity that
 		// owns the repository's bucket, and picking up an unrelated instance
@@ -187,6 +244,8 @@ func (s *S3) Exists(ctx context.Context, hash string) (bool, error) {
 	if err := validHashKey(hash); err != nil {
 		return false, err
 	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key(hash)),
@@ -241,6 +300,11 @@ func (s *S3) Put(ctx context.Context, hash string, r io.Reader, size int64) erro
 		}
 	}
 
+	// Bounded here rather than around the whole function so the peek above keeps
+	// its own budget: two operations, two deadlines.
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
 	in := &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -263,14 +327,33 @@ func (s *S3) Get(ctx context.Context, hash string) (io.ReadCloser, error) {
 	if err := validHashKey(hash); err != nil {
 		return nil, err
 	}
+	// NOT `defer cancel()`. GetObject returns as soon as the headers arrive and
+	// the caller streams the body afterwards, so cancelling on return would kill
+	// the download the moment it started. The cancel is attached to the body's
+	// Close instead, which the caller is already required to call — so the
+	// deadline covers the transfer and the context is still released.
+	ctx, cancel := withTimeout(ctx)
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key(hash)),
 	})
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("s3 get %s: %w", s.key(hash), err)
 	}
-	return out.Body, nil
+	return &cancelOnClose{ReadCloser: out.Body, cancel: cancel}, nil
+}
+
+// cancelOnClose releases a request context when the body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 // Delete removes an object.
@@ -278,6 +361,8 @@ func (s *S3) Delete(ctx context.Context, hash string) error {
 	if err := validHashKey(hash); err != nil {
 		return err
 	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key(hash)),

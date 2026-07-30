@@ -3390,6 +3390,43 @@ object references, and capping it lower would surface a size limit as a 401.
 Buffering that much is gated on a verified MAC, so only a key holder can ask for
 it, and such a caller can already submit a 10 GiB tar.
 
+### Diagnosing a publisher that has stopped making progress
+
+`--debug-listen 127.0.0.1:6060` (config `server.debug_listen`, empty = off) serves
+`/debug/pprof`. On a publisher that appears idle:
+
+```
+curl http://127.0.0.1:6060/debug/pprof/goroutine?debug=2
+```
+
+Use this rather than `SIGQUIT`. The pipeline is stages joined by bounded
+channels, so one stage that stops returning parks all the others at zero CPU
+with no log output — and `SIGQUIT` both kills the process and writes its
+traceback to stderr, which under systemd is a journald pipe subject to rate
+limiting: a few thousand lines then emerge at seconds per line. Keep the
+listener on loopback; the profiles expose heap contents, which can include
+credentials and payload bytes.
+
+Two ceilings stop a single stuck object from taking the service down, and both
+matter because the failure is silent without them:
+
+- `--job-timeout` (default 1h) bounds one job. The clock starts after the job
+  acquires a concurrency slot, so queueing does not count. Setting it to `0`
+  disables it, which means a blocked job holds its slot for the life of the
+  process; once every slot is held that way the publisher accepts nothing while
+  looking healthy.
+- The S3 CAS transport sets a 2m response-header timeout and a 15m
+  per-operation deadline. The AWS SDK's default client bounds neither, so a
+  store that accepts a request and never answers blocks until TCP keepalive
+  gives up, over two hours later.
+
+Throughput note: dedup is one `CAS.Exists` per object — an `os.Stat` for a local
+CAS, a **HEAD request** for S3 — run `--pipeline-upload-conc` at a time
+(default 4). Against a remote object store that round trip dominates a publish
+of already-present packages, where no upload happens at all. If jobs report
+`objects_new=0` and still take minutes, measure the HEAD latency before looking
+anywhere else, and raise the concurrency.
+
 `--signature-skew` (config `server.signature_skew`, default 2m) sets how far a
 signed request's timestamp may LAG the server clock; future-dated requests get a
 fixed 15 s regardless. The replay cache retains nonces for twice the skew, and

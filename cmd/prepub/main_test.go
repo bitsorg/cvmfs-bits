@@ -156,6 +156,7 @@ type applyTestVars struct {
 	gatewayDirectGraft                                      bool
 	gatewayAllowPlaintext                                   bool
 	authMode                                                string
+	debugListen                                             string
 	signatureSkew                                           time.Duration
 	ingestPublish                                           bool
 	ingestPublishOwner                                      string
@@ -192,6 +193,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.allowedPublishPrefixes,
 		&v.gatewayDirectGraft, &v.gatewayAllowPlaintext,
 		&v.authMode,
+		&v.debugListen,
 		&v.signatureSkew,
 		&v.ingestPublish, &v.ingestPublishOwner,
 		&v.ingestSwissknife, &v.ingestConfigPrefix, &v.ingestEnv,

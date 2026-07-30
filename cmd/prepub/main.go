@@ -54,6 +54,21 @@ import (
 	"cvmfs.io/prepub/pkg/observe"
 )
 
+// defaultJobTimeout bounds a single publish job.
+//
+// It used to be 0 (disabled), which is the wrong default for a service whose
+// jobs hold a bounded number of concurrency slots. A job that blocks — a CAS
+// upload to a store that accepts the request and never answers, say — keeps its
+// slot for as long as the process lives, and once every slot is held that way
+// the publisher stops accepting work entirely while looking perfectly healthy:
+// no error, no CPU, no log line. One stuck object should cost one package.
+//
+// Sized for the largest realistic package rather than a typical one. An O2-scale
+// tree is tens of thousands of entries and hundreds of megabytes through
+// compress, chunk and upload; an hour is far beyond that while still turning an
+// indefinite hang into a failed job within one publish cycle.
+const defaultJobTimeout = time.Hour
+
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────
 	// Subcommand: prepub revoke <node> -- revoke a receiver's control-plane
@@ -87,6 +102,7 @@ func main() {
 	spoolRoot := flag.String("spool-root", "/var/spool/cvmfs-prepub", "Spool root directory [publisher]")
 	stagingRoot := flag.String("staging-root", "", "Directory from which tar_path references (JSON submissions) are allowed; empty disables JSON/tar_path mode [publisher]")
 	listen := flag.String("listen", ":8080", "HTTP listen address for the API server [publisher]")
+	debugListen := flag.String("debug-listen", "", "Address for the pprof/debug listener, e.g. 127.0.0.1:6060. Empty disables it. Bind to loopback only: the profiles include heap contents, which can hold credentials and payload bytes [publisher]")
 	publishMode := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
 	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
 	gatewayAllowPlaintext := flag.Bool("gateway-allow-plaintext", false, "Permit a plaintext http:// gateway URL on a trusted network. Gateway requests are HMAC-SHA256 signed and the secret never transits, so the credential is safe without TLS; what plaintext gives up is confidentiality of the publish and authenticity of gateway responses. Loopback needs no flag. Prefer this over --dev, which also disables the gateway-secret and API-token requirements [publisher]")
@@ -108,7 +124,7 @@ func main() {
 	// indefinitely.  0 (default) disables the timeout for backward compatibility.
 	// When --max-concurrent-jobs is also set, the timeout starts AFTER the job
 	// acquires a concurrency slot, so queue-wait time does not count against it.
-	jobTimeout := flag.Duration("job-timeout", 0, "Maximum wall-clock time a single publish job may run before it is cancelled and failed; 0 disables the timeout [publisher]")
+	jobTimeout := flag.Duration("job-timeout", defaultJobTimeout, "Maximum wall-clock time a single publish job may run before it is cancelled and failed; 0 disables the timeout entirely (not recommended — a job that blocks then holds its concurrency slot forever). The clock starts after the job acquires a slot, so queueing does not count against it [publisher]")
 
 	// Server-side job concurrency limiter.  Limits how many jobs can run the
 	// pipeline + critical section simultaneously, preventing CPU
@@ -252,6 +268,7 @@ func main() {
 			allowedPublishPrefixes,
 			gatewayDirectGraft, gatewayAllowPlaintext,
 			authMode,
+			debugListen,
 			signatureSkew,
 			ingestPublish, ingestPublishOwner,
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
@@ -273,6 +290,13 @@ func main() {
 	}))
 
 	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode)
+
+	stopDebug, derr := startDebugListener(*debugListen, obs)
+	if derr != nil {
+		obs.Logger.Error("cannot start the debug listener", "error", derr)
+		os.Exit(1)
+	}
+	defer stopDebug()
 	obs.Logger.Debug("distribution config (ADR-0001 pull, MQTT-over-wss control plane)")
 
 	switch *mode {

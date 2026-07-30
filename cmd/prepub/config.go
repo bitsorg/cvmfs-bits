@@ -109,6 +109,9 @@ type fileConfig struct {
 		Listen  string `yaml:"listen"`
 		TLSCert string `yaml:"tls_cert"`
 		TLSKey  string `yaml:"tls_key"`
+		// DebugListen is the pprof listener address (e.g. 127.0.0.1:6060).
+		// Empty disables it. Loopback only — profiles expose heap contents.
+		DebugListen string `yaml:"debug_listen"`
 		// AuthMode: bearer | both | hmac. See ADR-0008 D3. Empty = both.
 		AuthMode string `yaml:"auth_mode"`
 		// SignatureSkew is how far a signed request's timestamp may lag before
@@ -265,6 +268,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	gatewayDirectGraft *bool,
 	gatewayAllowPlaintext *bool,
 	authMode *string,
+	debugListen *string,
 	signatureSkew *time.Duration,
 	ingestPublish *bool,
 	ingestPublishOwner *string,
@@ -317,6 +321,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("cas-root", casRoot, fc.CAS.Root)
 	str("cas-server-conf", casServerConf, fc.CAS.ServerConf)
 	str("auth-mode", authMode, fc.Server.AuthMode)
+	str("debug-listen", debugListen, fc.Server.DebugListen)
 	dur("signature-skew", signatureSkew, fc.Server.SignatureSkew)
 	i("pipeline-workers", pipelineWorkers, fc.Pipeline.Workers)
 	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)

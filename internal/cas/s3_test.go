@@ -12,9 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ── config parsing ────────────────────────────────────────────────────────────
@@ -569,5 +571,113 @@ func TestProbeHashShapeIsValid(t *testing.T) {
 	}
 	if err := validHashKey("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); err == nil {
 		t.Error("a 64-char SHA-256 must be rejected — it is not in the CVMFS hash enum")
+	}
+}
+
+// ── Transport and operation deadlines ────────────────────────────────────────
+//
+// These exist because their absence took a production publisher down. The store
+// accepted a PutObject, sent no response, and the SDK's default client bounds
+// nothing — so the upload worker never returned, the pipeline errgroup never
+// unwound, the job never released its concurrency slot, and once every slot was
+// held that way the service sat at 0% CPU accepting nothing, with no error and
+// no log line. A hung object must cost one job, not the publisher.
+
+// TestS3_PutIsBoundedWhenTheStoreNeverAnswers is the regression: a store that
+// accepts the request and goes silent must produce an error, not a hang.
+func TestS3_PutIsBoundedWhenTheStoreNeverAnswers(t *testing.T) {
+	blocked := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body) //nolint:errcheck // read the body, then never reply
+		<-blocked
+	}))
+	// Order matters: httptest.Server.Close waits for in-flight handlers, so the
+	// handler must be released BEFORE Close runs. Deferring close(blocked) first
+	// would schedule it last (LIFO) and deadlock the test itself.
+	defer func() {
+		close(blocked)
+		srv.Close()
+	}()
+
+	s, err := NewS3(context.Background(), S3Settings{
+		Host: srv.URL, Bucket: "b", AccessKey: "k", SecretKey: "s",
+		RepoAlias: "r", DNSBuckets: false,
+	})
+	if err != nil {
+		t.Fatalf("NewS3: %v", err)
+	}
+
+	// A short caller deadline stands in for the 15-minute production ceiling:
+	// what is under test is that SOME deadline reaches the transport, and that
+	// context.WithTimeout in withTimeout never extends the caller's own.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Put(ctx, strings.Repeat("a", 40), strings.NewReader("payload"), 7)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want an error from a store that never answers")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Put did not return — an unanswered upload can still wedge the pipeline")
+	}
+}
+
+// TestS3_GetDeadlineFollowsTheBody guards a trap in the fix itself: GetObject
+// returns once the headers arrive and the caller streams the body afterwards,
+// so a plain `defer cancel()` would kill every download the instant it started.
+func TestS3_GetDeadlineFollowsTheBody(t *testing.T) {
+	const body = "the object bytes"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(150 * time.Millisecond) // headers first, body later
+		io.WriteString(w, body)            //nolint:errcheck
+	}))
+	defer srv.Close()
+
+	s, err := NewS3(context.Background(), S3Settings{
+		Host: srv.URL, Bucket: "b", AccessKey: "k", SecretKey: "s",
+		RepoAlias: "r", DNSBuckets: false,
+	})
+	if err != nil {
+		t.Fatalf("NewS3: %v", err)
+	}
+
+	rc, err := s.Get(context.Background(), strings.Repeat("b", 40))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, rerr := io.ReadAll(rc)
+	if cerr := rc.Close(); cerr != nil {
+		t.Errorf("Close: %v", cerr)
+	}
+	if rerr != nil {
+		t.Fatalf("reading the body after Get returned: %v — the deadline was cancelled too early", rerr)
+	}
+	if string(got) != body {
+		t.Errorf("body = %q, want %q", got, body)
+	}
+}
+
+// TestWithTimeout_NeverExtendsTheCaller: a caller that already has a tighter
+// deadline (a job timeout, a cancelled request) must keep it.
+func TestWithTimeout_NeverExtendsTheCaller(t *testing.T) {
+	parent, cancelParent := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelParent()
+
+	ctx, cancel := withTimeout(parent)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("withTimeout outlived its parent")
 	}
 }
