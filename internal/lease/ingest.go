@@ -6,6 +6,7 @@ package lease
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path"
 	"strconv"
@@ -57,7 +58,11 @@ type IngestBackend struct {
 	// owner, when set, is passed as `ingest -u <owner>` so ingested files are
 	// owned by the repository owner rather than by whoever the tar says.
 	owner string
-	obs   *observe.Provider
+	// skipAncestorDirs disables the parent-directory materialisation in
+	// ensureAncestors. The zero value materialises, because not doing it turns
+	// a publish into a wasted upload plus a gateway panic.
+	skipAncestorDirs bool
+	obs              *observe.Provider
 
 	mu    sync.Mutex
 	repos map[string]*repoSlot // repo → 1-slot queue
@@ -80,6 +85,12 @@ type IngestOptions struct {
 	NestedCatalog bool
 	// Owner passes -u to cvmfs_server ingest. Optional.
 	Owner string
+	// SkipAncestorDirs disables creating the parent directory chain of a
+	// publish target that does not exist yet (see ensureAncestors). Off by
+	// default — the zero value materialises — because the failure it prevents
+	// is a full payload upload followed by a gateway panic. Set it only where
+	// the prefixes are known to be created by something else.
+	SkipAncestorDirs bool
 }
 
 // NewIngestBackend constructs an IngestBackend.
@@ -89,11 +100,12 @@ func NewIngestBackend(opt IngestOptions, obs *observe.Provider) *IngestBackend {
 		mount = "/cvmfs"
 	}
 	return &IngestBackend{
-		cvmfsMount:    mount,
-		nestedCatalog: opt.NestedCatalog,
-		owner:         opt.Owner,
-		obs:           obs,
-		repos:         make(map[string]*repoSlot),
+		cvmfsMount:       mount,
+		nestedCatalog:    opt.NestedCatalog,
+		owner:            opt.Owner,
+		skipAncestorDirs: opt.SkipAncestorDirs,
+		obs:              obs,
+		repos:            make(map[string]*repoSlot),
 	}
 }
 
@@ -204,6 +216,13 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 		base = "/" // publish at the repository root
 	}
 
+	// Do this BEFORE the ingest, not after a failure: the payload is already
+	// on disk and the gateway would otherwise accept the whole upload and only
+	// then panic during the commit merge.
+	if err := b.ensureAncestors(ctx, repo, req.CVMFSDir); err != nil {
+		return err
+	}
+
 	// Argument order matters and is not forgiving: cvmfs_server's option loop
 	// runs `while [ "$2" != "" ]` and then takes `$1` as the repository name,
 	// so the repository MUST be the final argument. Put it anywhere else and
@@ -223,15 +242,124 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 	start := time.Now()
 	out, err := b.cvmfsServerOutput(ctx, args...)
 	if err != nil {
-		logOut := out
-		if len(logOut) > maxCvmfsLogBytes {
-			logOut = logOut[:maxCvmfsLogBytes] + " …[truncated]"
-		}
-		return fmt.Errorf("cvmfs_server ingest into %q: %w (output: %s)", base, err, logOut)
+		return fmt.Errorf("cvmfs_server ingest into %q: %w (output: %s)",
+			base, err, truncateLog(out))
 	}
 	b.obs.Logger.Info("ingest backend: published",
 		"repo", repo, "base", base, "duration", time.Since(start).String())
 	return nil
+}
+
+// ensureAncestors creates the parent directory chain of cvmfsDir when it does
+// not exist yet.
+//
+// `cvmfs_server ingest -b <base>` creates <base> itself but NOT the directories
+// above it, and the receiver requires them. WritableCatalogManager, in the
+// cvmfs source deployed on the gateway:
+//
+//	GraftNestedCatalog  "The mountpoint directory must not yet exist. Its
+//	                     parent directory, however must exist."
+//	AddDirectory        PANIC when FindCatalog(parent_path) misses
+//
+// So publishing into a prefix whose ancestors are absent uploads the entire
+// payload, waits out the commit, and only then dies on the GATEWAY with
+//
+//	PANIC: catalog_mgr_rw.cc : 1076  failed to graft nested catalog '<path>'  (with -c)
+//	PANIC: catalog_mgr_rw.cc :  496  catalog for directory '<path>' cannot be found
+//
+// The cost is a full transfer per package, discarded. A 174-job ALICE O2
+// publish did exactly this: every payload uploaded, every commit panicked, and
+// the lease was cancelled — for eight minutes of transfer and nothing else.
+//
+// The chain is created in its own short transaction taken on the DEEPEST
+// EXISTING ancestor rather than on the repository root, so materialising one
+// leaf prefix does not lock every other path in the repository meanwhile.
+func (b *IngestBackend) ensureAncestors(ctx context.Context, repo, cvmfsDir string) error {
+	if b.skipAncestorDirs {
+		return nil
+	}
+	root := path.Join(b.cvmfsMount, repo)
+	parent := path.Dir(cvmfsDir)
+
+	// Publishing directly under the repository root needs nothing: the root
+	// always exists. The prefix test also rejects a parent that escaped the
+	// repository, which Commit's own guard should already have caught.
+	if parent == root || !strings.HasPrefix(parent, root+"/") {
+		return nil
+	}
+	if isDir(parent) {
+		return nil
+	}
+	// A missing repository mount is a misconfigured publisher, not a missing
+	// prefix — creating it is emphatically not this function's job, and
+	// walking up from here would otherwise silently try.
+	if !isDir(root) {
+		return fmt.Errorf("ingest backend: repository mount %q does not exist "+
+			"(is %s mounted on this publisher?)", root, repo)
+	}
+
+	leaseTarget := repo
+	if rel := strings.TrimPrefix(deepestExisting(root, parent), root); rel != "" {
+		leaseTarget = repo + strings.TrimSuffix(rel, "/")
+	}
+
+	b.obs.Logger.Info("ingest backend: creating missing ancestor directories",
+		"repo", repo, "parent", parent, "lease", leaseTarget)
+
+	if out, err := b.cvmfsServerOutput(ctx, "transaction", leaseTarget); err != nil {
+		return fmt.Errorf("ingest backend: cvmfs_server transaction %q (to create %q): "+
+			"%w (output: %s)", leaseTarget, parent, err, truncateLog(out))
+	}
+	// From here the transaction is OURS, so aborting it is safe and correct.
+	// That is the distinction Abort() draws: it refuses to abort because it can
+	// never know whose transaction is open, whereas here we just opened it.
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		b.abortOwn(ctx, repo, "mkdir failed")
+		return fmt.Errorf("ingest backend: mkdir %q inside transaction: %w", parent, err)
+	}
+	if out, err := b.cvmfsServerOutput(ctx, "publish", repo); err != nil {
+		b.abortOwn(ctx, repo, "publish failed")
+		return fmt.Errorf("ingest backend: cvmfs_server publish %q (creating %q): "+
+			"%w (output: %s)", repo, parent, err, truncateLog(out))
+	}
+	b.obs.Logger.Info("ingest backend: ancestor directories created",
+		"repo", repo, "parent", parent)
+	return nil
+}
+
+// abortOwn rolls back a transaction this backend opened itself. Failure is
+// logged, never returned: the caller is already failing for a better reason and
+// an orphaned transaction is the gateway's lease to expire.
+func (b *IngestBackend) abortOwn(ctx context.Context, repo, why string) {
+	if out, err := b.cvmfsServerOutput(ctx, "abort", "-f", repo); err != nil {
+		b.obs.Logger.Error("ingest backend: could not abort own transaction",
+			"repo", repo, "reason", why, "error", err, "output", truncateLog(out))
+	}
+}
+
+// deepestExisting walks up from dir towards root and returns the first
+// directory that exists. root is assumed to exist and is the stopping point, so
+// the result is always root or below.
+func deepestExisting(root, dir string) string {
+	for dir != root && strings.HasPrefix(dir, root+"/") {
+		if isDir(dir) {
+			return dir
+		}
+		dir = path.Dir(dir)
+	}
+	return root
+}
+
+func isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+func truncateLog(s string) string {
+	if len(s) > maxCvmfsLogBytes {
+		return s[:maxCvmfsLogBytes] + " …[truncated]"
+	}
+	return s
 }
 
 // commitArgs exposes the argument vector for testing: the ordering constraint
@@ -288,11 +416,7 @@ func (b *IngestBackend) cvmfsServerOutput(ctx context.Context, args ...string) (
 	raw, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(raw))
 	if out != "" {
-		logOut := out
-		if len(logOut) > maxCvmfsLogBytes {
-			logOut = logOut[:maxCvmfsLogBytes] + " …[truncated]"
-		}
-		b.obs.Logger.Debug("cvmfs_server", "args", args, "output", logOut)
+		b.obs.Logger.Debug("cvmfs_server", "args", args, "output", truncateLog(out))
 	}
 	return out, err
 }
