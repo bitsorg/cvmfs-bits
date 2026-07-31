@@ -1081,10 +1081,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		// the hook (e.g. early error during staging, local mode) the slot is
 		// still released exactly once via sync.Once.
 		var semOnce sync.Once
+		// grantedWeight is the admission cost this job was charged; Release must
+		// return exactly that, not a recomputed value — the effective limit (and
+		// hence the clamp inside jobWeight) can change while the job runs.
+		grantedWeight := 0
 		releaseSem := func() {
 			semOnce.Do(func() {
 				if s.dynaSem != nil {
-					s.dynaSem.Release()
+					s.dynaSem.Release(grantedWeight)
 					s.obs.Logger.Info("released concurrency slot (pipeline complete)",
 						"job_id", jobID)
 				}
@@ -1096,7 +1100,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				"job_id", jobID, "repo", j.Repo)
 			// Use abortCtx so that a manual abort unblocks the wait
 			// immediately rather than holding the slot indefinitely.
-			if err := s.dynaSem.Acquire(abortCtx, j.TarSize); err != nil {
+			gw, err := s.dynaSem.Acquire(abortCtx, j.TarSize)
+			if err != nil {
 				// abortCancel fired (operator abort or server shutdown) while
 				// the job was queued; mark it as aborted without running.
 				s.obs.Logger.Info("job aborted while waiting for slot",
@@ -1105,7 +1110,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 					fmt.Errorf("aborted while waiting for concurrency slot: %w", err))
 				return
 			}
-			s.obs.Logger.Info("job acquired concurrency slot", "job_id", jobID)
+			grantedWeight = gw
+			s.obs.Logger.Info("job acquired concurrency slot",
+				"job_id", jobID, "weight", gw, "tar_bytes", j.TarSize)
 		}
 		defer releaseSem() // safety net — no-op if hook already fired
 

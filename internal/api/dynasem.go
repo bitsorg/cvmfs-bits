@@ -50,9 +50,43 @@ const (
 	loadPollInterval = 5 * time.Second
 )
 
+// jobWeightUnitBytes is one unit of admission budget.
+//
+// A slot used to mean "one job", which prices a 4 KiB modulefile and a 5.2 GB
+// tar identically. On a spool volume delivering single-digit MB/s that is not a
+// rounding error: six multi-gigabyte packages admitted together each got a sixth
+// of the device, so all six took six times longer than any one of them would
+// have alone. Aggregate throughput was unchanged — a seek-limited disk does not
+// go faster when more readers ask — while per-job latency multiplied, which is
+// what actually breaks things downstream.
+//
+// Charging by size makes the common case unchanged (small packages weigh 1 and
+// still run tens at a time) and serialises the heavy ones, which is the whole
+// point: one big job at a time, finishing quickly, rather than six crawling.
+const jobWeightUnitBytes = 128 << 20
+
+// jobWeight converts a job's tar size into admission units, clamped to [1, budget].
+//
+// The upper clamp matters: a tar larger than the entire budget must still be
+// admissible, or it could never run at all. It simply runs alone.
+func jobWeight(tarBytes int64, budget int) int {
+	if budget < 1 {
+		budget = 1
+	}
+	units := int((tarBytes + jobWeightUnitBytes - 1) / jobWeightUnitBytes) // ceil
+	if units < 1 {
+		units = 1
+	}
+	if units > budget {
+		units = budget
+	}
+	return units
+}
+
 // waiter represents a single Acquire call blocked waiting for a slot.
 type waiter struct {
 	priority int64         // TarSize in bytes — larger = higher priority
+	weight   int           // admission units this job costs (see jobWeight)
 	index    int           // position in the heap (maintained by heap.Interface)
 	ready    chan struct{} // closed by Release() when the slot is granted
 	ctx      context.Context
@@ -92,10 +126,13 @@ type DynamicSemaphore struct {
 	// maxSlots is the ceiling (defaults to runtime.NumCPU() at construction).
 	maxSlots int
 
-	mu       sync.Mutex
-	waiters  waiterHeap // max-heap of pending Acquire calls
-	inFlight int        // number of acquired (unreleased) slots
-	load     float64    // most recent 1-min load average
+	mu      sync.Mutex
+	waiters waiterHeap // max-heap of pending Acquire calls
+	// inFlight is the sum of granted WEIGHTS, not a job count — see jobWeight.
+	inFlight int
+	// inFlightJobs is the number of jobs holding a grant, for reporting only.
+	inFlightJobs int
+	load         float64 // most recent 1-min load average
 
 	logger *slog.Logger
 
@@ -154,21 +191,25 @@ func (ds *DynamicSemaphore) effectiveSlotsLocked() int {
 // this under the lock — the same technique used by golang.org/x/sync/semaphore:
 // in the ctx.Done() branch, do a non-blocking receive on w.ready; if it
 // succeeds, return nil (the grant wins) so the slot is never leaked.
-func (ds *DynamicSemaphore) Acquire(ctx context.Context, priority int64) error {
+func (ds *DynamicSemaphore) Acquire(ctx context.Context, tarBytes int64) (int, error) {
 	ds.mu.Lock()
 
-	// Fast path — take a slot immediately if one is available and no one is
+	weight := jobWeight(tarBytes, ds.effectiveSlotsLocked())
+
+	// Fast path — take the slots immediately if they are available and no one is
 	// already queued (to avoid skipping ahead of higher-priority waiters).
-	if ds.inFlight < ds.effectiveSlotsLocked() && ds.waiters.Len() == 0 {
-		ds.inFlight++
+	if ds.inFlight+weight <= ds.effectiveSlotsLocked() && ds.waiters.Len() == 0 {
+		ds.inFlight += weight
+		ds.inFlightJobs++
 		ds.mu.Unlock()
-		return nil
+		return weight, nil
 	}
 
-	// Slow path — park on a private channel until Release() grants us the slot
+	// Slow path — park on a private channel until Release() grants us the slots
 	// or our context is cancelled.
 	w := &waiter{
-		priority: priority,
+		priority: tarBytes,
+		weight:   weight,
 		ready:    make(chan struct{}),
 		ctx:      ctx,
 	}
@@ -177,8 +218,8 @@ func (ds *DynamicSemaphore) Acquire(ctx context.Context, priority int64) error {
 
 	select {
 	case <-w.ready:
-		// Release() closed the channel — slot is ours.
-		return nil
+		// Release() closed the channel — the slots are ours.
+		return w.weight, nil
 
 	case <-ctx.Done():
 		// Cancelled while waiting.  Take the lock so we can check atomically
@@ -192,14 +233,14 @@ func (ds *DynamicSemaphore) Acquire(ctx context.Context, priority int64) error {
 			// The caller owns the slot and must call Release() when done.
 			// (The job will fail quickly anyway because its runCtx is also
 			// derived from abortCtx which is now cancelled.)
-			return nil
+			return w.weight, nil
 		default:
 			// Not granted yet.  Remove from the heap so Release() never
 			// grants us a slot after we return.
 			if w.index >= 0 && w.index < ds.waiters.Len() {
 				heap.Remove(&ds.waiters, w.index)
 			}
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 }
@@ -207,29 +248,54 @@ func (ds *DynamicSemaphore) Acquire(ctx context.Context, priority int64) error {
 // Release returns a slot.  It pops the highest-priority non-cancelled waiter
 // and grants the slot directly to that goroutine, bypassing the thundering-
 // herd issue of sync.Cond.Broadcast().
-func (ds *DynamicSemaphore) Release() {
+func (ds *DynamicSemaphore) Release(weight int) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 
-	if ds.inFlight > 0 {
-		ds.inFlight--
+	if weight < 1 {
+		weight = 1
 	}
+	ds.inFlight -= weight
+	if ds.inFlight < 0 {
+		ds.inFlight = 0
+	}
+	if ds.inFlightJobs > 0 {
+		ds.inFlightJobs--
+	}
+	ds.grantLocked()
+}
 
-	// Drain cancelled waiters from the top of the heap, then grant to the
-	// first live one.  If no live waiter exists, leave the slot free for the
-	// next Acquire fast-path.
+// grantLocked hands out slots to waiting jobs in priority order. Callers hold
+// ds.mu.
+//
+// It stops at the first waiter that does not fit rather than skipping to a
+// smaller one. That is deliberate head-of-line blocking: waiters are ordered by
+// tar size, so the one at the front is the largest, and letting small jobs
+// overtake it indefinitely is exactly how a big package never runs. Idling a
+// few units until it fits is the cheaper mistake — and on storage where the big
+// job is the bottleneck, running it sooner is what shortens the whole build.
+func (ds *DynamicSemaphore) grantLocked() {
+	limit := ds.effectiveSlotsLocked()
 	for ds.waiters.Len() > 0 {
-		w := heap.Pop(&ds.waiters).(*waiter)
-		if w.ctx.Err() != nil {
-			// This waiter was cancelled; skip it and try the next.
+		if ds.waiters[0].ctx.Err() != nil {
+			heap.Pop(&ds.waiters) // cancelled — drop and continue
 			continue
 		}
-		// Grant the slot to this waiter.
-		ds.inFlight++
+		w := ds.waiters[0]
+		if ds.inFlight+w.weight > limit {
+			// Escape hatch: a job whose weight exceeds the CURRENT limit (the
+			// limit can shrink under load after the weight was computed) would
+			// otherwise wait forever. When nothing else is running, let it
+			// through — it runs alone, which is what it would have done anyway.
+			if ds.inFlight > 0 {
+				return
+			}
+		}
+		heap.Pop(&ds.waiters)
+		ds.inFlight += w.weight
+		ds.inFlightJobs++
 		close(w.ready)
-		return
 	}
-	// No live waiters — slot remains free for next Acquire fast-path.
 }
 
 // Stop shuts down the background load-poller.  Subsequent Acquire calls still
@@ -267,24 +333,12 @@ func (ds *DynamicSemaphore) loadPoller() {
 			ds.load = newLoad
 			newLimit := ds.effectiveSlotsLocked()
 
-			slotsOpened := newLimit - prevLimit
-			if slotsOpened > 0 {
-				// Wake up to slotsOpened top-priority waiters.
-				for i := 0; i < slotsOpened && ds.waiters.Len() > 0; i++ {
-					// Drain cancelled entries first.
-					for ds.waiters.Len() > 0 && ds.waiters[0].ctx.Err() != nil {
-						heap.Pop(&ds.waiters)
-					}
-					if ds.waiters.Len() == 0 {
-						break
-					}
-					if ds.inFlight < ds.effectiveSlotsLocked() {
-						w := heap.Pop(&ds.waiters).(*waiter)
-						ds.inFlight++
-						close(w.ready)
-					}
-				}
+			if newLimit > prevLimit {
+				// More budget: hand it out by weight, same rule as Release.
+				ds.grantLocked()
 			}
+			inFlightJobs := ds.inFlightJobs
+			inFlightWeight := ds.inFlight
 			ds.mu.Unlock()
 
 			if newLimit != prevLimit {
@@ -292,7 +346,8 @@ func (ds *DynamicSemaphore) loadPoller() {
 					"prev_limit", prevLimit,
 					"new_limit", newLimit,
 					"load_avg_1min", fmt.Sprintf("%.2f", newLoad),
-					"in_flight", ds.inFlight,
+					"in_flight", inFlightJobs,
+					"in_flight_weight", inFlightWeight,
 					"min_slots", ds.minSlots,
 					"max_slots", ds.maxSlots,
 				)

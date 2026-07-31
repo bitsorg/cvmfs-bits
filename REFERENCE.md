@@ -3441,6 +3441,20 @@ this, three routine restarts during one debugging session terminally failed
 every in-flight job of a 174-package build — and a build with failed members is
 never auto-published, so the whole publish was lost.
 
+**Job admission is charged by tar size, not per job.** A slot used to mean "one
+job", which prices a 4 KiB modulefile and a 5.2 GB tar identically. Each job
+costs `ceil(tar_bytes / 128 MiB)` units of the effective slot count, clamped to
+at least 1 and at most the whole budget — so ordinary packages still run tens at
+a time, while anything from roughly 2 GB upward (at a 16-slot budget) occupies
+everything and runs alone.
+
+That matters on slow storage. Six multi-gigabyte packages admitted together each
+get a sixth of the device: a seek-limited volume does not go faster when more
+readers ask, so aggregate throughput is unchanged while every job's latency
+multiplies by six. Waiters are ordered largest-first and admission is
+head-of-line blocking — small jobs do not overtake a waiting large one, because
+that is how the large one never runs.
+
 **Phase 0 is bounded separately from the job semaphore.** The tar scan runs
 BEFORE a job competes for a concurrency slot, so that its compress workers can
 start the moment it gets one — which means the job semaphore does not cover it.

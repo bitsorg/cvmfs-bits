@@ -28,10 +28,10 @@ func TestAcquire_FastPath(t *testing.T) {
 	defer ds.Stop()
 
 	ctx := context.Background()
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("first Acquire: %v", err)
 	}
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("second Acquire: %v", err)
 	}
 }
@@ -43,13 +43,13 @@ func TestAcquire_BlocksWhenFull(t *testing.T) {
 	defer ds.Stop()
 
 	ctx := context.Background()
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("first Acquire: %v", err)
 	}
 
 	acquired := make(chan struct{})
 	go func() {
-		if err := ds.Acquire(ctx, 0); err == nil {
+		if _, err := ds.Acquire(ctx, 0); err == nil {
 			close(acquired)
 		}
 	}()
@@ -62,7 +62,7 @@ func TestAcquire_BlocksWhenFull(t *testing.T) {
 		// Good — still blocked.
 	}
 
-	ds.Release()
+	ds.Release(1)
 
 	select {
 	case <-acquired:
@@ -80,14 +80,14 @@ func TestAcquire_CancellationUnblocks(t *testing.T) {
 
 	ctx := context.Background()
 	// Fill the one slot.
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 
 	cancelCtx, cancel := context.WithCancel(ctx)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- ds.Acquire(cancelCtx, 0)
+		errCh <- func() error { _, e := ds.Acquire(cancelCtx, 0); return e }()
 	}()
 
 	// Give the goroutine time to park on the channel.
@@ -116,7 +116,7 @@ func TestAcquire_LargestJobGetsSlotFirst(t *testing.T) {
 
 	ctx := context.Background()
 	// Hold the only slot.
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("holder Acquire: %v", err)
 	}
 
@@ -140,14 +140,14 @@ func TestAcquire_LargestJobGetsSlotFirst(t *testing.T) {
 			started.Done()                    // signal that goroutine is running
 			time.Sleep(10 * time.Millisecond) // give all goroutines time to start
 			parked.Add(1)
-			if err := ds.Acquire(ctx, sz); err != nil {
+			if _, err := ds.Acquire(ctx, sz); err != nil {
 				t.Errorf("Acquire(priority=%d): %v", sz, err)
 				return
 			}
 			// Record the order in which slots were granted.
 			ord := int(orderCounter.Add(1))
 			orderCh <- result{priority: sz, order: ord}
-			ds.Release()
+			ds.Release(1)
 		}()
 	}
 
@@ -156,7 +156,7 @@ func TestAcquire_LargestJobGetsSlotFirst(t *testing.T) {
 	time.Sleep(80 * time.Millisecond) // let all three park in Acquire
 
 	// Release the held slot — this should wake the highest-priority waiter.
-	ds.Release()
+	ds.Release(1)
 
 	// Collect all three results with a generous timeout.
 	results := make([]result, 0, 3)
@@ -205,7 +205,7 @@ func TestRelease_SkipsCancelledWaiters(t *testing.T) {
 
 	ctx := context.Background()
 	// Hold the slot.
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 
@@ -213,14 +213,14 @@ func TestRelease_SkipsCancelledWaiters(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancelledCh := make(chan error, 1)
 	go func() {
-		cancelledCh <- ds.Acquire(cancelCtx, 1000) // highest priority — will be cancelled
+		cancelledCh <- func() error { _, e := ds.Acquire(cancelCtx, 1000); return e }() // highest priority — will be cancelled
 	}()
 	time.Sleep(20 * time.Millisecond)
 
 	// Queue a lower-priority live waiter.
 	liveCh := make(chan error, 1)
 	go func() {
-		liveCh <- ds.Acquire(ctx, 50) // lower priority but not cancelled
+		liveCh <- func() error { _, e := ds.Acquire(ctx, 50); return e }() // lower priority but not cancelled
 	}()
 	time.Sleep(20 * time.Millisecond)
 
@@ -236,7 +236,7 @@ func TestRelease_SkipsCancelledWaiters(t *testing.T) {
 	}
 
 	// Release — should skip the (now-cancelled) high-priority entry and grant to live waiter.
-	ds.Release()
+	ds.Release(1)
 	select {
 	case err := <-liveCh:
 		if err != nil {
@@ -256,7 +256,7 @@ func TestAcquire_NoSlotsLeakedOnCancellation(t *testing.T) {
 
 	ctx := context.Background()
 	// Hold the slot.
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("holder Acquire: %v", err)
 	}
 
@@ -264,18 +264,18 @@ func TestAcquire_NoSlotsLeakedOnCancellation(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- ds.Acquire(cancelCtx, 100)
+		errCh <- func() error { _, e := ds.Acquire(cancelCtx, 100); return e }()
 	}()
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 	<-errCh
 
 	// Release the held slot — should be available for a new Acquire.
-	ds.Release()
+	ds.Release(1)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- ds.Acquire(ctx, 0)
+		done <- func() error { _, e := ds.Acquire(ctx, 0); return e }()
 	}()
 	select {
 	case err := <-done:
@@ -296,7 +296,7 @@ func TestAcquire_ZeroPriorityInteroperates(t *testing.T) {
 
 	ctx := context.Background()
 	// Hold the slot.
-	if err := ds.Acquire(ctx, 0); err != nil {
+	if _, err := ds.Acquire(ctx, 0); err != nil {
 		t.Fatalf("holder Acquire: %v", err)
 	}
 
@@ -311,18 +311,18 @@ func TestAcquire_ZeroPriorityInteroperates(t *testing.T) {
 		sz := sz
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			if err := ds.Acquire(ctx, sz); err != nil {
+			if _, err := ds.Acquire(ctx, sz); err != nil {
 				t.Errorf("Acquire(%d): %v", sz, err)
 				return
 			}
 			ord := int(orderCounter.Add(1))
 			orderCh <- result{priority: sz, order: ord}
-			ds.Release()
+			ds.Release(1)
 		}()
 	}
 
 	time.Sleep(80 * time.Millisecond)
-	ds.Release()
+	ds.Release(1)
 
 	results := make([]result, 0, 2)
 	timeout := time.After(3 * time.Second)
@@ -344,4 +344,116 @@ func TestAcquire_ZeroPriorityInteroperates(t *testing.T) {
 	if ord999 != 1 {
 		t.Errorf("priority-999 job was dispatched #%d; want #1", ord999)
 	}
+}
+
+// ── Size-weighted admission ──────────────────────────────────────────────────
+//
+// A slot used to mean "one job", pricing a 4 KiB modulefile and a 5.2 GB tar
+// identically. On a spool volume delivering single-digit MB/s that admitted six
+// multi-gigabyte packages together; each got a sixth of the device and took six
+// times longer than it would have alone. A seek-limited disk does not go faster
+// when more readers ask, so the concurrency bought nothing and multiplied every
+// job's latency.
+
+func TestJobWeight(t *testing.T) {
+	const budget = 16
+	for _, tc := range []struct {
+		name  string
+		bytes int64
+		want  int
+	}{
+		{"empty", 0, 1},
+		{"modulefile tar", 4 << 10, 1},
+		{"just under a unit", jobWeightUnitBytes - 1, 1},
+		{"exactly one unit", jobWeightUnitBytes, 1},
+		{"just over a unit", jobWeightUnitBytes + 1, 2},
+		{"944 MiB", 944 << 20, 8},
+		// 20 units uncapped, but the budget is 16 — so at this slot count
+		// anything from ~2 GiB up already runs alone, which is the intent.
+		{"2.5 GiB, clamped by a 16 budget", 2560 << 20, budget},
+		// Clamped: a tar bigger than the whole budget must still be admissible,
+		// or the largest package in a build could never run at all.
+		{"5.2 GiB against a 16 budget", 5325 << 20, budget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := jobWeight(tc.bytes, budget); got != tc.want {
+				t.Errorf("jobWeight(%d, %d) = %d, want %d", tc.bytes, budget, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDynaSem_LargeJobsSerialise is the property asked for: big packages run one
+// at a time even though the slot count is high.
+func TestDynaSem_LargeJobsSerialise(t *testing.T) {
+	ds := NewDynamicSemaphore(16, 16, nopLogger())
+	defer ds.Stop()
+	ctx := context.Background()
+
+	const huge = int64(6) << 30 // weighs the whole budget
+
+	w1, err := ds.Acquire(ctx, huge)
+	if err != nil {
+		t.Fatalf("first Acquire: %v", err)
+	}
+
+	second := make(chan int, 1)
+	go func() {
+		w, aerr := ds.Acquire(ctx, huge)
+		if aerr != nil {
+			t.Errorf("second Acquire: %v", aerr)
+		}
+		second <- w
+	}()
+
+	select {
+	case <-second:
+		t.Fatal("two whole-budget jobs ran at once; large jobs must serialise")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	ds.Release(w1)
+	select {
+	case <-second:
+	case <-time.After(2 * time.Second):
+		t.Error("the second large job never started after the first released")
+	}
+}
+
+// TestDynaSem_SmallJobsStillRunConcurrently is the other half: weighting must
+// not throttle ordinary packages, which are the overwhelming majority.
+func TestDynaSem_SmallJobsStillRunConcurrently(t *testing.T) {
+	const slots = 16
+	ds := NewDynamicSemaphore(slots, slots, nopLogger())
+	defer ds.Stop()
+	ctx := context.Background()
+
+	for i := 0; i < slots; i++ {
+		if _, err := ds.Acquire(ctx, 4<<10); err != nil {
+			t.Fatalf("small Acquire %d: %v", i, err)
+		}
+	}
+	// The budget is now full; the next one must wait.
+	tight, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := ds.Acquire(tight, 4<<10); err == nil {
+		t.Error("admitted more small jobs than the budget allows")
+	}
+}
+
+// TestDynaSem_OversizedJobRunsAloneRatherThanNever covers the escape hatch: the
+// effective limit can shrink under load after a weight was computed, and a
+// waiter whose weight then exceeds the limit must not wait forever.
+func TestDynaSem_OversizedJobRunsAloneRatherThanNever(t *testing.T) {
+	ds := NewDynamicSemaphore(1, 1, nopLogger())
+	defer ds.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	w, err := ds.Acquire(ctx, 100<<30) // vastly over any budget
+	if err != nil {
+		t.Fatalf("an oversized job must still be admitted when idle: %v", err)
+	}
+	ds.Release(w)
 }
