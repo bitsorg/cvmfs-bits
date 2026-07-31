@@ -106,14 +106,17 @@ type fakeAddr string
 func (f fakeAddr) Network() string { return "tcp" }
 func (f fakeAddr) String() string  { return string(f) }
 
-// TestDefaultJobTimeout guards the value that stops one stuck job from wedging
-// the queue. Zero means "no timeout", which is how a single unanswered S3 PUT
-// took every concurrency slot and left the publisher idle-looking and dead.
+// TestDefaultJobTimeout pins the default OFF.
+//
+// This assertion is inverted from the one it replaces, and the reason is worth
+// keeping: a one-hour default cancelled six multi-gigabyte packages that were
+// progressing normally on slow storage, failing a 170-package build. A wall
+// clock cannot distinguish "stuck" from "slow", so no fixed value is safe for
+// both a 4 KiB modulefile and a 5.2 GB tar. Bounding a stalled job needs a
+// progress watchdog; until then the ceiling is the operator's to set.
 func TestDefaultJobTimeout(t *testing.T) {
-	if defaultJobTimeout <= 0 {
-		t.Fatal("a zero/negative default lets a blocked job hold its slot forever")
-	}
-	if defaultJobTimeout < 10*time.Minute {
-		t.Errorf("default %v is too tight for a large package's compress+upload", defaultJobTimeout)
+	if defaultJobTimeout != 0 {
+		t.Errorf("defaultJobTimeout = %v, want 0 (disabled): a fixed wall-clock "+
+			"budget kills slow-but-working jobs on slow storage", defaultJobTimeout)
 	}
 }

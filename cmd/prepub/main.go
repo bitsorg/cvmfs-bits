@@ -54,20 +54,31 @@ import (
 	"cvmfs.io/prepub/pkg/observe"
 )
 
-// defaultJobTimeout bounds a single publish job.
+// defaultJobTimeout is 0 — DISABLED — and that is deliberate.
 //
-// It used to be 0 (disabled), which is the wrong default for a service whose
-// jobs hold a bounded number of concurrency slots. A job that blocks — a CAS
-// upload to a store that accepts the request and never answers, say — keeps its
-// slot for as long as the process lives, and once every slot is held that way
-// the publisher stops accepting work entirely while looking perfectly healthy:
-// no error, no CPU, no log line. One stuck object should cost one package.
+// A previous version of this file set it to one hour, reasoning that a job which
+// blocks forever holds a concurrency slot forever and should be bounded. The
+// intent was right and the instrument was wrong, in a way that only production
+// showed: on a spool volume delivering single-digit MB/s, six multi-gigabyte
+// packages exceeded the hour while making steady progress, were cancelled
+// mid-unpack, and took a 170-package build down with them. They were not stuck;
+// they were slow, and a wall clock cannot tell the difference.
 //
-// Sized for the largest realistic package rather than a typical one. An O2-scale
-// tree is tens of thousands of entries and hundreds of megabytes through
-// compress, chunk and upload; an hour is far beyond that while still turning an
-// indefinite hang into a failed job within one publish cycle.
-const defaultJobTimeout = time.Hour
+// No fixed value can. The same number has to cover a 4 KiB modulefile and a
+// 5.2 GB tar on storage whose speed this process cannot know in advance — any
+// value safe for the second is useless against the first, and any value tight
+// enough to catch a hang will kill legitimate work on slow disks.
+//
+// It was also not bounding what it claimed to. unpack observes the context only
+// between archive entries, so a deadline that expired inside a large member went
+// unnoticed until that member finished: two of those six jobs ran 2h28m and
+// 2h35m past a one-hour deadline before failing.
+//
+// The right instrument measures PROGRESS, not elapsed time: fail a job that has
+// stopped moving, whatever its size, and never one that is merely slow. Until
+// that exists, disabled is the honest default — an operator who wants a ceiling
+// can set --job-timeout, having seen their own storage.
+const defaultJobTimeout = 0
 
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────

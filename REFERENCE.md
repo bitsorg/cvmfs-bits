@@ -3410,11 +3410,16 @@ credentials and payload bytes.
 Two ceilings stop a single stuck object from taking the service down, and both
 matter because the failure is silent without them:
 
-- `--job-timeout` (default 1h) bounds one job. The clock starts after the job
-  acquires a concurrency slot, so queueing does not count. Setting it to `0`
-  disables it, which means a blocked job holds its slot for the life of the
-  process; once every slot is held that way the publisher accepts nothing while
-  looking healthy.
+- `--job-timeout` bounds one job, and **defaults to 0 (disabled)**. It was
+  briefly 1h; that cancelled six multi-gigabyte packages which were progressing
+  normally on a slow spool volume and failed a 170-package build. A wall clock
+  cannot distinguish a stuck job from a slow one, and no single value suits both
+  a 4 KiB modulefile and a 5.2 GB tar on storage of unknown speed. It is also
+  imprecise: `unpack` checks the context only between archive entries, so a
+  deadline expiring inside a large member is not noticed until that member
+  finishes — two of those jobs overran the deadline by more than 90 minutes.
+  Set it only if you know your storage, and size it against your largest
+  package rather than your typical one.
 - The S3 CAS transport sets a 2m response-header timeout and a 15m
   per-operation deadline. The AWS SDK's default client bounds neither, so a
   store that accepts a request and never answers blocks until TCP keepalive
