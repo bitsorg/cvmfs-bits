@@ -1711,6 +1711,27 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		return o.abortJob(ctx, j, err)
 	}
 
+	// Re-derive TarPath from the job's CURRENT directory.
+	//
+	// The spool moves the job directory on every state transition
+	// (incoming -> staging -> ... -> leased -> committing), so any absolute
+	// path captured earlier is stale the moment the job advances. The pipeline
+	// branch above already refreshes it after the incoming->staging rename —
+	// but ONLY there, and IngestBackend.NeedsPipeline() is false, so a job on
+	// the `ingest` publish path never passed through that code and carried an
+	// incoming/ path all the way to the backend:
+	//
+	//   cvmfs_server ingest -T /data/spool/leased/<job>/payload.tar
+	//   Impossible to open the archive: Failed to open '...'
+	//
+	// after the gateway transaction had already been opened — so it presented
+	// as a broken payload rather than a path bug. Derived here, once, for every
+	// backend, because the spool layout is the orchestrator's business and the
+	// backends should not have to know which states rename what.
+	if j.TarPath != "" {
+		j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
+	}
+
 	// Build the commit request, populating fields for whichever backend is active.
 	cvmfsDir := filepath.Join(o.CVMFSMount, j.Repo, j.Path)
 	req := lease.CommitRequest{
