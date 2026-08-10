@@ -290,12 +290,29 @@ func (b *IngestBackend) ensureAncestors(ctx context.Context, repo, cvmfsDir stri
 	if isDir(parent) {
 		return nil
 	}
-	// A missing repository mount is a misconfigured publisher, not a missing
-	// prefix — creating it is emphatically not this function's job, and
-	// walking up from here would otherwise silently try.
+	// No repository mount: this is a MOUNTLESS publisher.
+	//
+	// `cvmfs_server connect-gw -P` registers a repository for gateway publishing
+	// without mounting it — that is the whole point of the -P registration, and
+	// the testbed's native publisher container runs that way with no /cvmfs at
+	// all. There is then nothing to stat and nothing to mkdir into, because
+	// creating a directory needs a writable union mount.
+	//
+	// So this is "cannot check", not "misconfigured". Erroring here would fail
+	// EVERY publish on a mountless publisher, which is strictly worse than the
+	// gateway panic this function exists to prevent — and it would fail the
+	// common case (prefix already present) as loudly as the rare one.
+	//
+	// Warn rather than stay silent: on a mountless publisher, a first publish
+	// into a brand-new prefix will still hit the receiver panic, and the log
+	// line is what connects that panic back to here.
 	if !isDir(root) {
-		return fmt.Errorf("ingest backend: repository mount %q does not exist "+
-			"(is %s mounted on this publisher?)", root, repo)
+		b.obs.Logger.Warn("ingest backend: no repository mount — cannot verify or create ancestors",
+			"repo", repo, "mount", root, "parent", parent,
+			"note", "mountless publisher (connect-gw -P); a first publish into a new "+
+				"prefix may fail in the gateway with 'failed to graft nested catalog' "+
+				"or 'catalog for directory ... cannot be found'")
+		return nil
 	}
 
 	leaseTarget := repo

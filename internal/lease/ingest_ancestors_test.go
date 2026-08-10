@@ -146,24 +146,27 @@ func TestEnsureAncestors_NoopAtRepositoryRoot(t *testing.T) {
 	}
 }
 
-// TestEnsureAncestors_MissingMountIsAnError distinguishes "this prefix does not
-// exist yet" from "this repository is not mounted here". Walking up from an
-// unmounted repository would otherwise try to create the mount point.
-func TestEnsureAncestors_MissingMountIsAnError(t *testing.T) {
+// TestEnsureAncestors_MountlessIsSkippedNotFailed covers the mountless
+// publisher: `cvmfs_server connect-gw -P` registers a repository for gateway
+// publishing WITHOUT mounting it, so there is nothing to stat and nothing to
+// mkdir into.
+//
+// This must not be an error. Erroring would fail every publish on a mountless
+// publisher — including the overwhelmingly common case where the prefix already
+// exists — which is strictly worse than the gateway panic this function exists
+// to prevent. The earlier version of this code did exactly that, and it would
+// have blocked the ingest path in the testbed entirely.
+func TestEnsureAncestors_MountlessIsSkippedNotFailed(t *testing.T) {
 	calls := fakeCvmfsServer(t, "")
-	mount := t.TempDir() // deliberately no <mount>/<repo>
+	mount := t.TempDir() // deliberately no <mount>/<repo>: mountless publisher
 	b := NewIngestBackend(IngestOptions{CVMFSMount: mount}, newTestObs(t))
 
-	err := b.ensureAncestors(context.Background(), "bits.cern.ch",
-		filepath.Join(mount, "bits.cern.ch", "a/b/pkg"))
-	if err == nil {
-		t.Fatal("want error for unmounted repository, got nil")
-	}
-	if !strings.Contains(err.Error(), "does not exist") {
-		t.Errorf("error should name the missing mount, got: %v", err)
+	if err := b.ensureAncestors(context.Background(), "bits.cern.ch",
+		filepath.Join(mount, "bits.cern.ch", "a/b/pkg")); err != nil {
+		t.Fatalf("mountless publisher must be skipped, not failed: %v", err)
 	}
 	if got := calls(); len(got) != 0 {
-		t.Errorf("must not open a transaction against an unmounted repo, got %v", got)
+		t.Errorf("must not open a transaction with no mount to write into, got %v", got)
 	}
 }
 
