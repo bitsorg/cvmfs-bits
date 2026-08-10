@@ -213,6 +213,49 @@ func (s *Server) SetAllowedPublishPrefixes(prefixes []string) {
 	s.allowedPublishPrefixes = out
 }
 
+// validateSubPath rejects a job path that is not repository-relative.
+//
+// The submitted path is joined onto /cvmfs/<repo> everywhere downstream, and
+// BOTH joins silently absorb an absolute path instead of rejecting it:
+//
+//	filepath.Join("/cvmfs", "test.cvmfs.io", "/cvmfs/bits.cern.ch/alice/x")
+//	  => "/cvmfs/test.cvmfs.io/cvmfs/bits.cern.ch/alice/x"
+//
+// so a fully-qualified path from another repository lands *inside* this one and
+// passes every containment check, because it genuinely is under the root — just
+// at a nonsense location. Observed in production as
+//
+//	cvmfs_server ingest -N test.cvmfs.io -B cvmfs/bits.cern.ch/alice/el9-x86_64/...
+//
+// after a Testbed build reused packages whose .meta.json still carried the
+// production prefix. Nothing complained until the gateway had a transaction
+// open.
+//
+// The "cvmfs" leading-segment rule is the one that catches that case, and it is
+// worth the small loss of generality: no legitimate repository-relative path
+// starts with a `cvmfs/` component, and a caller that sends one has almost
+// certainly passed a full /cvmfs/<repo>/... path by mistake.
+func validateSubPath(p string) error {
+	if p == "" {
+		return nil // publish at the repository root
+	}
+	if strings.HasPrefix(p, "/") {
+		return fmt.Errorf("path must be repository-relative, not absolute (got %q) — "+
+			"send \"a/b/c\", not \"/cvmfs/<repo>/a/b/c\"", p)
+	}
+	clean := path.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return fmt.Errorf("path escapes the repository (got %q)", p)
+	}
+	if clean == "cvmfs" || strings.HasPrefix(clean, "cvmfs/") {
+		return fmt.Errorf("path starts with a %q component (got %q) — this is "+
+			"almost always a full /cvmfs/<repo>/... path submitted where a "+
+			"repository-relative one was expected; it would be published at "+
+			"<repo>/%s", "cvmfs", p, clean)
+	}
+	return nil
+}
+
 // publishAuthorized reports whether a {repo, subPath} target resolves to a path
 // under an authorized CVMFS root. path.Clean collapses any ".." so a traversal
 // cannot escape the namespace. No configured prefixes ⇒ allowed (check disabled).
@@ -928,6 +971,19 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if finalize && buildID == "" {
 		http.Error(w, `{"error":"finalize requires build_id"}`, http.StatusBadRequest)
 		return
+	}
+
+	// Shape: the path must be REPOSITORY-RELATIVE. Checked before containment,
+	// because a malformed path defeats the containment check rather than
+	// tripping it (see validateSubPath).
+	if !finalize {
+		if err := validateSubPath(subPath); err != nil {
+			os.RemoveAll(jobDir)
+			s.obs.Logger.Warn("submit: malformed target path",
+				"repo", repo, "path", subPath, "error", err)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Containment: a payload job must publish inside this deployment's authorized
