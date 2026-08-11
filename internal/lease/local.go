@@ -104,6 +104,30 @@ func (b *LocalBackend) Heartbeat(_ context.Context, _ string, _ time.Duration, _
 	return func() {} // no-op cancel
 }
 
+// ErrPublishInterrupted reports a publish killed by context cancellation or
+// timeout. It exists so the error CLASS does not depend on why the context
+// ended: cvmfs_server's own error is frequently ctx.Err() verbatim -- exec
+// returns it when Start sees a done context, and again when the process exits
+// 0 at the deadline -- and context.DeadlineExceeded satisfies net.Error, so
+// wrapping it makes ClassOf say "transient" and invites a retry of a publish
+// that may already be in the repository. Wrapping this instead keeps one
+// class, chosen deliberately; the cause is still in the message.
+var ErrPublishInterrupted = errors.New("publish interrupted")
+
+// interruptedPublishErr builds the error for a publish killed by cancellation
+// or timeout.
+//
+// Both causes are formatted with %v, never %w, so that neither can reach
+// errors.Is: cvmfs_server's own error IS ctx.Err() in reachable cases (exec
+// returns it when Start sees a done context, and again when the process exits 0
+// at the deadline), and context.DeadlineExceeded satisfies net.Error, so
+// wrapping it would make ClassOf report "transient" and invite a retry of a
+// publish that may already be in the repository. Only the sentinel is wrapped.
+func interruptedPublishErr(repo string, ctxErr, pubErr error, markerSeen bool) error {
+	return fmt.Errorf("%w: cvmfs_server publish %q (%v; commit marker seen: %t): %v",
+		ErrPublishInterrupted, repo, ctxErr, markerSeen, pubErr)
+}
+
 // Commit extracts the tar at req.TarPath into req.CVMFSDir and then runs
 // cvmfs_server publish on the repository identified by req.Token.
 //
@@ -113,6 +137,11 @@ func (b *LocalBackend) Heartbeat(_ context.Context, _ string, _ time.Duration, _
 //     semaphore is released.  Caller should treat as published.
 //   - any other error:            publish failed before or during cvmfs_server;
 //     semaphore is NOT released so Abort can still abort the open transaction.
+//     This includes an interrupted publish (ctx cancelled or timed out), where
+//     the output is a fragment of a killed run and its markers cannot be
+//     trusted — before the process group was killed on cancel, that case simply
+//     never returned, so ErrCommittedNotRemounted implied a finished commit by
+//     accident rather than by design.
 func (b *LocalBackend) Commit(ctx context.Context, req CommitRequest) error {
 	repo := req.Token // for local backend, token == repo name
 
@@ -149,9 +178,25 @@ func (b *LocalBackend) Commit(ctx context.Context, req CommitRequest) error {
 		// lands after the marker would otherwise be reported as
 		// ErrCommittedNotRemounted, which the orchestrator treats as published.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			b.evict(repo, b.semFor(repo))
-			return fmt.Errorf("cvmfs_server publish %q interrupted (%w): %w\noutput: %s",
-				repo, ctxErr, pubErr, logOut)
+			// Deliberately NOT evicting: this is an "any other error" return, so
+			// the semaphore stays held and Abort can still close the open
+			// transaction, per the contract above.
+			//
+			// ctxErr is formatted with %s, not %w, on purpose. Wrapping it makes
+			// the class depend on WHY the context ended — context.DeadlineExceeded
+			// satisfies net.Error so ClassOf calls it transient and the publisher
+			// retries, while context.Canceled is internal and it does not. A
+			// publish killed after the commit marker may already be in the
+			// repository, so retrying risks the duplicate publishes this whole
+			// change set exists to stop. One deterministic class, chosen rather
+			// than inherited; the marker is reported so an operator can tell
+			// which side of the commit it died on.
+			b.obs.Logger.Warn("local backend: publish interrupted",
+				"repo", repo, "cause", ctxErr.Error(),
+				"committed_marker", strings.Contains(out, "Exporting repository manifest"),
+				"output", logOut)
+			return interruptedPublishErr(repo, ctxErr, pubErr,
+				strings.Contains(out, "Exporting repository manifest"))
 		}
 		if strings.Contains(out, "Exporting repository manifest") {
 			// Phase 1 (catalog commit) succeeded; only the FUSE remount failed.

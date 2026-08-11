@@ -774,7 +774,7 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 	// Fetch current root hash from .cvmfspublished (~200-byte HTTP GET).
 	mkdirOldRoot, fetchErr := cvmfscatalog.FetchManifestRootHash(ctx, nil, o.Stratum0URL, j.Repo)
 	if fetchErr != nil {
-		_ = o.leaseFor(j).Abort(ctx, mkdirToken)
+		o.abortLeaseDetached(j, mkdirToken)
 		return fmt.Errorf("mkdir-p: fetch manifest: %w", fetchErr)
 	}
 
@@ -790,7 +790,7 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 		// ObjectHashes intentionally empty: no data objects in a dir-only catalog.
 	})
 	if commitErr != nil {
-		_ = o.leaseFor(j).Abort(ctx, mkdirToken)
+		o.abortLeaseDetached(j, mkdirToken)
 		return fmt.Errorf("mkdir-p: commit for %q: %w", graftPath, commitErr)
 	}
 
@@ -1989,7 +1989,11 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 	// Release any stale transaction.  The token may have already been
 	// released or expired — Abort is idempotent and errors are non-fatal here.
 	if j.LeaseToken != "" {
-		if releaseErr := o.leaseFor(j).Abort(ctx, j.LeaseToken); releaseErr != nil {
+		// Detached context: Recover runs at startup and during shutdown, where
+		// the caller's ctx is routinely already cancelled — an abort issued on
+		// it is a silent no-op and strands the lease until the gateway expires
+		// it. Same reason as the rollback paths in ensureParentDirs.
+		if releaseErr := o.abortLeaseDetachedErr(j, j.LeaseToken); releaseErr != nil {
 			logger.Warn("failed to abort stale transaction during recovery (ignoring)",
 				"token", j.LeaseToken, "error", releaseErr)
 		}
@@ -2104,4 +2108,34 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	}
 
 	return err
+}
+
+// leaseAbortTimeout bounds a rollback issued on a detached context.
+// Matches abortJob's cleanupCtx budget: one number for "abort a lease",
+// and short enough to fit inside the 30s shutdown budget rather than
+// guaranteeing it cannot complete there.
+const leaseAbortTimeout = 30 * time.Second
+
+// abortLeaseDetached releases a lease using a FRESH context.
+//
+// The usual reason to be rolling back is that the job's context is already
+// cancelled or past its deadline — and an abort issued on that context is a
+// silent no-op: exec.Cmd.Start returns ctx.Err() before forking, and an HTTP
+// abort fails the same way. The lease then sits until the gateway expires it,
+// blocking the repository. abortJob already takes this precaution; these paths
+// did not, which mattered little while a cancelled cvmfs_server never returned
+// at all, and matters now that the process group is killed on cancel.
+func (o *Orchestrator) abortLeaseDetached(j *job.Job, token string) {
+	if err := o.abortLeaseDetachedErr(j, token); err != nil {
+		o.Obs.Logger.Warn("could not abort lease during rollback",
+			"repo", j.Repo, "token", token, "error", err)
+	}
+}
+
+// abortLeaseDetachedErr is abortLeaseDetached for callers that report the error
+// themselves.
+func (o *Orchestrator) abortLeaseDetachedErr(j *job.Job, token string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), leaseAbortTimeout)
+	defer cancel()
+	return o.leaseFor(j).Abort(ctx, token)
 }

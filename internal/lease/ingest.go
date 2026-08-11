@@ -347,12 +347,26 @@ func (b *IngestBackend) ensureAncestors(ctx context.Context, repo, cvmfsDir stri
 // abortOwn rolls back a transaction this backend opened itself. Failure is
 // logged, never returned: the caller is already failing for a better reason and
 // an orphaned transaction is the gateway's lease to expire.
-func (b *IngestBackend) abortOwn(ctx context.Context, repo, why string) {
+//
+// The caller's context is deliberately NOT used. The common reason to be here
+// is that the context is already done — and exec.Cmd.Start returns ctx.Err()
+// before forking, so the abort would be a silent no-op and leave the
+// transaction this function itself opened dangling until the lease expired.
+// That mattered little while a cancelled cvmfs_server never returned at all;
+// now that the process group is killed on cancel, this path is reachable.
+func (b *IngestBackend) abortOwn(_ context.Context, repo, why string) {
+	ctx, cancel := context.WithTimeout(context.Background(), abortCleanupTimeout)
+	defer cancel()
 	if out, err := b.cvmfsServerOutput(ctx, "abort", "-f", repo); err != nil {
 		b.obs.Logger.Error("ingest backend: could not abort own transaction",
 			"repo", repo, "reason", why, "error", err, "output", truncateLog(out))
 	}
 }
+
+// abortCleanupTimeout bounds a rollback that runs on a fresh context. Long
+// enough for `cvmfs_server abort -f` on a large transaction, short enough that
+// a wedged abort cannot hold a failing job open indefinitely.
+const abortCleanupTimeout = 30 * time.Second
 
 // deepestExisting walks up from dir towards root and returns the first
 // directory that exists. root is assumed to exist and is the stopping point, so

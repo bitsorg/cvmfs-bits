@@ -32,8 +32,28 @@ func TestCvmfsServerCmd_ReapRaceDoesNotFailASuccessfulCommand(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	// Deterministic half: reap first, THEN invoke the cancel closure directly.
+	// That is exactly the state Cancel finds when it loses the race, with none
+	// of the scheduling luck — the probabilistic loop below observes a
+	// successful process in only a handful of its iterations, so on its own it
+	// passes about half the time with the bug reintroduced.
+	t.Run("cancel after reap reports ErrProcessDone", func(t *testing.T) {
+		cmd := newCvmfsServerCmd(context.Background(), "publish", "test.cvmfs.io")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+		if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
+			t.Fatalf("Cancel() after the group was reaped = %v; want os.ErrProcessDone. "+
+				"os/exec promotes any other non-nil value into the command's "+
+				"error, so a command that succeeded is reported as failed.", err)
+		}
+	})
+
 	const iterations = 400
-	spurious := 0
+	spurious, observed := 0, 0
 	for i := 0; i < iterations; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		cmd := newCvmfsServerCmd(ctx, "publish", "test.cvmfs.io")
@@ -50,19 +70,24 @@ func TestCvmfsServerCmd_ReapRaceDoesNotFailASuccessfulCommand(t *testing.T) {
 		// (and do) check ctx.Err(). What must NOT happen is a DIFFERENT error —
 		// that is the ESRCH path, where os/exec promotes the cancel failure into
 		// the command's error and a successful run looks like a failed one.
-		if cmd.ProcessState != nil && cmd.ProcessState.Success() && err != nil &&
-			!errors.Is(err, context.Canceled) {
-			spurious++
-			if spurious == 1 {
-				t.Logf("first spurious failure on iteration %d: %v", i, err)
+		if cmd.ProcessState != nil && cmd.ProcessState.Success() {
+			observed++
+			if err != nil && !errors.Is(err, context.Canceled) {
+				spurious++
+				if spurious == 1 {
+					t.Logf("first spurious failure on iteration %d: %v", i, err)
+				}
 			}
 		}
 	}
 	if spurious != 0 {
 		t.Errorf("%d/%d successful runs failed with a non-cancellation error; "+
 			"ESRCH from the group kill is not mapped to os.ErrProcessDone",
-			spurious, iterations)
+			spurious, observed)
 	}
+	// Without this the loop can "pass" having never seen a successful process,
+	// which is how the original version of this test managed to be a coin flip.
+	t.Logf("observed %d/%d iterations where the process exited 0", observed, iterations)
 }
 
 // TestCvmfsServerCmd_CancelKillsTheWholeGroup is the regression test for an

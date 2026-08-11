@@ -48,10 +48,13 @@ func newCvmfsServerCmd(ctx context.Context, args ...string) *exec.Cmd {
 		if cmd.Process != nil {
 			pid = cmd.Process.Pid
 		}
-		// kill(-1) signals every process we may signal, and kill(0) the whole
-		// caller's group. Neither is reachable via os/exec's contract, but the
-		// blast radius if it ever were is the entire container.
-		if pid <= 0 {
+		// Guard the pids whose NEGATION is catastrophic: kill(-1) signals every
+		// process we are permitted to signal — the whole container, and this
+		// daemon usually runs as root — and kill(0) the caller's own group.
+		// pid 1 is the one that yields -1, so the bound is 1, not 0. Neither is
+		// reachable via os/exec's contract; the blast radius if it ever were is
+		// what makes the check worth its two lines.
+		if pid <= 1 {
 			return os.ErrProcessDone
 		}
 		// Negative pid: signal the entire process group, not just the leader.
