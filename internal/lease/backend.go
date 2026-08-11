@@ -75,6 +75,13 @@ type CommitRequest struct {
 	// DirectGraft is purely a performance optimisation.
 	DirectGraft bool
 
+	// DirectS3 adds --direct-s3 to `cvmfs_server ingest`, sending data objects
+	// straight to S3 while catalogs still go through the gateway session.
+	// Ignored by backends that do not shell out to cvmfs_server.
+	//
+	// False does not pass --no-direct-s3; it defers to the repository config.
+	DirectS3 bool
+
 	// ── Tagging (gateway mode) ───────────────────────────────────────────────
 
 	// TagName is the optional CVMFS snapshot tag to create on commit.

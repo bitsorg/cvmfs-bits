@@ -590,6 +590,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		buildID                   string   // optional: groups a build's packages (ADR-0007)
 		buildExpect               int      // optional: package count → auto-finalize when reached
 		finalize                  bool     // coarse-publish finalize job (no tar payload)
+		directS3                  bool     // pass --direct-s3 to cvmfs_server ingest (this job only)
 		publishPath               string   // optional: "prepub" (default) or "ingest"
 		preWarm                   *bool    // optional: nil = node default
 	)
@@ -897,6 +898,18 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preloadExe = field("preload_exe") // optional
 		buildID = field("build_id")       // optional (ADR-0007 coarse publish)
 		finalize = field("finalize") == "true"
+		// Parsed, not compared against "true": this knob exists to A/B the two
+		// transports, and a typo that silently means false yields a full
+		// gateway-path run recorded as a direct-S3 run. Fail loudly instead.
+		if raw := field("direct_s3"); raw != "" {
+			v, convErr := strconv.ParseBool(strings.TrimSpace(raw))
+			if convErr != nil {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"direct_s3 must be a boolean"}`, http.StatusBadRequest)
+				return
+			}
+			directS3 = v
+		}
 		// build_expect: how many packages this build will contain.  When set,
 		// prepub finalizes the build itself once that many have accumulated,
 		// so the producer can exit after its last upload.
@@ -1011,6 +1024,18 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
+	// direct_s3 is a property of the ingest path: it becomes --direct-s3 on
+	// cvmfs_server. On any other path nothing reads it, and accepting it would
+	// hand back a 202 for a request whose central instruction was dropped —
+	// the same reasoning applied to prewarm and build_id below, and the same
+	// silent-success failure this flag was added to remove.
+	if directS3 && publishPath != "ingest" {
+		os.RemoveAll(jobDir)
+		http.Error(w, fmt.Sprintf(
+			`{"error":"direct_s3 is only supported on the \"ingest\" publish path (got %q)"}`,
+			jsonEscape(publishPath)), http.StatusBadRequest)
+		return
+	}
 	if publishPath != "" && publishPath != DefaultPublishPath {
 		// Pre-warming is a property of the prepub pipeline: the ingest path
 		// commits through the gateway, so there is no window in which the
@@ -1052,6 +1077,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.Path = subPath
 	j.BuildID = buildID
 	j.Finalize = finalize
+	j.DirectS3 = directS3
 	j.WebhookURL = webhookURL
 	j.TarSHA256 = submittedSHA256
 	j.TagName = tagName

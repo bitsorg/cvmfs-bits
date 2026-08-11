@@ -30,9 +30,12 @@ import (
 //
 // after which `cvmfs_server ingest` opens its own gateway lease, streams the
 // tar through `cvmfs_swissknife ingest`, uploads the objects and closes the
-// lease — no FUSE mount, no overlay, no privileged container. Where the
-// publisher additionally has /etc/cvmfs/<repo>.s3.conf, data chunks go straight
-// to S3 and only catalogs pass through the gateway.
+// lease — no FUSE mount, no overlay, no privileged container. With
+// CommitRequest.DirectS3 it also passes --direct-s3, so data chunks go straight
+// to S3 and only catalogs pass through the gateway; the S3 config is read from
+// /etc/cvmfs/<repo>.s3.conf (or --s3-config / CVMFS_INGEST_DIRECT_S3_CONFIG).
+// The file's presence alone does NOT enable it — that was true only of an early
+// prototype, and assuming it still held cost a full round of debugging.
 //
 // What this trades away, deliberately: no pre-warming (Stratum 1s see the
 // content only after the commit), no local dedup, and one gateway transaction
@@ -229,16 +232,13 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 	// the last flag is consumed as the repository name instead — with no owner
 	// the "-c" would silently become the repo and the publish would die in
 	// load_repo_config.
-	args := []string{"ingest", "-t", req.TarPath, "-b", base}
-	if b.nestedCatalog {
-		args = append(args, "-c")
-	}
-	if b.owner != "" {
-		args = append(args, "-u", b.owner)
-	}
-	args = append(args, repo)
+	args := b.commitArgs(repo, base, req.TarPath, req.DirectS3)
 
-	b.obs.Logger.Info("ingest backend: publishing", "repo", repo, "base", base, "tar", req.TarPath)
+	// direct_s3 is logged on both lines because its failure mode is silence:
+	// when it does not take effect the publish still succeeds, via the gateway,
+	// and the only other clue is an empty bucket.
+	b.obs.Logger.Info("ingest backend: publishing",
+		"repo", repo, "base", base, "tar", req.TarPath, "direct_s3", req.DirectS3)
 	start := time.Now()
 	out, err := b.cvmfsServerOutput(ctx, args...)
 	if err != nil {
@@ -246,7 +246,8 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 			base, err, truncateLog(out))
 	}
 	b.obs.Logger.Info("ingest backend: published",
-		"repo", repo, "base", base, "duration", time.Since(start).String())
+		"repo", repo, "base", base, "duration", time.Since(start).String(),
+		"direct_s3", req.DirectS3)
 	return nil
 }
 
@@ -396,13 +397,20 @@ func truncateLog(s string) string {
 // commitArgs exposes the argument vector for testing: the ordering constraint
 // it encodes is enforced by a shell script in another project, so it deserves a
 // test rather than a comment alone.
-func (b *IngestBackend) commitArgs(repo, base, tarPath string) []string {
+func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3 bool) []string {
 	args := []string{"ingest", "-t", tarPath, "-b", base}
 	if b.nestedCatalog {
 		args = append(args, "-c")
 	}
 	if b.owner != "" {
 		args = append(args, "-u", b.owner)
+	}
+	if directS3 {
+		// Data objects go straight to S3; only catalogs traverse the gateway.
+		// cvmfs_server finds the config itself (--s3-config,
+		// CVMFS_INGEST_DIRECT_S3_CONFIG, or /etc/cvmfs/<repo>.s3.conf); the
+		// file's presence is NOT the trigger, whatever an earlier prototype did.
+		args = append(args, "--direct-s3")
 	}
 	return append(args, repo)
 }

@@ -199,7 +199,7 @@ func TestIngestBackend_CommitArgsPutRepoLast(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := NewIngestBackend(tc.opt, newTestObs(t))
-			got := b.commitArgs("repo.example.org", "pkg/1.0", "/spool/p.tar")
+			got := b.commitArgs("repo.example.org", "pkg/1.0", "/spool/p.tar", false)
 			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
 				t.Errorf("commitArgs =\n  %v\nwant\n  %v", got, tc.want)
 			}

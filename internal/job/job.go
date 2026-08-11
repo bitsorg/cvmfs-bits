@@ -116,6 +116,16 @@ type Job struct {
 	// of pipelining a tar, the orchestrator publishes all of the build's
 	// accumulated packages in one ingestsql commit. Carries no payload.
 	Finalize bool `json:"finalize,omitempty"`
+
+	// DirectS3 asks the ingest backend to pass --direct-s3, so cvmfs_server
+	// uploads data objects straight to S3 and only catalogs traverse the
+	// gateway. Per job on purpose: it is the knob the two publish paths are
+	// compared with, and requiring a reconfigure to switch would mean the two
+	// measurements were taken against different deployments.
+	//
+	// Absent/false does NOT pass --no-direct-s3: it leaves the decision to the
+	// repository config, whose default is off.
+	DirectS3 bool `json:"direct_s3,omitempty"`
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string
 	// TarName is the original base filename of the submitted tar (e.g.
