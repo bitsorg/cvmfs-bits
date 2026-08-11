@@ -429,7 +429,7 @@ func (b *IngestBackend) Probe(_ context.Context) error {
 // ── subprocess helpers ────────────────────────────────────────────────────────
 
 func (b *IngestBackend) cvmfsServerOutput(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "cvmfs_server", args...)
+	cmd := newCvmfsServerCmd(ctx, args...)
 	raw, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(raw))
 	if out != "" {

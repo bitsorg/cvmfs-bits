@@ -219,7 +219,7 @@ const maxCvmfsLogBytes = 8192
 // always returned regardless of exit status so callers can inspect specific
 // markers; only the structured-log entry is capped at maxCvmfsLogBytes.
 func (b *LocalBackend) cvmfsServerOutput(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "cvmfs_server", args...)
+	cmd := newCvmfsServerCmd(ctx, args...)
 	raw, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(raw))
 	if out != "" {
