@@ -141,6 +141,18 @@ func (b *LocalBackend) Commit(ctx context.Context, req CommitRequest) error {
 	}
 
 	if pubErr != nil {
+		// A cancelled context means we killed cvmfs_server mid-publish, so the
+		// output is a fragment of an interrupted run and its markers cannot be
+		// trusted. Before the process-group kill this branch was unreachable on
+		// timeout — the publish simply never returned — so "marker printed =>
+		// commit finished" held by accident. It no longer does: a kill that
+		// lands after the marker would otherwise be reported as
+		// ErrCommittedNotRemounted, which the orchestrator treats as published.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			b.evict(repo, b.semFor(repo))
+			return fmt.Errorf("cvmfs_server publish %q interrupted (%w): %w\noutput: %s",
+				repo, ctxErr, pubErr, logOut)
+		}
 		if strings.Contains(out, "Exporting repository manifest") {
 			// Phase 1 (catalog commit) succeeded; only the FUSE remount failed.
 			b.obs.Logger.Warn("local backend: catalog committed but FUSE remount failed",

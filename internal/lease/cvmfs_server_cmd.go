@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build unix
+
 package lease
 
 import (
 	"context"
+	"errors"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -40,11 +44,31 @@ func newCvmfsServerCmd(ctx context.Context, args ...string) *exec.Cmd {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
+		pid := 0
+		if cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
+		// kill(-1) signals every process we may signal, and kill(0) the whole
+		// caller's group. Neither is reachable via os/exec's contract, but the
+		// blast radius if it ever were is the entire container.
+		if pid <= 0 {
+			return os.ErrProcessDone
 		}
 		// Negative pid: signal the entire process group, not just the leader.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+			// Cancel races Wait: when the context fires and the child exits at
+			// the same moment, Go picks between them at random, so the group can
+			// already be reaped. Raw Kill then returns ESRCH, and os/exec turns
+			// a non-nil, non-ErrProcessDone cancel error into the command's
+			// error — reporting a command that SUCCEEDED as failed. Measured at
+			// ~6% of races; os.Process.Kill avoids it by returning
+			// ErrProcessDone, which os/exec swallows. Do the same.
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
 	}
 
 	// If a group member still holds the pipe after the kill, give up on it
