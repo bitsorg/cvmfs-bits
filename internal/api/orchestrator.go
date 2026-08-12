@@ -1742,6 +1742,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		TagDescription: j.TagDescription,
 		DirectGraft:    o.DirectGraft,
 		DirectS3:       j.DirectS3,
+		ObjectList:     j.ObjectList,
 	}
 	if preMutexLease {
 		// Catalog already uploaded to the gateway in Phase 2.7 (BuildSubtree).

@@ -4,6 +4,7 @@
 package lease
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -232,23 +233,102 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 	// the last flag is consumed as the repository name instead — with no owner
 	// the "-c" would silently become the repo and the publish would die in
 	// load_repo_config.
-	args := b.commitArgs(repo, base, req.TarPath, req.DirectS3)
+	// Resolved once for the branch below; commitArgs re-checks the same rule
+	// independently. Both must agree before the flag is emitted, so the pair
+	// can only ever fail closed — see the comment at the commitArgs guard.
+	useObjectList := req.ObjectList && req.DirectS3
+	if req.ObjectList && !req.DirectS3 {
+		// Dropped, not refused — ingress rejects this combination with a 400
+		// once object_list is accepted there. Say so rather than going quiet.
+		b.obs.Logger.Warn("ingest backend: object_list ignored without direct_s3",
+			"repo", repo, "base", base)
+	}
+	args := b.commitArgs(repo, base, req.TarPath, req.DirectS3, useObjectList)
 
 	// direct_s3 is logged on both lines because its failure mode is silence:
 	// when it does not take effect the publish still succeeds, via the gateway,
 	// and the only other clue is an empty bucket.
 	b.obs.Logger.Info("ingest backend: publishing",
-		"repo", repo, "base", base, "tar", req.TarPath, "direct_s3", req.DirectS3)
+		"repo", repo, "base", base, "tar", req.TarPath, "direct_s3", req.DirectS3,
+		"object_list", req.ObjectList)
 	start := time.Now()
-	out, err := b.cvmfsServerOutput(ctx, args...)
+
+	// Two shapes, because collecting the list needs Start/Wait around the pipe
+	// and cvmfsServerOutput uses CombinedOutput, which does both itself. The
+	// no-list branch is the pre-existing call, untouched.
+	var (
+		out       string
+		err       error
+		listed    int
+		readToEOF bool
+	)
+	if useObjectList {
+		out, readToEOF, err = b.cvmfsServerOutputWithObjectList(ctx,
+			func(string) { listed++ }, args...)
+	} else {
+		out, err = b.cvmfsServerOutput(ctx, args...)
+	}
+
 	if err != nil {
+		if useObjectList {
+			// Logged, not returned: a failed publish still uploaded objects,
+			// and the count separates "nothing happened" from "a partial
+			// revision is in S3". Never a pre-warm input — the revision was
+			// not published — so the verdict is stated rather than implied by
+			// the absence of the field.
+			b.obs.Logger.Warn("ingest backend: publish failed, object list is partial",
+				"repo", repo, "base", base,
+				"object_list_lines", listed, "object_list_authoritative", false)
+		}
 		return fmt.Errorf("cvmfs_server ingest into %q: %w (output: %s)",
 			base, err, truncateLog(out))
 	}
-	b.obs.Logger.Info("ingest backend: published",
+	fields := []any{
 		"repo", repo, "base", base, "duration", time.Since(start).String(),
-		"direct_s3", req.DirectS3)
+		"direct_s3", req.DirectS3,
+	}
+	if useObjectList {
+		// Authoritative needs BOTH: err==nil (checked above, so the revision
+		// really was published) and readToEOF (the reader was not cut short).
+		// Either alone warms a cache from a set that is wrong or partial, so
+		// log the verdict rather than a bare count whose meaning depends on a
+		// field nobody printed.
+		// LINES, not confirmed objects: a "<key> failed -" line is counted too.
+		// A consumer that pre-warms from every line would fetch objects that
+		// never reached S3, so the name has to say what it is.
+		fields = append(fields, "object_list_lines", listed,
+			"object_list_authoritative", readToEOF)
+		if !readToEOF {
+			b.obs.Logger.Warn("ingest backend: publish succeeded but the object "+
+				"list was truncated; do not pre-warm from it",
+				"repo", repo, "base", base, "object_list_lines", listed)
+		}
+	}
+	b.obs.Logger.Info("ingest backend: published", fields...)
 	return nil
+}
+
+// cvmfsServerOutputWithObjectList runs cvmfs_server with the object-list pipe
+// attached, calling onLine for each line the publisher writes to it.
+//
+// Same combined stdout+stderr capture as cvmfsServerOutput: os/exec gives both
+// streams a single pipe when Stdout and Stderr are the same writer, which is
+// how CombinedOutput itself avoids interleaving two goroutines into one buffer.
+func (b *IngestBackend) cvmfsServerOutputWithObjectList(
+	ctx context.Context, onLine func(string), args ...string,
+) (string, bool, error) {
+	cmd := newCvmfsServerCmd(ctx, args...)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	readToEOF, err := runWithObjectList(ctx, cmd, b.obs.Logger, onLine)
+
+	out := strings.TrimSpace(buf.String())
+	if out != "" {
+		b.obs.Logger.Debug("cvmfs_server", "args", args, "output", truncateLog(out))
+	}
+	return out, readToEOF, err
 }
 
 // ensureAncestors creates the parent directory chain of cvmfsDir when it does
@@ -397,7 +477,7 @@ func truncateLog(s string) string {
 // commitArgs exposes the argument vector for testing: the ordering constraint
 // it encodes is enforced by a shell script in another project, so it deserves a
 // test rather than a comment alone.
-func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3 bool) []string {
+func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3, objectList bool) []string {
 	args := []string{"ingest", "-t", tarPath, "-b", base}
 	if b.nestedCatalog {
 		args = append(args, "-c")
@@ -412,6 +492,20 @@ func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3 bool) []
 		// file's presence is NOT the trigger, whatever an earlier prototype did.
 		args = append(args, "--direct-s3")
 	}
+	// Only meaningful with --direct-s3, and cvmfs_server aborts the transaction
+	// if given one without the other, so never emit it alone. The path names
+	// the inherited pipe runWithObjectList attaches; it is valid ONLY for a
+	// command run through that function.
+	// Deliberately re-checked here as well as in Commit: both must agree, so
+	// the pair can only fail CLOSED. The drift that would hurt is "flag
+	// emitted, pipe not attached" — cvmfs_server would then open its OWN fd 3
+	// (a shell lock descriptor) with fopen(,"w"), i.e. O_TRUNC.
+	if objectList && directS3 {
+		args = append(args, "--object-list", objectListChildPath())
+	}
+	// The repository stays last: cvmfs_server's option loop runs
+	// `while [ "$2" != "" ]` and takes $1 as the repository name, so anything
+	// appended after this is consumed as the repository instead.
 	return append(args, repo)
 }
 

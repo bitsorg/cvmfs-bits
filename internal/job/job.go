@@ -126,6 +126,18 @@ type Job struct {
 	// Absent/false does NOT pass --no-direct-s3: it leaves the decision to the
 	// repository config, whose default is off.
 	DirectS3 bool `json:"direct_s3,omitempty"`
+
+	// ObjectList asks the ingest backend to collect the list of data objects
+	// the publisher confirmed into S3, so it can later pre-warm Stratum 1
+	// without re-deriving the set. Only the direct-S3 uploader produces it, so
+	// it is meaningless without DirectS3: the backend drops it with a warning,
+	// and ingress will reject the combination with a 400.
+	//
+	// A separate knob from DirectS3 rather than implied by it: it changes what
+	// the publisher reports, not how it publishes, so keeping it independent
+	// lets its cost be measured on its own.
+	ObjectList bool `json:"object_list,omitempty"`
+
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string
 	// TarName is the original base filename of the submitted tar (e.g.

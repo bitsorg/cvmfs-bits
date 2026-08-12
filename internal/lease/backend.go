@@ -82,6 +82,12 @@ type CommitRequest struct {
 	// False does not pass --no-direct-s3; it defers to the repository config.
 	DirectS3 bool
 
+	// ObjectList adds --object-list, handing the publisher an inherited pipe
+	// and collecting the data objects it confirmed into S3. Requires DirectS3:
+	// only that uploader writes the list, and cvmfs_server refuses the flag
+	// without it. Ignored by backends that do not shell out to cvmfs_server.
+	ObjectList bool
+
 	// ── Tagging (gateway mode) ───────────────────────────────────────────────
 
 	// TagName is the optional CVMFS snapshot tag to create on commit.
