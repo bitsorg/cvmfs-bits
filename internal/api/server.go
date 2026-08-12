@@ -591,6 +591,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		buildExpect               int      // optional: package count → auto-finalize when reached
 		finalize                  bool     // coarse-publish finalize job (no tar payload)
 		directS3                  bool     // pass --direct-s3 to cvmfs_server ingest (this job only)
+		objectList                bool     // collect the S3 object list (needs directS3)
 		publishPath               string   // optional: "prepub" (default) or "ingest"
 		preWarm                   *bool    // optional: nil = node default
 	)
@@ -910,6 +911,18 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 			directS3 = v
 		}
+		// Same reasoning as direct_s3: parsed, not compared against "true", so
+		// a typo fails loudly instead of yielding a run with no list that is
+		// recorded as a run with one.
+		if raw := field("object_list"); raw != "" {
+			v, convErr := strconv.ParseBool(strings.TrimSpace(raw))
+			if convErr != nil {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"object_list must be a boolean"}`, http.StatusBadRequest)
+				return
+			}
+			objectList = v
+		}
 		// build_expect: how many packages this build will contain.  When set,
 		// prepub finalizes the build itself once that many have accumulated,
 		// so the producer can exit after its last upload.
@@ -1036,6 +1049,23 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			jsonEscape(publishPath)), http.StatusBadRequest)
 		return
 	}
+	// object_list rides on the direct-S3 uploader: only that one writes a list,
+	// and cvmfs_server ABORTS the transaction when given --object-list without
+	// --direct-s3. Accepting it here would hand back a 202 for a request that
+	// either drops its instruction or fails at commit. Refuse both mismatches
+	// separately so the message names the one that is actually wrong.
+	if objectList && publishPath != "ingest" {
+		os.RemoveAll(jobDir)
+		http.Error(w, fmt.Sprintf(
+			`{"error":"object_list is only supported on the \"ingest\" publish path (got \"%s\")"}`,
+			jsonEscape(publishPath)), http.StatusBadRequest)
+		return
+	}
+	if objectList && !directS3 {
+		os.RemoveAll(jobDir)
+		http.Error(w, `{"error":"object_list requires direct_s3"}`, http.StatusBadRequest)
+		return
+	}
 	if publishPath != "" && publishPath != DefaultPublishPath {
 		// Pre-warming is a property of the prepub pipeline: the ingest path
 		// commits through the gateway, so there is no window in which the
@@ -1078,6 +1108,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.BuildID = buildID
 	j.Finalize = finalize
 	j.DirectS3 = directS3
+	j.ObjectList = objectList
 	j.WebhookURL = webhookURL
 	j.TarSHA256 = submittedSHA256
 	j.TagName = tagName

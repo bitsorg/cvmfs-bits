@@ -130,8 +130,8 @@ type Job struct {
 	// ObjectList asks the ingest backend to collect the list of data objects
 	// the publisher confirmed into S3, so it can later pre-warm Stratum 1
 	// without re-deriving the set. Only the direct-S3 uploader produces it, so
-	// it is meaningless without DirectS3: the backend drops it with a warning,
-	// and ingress will reject the combination with a 400.
+	// it is meaningless without DirectS3: ingress rejects the combination
+	// with a 400, and the backend drops it with a warning if it ever arrives.
 	//
 	// A separate knob from DirectS3 rather than implied by it: it changes what
 	// the publisher reports, not how it publishes, so keeping it independent
