@@ -56,6 +56,21 @@ const (
 	// the whole call including the body transfer and any SDK retries, so it must
 	// accommodate the largest single object at the slowest tolerable rate.
 	opTimeout = 15 * time.Minute
+
+	// maxIdleConnsPerHost sizes the keep-alive pool toward the (single) object
+	// store host. The SDK's BuildableClient default transport parks only 10
+	// idle connections per host (100 total) — so with ~128 workers in flight,
+	// each drain cycle closes ~118 connections into 60 s TIME_WAIT. At full
+	// pipeline rate that exhausts the ~28k ephemeral ports in minutes and
+	// every subsequent dial fails with "cannot assign requested address"
+	// (observed 2026-08-12: 64 of 170 jobs lost in a 39 s window).
+	// Sized >= max job slots (32) x upload workers (4) so every in-flight
+	// request can park and reuse a connection; keep in step with those two
+	// knobs. Same reasoning as the distribute receiver's 128.
+	//
+	// This fixes steady-state churn only: connections closed by errors or
+	// timeouts still go to TIME_WAIT, so an error storm can still churn.
+	maxIdleConnsPerHost = 256
 )
 
 // withTimeout bounds a single CAS operation.
@@ -110,6 +125,11 @@ func NewS3(ctx context.Context, st S3Settings) (*S3, error) {
 				tr.ResponseHeaderTimeout = responseHeaderTimeout
 				tr.ExpectContinueTimeout = expectContinueTimeout
 				tr.IdleConnTimeout = idleConnTimeout
+				// Reuse connections instead of churning them into TIME_WAIT;
+				// see maxIdleConnsPerHost. MaxIdleConns must be raised too:
+				// its SDK default (100) would otherwise cap the per-host pool.
+				tr.MaxIdleConns = maxIdleConnsPerHost
+				tr.MaxIdleConnsPerHost = maxIdleConnsPerHost
 			})),
 		// Credentials come from the repository's own S3 config, NOT from the
 		// ambient AWS chain: the prepub must authenticate as the identity that
