@@ -33,6 +33,25 @@ type capturingBackend struct {
 	// promotedBy is read at Commit time to prove promotion happened FIRST.
 	promotedBy func() int
 	promotedAt int
+	acquiredAt int
+	acquires   int
+}
+
+// Acquire records how much promotion had happened by the time the lease was
+// taken. The promotion is a byte copy that needs no exclusivity, and holding a
+// non-renewable gateway lease across it burns max_lease_time while blocking
+// every other publish to the repository.
+func (c *capturingBackend) Acquire(_ context.Context, _, _ string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.promotedBy != nil && c.acquires == 0 {
+		// FIRST acquire only. Last-write-wins would silently start describing a
+		// different call as soon as a test sets Stratum0URL and ensureParentDirs
+		// begins taking its own lease.
+		c.acquiredAt = c.promotedBy()
+	}
+	c.acquires++
+	return "noop-token", nil
 }
 
 func (c *capturingBackend) Commit(_ context.Context, req lease.CommitRequest) error {
@@ -202,6 +221,18 @@ func TestRun_StagedPublishPromotesThenGrafts(t *testing.T) {
 	if cb.promotedAt != 1 {
 		t.Errorf("promotion had run %d times when Commit was called, want 1 — "+
 			"the objects must be in the CAS before the graft", cb.promotedAt)
+	}
+	// ...and it must have finished BEFORE the lease was taken. The copy needs no
+	// exclusivity; running it under the lease burns a non-renewable
+	// max_lease_time and blocks every other publish to this repository.
+	//
+	// NEGATIVE CONTROL: move the promotion block back below Phase 3 and this
+	// reports 0. Verified.
+	if cb.acquires == 0 {
+		t.Error("no lease was acquired; the ordering assertion below proves nothing")
+	} else if cb.acquiredAt != 1 {
+		t.Errorf("promotion had run %d times when the lease was acquired, want 1 — "+
+			"promotion must complete before the lease is held", cb.acquiredAt)
 	}
 }
 

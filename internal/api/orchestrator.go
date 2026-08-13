@@ -1659,6 +1659,78 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// was already acquired and the heartbeat already started in Phase 2.7.
 	// Skip acquisition here to avoid a redundant gateway round-trip.
 	if !o.leaseFor(j).NeedsPipeline() {
+		// ── Staged publish: promote, BEFORE the lock and the lease ────────────
+		//
+		// A producer running the canonical publisher elsewhere already chunked,
+		// compressed and hashed this package into a prefix of the repository's
+		// own bucket, and built the subtree catalog. There is no tar: prepub
+		// moves the objects into the CAS with a server-side copy and asks the
+		// gateway to graft the catalog the producer named.
+		//
+		// The receiver fetches that catalog from stratum0 by content hash
+		// (receiver/commit_processor.cc), so the objects must be in the store
+		// before the commit -- otherwise the graft downloads what is not there.
+		// "Before the commit" is the whole constraint, and it does NOT imply
+		// holding anything: promotion adds content-addressed objects that no
+		// catalog references yet, so they are invisible to clients and harmless
+		// to repeat. It publishes nothing.
+		//
+		// Of the two, only "before the lease" is observed by a test (the fake
+		// backend samples the promotion count inside Acquire). "Before the lock"
+		// rests on the placement being read, not on an assertion.
+		//
+		// Doing it here rather than after Phase 3 matters at scale. A
+		// multi-thousand-object copy took minutes while holding a gateway lease
+		// that CANNOT be renewed -- Renew returns ErrRenewalNotSupported and the
+		// heartbeat then disables itself, so the copy simply burned the
+		// gateway's max_lease_time -- and while holding the per-repo commit
+		// lock, which the surrounding design says should cover milliseconds of
+		// manifest read plus commit POST. Every other publish to that repository
+		// waited behind a byte copy that needed no exclusivity at all.
+		if j.StagingPrefix != "" {
+			p, ok := o.CAS.(promoter)
+			if !ok {
+				return o.abortJob(ctx, j, fmt.Errorf(
+					"staged publish needs a CAS that can promote a staging prefix "+
+						"(cas.type: s3); this prepub has %T", o.CAS))
+			}
+			promoteStart := time.Now()
+			res, promoteErr := p.PromoteFrom(ctx, j.StagingPrefix, 0)
+			if promoteErr != nil {
+				span.RecordError(promoteErr)
+				return o.abortJob(ctx, j, fmt.Errorf(
+					"promoting staged objects from %q: %w", j.StagingPrefix, promoteErr))
+			}
+			logger.Info("staged publish: promoted objects into the CAS",
+				"prefix", j.StagingPrefix, "copied", res.Copied, "skipped", res.Skipped,
+				"rejected", res.Rejected, "bytes", res.Bytes,
+				"duration", time.Since(promoteStart).String())
+
+			// Confirm the CATALOG is in the store, not merely that something was
+			// promoted. An empty or mistyped prefix lists nothing and copies
+			// nothing WITHOUT erroring, and grafting then publishes a catalog
+			// whose objects were never moved -- surfacing much later as EIO on a
+			// client, a long way from the cause.
+			//
+			// Counting promoted objects is the weaker test and gets two cases
+			// wrong: a prefix holding one unrelated object passes it, and a retry
+			// whose producer has since cleaned up its prefix fails it even though
+			// every object is already in the CAS. Asking after the one object the
+			// graft actually needs is exact, and it is a single HEAD.
+			haveCatalog, existsErr := o.CAS.Exists(ctx, j.CatalogHash)
+			if existsErr != nil {
+				span.RecordError(existsErr)
+				return o.abortJob(ctx, j, fmt.Errorf(
+					"checking the promoted catalog %s: %w", j.CatalogHash, existsErr))
+			}
+			if !haveCatalog {
+				return o.abortJob(ctx, j, fmt.Errorf(
+					"staged publish: catalog %s is not in the store after promoting %q "+
+						"(copied %d, skipped %d, rejected %d) — nothing to graft",
+					j.CatalogHash, j.StagingPrefix, res.Copied, res.Skipped, res.Rejected))
+			}
+		}
+
 		// No-pipeline backends (local extraction, ingest relay) skipped every
 		// pipeline state and are still StateIncoming. They also skipped the
 		// per-repo commit lock taken inside the pipeline branch above — which
@@ -1819,77 +1891,26 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
 	}
 
-	// ── Staged publish: promote, then graft ───────────────────────────────────
+	// The graft commits against the repository's current root, read here -- late,
+	// and after ensureParentDirs, so it reflects any parent-dir commit this job
+	// just made. The pipeline path's fetch is gated on pipelineResult, which is
+	// nil here, so it has not run.
 	//
-	// A producer running the canonical publisher elsewhere has already chunked,
-	// compressed and hashed this package into a prefix of the repository's own
-	// bucket, and built the subtree catalog. There is no tar: prepub moves the
-	// objects into the CAS with a server-side copy and asks the gateway to graft
-	// the catalog the producer named.
-	//
-	// The receiver fetches that catalog from stratum0 by content hash
-	// (receiver/commit_processor.cc), so the promotion has to happen BEFORE the
-	// commit -- otherwise the graft downloads an object that is not there yet.
-	if j.StagingPrefix != "" {
-		p, ok := o.CAS.(promoter)
-		if !ok {
+	// The per-repo commit lock does NOT make this read authoritative, and it
+	// would be wrong to write that it does. The lock only guarantees freshness
+	// if the previous holder held it until its own commit was visible on
+	// stratum0, and that is the serialize-until-published barrier, which is
+	// gated on subtreeResult != nil and therefore never runs for a staged job.
+	// So a staged job can still read a root that predates the previous staged
+	// job's commit. That gap is known, is not closed here, and is the next
+	// thing to fix on this path.
+	if j.StagingPrefix != "" && o.Stratum0URL != "" {
+		oldRootHash, err = cvmfscatalog.FetchManifestRootHash(leaseCtx, nil, o.Stratum0URL, j.Repo)
+		if err != nil {
+			span.RecordError(err)
 			cancelHeartbeat()
 			leaseCancel()
-			return o.abortJob(ctx, j, fmt.Errorf(
-				"staged publish needs a CAS that can promote a staging prefix "+
-					"(cas.type: s3); this prepub has %T", o.CAS))
-		}
-		promoteStart := time.Now()
-		res, promoteErr := p.PromoteFrom(leaseCtx, j.StagingPrefix, 0)
-		if promoteErr != nil {
-			span.RecordError(promoteErr)
-			cancelHeartbeat()
-			leaseCancel()
-			return o.abortJob(ctx, j, fmt.Errorf(
-				"promoting staged objects from %q: %w", j.StagingPrefix, promoteErr))
-		}
-		logger.Info("staged publish: promoted objects into the CAS",
-			"prefix", j.StagingPrefix, "copied", res.Copied, "skipped", res.Skipped,
-			"rejected", res.Rejected, "bytes", res.Bytes,
-			"duration", time.Since(promoteStart).String())
-		// Confirm the CATALOG is in the store, not merely that something was
-		// promoted. An empty or mistyped prefix lists nothing and copies nothing
-		// WITHOUT erroring, and grafting then publishes a catalog whose objects
-		// were never moved — surfacing much later as EIO on a client, a long way
-		// from the cause.
-		//
-		// Counting promoted objects is the weaker test and gets two cases wrong:
-		// a prefix holding one unrelated object passes it, and a retry whose
-		// producer has since cleaned up its prefix fails it even though every
-		// object is already in the CAS. Asking after the one object the graft
-		// actually needs is exact, and it is a single HEAD.
-		haveCatalog, existsErr := o.CAS.Exists(leaseCtx, j.CatalogHash)
-		if existsErr != nil {
-			span.RecordError(existsErr)
-			cancelHeartbeat()
-			leaseCancel()
-			return o.abortJob(ctx, j, fmt.Errorf(
-				"checking the promoted catalog %s: %w", j.CatalogHash, existsErr))
-		}
-		if !haveCatalog {
-			cancelHeartbeat()
-			leaseCancel()
-			return o.abortJob(ctx, j, fmt.Errorf(
-				"staged publish: catalog %s is not in the store after promoting %q "+
-					"(copied %d, skipped %d, rejected %d) — nothing to graft",
-				j.CatalogHash, j.StagingPrefix, res.Copied, res.Skipped, res.Rejected))
-		}
-		// The graft commits against the repository's current root. The fetch
-		// above is gated on pipelineResult, which is nil on this path, so it has
-		// not run.
-		if o.Stratum0URL != "" {
-			oldRootHash, err = cvmfscatalog.FetchManifestRootHash(leaseCtx, nil, o.Stratum0URL, j.Repo)
-			if err != nil {
-				span.RecordError(err)
-				cancelHeartbeat()
-				leaseCancel()
-				return o.abortJob(ctx, j, fmt.Errorf("fetching manifest root hash: %w", err))
-			}
+			return o.abortJob(ctx, j, fmt.Errorf("fetching manifest root hash: %w", err))
 		}
 	}
 
