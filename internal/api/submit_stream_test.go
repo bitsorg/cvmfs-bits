@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTarFirstRequest builds a multipart body in which the "tar" part precedes
@@ -72,6 +73,34 @@ func findSpooledTar(t *testing.T, spoolRoot string) string {
 	return found
 }
 
+// readSpooledTar returns the payload's bytes, following it as the job moves it.
+//
+// submitJob answers 202 and hands the job to a goroutine that advances it
+// through the spool's state directories, so payload.tar is a moving target: a
+// test that resolves a path and then reads it intermittently fails with "no
+// such file or directory" on a path that existed a moment earlier. Locating and
+// reading therefore have to be one retried operation.
+//
+// Blocking the lease backend does not fix this — the payload leaves incoming/
+// before Acquire is reached, which was tried and did not hold.
+func readSpooledTar(t *testing.T, spoolRoot string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if p := findSpooledTar(t, spoolRoot); p != "" {
+			if b, err := os.ReadFile(p); err == nil {
+				return b
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("read spooled tar %s: %v", p, err)
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("payload.tar never readable in the spool")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // TestSubmitJob_TarBeforeFields verifies that a client which sends the payload
 // before the form fields is accepted, and that tar_sha256 is still verified —
 // the hash cannot be computed lazily once the payload has streamed past, so the
@@ -96,14 +125,7 @@ func TestSubmitJob_TarBeforeFields(t *testing.T) {
 		t.Fatalf("want 202, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	tarPath := findSpooledTar(t, sp.Root)
-	if tarPath == "" {
-		t.Fatal("payload.tar not found in spool")
-	}
-	got, err := os.ReadFile(tarPath)
-	if err != nil {
-		t.Fatalf("read spooled tar: %v", err)
-	}
+	got := readSpooledTar(t, sp.Root)
 	if !bytes.Equal(got, content) {
 		t.Errorf("spooled payload mismatch: got %q want %q", got, content)
 	}
