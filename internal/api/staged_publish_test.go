@@ -66,6 +66,7 @@ type fakeCAS struct {
 	result    cas.PromoteResult
 	err       error
 	promotes  int
+	puts      int
 	adds      []string        // what a successful promotion lands in the store
 	present   map[string]bool // the store
 	existsErr error
@@ -103,8 +104,22 @@ func (f *fakeCAS) Exists(_ context.Context, hash string) (bool, error) {
 	}
 	return f.present[hash], nil
 }
-func (f *fakeCAS) Put(context.Context, string, io.Reader, int64) error {
-	return errors.New("fakeCAS: Put must not be called on the staged path")
+
+// Put succeeds and counts. It used to return an error to express "the staged
+// path must not stream data" -- but nothing asserted the error, and it silently
+// broke ensureParentDirs, which legitimately Puts the small directory catalog
+// it builds. Counting states the same claim and can actually be checked.
+func (f *fakeCAS) Put(_ context.Context, hash string, _ io.Reader, _ int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.puts++
+	f.present[hash] = true
+	return nil
+}
+func (f *fakeCAS) putCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.puts
 }
 func (f *fakeCAS) Get(context.Context, string) (io.ReadCloser, error) { return nil, nil }
 func (f *fakeCAS) Size(context.Context, string) (int64, error)        { return 0, nil }
@@ -173,6 +188,13 @@ func TestRun_StagedPublishPromotesThenGrafts(t *testing.T) {
 	}
 	if req.TarPath != "" {
 		t.Errorf("a staged commit must carry no tar, got TarPath = %q", req.TarPath)
+	}
+	// Promotion is a server-side copy. Streaming objects through prepub is the
+	// work this design removes, so no CAS Put may happen on this path. (A deep
+	// path would Put the parent-dir catalog; this job publishes at depth 2 with
+	// no Stratum0URL configured, so ensureParentDirs is a no-op here.)
+	if n := fc.putCount(); n != 0 {
+		t.Errorf("promotion issued %d CAS Puts, want 0 — it must copy server-side", n)
 	}
 	// Ordering: the receiver downloads the catalog by hash during the commit, so
 	// a commit that ran before the promotion would fetch an object that is not

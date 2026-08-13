@@ -48,6 +48,18 @@ const MaxRecoveries = 3
 // restart loop cannot re-run the same job forever.
 const MaxInterrupts = 20
 
+// graftsAt reports whether this job's content commit will graft its subtree
+// catalog rather than let the receiver diff it.
+//
+// One definition, because two places depend on the answer and they must agree:
+// the commit itself, and ensureParentDirs, which must not pre-create the leaf
+// directory that a graft is going to insert a nested catalog at.
+func (o *Orchestrator) graftsAt(j *job.Job) bool {
+	// A staged job always grafts: its producer built the catalog, so there is
+	// nothing for the receiver to diff against.
+	return o.DirectGraft || (j != nil && j.StagingPrefix != "")
+}
+
 // promoter is the part of a CAS backend a staged publish needs: moving objects
 // a producer prepared under some prefix into the store proper, server-side.
 //
@@ -647,8 +659,20 @@ func (o *Orchestrator) takePrefetch(ctx context.Context, jobID string) *pipeline
 // Phase 2.7 (leaf lease acquisition), so that no overlapping path leases
 // exist when the parent lease is acquired.
 func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
-	if o.Stratum0URL == "" || j.Path == "" || !o.leaseFor(j).NeedsPipeline() {
+	// A staged job needs parent directories for the same reason a pipeline job
+	// does -- both graft a subtree at the lease path -- but it has no pipeline,
+	// so NeedsPipeline alone would exclude it.
+	if o.Stratum0URL == "" || j.Path == "" ||
+		(!o.leaseFor(j).NeedsPipeline() && j.StagingPrefix == "") {
 		return nil
+	}
+	// This function uploads the catalog it builds, so it needs a CAS. The
+	// invariant check at startup only covers pipeline backends, and a staged job
+	// is not one -- without this it would panic on o.CAS.Put below, before
+	// reaching the staged path's own clear "needs a CAS that can promote" error.
+	if o.CAS == nil {
+		return fmt.Errorf("mkdir-p: no CAS configured; cannot create parent " +
+			"directories for a grafted publish")
 	}
 
 	// Decompose j.Path into its ancestor path components (not including j.Path
@@ -721,7 +745,16 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 	// "invalid attempt to graft nested catalog into existing directory" PANIC.
 	// For the standard DiffRec path we still add a placeholder so that the
 	// content commit can replace it.
-	if !o.DirectGraft {
+	//
+	// The test is the EFFECTIVE graft mode, which must be computed exactly as
+	// the content commit computes it. A staged job always grafts -- its producer
+	// built the catalog, so there is nothing to diff -- regardless of the node's
+	// o.DirectGraft setting. Testing o.DirectGraft alone would, on a node run
+	// with --gateway-direct-graft=false, pre-create j.Path here and then graft
+	// into it. That fails as a generic merge_error, and the handler's PathExists
+	// check then finds the directory this function just created and reports
+	// "already published" -- a first-ever publish rejected as a duplicate.
+	if !o.graftsAt(j) {
 		leafRel := strings.TrimPrefix(j.Path, graftPath+"/")
 		dirEntries = append(dirEntries, cvmfscatalog.Entry{
 			FullPath: leafRel, Mode: fs.ModeDir | 0o755, Mtime: now, LinkCount: 2,
@@ -777,6 +810,11 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 	if o.GatewayQueue != nil {
 		mkdirToken, leaseErr = o.GatewayQueue.Acquire(ctx, j.Repo, graftPath, 0)
 	} else {
+		// Acquire (and the abort on the failure paths below) stay on the job's
+		// backend while the commit above uses o.Lease. That is not an
+		// inconsistency: StagedBackend embeds the very same *lease.Client, so
+		// the token it issues is the token o.Lease commits and aborts. Only
+		// Commit differs between them, and only in whether it submits a payload.
 		mkdirToken, leaseErr = o.leaseFor(j).Acquire(ctx, j.Repo, graftPath)
 	}
 	if leaseErr != nil {
@@ -795,10 +833,23 @@ func (o *Orchestrator) ensureParentDirs(ctx context.Context, j *job.Job) error {
 		return fmt.Errorf("mkdir-p: fetch manifest: %w", fetchErr)
 	}
 
-	// Commit the directory-only subtree catalog.
-	// Lease.Commit handles SubmitPayload + commit POST.  On failure, abort the
-	// lease so the gateway releases it promptly instead of waiting for expiry.
-	commitErr := o.leaseFor(j).Commit(ctx, lease.CommitRequest{
+	// Commit the directory-only subtree catalog through the DEFAULT backend, not
+	// the job's own.
+	//
+	// Creating a parent directory is an ordinary small publish that happens to
+	// precede another one; it is not a staged publish. o.Lease.Commit does
+	// SubmitPayload + commit POST, which is what puts this freshly built catalog
+	// where the gateway can read it. A staged job's own backend deliberately
+	// skips SubmitPayload -- correct for its own content, which is already in
+	// the store, and wrong for a catalog built here seconds ago.
+	//
+	// Behaviour-preserving for every path that reached this function before:
+	// the guard above admitted only backends with NeedsPipeline() true, and the
+	// gateway Client is the only one, so o.leaseFor(j) WAS o.Lease.
+	//
+	// On failure, abort the lease so the gateway releases it promptly instead of
+	// waiting for expiry.
+	commitErr := o.Lease.Commit(ctx, lease.CommitRequest{
 		Token:               mkdirToken,
 		OldRootHash:         mkdirOldRoot,
 		NewRootHashSuffixed: mkdirResult.CatalogHashSuffixed,
@@ -1626,6 +1677,25 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			logger.Info("acquired per-repo commit serialisation lock", "repo", j.Repo)
 		}
 
+		// A staged publish grafts a subtree at the lease path, exactly as a
+		// pipeline publish does, so it needs the same intermediate directory
+		// entries: cvmfs_receiver does not create them, and without them the
+		// FUSE client returns ENOENT for any traversal through them.
+		//
+		// The mechanism is Phase 2.65's and is unchanged -- a directory-only
+		// catalog committed for the first missing ancestor. Staged jobs simply
+		// did not reach it, because both it and its call site sit inside the
+		// pipeline branch. Called here for the same reason it is called there:
+		// after the per-repo commit lock (so the mkdir commit and the content
+		// graft are one serialised unit) and BEFORE the lease is acquired, so no
+		// overlapping path lease exists when ensureParentDirs takes its own.
+		if j.StagingPrefix != "" {
+			if ensureErr := o.ensureParentDirs(ctx, j); ensureErr != nil {
+				span.RecordError(ensureErr)
+				return o.abortJob(ctx, j, ensureErr)
+			}
+		}
+
 		// Transition to StateLeased so the FSM is consistent before Commit.
 		// This RENAMES the job directory, so the tar path recorded at
 		// submission no longer resolves — refresh it before Commit reads it.
@@ -1833,7 +1903,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		TagDescription: j.TagDescription,
 		// A staged job always grafts: the producer built the subtree catalog, so
 		// there is nothing for DiffRec to diff against.
-		DirectGraft: o.DirectGraft || j.StagingPrefix != "",
+		DirectGraft: o.graftsAt(j),
 		DirectS3:    j.DirectS3,
 		ObjectList:  j.ObjectList,
 	}
