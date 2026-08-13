@@ -125,6 +125,7 @@ type fakeS3 struct {
 	objects map[string][]byte
 	acls    map[string]string
 	puts    int
+	copies  int // server-side CopyObject calls (PUT with x-amz-copy-source)
 }
 
 func newFakeS3() *fakeS3 {
@@ -145,6 +146,22 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 
 		switch r.Method {
 		case http.MethodPut:
+			// CopyObject is a PUT carrying x-amz-copy-source and no body.
+			if src := r.Header.Get("x-amz-copy-source"); src != "" {
+				srcKey := strings.TrimPrefix(strings.TrimPrefix(src, "/"), bucket+"/")
+				b, ok := f.objects[srcKey]
+				if !ok {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				f.objects[key] = append([]byte(nil), b...)
+				f.acls[key] = r.Header.Get("x-amz-acl")
+				f.copies++
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` +
+					`<CopyObjectResult><ETag>"copied"</ETag></CopyObjectResult>`))
+				return
+			}
 			body, _ := io.ReadAll(r.Body)
 			f.objects[key] = body
 			f.acls[key] = r.Header.Get("x-amz-acl")
@@ -184,12 +201,36 @@ func (f *fakeS3) list(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(keys)
 
+	// Always page, and small. Without truncation the paginator loop runs
+	// exactly once in every test, so a bug that processed only the first page
+	// would pass the whole suite. Real S3 pages at 1000; 4 makes every test
+	// that lists more than four objects exercise continuation.
+	const fakePageSize = 4
+	start := 0
+	if tok := r.URL.Query().Get("continuation-token"); tok != "" {
+		for i, k := range keys {
+			if k == tok {
+				start = i
+				break
+			}
+		}
+	}
+	end := len(keys)
+	if start+fakePageSize < end {
+		end = start + fakePageSize
+	}
+	page := keys[start:end]
+	truncated := end < len(keys)
+
 	var sb strings.Builder
 	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>`)
-	for _, k := range keys {
+	for _, k := range page {
 		fmt.Fprintf(&sb, "<Contents><Key>%s</Key><Size>%d</Size></Contents>", k, len(f.objects[k]))
 	}
-	sb.WriteString(`<IsTruncated>false</IsTruncated></ListBucketResult>`)
+	if truncated {
+		fmt.Fprintf(&sb, "<NextContinuationToken>%s</NextContinuationToken>", keys[end])
+	}
+	fmt.Fprintf(&sb, "<IsTruncated>%t</IsTruncated></ListBucketResult>", truncated)
 	w.Header().Set("Content-Type", "application/xml")
 	_, _ = w.Write([]byte(sb.String()))
 }
