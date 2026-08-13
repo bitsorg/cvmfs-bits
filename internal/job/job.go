@@ -8,6 +8,7 @@ package job
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -34,6 +35,80 @@ func ValidateTagName(name string) error {
 	}
 	return nil
 }
+
+// ValidCatalogHash reports whether h names a CVMFS catalog object: hex digits
+// carrying the catalog content-type suffix.
+//
+// The suffix is not decoration. It is part of the CAS key, so a bare hash names
+// a different object than the catalog; and the receiver refuses a graft whose
+// hash lacks it outright — "DirectGraft requires a catalog hash",
+// receiver/commit_processor.cc. Rejecting it at ingress names the field, where
+// rejecting it at commit costs a lease and a promotion first and reports only
+// that the graft failed.
+//
+// Exactly 40 lower-case hex digits plus the suffix. Not a length window: this
+// stack computes CAS keys with SHA-1 and nothing else (cvmfshash.HashReader),
+// so 40 is the only width it can produce or resolve. The wider algorithms the
+// C++ receiver recognises are rendered "<hex>-rmd160" / "<hex>-shake128", which
+// a hex-only rule would reject anyway — a window of 41..51 hex characters
+// therefore admits nothing real while looking permissive.
+func ValidCatalogHash(h string) bool {
+	if len(h) != 41 || h[40] != CatalogHashSuffix {
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		c := h[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidStagingPrefix reports whether p is usable as an S3 key prefix for a
+// staged publish.
+//
+// The value is producer-supplied and becomes the base of every key a promotion
+// lists and copies, so it is validated here rather than trusted. The failure it
+// mainly guards is not traversal — the promotion validates each key it derives —
+// but SILENCE: a prefix that is merely wrong lists nothing, copies nothing, and
+// returns no error, leaving a graft to run against objects that were never
+// promoted. That is the "202 for a request that does nothing" this handler
+// exists to refuse.
+//
+// Rules: 1..128 bytes, slash-separated segments of [A-Za-z0-9._-], no empty
+// segment, no "." or "..", no leading or trailing slash. A final "data" segment
+// is refused specifically: the promotion appends "/data/" itself, so
+// "<prefix>/data" is the likeliest producer mistake and its symptom is an empty
+// listing rather than an error.
+func ValidStagingPrefix(p string) bool {
+	if p == "" || len(p) > 128 {
+		return false
+	}
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		if s == "" || s == "." || s == ".." {
+			return false
+		}
+		if i == len(segs)-1 && s == "data" {
+			return false
+		}
+		for j := 0; j < len(s); j++ {
+			c := s[j]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case c == '.' || c == '_' || c == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// CatalogHashSuffix is the CVMFS content-type suffix for catalog objects
+// (shash::kSuffixCatalog).
+const CatalogHashSuffix = 'C'
 
 // State represents a job's position in the FSM lifecycle.
 type State string
@@ -137,6 +212,27 @@ type Job struct {
 	// the publisher reports, not how it publishes, so keeping it independent
 	// lets its cost be measured on its own.
 	ObjectList bool `json:"object_list,omitempty"`
+
+	// StagingPrefix names an S3 key prefix, in the repository's own bucket,
+	// that a producer has already filled with prepared CVMFS objects — chunked,
+	// compressed and hashed by the canonical publisher running on the build
+	// node. prepub promotes them into the CAS with a server-side copy instead of
+	// receiving and re-processing a tar.
+	//
+	// Set together with CatalogHash; either alone is refused at ingress. The two
+	// are what make the graft possible: the objects must be in the CAS before
+	// the receiver can fetch the catalog that references them.
+	StagingPrefix string `json:"staging_prefix,omitempty"`
+
+	// CatalogHash is the subtree catalog the producer built, as a suffixed
+	// CVMFS hash (…C). It becomes new_root_hash on the gateway's graft
+	// endpoint, and the receiver downloads it from stratum0 by that hash — so
+	// it must name an object the promotion has placed in the CAS.
+	//
+	// Suffixed, not bare: the receiver refuses a graft whose hash does not carry
+	// the catalog suffix ("DirectGraft requires a catalog hash",
+	// receiver/commit_processor.cc).
+	CatalogHash string `json:"catalog_hash,omitempty"`
 
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string

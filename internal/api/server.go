@@ -592,6 +592,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		finalize                  bool     // coarse-publish finalize job (no tar payload)
 		directS3                  bool     // pass --direct-s3 to cvmfs_server ingest (this job only)
 		objectList                bool     // collect the S3 object list (needs directS3)
+		stagingPrefix             string   // S3 prefix a producer already filled with prepared objects
+		catalogHash               string   // suffixed subtree catalog hash to graft
 		publishPath               string   // optional: "prepub" (default) or "ingest"
 		preWarm                   *bool    // optional: nil = node default
 	)
@@ -620,6 +622,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			BuildExpect    int      `json:"build_expect"`
 			PublishPath    string   `json:"publish_path"`
 			PreWarm        *bool    `json:"prewarm"`
+			// Staged publish. Present here as well as in the multipart branch:
+			// this mode accepts publish_path, so a producer will reasonably send
+			// them, and silently dropping them would answer 202 for an ordinary
+			// tar publish instead.
+			StagingPrefix string `json:"staging_prefix"`
+			CatalogHash   string `json:"catalog_hash"`
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
@@ -647,6 +655,16 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		// (which panic on invalid input) never receive bad data.
 		if err := broker.ValidateRepo(req.Repo); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		// Staged publish is multipart-only, and this must be refused BEFORE the
+		// tar_path requirement below: this mode exists for a tar already on the
+		// server's filesystem, while a staged submission has no payload at all.
+		// Checked after it, the client is told "tar_path field is required",
+		// which names the wrong thing entirely.
+		if strings.TrimSpace(req.StagingPrefix) != "" || strings.TrimSpace(req.CatalogHash) != "" {
+			http.Error(w, `{"error":"staging_prefix/catalog_hash are only supported in multipart submissions"}`,
+				http.StatusBadRequest)
 			return
 		}
 		if req.TarPath == "" {
@@ -923,6 +941,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 			objectList = v
 		}
+		// staging_prefix / catalog_hash: the producer prepared the objects and
+		// tells prepub where they are and which catalog to graft. Taken as
+		// opaque strings here; both are validated below, where the publish path
+		// is known.
+		stagingPrefix = strings.TrimSpace(field("staging_prefix"))
+		catalogHash = strings.TrimSpace(field("catalog_hash"))
 		// build_expect: how many packages this build will contain.  When set,
 		// prepub finalizes the build itself once that many have accumulated,
 		// so the producer can exit after its last upload.
@@ -979,6 +1003,21 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			if sawTar {
 				os.RemoveAll(jobDir)
 				spoolTarPath = ""
+			}
+		case stagingPrefix != "" || catalogHash != "":
+			// A staged job carries no payload either: its objects are already in
+			// the store, which is the whole point. Accepting a tar as well would
+			// publish the same subtree twice by two different routes -- an ingest
+			// and a graft -- with no rule saying which wins, so refuse rather
+			// than silently dropping it as finalize does.
+			//
+			// Either field alone lands here too, so that the pairing check below
+			// reports what is actually wrong rather than "tar field is required".
+			if sawTar {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"a staged submission (staging_prefix) must not carry a tar payload"}`,
+					http.StatusBadRequest)
+				return
 			}
 		case !sawTar:
 			os.RemoveAll(jobDir)
@@ -1066,6 +1105,54 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"object_list requires direct_s3"}`, http.StatusBadRequest)
 		return
 	}
+	// staging_prefix and catalog_hash are one instruction in two fields: the
+	// objects to promote and the catalog that references them. Either alone
+	// cannot be acted on, and accepting one would hand back a 202 for a request
+	// that silently does nothing — the failure mode every knob on this handler
+	// exists to avoid.
+	if (stagingPrefix == "") != (catalogHash == "") {
+		os.RemoveAll(jobDir)
+		http.Error(w, `{"error":"staging_prefix and catalog_hash must be given together"}`,
+			http.StatusBadRequest)
+		return
+	}
+	if stagingPrefix != "" && publishPath != "ingest" {
+		os.RemoveAll(jobDir)
+		http.Error(w, fmt.Sprintf(
+			`{"error":"staging_prefix is only supported on the \"ingest\" publish path (got \"%s\")"}`,
+			jsonEscape(publishPath)), http.StatusBadRequest)
+		return
+	}
+	// The receiver refuses a graft whose hash lacks the catalog suffix
+	// ("DirectGraft requires a catalog hash"). Catching it here names the field;
+	// catching it there costs a lease, a promotion and an opaque commit failure.
+	if stagingPrefix != "" && !job.ValidStagingPrefix(stagingPrefix) {
+		os.RemoveAll(jobDir)
+		http.Error(w, `{"error":"staging_prefix must be slash-separated segments of [A-Za-z0-9._-], at most 128 bytes, and must not end in \"data\""}`,
+			http.StatusBadRequest)
+		return
+	}
+	// direct_s3 and object_list instruct cvmfs_server how to publish a tar. A
+	// staged job publishes no tar, so neither can be acted on; accepting them
+	// would answer 202 for an instruction that is silently dropped.
+	if stagingPrefix != "" && directS3 {
+		os.RemoveAll(jobDir)
+		http.Error(w, `{"error":"direct_s3 cannot be combined with staging_prefix: a staged submission publishes no tar"}`,
+			http.StatusBadRequest)
+		return
+	}
+	if stagingPrefix != "" && objectList {
+		os.RemoveAll(jobDir)
+		http.Error(w, `{"error":"object_list cannot be combined with staging_prefix: a staged submission publishes no tar"}`,
+			http.StatusBadRequest)
+		return
+	}
+	if catalogHash != "" && !job.ValidCatalogHash(catalogHash) {
+		os.RemoveAll(jobDir)
+		http.Error(w, `{"error":"catalog_hash must be a CVMFS catalog hash: hex with the catalog suffix, e.g. 0123…C"}`,
+			http.StatusBadRequest)
+		return
+	}
 	if publishPath != "" && publishPath != DefaultPublishPath {
 		// Pre-warming is a property of the prepub pipeline: the ingest path
 		// commits through the gateway, so there is no window in which the
@@ -1109,6 +1196,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.Finalize = finalize
 	j.DirectS3 = directS3
 	j.ObjectList = objectList
+	j.StagingPrefix = stagingPrefix
+	j.CatalogHash = catalogHash
 	j.WebhookURL = webhookURL
 	j.TarSHA256 = submittedSHA256
 	j.TagName = tagName
