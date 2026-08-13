@@ -59,7 +59,7 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 		{
 			name: "accepted with no payload",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": prefix, "catalog_hash": good,
+				"publish_path": StagedPublishPath, "staging_prefix": prefix, "catalog_hash": good,
 			},
 			wantCode: http.StatusAccepted, wantPrefix: prefix, wantHash: good,
 		},
@@ -68,19 +68,19 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 			// subtree a second way, by ingest, with no rule saying which wins.
 			name: "refused when a tar is also sent",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": prefix, "catalog_hash": good,
+				"publish_path": StagedPublishPath, "staging_prefix": prefix, "catalog_hash": good,
 			},
 			withTar:  true,
 			wantCode: http.StatusBadRequest, wantMsg: "must not carry a tar payload",
 		},
 		{
 			name:     "prefix without catalog hash is refused",
-			fields:   map[string]string{"publish_path": "ingest", "staging_prefix": prefix},
+			fields:   map[string]string{"publish_path": StagedPublishPath, "staging_prefix": prefix},
 			wantCode: http.StatusBadRequest, wantMsg: "must be given together",
 		},
 		{
 			name:     "catalog hash without prefix is refused",
-			fields:   map[string]string{"publish_path": "ingest", "catalog_hash": good},
+			fields:   map[string]string{"publish_path": StagedPublishPath, "catalog_hash": good},
 			wantCode: http.StatusBadRequest, wantMsg: "must be given together",
 		},
 		{
@@ -93,7 +93,7 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 			// receiver refuses the graft outright.
 			name: "unsuffixed catalog hash is refused",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": prefix,
+				"publish_path": StagedPublishPath, "staging_prefix": prefix,
 				"catalog_hash": strings.Repeat("a", 40),
 			},
 			wantCode: http.StatusBadRequest, wantMsg: "catalog suffix",
@@ -101,7 +101,7 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 		{
 			name: "non-hex catalog hash is refused",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": prefix,
+				"publish_path": StagedPublishPath, "staging_prefix": prefix,
 				"catalog_hash": strings.Repeat("z", 40) + "C",
 			},
 			wantCode: http.StatusBadRequest, wantMsg: "catalog suffix",
@@ -111,7 +111,7 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 			// without erroring, so it has to be refused here.
 			name: "traversal in the prefix is refused",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": "staging/../../etc",
+				"publish_path": StagedPublishPath, "staging_prefix": "staging/../../etc",
 				"catalog_hash": good,
 			},
 			wantCode: http.StatusBadRequest, wantMsg: "staging_prefix must be",
@@ -119,7 +119,7 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 		{
 			name: "prefix ending in data is refused",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": "staging/host7/data",
+				"publish_path": StagedPublishPath, "staging_prefix": "staging/host7/data",
 				"catalog_hash": good,
 			},
 			wantCode: http.StatusBadRequest, wantMsg: "staging_prefix must be",
@@ -127,28 +127,42 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 		{
 			name: "oversized prefix is refused",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": strings.Repeat("a", 129),
+				"publish_path": StagedPublishPath, "staging_prefix": strings.Repeat("a", 129),
 				"catalog_hash": good,
 			},
 			wantCode: http.StatusBadRequest, wantMsg: "staging_prefix must be",
 		},
 		{
-			// direct_s3 and object_list instruct cvmfs_server how to publish a
-			// tar. A staged job publishes none.
+			// direct_s3 wants publish_path "ingest"; a staged job wants "staged".
+			// The refusal names the path, which is the real conflict.
 			name: "direct_s3 with staging_prefix is refused",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": prefix,
+				"publish_path": StagedPublishPath, "staging_prefix": prefix,
 				"catalog_hash": good, "direct_s3": "true",
 			},
-			wantCode: http.StatusBadRequest, wantMsg: "direct_s3 cannot be combined",
+			wantCode: http.StatusBadRequest, wantMsg: "direct_s3 is only supported",
 		},
 		{
 			name: "object_list with staging_prefix is refused",
 			fields: map[string]string{
-				"publish_path": "ingest", "staging_prefix": prefix,
-				"catalog_hash": good, "direct_s3": "true", "object_list": "true",
+				"publish_path": StagedPublishPath, "staging_prefix": prefix,
+				"catalog_hash": good, "object_list": "true",
 			},
-			wantCode: http.StatusBadRequest, wantMsg: "cannot be combined",
+			wantCode: http.StatusBadRequest, wantMsg: "object_list is only supported",
+		},
+		{
+			// The dangerous direction: the staged backend reads no tar, so this
+			// was accepted, the payload discarded, an empty transaction committed,
+			// and the job reported "published".
+			name:     "the staged path with a tar and no prefix is refused",
+			fields:   map[string]string{"publish_path": StagedPublishPath},
+			withTar:  true,
+			wantCode: http.StatusBadRequest, wantMsg: "must not carry a tar payload",
+		},
+		{
+			name:     "the staged path without a prefix is refused",
+			fields:   map[string]string{"publish_path": StagedPublishPath},
+			wantCode: http.StatusBadRequest, wantMsg: "requires staging_prefix",
 		},
 		{
 			name:     "absent leaves the ordinary ingest path alone",
@@ -160,7 +174,9 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, sp, orch := newTestServer(t)
 			orch.Lease = &noopBackend{}
-			orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}}
+			orch.PublishPaths = map[string]lease.Backend{
+				"ingest": &altBackend{}, StagedPublishPath: &altBackend{},
+			}
 
 			f := map[string]string{
 				"repo": "software.cern.ch",
@@ -221,9 +237,11 @@ func TestSubmitJob_StagedFieldsIngress(t *testing.T) {
 func TestSubmitJob_StagedFieldsRefusedInJSONMode(t *testing.T) {
 	srv, _, orch := newTestServer(t)
 	orch.Lease = &noopBackend{}
-	orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}}
+	orch.PublishPaths = map[string]lease.Backend{
+		"ingest": &altBackend{}, StagedPublishPath: &altBackend{},
+	}
 
-	body := `{"repo":"software.cern.ch","path":"x/1.0","publish_path":"ingest",` +
+	body := `{"repo":"software.cern.ch","path":"x/1.0","publish_path":"staged",` +
 		`"staging_prefix":"staging/host7/job-1","catalog_hash":"` + catHash("a") + `"}`
 	req := httptest.NewRequest("POST", "/api/v1/jobs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -291,5 +309,29 @@ func TestValidStagingPrefix(t *testing.T) {
 		if got := job.ValidStagingPrefix(tc.in); got != tc.want {
 			t.Errorf("ValidStagingPrefix(%q) = %v, want %v", tc.in, got, tc.want)
 		}
+	}
+}
+
+// Blocking only the staged FIELDS in JSON mode leaves the staged PATH usable
+// with a tar_path, which the staged backend cannot read.
+func TestSubmitJob_StagedPathRefusedInJSONMode(t *testing.T) {
+	srv, _, orch := newTestServer(t)
+	orch.Lease = &noopBackend{}
+	orch.PublishPaths = map[string]lease.Backend{StagedPublishPath: &altBackend{}}
+
+	body := `{"repo":"software.cern.ch","path":"x/1.0","publish_path":"` +
+		StagedPublishPath + `","tar_path":"/tmp/x.tar","tar_sha256":"` +
+		strings.Repeat("a", 64) + `"}`
+	req := httptest.NewRequest("POST", "/api/v1/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	srv.submitJob(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "multipart submissions") {
+		t.Errorf("error should say the path is multipart-only, got: %s", rec.Body.String())
 	}
 }

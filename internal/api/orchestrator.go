@@ -48,6 +48,17 @@ const MaxRecoveries = 3
 // restart loop cannot re-run the same job forever.
 const MaxInterrupts = 20
 
+// promoter is the part of a CAS backend a staged publish needs: moving objects
+// a producer prepared under some prefix into the store proper, server-side.
+//
+// Declared as an interface here, at the point of use, rather than asserting the
+// concrete *cas.S3 -- that assertion cannot be satisfied in this package's
+// tests, since the S3 fake is private to internal/cas, and it would have left
+// the whole staged path unexercised.
+type promoter interface {
+	PromoteFrom(ctx context.Context, stagingAlias string, workers int) (cas.PromoteResult, error)
+}
+
 // Orchestrator manages the end-to-end lifecycle of a publish job.
 // It coordinates pipeline stages, distribution to Stratum 1 endpoints,
 // transaction/lease acquisition, and commit operations via a pluggable
@@ -360,6 +371,12 @@ func (o *Orchestrator) waitForManifestPropagation(ctx context.Context, repo, pat
 // can read all content through the fd even after the rename completes.
 // DefaultPublishPath is the publish path used when a job does not name one.
 const DefaultPublishPath = "prepub"
+
+// StagedPublishPath is the path a job names when its content was prepared by a
+// producer and only needs grafting (see lease.StagedBackend). Named here rather
+// than written as a literal in the handler and the wiring, because those two
+// have to agree or submissions are rejected for naming a path nobody serves.
+const StagedPublishPath = "staged"
 
 // leaseFor returns the publish backend for a job.  A job that names a publish
 // path gets the backend registered for it; everything else gets the default.
@@ -1732,6 +1749,80 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		j.TarPath = filepath.Join(o.Spool.JobDir(j), "payload.tar")
 	}
 
+	// ── Staged publish: promote, then graft ───────────────────────────────────
+	//
+	// A producer running the canonical publisher elsewhere has already chunked,
+	// compressed and hashed this package into a prefix of the repository's own
+	// bucket, and built the subtree catalog. There is no tar: prepub moves the
+	// objects into the CAS with a server-side copy and asks the gateway to graft
+	// the catalog the producer named.
+	//
+	// The receiver fetches that catalog from stratum0 by content hash
+	// (receiver/commit_processor.cc), so the promotion has to happen BEFORE the
+	// commit -- otherwise the graft downloads an object that is not there yet.
+	if j.StagingPrefix != "" {
+		p, ok := o.CAS.(promoter)
+		if !ok {
+			cancelHeartbeat()
+			leaseCancel()
+			return o.abortJob(ctx, j, fmt.Errorf(
+				"staged publish needs a CAS that can promote a staging prefix "+
+					"(cas.type: s3); this prepub has %T", o.CAS))
+		}
+		promoteStart := time.Now()
+		res, promoteErr := p.PromoteFrom(leaseCtx, j.StagingPrefix, 0)
+		if promoteErr != nil {
+			span.RecordError(promoteErr)
+			cancelHeartbeat()
+			leaseCancel()
+			return o.abortJob(ctx, j, fmt.Errorf(
+				"promoting staged objects from %q: %w", j.StagingPrefix, promoteErr))
+		}
+		logger.Info("staged publish: promoted objects into the CAS",
+			"prefix", j.StagingPrefix, "copied", res.Copied, "skipped", res.Skipped,
+			"rejected", res.Rejected, "bytes", res.Bytes,
+			"duration", time.Since(promoteStart).String())
+		// Confirm the CATALOG is in the store, not merely that something was
+		// promoted. An empty or mistyped prefix lists nothing and copies nothing
+		// WITHOUT erroring, and grafting then publishes a catalog whose objects
+		// were never moved — surfacing much later as EIO on a client, a long way
+		// from the cause.
+		//
+		// Counting promoted objects is the weaker test and gets two cases wrong:
+		// a prefix holding one unrelated object passes it, and a retry whose
+		// producer has since cleaned up its prefix fails it even though every
+		// object is already in the CAS. Asking after the one object the graft
+		// actually needs is exact, and it is a single HEAD.
+		haveCatalog, existsErr := o.CAS.Exists(leaseCtx, j.CatalogHash)
+		if existsErr != nil {
+			span.RecordError(existsErr)
+			cancelHeartbeat()
+			leaseCancel()
+			return o.abortJob(ctx, j, fmt.Errorf(
+				"checking the promoted catalog %s: %w", j.CatalogHash, existsErr))
+		}
+		if !haveCatalog {
+			cancelHeartbeat()
+			leaseCancel()
+			return o.abortJob(ctx, j, fmt.Errorf(
+				"staged publish: catalog %s is not in the store after promoting %q "+
+					"(copied %d, skipped %d, rejected %d) — nothing to graft",
+				j.CatalogHash, j.StagingPrefix, res.Copied, res.Skipped, res.Rejected))
+		}
+		// The graft commits against the repository's current root. The fetch
+		// above is gated on pipelineResult, which is nil on this path, so it has
+		// not run.
+		if o.Stratum0URL != "" {
+			oldRootHash, err = cvmfscatalog.FetchManifestRootHash(leaseCtx, nil, o.Stratum0URL, j.Repo)
+			if err != nil {
+				span.RecordError(err)
+				cancelHeartbeat()
+				leaseCancel()
+				return o.abortJob(ctx, j, fmt.Errorf("fetching manifest root hash: %w", err))
+			}
+		}
+	}
+
 	// Build the commit request, populating fields for whichever backend is active.
 	cvmfsDir := filepath.Join(o.CVMFSMount, j.Repo, j.Path)
 	req := lease.CommitRequest{
@@ -1740,11 +1831,19 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		CVMFSDir:       cvmfsDir,
 		TagName:        j.TagName,
 		TagDescription: j.TagDescription,
-		DirectGraft:    o.DirectGraft,
-		DirectS3:       j.DirectS3,
-		ObjectList:     j.ObjectList,
+		// A staged job always grafts: the producer built the subtree catalog, so
+		// there is nothing for DiffRec to diff against.
+		DirectGraft: o.DirectGraft || j.StagingPrefix != "",
+		DirectS3:    j.DirectS3,
+		ObjectList:  j.ObjectList,
 	}
-	if preMutexLease {
+	if j.StagingPrefix != "" {
+		// The producer named the catalog; the receiver downloads it by this hash.
+		// Suffixed, which ingress has already checked -- the receiver refuses a
+		// graft whose hash carries no catalog suffix.
+		req.OldRootHash = oldRootHash
+		req.NewRootHashSuffixed = j.CatalogHash
+	} else if preMutexLease {
 		// Catalog already uploaded to the gateway in Phase 2.7 (BuildSubtree).
 		// Only supply the hashes needed for the commit POST — do NOT populate
 		// ObjectStore/ObjectHashes/CatalogHash (already uploaded; re-uploading

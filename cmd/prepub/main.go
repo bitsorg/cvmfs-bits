@@ -417,6 +417,10 @@ func runPublisher(
 	var casBackend cas.Backend
 	var leaseBackend lease.Backend
 	var gatewayQueue *api.GatewayQueue // non-nil only in gateway mode
+	// The gateway client itself, kept so publish paths that are the gateway in
+	// all but one respect can share it rather than open a second one. Nil in
+	// local mode, which is what gates the staged path off there.
+	var gwClient *lease.Client
 
 	switch publishMode {
 	case "gateway":
@@ -499,6 +503,7 @@ func runPublisher(
 			lc.RetryMax = leaseRetryMax
 		}
 		leaseBackend = lc
+		gwClient = lc
 		gatewayQueue = api.NewGatewayQueue(lc, obs)
 		obs.Logger.Info("gateway credentials", "key_id", gatewayKeyID)
 		obs.Logger.Info("publish backend: gateway", "url", gatewayURL,
@@ -552,6 +557,17 @@ func runPublisher(
 				"(local + ingest): publishes to one repository are serialised by " +
 				"the per-repo commit lock, different repositories still run in parallel")
 		}
+	}
+
+	// The staged path: content a producer already prepared into the repository's
+	// store, which prepub promotes and grafts. It needs the gateway — grafting
+	// is a gateway endpoint — so it is offered only in gateway mode, and a job
+	// naming it on a local-mode node is rejected at submission rather than
+	// published some other way.
+	if gwClient != nil {
+		publishPaths[api.StagedPublishPath] = lease.NewStagedBackend(gwClient)
+		obs.Logger.Info("publish path available: " + api.StagedPublishPath +
+			" (producer-prepared objects, promoted and grafted — no payload)")
 	}
 
 	// Startup probe: confirm backends are reachable before accepting jobs.

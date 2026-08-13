@@ -667,6 +667,16 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				http.StatusBadRequest)
 			return
 		}
+		// The path has to be refused here as well as the fields. Blocking only
+		// the fields leaves `publish_path: staged` with a tar_path accepted, and
+		// the staged backend has no code that reads a tar — it would commit an
+		// empty transaction and report the job published.
+		if req.PublishPath == StagedPublishPath {
+			http.Error(w, fmt.Sprintf(
+				`{"error":"the \"%s\" publish path is only supported in multipart submissions: it publishes prepared objects, not a tar"}`,
+				StagedPublishPath), http.StatusBadRequest)
+			return
+		}
 		if req.TarPath == "" {
 			http.Error(w, `{"error":"tar_path field is required"}`, http.StatusBadRequest)
 			return
@@ -1004,7 +1014,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				os.RemoveAll(jobDir)
 				spoolTarPath = ""
 			}
-		case stagingPrefix != "" || catalogHash != "":
+		case stagingPrefix != "" || catalogHash != "" || publishPath == StagedPublishPath:
 			// A staged job carries no payload either: its objects are already in
 			// the store, which is the whole point. Accepting a tar as well would
 			// publish the same subtree twice by two different routes -- an ingest
@@ -1013,6 +1023,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			//
 			// Either field alone lands here too, so that the pairing check below
 			// reports what is actually wrong rather than "tar field is required".
+			//
+			// The PATH is in this condition as well as the fields, so that
+			// `publish_path=staged` with neither field and no tar is answered by
+			// the check that names the missing prefix. Without it the generic
+			// "tar field is required" fires first and tells the client to add
+			// the one thing this path can never use.
 			if sawTar {
 				os.RemoveAll(jobDir)
 				http.Error(w, `{"error":"a staged submission (staging_prefix) must not carry a tar payload"}`,
@@ -1116,11 +1132,29 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
-	if stagingPrefix != "" && publishPath != "ingest" {
+	// The "staged" path, not "ingest": the two are different mechanisms. The
+	// ingest backend hands a tar to `cvmfs_server ingest`; it has no use for a
+	// staging prefix and would reject the job for want of a payload. Staged
+	// jobs take the lease and graft, which is what StagedBackend does.
+	if stagingPrefix != "" && publishPath != StagedPublishPath {
 		os.RemoveAll(jobDir)
 		http.Error(w, fmt.Sprintf(
-			`{"error":"staging_prefix is only supported on the \"ingest\" publish path (got \"%s\")"}`,
-			jsonEscape(publishPath)), http.StatusBadRequest)
+			`{"error":"staging_prefix is only supported on the \"%s\" publish path (got \"%s\")"}`,
+			StagedPublishPath, jsonEscape(publishPath)), http.StatusBadRequest)
+		return
+	}
+	// ...and the converse, which is the dangerous direction. The staged path
+	// publishes ONLY what staging_prefix names; it has no code that reads a tar.
+	// Without this, `publish_path=staged` with a payload and no prefix is
+	// accepted, the tar is silently discarded, an empty transaction is committed
+	// to the gateway, and the job reports "published" — a success answer for
+	// content that was never published. Every other check in this handler exists
+	// to prevent exactly that, and this one was missing until a review probed it.
+	if publishPath == StagedPublishPath && stagingPrefix == "" {
+		os.RemoveAll(jobDir)
+		http.Error(w, fmt.Sprintf(
+			`{"error":"the \"%s\" publish path requires staging_prefix and catalog_hash: it publishes prepared objects and ignores any tar payload"}`,
+			StagedPublishPath), http.StatusBadRequest)
 		return
 	}
 	// The receiver refuses a graft whose hash lacks the catalog suffix
@@ -1132,21 +1166,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
-	// direct_s3 and object_list instruct cvmfs_server how to publish a tar. A
-	// staged job publishes no tar, so neither can be acted on; accepting them
-	// would answer 202 for an instruction that is silently dropped.
-	if stagingPrefix != "" && directS3 {
-		os.RemoveAll(jobDir)
-		http.Error(w, `{"error":"direct_s3 cannot be combined with staging_prefix: a staged submission publishes no tar"}`,
-			http.StatusBadRequest)
-		return
-	}
-	if stagingPrefix != "" && objectList {
-		os.RemoveAll(jobDir)
-		http.Error(w, `{"error":"object_list cannot be combined with staging_prefix: a staged submission publishes no tar"}`,
-			http.StatusBadRequest)
-		return
-	}
+	// direct_s3 and object_list are NOT re-checked against staging_prefix here:
+	// they require publish_path "ingest" (checked above) and a staged job
+	// requires "staged", so the combination cannot be expressed. Whichever
+	// check runs first refuses it and names the path, which IS the conflict.
+	// A second "cannot be combined" check would be unreachable, and
+	// unreachable validation rots -- it stops being exercised while still
+	// looking like a guarantee.
 	if catalogHash != "" && !job.ValidCatalogHash(catalogHash) {
 		os.RemoveAll(jobDir)
 		http.Error(w, `{"error":"catalog_hash must be a CVMFS catalog hash: hex with the catalog suffix, e.g. 0123…C"}`,
