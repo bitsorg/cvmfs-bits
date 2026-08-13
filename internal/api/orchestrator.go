@@ -1896,14 +1896,12 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// just made. The pipeline path's fetch is gated on pipelineResult, which is
 	// nil here, so it has not run.
 	//
-	// The per-repo commit lock does NOT make this read authoritative, and it
-	// would be wrong to write that it does. The lock only guarantees freshness
-	// if the previous holder held it until its own commit was visible on
-	// stratum0, and that is the serialize-until-published barrier, which is
-	// gated on subtreeResult != nil and therefore never runs for a staged job.
-	// So a staged job can still read a root that predates the previous staged
-	// job's commit. That gap is known, is not closed here, and is the next
-	// thing to fix on this path.
+	// This read is authoritative only because the previous holder of the commit
+	// lock held it until its own commit was visible on stratum0 -- the
+	// serialize-until-published barrier at the end of this function. The lock
+	// alone would not be enough: it was not enough until that barrier's gate was
+	// widened to cover staged jobs, and before then two staged publishes in a
+	// row could read a root that predated the first one's commit.
 	if j.StagingPrefix != "" && o.Stratum0URL != "" {
 		oldRootHash, err = cvmfscatalog.FetchManifestRootHash(leaseCtx, nil, o.Stratum0URL, j.Repo)
 		if err != nil {
@@ -2038,7 +2036,22 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// produces the final merged root during the graft; we learn it by polling the
 	// manifest until it advances past the base we committed against (oldRootHash),
 	// which doubles as recording j.NewRootHash for S1 propagation tracking.
-	if subtreeResult != nil && o.Stratum0URL != "" {
+	//
+	// A staged job needs this barrier at least as much as a pipeline job, and
+	// was not getting it: subtreeResult is the pipeline's catalog build and is
+	// always nil here, so the gate excluded the one publish kind that ALWAYS
+	// grafts. Two staged publishes in a row would then read old_root_hash from a
+	// stratum0 that had not yet caught up, and the second graft fails with the
+	// spurious merge_error this barrier exists to prevent -- which the handler
+	// reports as "already published" once PathExists sees the path.
+	//
+	// It also fills j.NewRootHash, without which the post-commit MQTT broadcast
+	// is skipped and Stratum 1 receivers only learn of the publish from the
+	// backstop poll.
+	//
+	// The gate is now "did this commit graft a subtree", which is what the
+	// barrier is actually about, rather than "did the pipeline build one".
+	if (subtreeResult != nil || j.StagingPrefix != "") && o.Stratum0URL != "" {
 		if newRoot := o.waitForManifestPropagation(ctx, j.Repo, j.Path, oldRootHash); newRoot != "" {
 			// FetchManifestRootHash returns hash+"C"; strip the suffix for
 			// j.NewRootHash which is always plain hex (no content-type suffix).
