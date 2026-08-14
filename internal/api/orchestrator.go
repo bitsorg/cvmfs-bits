@@ -1706,6 +1706,27 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 				"rejected", res.Rejected, "bytes", res.Bytes,
 				"duration", time.Since(promoteStart).String())
 
+			// Record what moved (ADR-0011 D6). Without this a staged publish
+			// reports objects=0 bytes=0 on completion and in every accounting
+			// built on the job record -- which is what the first end-to-end run
+			// showed (MEASUREMENTS §22), a publish of 6 objects and 102 kB
+			// looking empty.
+			//
+			// NObjects counts everything this publish needs in the store,
+			// including what deduplication already put there; NNewObjects counts
+			// only what this promotion actually copied. The gap between them IS
+			// the dedup hit rate, which is the number worth watching at O2
+			// scale.
+			//
+			// NBytesRaw stays 0 and that is not an oversight: promotion moves
+			// COMPRESSED objects and never sees the uncompressed sizes. Only the
+			// producer knows those, and it does not report them. Recording the
+			// compressed figure as if it were raw would quietly corrupt every
+			// compression ratio computed downstream.
+			j.NObjects = res.Copied + res.Skipped
+			j.NNewObjects = res.Copied
+			j.NBytesCompressed = res.Bytes
+
 			// Confirm the CATALOG is in the store, not merely that something was
 			// promoted. An empty or mistyped prefix lists nothing and copies
 			// nothing WITHOUT erroring, and grafting then publishes a catalog
