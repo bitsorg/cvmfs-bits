@@ -122,6 +122,7 @@ func main() {
 	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels). See ADR-0008 D3 [publisher]")
 	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
+	replaceOnConflict := flag.Bool("replace-on-conflict", false, "REPLACE an already published path when a commit fails on it: confirm the conflict against the published catalogs, delete the existing subtree in its own transaction, and retry the commit once. Destroys the published subtree at the conflicting path (prior revisions keep their objects until GC); off, a conflict stays a terminal error [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
 	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
@@ -284,6 +285,7 @@ func main() {
 			debugListen,
 			signatureSkew,
 			ingestPublish, ingestPublishOwner,
+			replaceOnConflict,
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc, prefetchLimit, prefetch,
@@ -314,7 +316,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *signatureSkew, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *signatureSkew, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *replaceOnConflict, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
@@ -350,6 +352,7 @@ func runPublisher(
 	cvmfsMount string,
 	ingestPublish bool,
 	ingestPublishOwner string,
+	replaceOnConflict bool,
 	stratum0URL, repoName, casType, casRoot, casServerConf string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv string,
 	provenanceEnabled bool,
@@ -557,6 +560,13 @@ func runPublisher(
 				"(local + ingest): publishes to one repository are serialised by " +
 				"the per-repo commit lock, different repositories still run in parallel")
 		}
+	}
+
+	if replaceOnConflict {
+		obs.Logger.Warn("replace_on_conflict ENABLED: a commit that fails on an " +
+			"already published path deletes the existing subtree and retries once " +
+			"(destructive; the conflict is confirmed against the published " +
+			"catalogs before anything is deleted)")
 	}
 
 	// The staged path: content a producer already prepared into the repository's
@@ -776,6 +786,7 @@ func runPublisher(
 		CVMFSMount:         cvmfsMount,
 		Stratum0URL:        stratum0URL,
 		DirectGraft:        gatewayDirectGraft,
+		ReplaceOnConflict:  replaceOnConflict,
 		IngestSwissknife:   ingestSwissknife,
 		IngestConfigPrefix: ingestConfigPrefix,
 		IngestEnv:          splitCSV(ingestEnv),

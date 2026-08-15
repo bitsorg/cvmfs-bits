@@ -160,6 +160,7 @@ type applyTestVars struct {
 	signatureSkew                                           time.Duration
 	ingestPublish                                           bool
 	ingestPublishOwner                                      string
+	replaceOnConflict                                       bool
 	ingestSwissknife, ingestConfigPrefix, ingestEnv         string
 	chunkMin, chunkAvg, chunkMax                            int64
 	pipelineWorkers, pipelineUploadConc, prefetchLimit      int
@@ -197,6 +198,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.debugListen,
 		&v.signatureSkew,
 		&v.ingestPublish, &v.ingestPublishOwner,
+		&v.replaceOnConflict,
 		&v.ingestSwissknife, &v.ingestConfigPrefix, &v.ingestEnv,
 		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
 		&v.pipelineWorkers, &v.pipelineUploadConc, &v.prefetchLimit, &v.prefetch,
@@ -266,5 +268,20 @@ func TestApplyFileConfig_PipelineWorkers(t *testing.T) {
 	v.apply(fc, map[string]bool{"pipeline-workers": true})
 	if v.pipelineWorkers != 8 {
 		t.Errorf("explicit --pipeline-workers was overridden: %d", v.pipelineWorkers)
+	}
+}
+
+func TestApplyFileConfig_ReplaceOnConflict(t *testing.T) {
+	fc := &fileConfig{ReplaceOnConflict: true}
+	v := defaultApplyVars()
+	v.apply(fc, map[string]bool{})
+	if !v.replaceOnConflict {
+		t.Error("replace_on_conflict: true in config was not applied")
+	}
+	// An explicit CLI flag wins over the config file, both directions.
+	v2 := defaultApplyVars()
+	v2.apply(fc, map[string]bool{"replace-on-conflict": true})
+	if v2.replaceOnConflict {
+		t.Error("explicit --replace-on-conflict=false was overridden by config")
 	}
 }

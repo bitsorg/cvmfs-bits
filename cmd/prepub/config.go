@@ -82,6 +82,11 @@ type fileConfig struct {
 	IngestPublish      bool   `yaml:"ingest_publish"`
 	IngestPublishOwner string `yaml:"ingest_publish_owner"`
 
+	// ReplaceOnConflict lets a commit that fails on an already published path
+	// delete the existing subtree and retry once (--replace-on-conflict).
+	// Destructive by design, so it is opt-in and defaults to off.
+	ReplaceOnConflict bool `yaml:"replace_on_conflict"`
+
 	// Coarse-publish finalize (ADR-0007): one cvmfs_swissknife ingestsql
 	// invocation commits a whole build. Without IngestConfigPrefix the finalize
 	// is DISABLED, and since a sealed build finalizes server-side, that failure
@@ -285,6 +290,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	signatureSkew *time.Duration,
 	ingestPublish *bool,
 	ingestPublishOwner *string,
+	replaceOnConflict *bool,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv *string,
 	chunkMin, chunkAvg, chunkMax *int64,
 	pipelineWorkers, pipelineUploadConc, prefetchLimit *int,
@@ -409,6 +415,12 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		*ingestPublish = true
 	}
 	str("ingest-publish-owner", ingestPublishOwner, fc.IngestPublishOwner)
+	// Same bool caveat again: config can only turn replacement ON; use
+	// --replace-on-conflict=false on the CLI to override a config that
+	// enables it.
+	if !has("replace-on-conflict") && fc.ReplaceOnConflict {
+		*replaceOnConflict = true
+	}
 	str("ingest-swissknife", ingestSwissknife, fc.IngestSwissknife)
 	str("ingest-config-prefix", ingestConfigPrefix, fc.IngestConfigPrefix)
 	if !has("ingest-env") && len(fc.IngestEnv) > 0 {
