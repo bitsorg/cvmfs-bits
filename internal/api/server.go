@@ -595,7 +595,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		submittedSHA256           string   // caller-supplied; may be empty
 		preloadExe                string   // optional: repo-relative exe path for preload
 		preloadPaths              []string // optional: repo-relative paths opened at startup
-		buildID                   string   // optional: groups a build's packages (ADR-0007)
+		buildID                   string   // optional: the CI pipeline identity of this run
+		coarseField               string   // optional: "true"/"false"; empty means "infer" (ADR-0007)
 		buildExpect               int      // optional: package count → auto-finalize when reached
 		finalize                  bool     // coarse-publish finalize job (no tar payload)
 		directS3                  bool     // pass --direct-s3 to cvmfs_server ingest (this job only)
@@ -627,6 +628,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			PreloadExe     string   `json:"preload_exe"`
 			PreloadPaths   []string `json:"preload_paths"`
 			BuildID        string   `json:"build_id"`
+			Coarse         *bool    `json:"coarse"`
 			BuildExpect    int      `json:"build_expect"`
 			PublishPath    string   `json:"publish_path"`
 			PreWarm        *bool    `json:"prewarm"`
@@ -739,6 +741,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preloadExe = req.PreloadExe
 		preloadPaths = req.PreloadPaths
 		buildID = req.BuildID
+		if req.Coarse != nil {
+			coarseField = strconv.FormatBool(*req.Coarse)
+		}
 		buildExpect = req.BuildExpect
 		publishPath = req.PublishPath
 		preWarm = req.PreWarm
@@ -933,7 +938,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		tagName = field("tag_name")
 		tagDescription = field("tag_description")
 		preloadExe = field("preload_exe") // optional
-		buildID = field("build_id")       // optional (ADR-0007 coarse publish)
+		buildID = field("build_id")       // optional: the CI pipeline identity
+		coarseField = field("coarse")     // optional: "true"/"false"; see below
 		finalize = field("finalize") == "true"
 		// Parsed, not compared against "true": this knob exists to A/B the two
 		// transports, and a typo that silently means false yields a full
@@ -1198,16 +1204,60 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				jsonEscape(publishPath), DefaultPublishPath), http.StatusBadRequest)
 			return
 		}
-		// Likewise coarse publish: an alternative path commits each package as
-		// it arrives, so there is nothing to accumulate and a finalize would
-		// never fire. Silently dropping build_id would leave the producer
-		// waiting on a build that can never complete.
-		if buildID != "" {
+		// Coarse publish, however, is genuinely impossible here: an alternative
+		// path commits each package as it arrives, so there is nothing to
+		// accumulate and a finalize would never fire.
+		//
+		// It is the COARSE REQUEST that is refused, not the build id. The build
+		// id is the CI pipeline identity -- carried by every job of the run,
+		// used for the views and the signed common manifest, and the key an
+		// operator uses to find the run's measurement records. Refusing it here
+		// forced the producer to send none at all on these paths.
+		if v, perr := strconv.ParseBool(strings.TrimSpace(coarseField)); coarseField != "" && perr == nil && v {
 			os.RemoveAll(jobDir)
-			http.Error(w, fmt.Sprintf(`{"error":"publish path %q commits each package on arrival and cannot take part in a coarse build; drop build_id or use the %q path"}`,
+			http.Error(w, fmt.Sprintf(`{"error":"publish path %q commits each package on arrival and cannot take part in a coarse build; drop coarse=true or use the %q path"}`,
 				jsonEscape(publishPath), DefaultPublishPath), http.StatusBadRequest)
 			return
 		}
+	}
+
+	// Resolve the coarse decision ONCE, here, so every consumer asks the same
+	// question instead of re-deriving it from build_id.
+	//
+	// Absent field keeps the historical behaviour exactly: a build id on the
+	// default path meant "accumulate". An explicit value wins, which is what
+	// lets a producer carry the pipeline identity on a per-package path
+	// without joining a coarse build.
+	// publishPath is normalised: "" and "prepub" are the same path everywhere
+	// else, and treating them differently here would silently stop an explicit
+	// publish_path=prepub from accumulating.
+	onDefaultPath := publishPath == "" || publishPath == DefaultPublishPath
+	coarse := buildID != "" && onDefaultPath && !finalize
+	if coarseField != "" {
+		// Parsed, not compared against "true", for the same reason as
+		// direct_s3 above: a typo must not silently mean the opposite. A
+		// producer that says "no" and gets a coarse build is the failure this
+		// handler exists to prevent.
+		v, perr := strconv.ParseBool(strings.TrimSpace(coarseField))
+		if perr != nil {
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"coarse must be true or false"}`, http.StatusBadRequest)
+			return
+		}
+		coarse = v
+	}
+	// A coarse job accumulates into a build keyed by its id; without one the
+	// buildset write fails only AFTER the payload has been pipelined and
+	// uploaded (or, with build_expect, 500s here). Refuse it at submit, the
+	// same way finalize-without-build_id is refused above.
+	if coarse && buildID == "" {
+		os.RemoveAll(jobDir)
+		http.Error(w, `{"error":"coarse requires build_id"}`, http.StatusBadRequest)
+		return
+	}
+	// A finalize job IS the coarse commit; it does not accumulate.
+	if finalize {
+		coarse = false
 	}
 
 	// Record the build's expected package count before the job can accumulate,
@@ -1215,7 +1265,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// trigger the finalize itself.  Every package of the build carries the same
 	// value; the write is atomic and idempotent.  A finalize job never declares
 	// (it IS the finalize).
-	if buildID != "" && buildExpect > 0 && !finalize {
+	if coarse && buildExpect > 0 {
 		if err := buildset.SetExpect(s.spoolRoot, buildID, buildExpect); err != nil {
 			span.RecordError(err)
 			os.RemoveAll(jobDir)
@@ -1227,6 +1277,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j := job.NewJob(jobID, repo, "", spoolTarPath)
 	j.Path = subPath
 	j.BuildID = buildID
+	j.Coarse = &coarse
 	j.Finalize = finalize
 	j.DirectS3 = directS3
 	j.ObjectList = objectList

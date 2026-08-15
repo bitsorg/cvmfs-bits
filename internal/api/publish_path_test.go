@@ -12,8 +12,13 @@ package api
 
 import (
 	"context"
+	"cvmfs.io/prepub/internal/cas"
+	"cvmfs.io/prepub/internal/pipeline"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -169,30 +174,51 @@ func TestSubmitJob_RejectsPreWarmOnAlternativePath(t *testing.T) {
 	}
 }
 
-// TestSubmitJob_RejectsBuildIDOnAlternativePath: an alternative path commits
-// each package on arrival, so it can never accumulate into a coarse build.
-// Dropping build_id silently would leave the producer sealing a build that can
-// never complete.
-func TestSubmitJob_RejectsBuildIDOnAlternativePath(t *testing.T) {
-	srv, _, orch := newTestServer(t)
-	orch.Lease = &noopBackend{}
-	orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}}
+// An alternative path commits each package on arrival, so it cannot take part
+// in a coarse build -- but it MUST still accept the build id, which is the CI
+// pipeline identity every job of a run carries (the same one the views and the
+// signed common manifest use, and the key its measurement records are filed
+// under). Refusing the id forced producers to send none at all on these paths,
+// which left their records unattributable.
+//
+// NEGATIVE CONTROL: restore the old `if buildID != ""` rejection and the first
+// case fails with 400.
+func TestSubmitJob_AcceptsBuildIDButRefusesCoarseOnAlternativePath(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fields   map[string]string
+		wantCode int
+	}{
+		"identity only is accepted": {
+			fields: map[string]string{
+				"repo": "software.cern.ch", "path": "x86_64-el9/pkg/1.0",
+				"publish_path": "ingest", "build_id": "pipeline-1",
+			},
+			wantCode: http.StatusAccepted,
+		},
+		"an explicit coarse request is refused": {
+			fields: map[string]string{
+				"repo": "software.cern.ch", "path": "x86_64-el9/pkg/2.0",
+				"publish_path": "ingest", "build_id": "pipeline-1", "coarse": "true",
+			},
+			wantCode: http.StatusBadRequest,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, _, orch := newTestServer(t)
+			orch.Lease = &noopBackend{}
+			orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}}
 
-	req := newMultipartRequest(t, map[string]string{
-		"repo":         "software.cern.ch",
-		"path":         "x86_64-el9/pkg/1.0",
-		"publish_path": "ingest",
-		"build_id":     "pipeline-1",
-	}, []byte("dummy"))
+			rec := httptest.NewRecorder()
+			srv.submitJob(rec, newMultipartRequest(t, tc.fields, []byte("dummy")))
 
-	rec := httptest.NewRecorder()
-	srv.submitJob(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "coarse build") {
-		t.Errorf("unexpected error body: %s", rec.Body.String())
+			if rec.Code != tc.wantCode {
+				t.Fatalf("want %d, got %d: %s", tc.wantCode, rec.Code, rec.Body.String())
+			}
+			if tc.wantCode == http.StatusBadRequest &&
+				!strings.Contains(rec.Body.String(), "coarse") {
+				t.Errorf("error should name the coarse request: %s", rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -268,5 +294,208 @@ func TestRun_FailsWhenPublishPathDisappeared(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not configured") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// The invariant that makes the build id safe to carry everywhere: on a
+// per-package path it is IDENTITY ONLY. It must not declare an expectation,
+// because nothing will ever accumulate against it and the build would wait
+// forever for packages that already committed on arrival.
+//
+// NEGATIVE CONTROL: gate SetExpect on `buildID != ""` again (the old code) and
+// this fails — a builds/ directory appears for the pipeline.
+func TestSubmitJob_BuildIDOnAlternativePathDeclaresNoBuild(t *testing.T) {
+	srv, sp, orch := newTestServer(t)
+	orch.Lease = &noopBackend{}
+	orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}}
+
+	rec := httptest.NewRecorder()
+	srv.submitJob(rec, newMultipartRequest(t, map[string]string{
+		"repo": "software.cern.ch", "path": "x86_64-el9/pkg/1.0",
+		"publish_path": "ingest",
+		"build_id":     "pipeline-77",
+		"build_expect": "170",
+	}, []byte("dummy")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(sp.Root, "builds", "pipeline-77")); !os.IsNotExist(err) {
+		t.Errorf("a coarse build was declared for a per-package publish (err=%v)", err)
+	}
+}
+
+// The default path keeps its historical behaviour with no `coarse` field at
+// all: a build id there still means accumulate. Old producers are unaffected.
+func TestSubmitJob_DefaultPathStillInfersCoarseFromBuildID(t *testing.T) {
+	srv, sp, orch := newTestServer(t)
+	orch.Lease = &noopBackend{}
+
+	rec := httptest.NewRecorder()
+	srv.submitJob(rec, newMultipartRequest(t, map[string]string{
+		"repo": "software.cern.ch", "path": "x86_64-el9/pkg/1.0",
+		"build_id":     "pipeline-88",
+		"build_expect": "3",
+	}, []byte("dummy")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(sp.Root, "builds", "pipeline-88")); err != nil {
+		t.Errorf("the default path stopped declaring a coarse build: %v", err)
+	}
+}
+
+// Links the coarse DECISION to what Run does with it. The previous version of
+// this test set Coarse AND BuildID and asserted only the accumulate case, so
+// reverting the gate to `j.BuildID != ""` still satisfied it — a test whose
+// comment claimed a control it did not have. The discriminating cases are the
+// ones where the decision and the build id disagree.
+//
+// NEGATIVE CONTROL: revert the accumulate gate (orchestrator.go) to
+// `j.BuildID != ""` and the "explicitly not coarse" case fails, because a job
+// carrying a build id would accumulate against the producer's decision.
+func TestSubmitToRun_CoarseDecisionDrivesAccumulation(t *testing.T) {
+	yes, no := true, false
+	for name, tc := range map[string]struct {
+		coarse      *bool
+		publishPath string
+		wantState   job.State
+	}{
+		"explicitly coarse accumulates": {
+			coarse: &yes, wantState: job.StateAccumulated,
+		},
+		"explicitly not coarse commits on arrival": {
+			coarse: &no, wantState: job.StatePublished,
+		},
+		"not stated on the default path infers coarse": {
+			coarse: nil, wantState: job.StateAccumulated,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			backend := &mockBackend{needsPipeline: true}
+			o, sp := minimalOrch(t, backend)
+			cs, err := cas.NewLocalFS(t.TempDir())
+			if err != nil {
+				t.Fatalf("cas.NewLocalFS: %v", err)
+			}
+			o.CAS = cs
+			o.Pipeline = pipeline.Config{
+				Workers: 1, UploadConc: 1, CompressLevel: 1,
+				ChunkMin: 1 << 20, ChunkAvg: 1 << 22, ChunkMax: 1 << 23,
+				CAS: cs, SpoolDir: t.TempDir(), Obs: o.Obs,
+			}
+
+			j := newIncomingJob(t, sp)
+			j.BuildID = "pipeline-run" // identity: present in EVERY case
+			j.Coarse = tc.coarse
+			if tc.publishPath != "" {
+				j.PublishPath = tc.publishPath
+			}
+			tarPath := filepath.Join(sp.JobDir(j), "payload.tar")
+			if err := os.WriteFile(tarPath, make([]byte, 10240), 0o644); err != nil {
+				t.Fatalf("write payload: %v", err)
+			}
+			j.TarPath = tarPath
+
+			if err := o.Run(context.Background(), j, nil); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if j.State != tc.wantState {
+				t.Errorf("state = %v, want %v (build id present in all cases, so only "+
+					"the coarse decision can distinguish them)", j.State, tc.wantState)
+			}
+		})
+	}
+}
+
+// A job whose manifest predates the coarse field (nil) must still accumulate,
+// or a build interrupted by a prepub restart strands every remaining package.
+func TestIsCoarse_NilFallsBackToTheOldInference(t *testing.T) {
+	for name, tc := range map[string]struct {
+		j    job.Job
+		want bool
+	}{
+		"old manifest, default path, has build id": {job.Job{BuildID: "p1"}, true},
+		"old manifest, explicit prepub path":       {job.Job{BuildID: "p1", PublishPath: "prepub"}, true},
+		"old manifest, ingest path":                {job.Job{BuildID: "p1", PublishPath: "ingest"}, false},
+		"old manifest, no build id":                {job.Job{}, false},
+		"finalize never accumulates":               {job.Job{BuildID: "p1", Finalize: true}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.j.IsCoarse(); got != tc.want {
+				t.Errorf("IsCoarse() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	// An explicit value always wins over the inference.
+	no := false
+	if (&job.Job{BuildID: "p1", Coarse: &no}).IsCoarse() {
+		t.Error("an explicit coarse=false was overridden by the inference")
+	}
+}
+
+// The duplicated constant must not drift from the one it mirrors.
+func TestDefaultPublishPathNamesAgree(t *testing.T) {
+	if job.DefaultPublishPathName != DefaultPublishPath {
+		t.Errorf("job.DefaultPublishPathName=%q but api.DefaultPublishPath=%q",
+			job.DefaultPublishPathName, DefaultPublishPath)
+	}
+}
+
+// Pins the ingress assignment itself. The default path + a build id INFERS
+// coarse, so an explicit coarse=false is the only input where the stored
+// decision differs from the fallback — and therefore the only one that can
+// catch `j.Coarse = &coarse` going missing.
+//
+// NEGATIVE CONTROL: delete that assignment and this fails: Coarse comes back
+// nil, IsCoarse() infers true from the build id, and the job would accumulate
+// into a build the producer explicitly declined.
+func TestSubmitJob_ExplicitCoarseFalseIsStoredNotInferred(t *testing.T) {
+	srv, sp, orch := newTestServer(t)
+	orch.Lease = &noopBackend{}
+
+	rec := httptest.NewRecorder()
+	srv.submitJob(rec, newMultipartRequest(t, map[string]string{
+		"repo": "software.cern.ch", "path": "x86_64-el9/pkg/1.0",
+		"build_id": "pipeline-55",
+		"coarse":   "false",
+	}, []byte("dummy")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var id struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &id); err != nil || id.JobID == "" {
+		t.Fatalf("no job id in %s (err %v)", rec.Body.String(), err)
+	}
+	j, err := sp.FindJob(id.JobID)
+	if err != nil {
+		t.Fatalf("FindJob: %v", err)
+	}
+	if j.Coarse == nil {
+		t.Fatal("Coarse was not stored: it is nil, so IsCoarse() would infer true from the build id")
+	}
+	if *j.Coarse {
+		t.Error("an explicit coarse=false was stored as true")
+	}
+	if j.IsCoarse() {
+		t.Error("IsCoarse() ignored the explicit decision")
+	}
+}
+
+// A malformed boolean must be refused, not silently read as false — the same
+// rule the sibling knobs on this handler follow.
+func TestSubmitJob_RejectsMalformedCoarse(t *testing.T) {
+	srv, _, orch := newTestServer(t)
+	orch.Lease = &noopBackend{}
+	rec := httptest.NewRecorder()
+	srv.submitJob(rec, newMultipartRequest(t, map[string]string{
+		"repo": "software.cern.ch", "path": "x86_64-el9/pkg/1.0",
+		"coarse": "maybe",
+	}, []byte("dummy")))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("want 400 for coarse=maybe, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

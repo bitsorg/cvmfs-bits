@@ -258,6 +258,8 @@ func TestOrchestrator_AccumulatePathIsRecordedAndReleased(t *testing.T) {
 
 	j := newIncomingJob(t, sp)
 	j.BuildID = "b-accum"
+	coarse := true
+	j.Coarse = &coarse // accumulate: what "join this build's one commit" means
 	// The pipeline reads <jobdir>/payload.tar; the spool rename carries it
 	// along as the job advances. An empty archive is enough — the accumulate
 	// branch is about where Run returns, not about content.

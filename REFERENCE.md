@@ -3380,9 +3380,9 @@ of the canonical cvmfs catalog code.
 ### 36.1 API
 
 - **Package jobs** — `POST /api/v1/jobs` with a `build_id` form field (multipart).
-  A non-empty `build_id` makes the prepub upload the objects and pipeline as
+  A `coarse=true` submission makes the prepub upload the objects and pipeline as
   usual, then record the package's entries and finish in state `accumulated`
-  (no gateway commit). Empty `build_id` = legacy per-package commit.
+  (no gateway commit). `coarse=false` (or omitted on a per-package path) = commit on arrival.
 - **Finalize job** — `POST /api/v1/jobs` with `finalize=true` + `build_id` and
   **no tar**. The prepub assembles all of the build's accumulated packages into
   one descriptor and publishes them in a single commit, finishing in `published`.
@@ -3579,7 +3579,8 @@ are refused.
   `prepub` (default, may be omitted) runs the pipeline described here;
   `ingest` hands the tar to `cvmfs_server ingest` so the gateway does the
   chunking, dedup and catalogs (ADR-0008 D7). The ingest path commits each
-  package on arrival, so it accepts neither `build_id` nor `prewarm` — both are
+  package on arrival, so it accepts `build_id` (the run's identity, used for
+  grouping and monitoring) but neither `coarse=true` nor `prewarm` — those are
   rejected with 400 rather than silently ignored. A path the deployment does not
   offer is rejected at submission; `--ingest-publish` (config `ingest_publish`)
   is what adds `ingest`, and the startup log lists what the node serves.

@@ -77,3 +77,4 @@ journal.jsonl
 /etc/
 *.gw
 *.s3.conf
+.gofmt-leftovers/

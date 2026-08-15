@@ -181,12 +181,28 @@ type Job struct {
 	Path string
 	// PackageName is an optional human-readable package name.
 	PackageName string
-	// BuildID groups the package jobs of one build (ADR-0007 coarse publish).
-	// When non-empty, the orchestrator records this job's catalog entries into
-	// the build-scoped accumulator (internal/buildset) instead of committing
-	// per-package; a single end-of-build finalize then publishes the whole set.
+	// BuildID identifies the run that produced this job -- the CI pipeline.
+	// It is IDENTITY, not behaviour: the views, the signed common manifest and
+	// the measurement records are all keyed on it, and every job of a run
+	// carries it whatever publish path it takes. Whether the packages
+	// accumulate into one commit is Coarse, below.
 	// Empty preserves the legacy per-package commit behaviour.
 	BuildID string `json:"build_id,omitempty"`
+	// Coarse says this job takes part in its build's ONE commit (ADR-0007
+	// accumulate + finalize) rather than committing on arrival.
+	//
+	// Separate from BuildID on purpose. BuildID is the CI pipeline that
+	// produced the job -- the same identity the views and the signed common
+	// manifest are keyed on, and the one an operator uses to find a run's
+	// monitoring records. Inferring "accumulate" from "has an identity" meant
+	// the per-package paths had to send NO build id at all, which left their
+	// measurement records unattributable and made every run land in one
+	// undifferentiated file.
+	// Nil means "not stated" -- which is what every manifest written before
+	// this field existed looks like. IsCoarse() then falls back to the old
+	// inference, so a job recovered across the upgrade still accumulates
+	// instead of silently committing on its own and stranding its build.
+	Coarse *bool `json:"coarse,omitempty"`
 	// Finalize marks this job as the coarse-publish finalize for BuildID: instead
 	// of pipelining a tar, the orchestrator publishes all of the build's
 	// accumulated packages in one ingestsql commit. Carries no payload.
@@ -364,4 +380,31 @@ func NewJob(id, repo, packageName, tarPath string) *Job {
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
+}
+
+// DefaultPublishPathName is the name of the default publish path. Duplicated
+// from api.DefaultPublishPath because job cannot import api (cycle); the two
+// are pinned together by TestDefaultPublishPathNamesAgree.
+const DefaultPublishPathName = "prepub"
+
+// IsCoarse reports whether this job accumulates into its build's single
+// commit (ADR-0007) rather than committing on arrival.
+//
+// A nil Coarse means the producer did not say -- either an older producer, or
+// a manifest written before the field existed. Fall back to what prepub used
+// to infer: a build id on the default publish path meant "accumulate". Without
+// this, a job recovered across the upgrade would take the per-package path,
+// its build would never reach its expected member count, and the remaining
+// packages of that build would never be published.
+func (j *Job) IsCoarse() bool {
+	if j == nil {
+		return false
+	}
+	if j.Finalize {
+		return false // the finalize IS the commit; it does not accumulate
+	}
+	if j.Coarse != nil {
+		return *j.Coarse
+	}
+	return j.BuildID != "" && (j.PublishPath == "" || j.PublishPath == DefaultPublishPathName)
 }

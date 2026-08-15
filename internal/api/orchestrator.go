@@ -1354,9 +1354,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// CAS and pre-warmed to the Stratum 1s above.  Record its catalog entries in
 	// the build-scoped accumulator and finish in StateAccumulated; a single
 	// end-of-build finalize (POST /builds/{id}/finalize) then publishes the whole
-	// set in one gateway commit via ingestsql.  An empty BuildID preserves the
-	// legacy per-package commit path below.
-	if j.BuildID != "" && pipelineResult != nil && j.Path != "" {
+	// set in one gateway commit via ingestsql. Keyed on the job's coarse
+	// decision, not on having a build id: the id is the run's identity and is
+	// carried on every path, including the ones that commit on arrival.
+	if j.IsCoarse() && pipelineResult != nil && j.Path != "" {
 		if onStagingComplete != nil {
 			onStagingComplete()
 		}
@@ -2473,7 +2474,7 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	// sealed build can still reach a decision.  Without this the declared count
 	// is never met and the build waits forever for a package that will never
 	// arrive — with the producer long gone, nobody would notice.
-	if j.BuildID != "" && !j.Finalize {
+	if j.IsCoarse() {
 		if mErr := buildset.MarkFailed(o.Spool.Root, j.BuildID, j.ID, ClassOf(err).String()); mErr != nil {
 			o.Obs.Logger.Warn("could not mark build member failed",
 				"build_id", j.BuildID, "job_id", j.ID, "error", mErr)
