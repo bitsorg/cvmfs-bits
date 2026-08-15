@@ -2941,6 +2941,8 @@ internal port by a reverse proxy if needed.
 | `GET` | `/api/v1/jobs/{id}` | Required | Get job status |
 | `POST` | `/api/v1/jobs/{id}/abort` | Required | Request job abort |
 | `GET` | `/api/v1/jobs/{id}/events` | Required | Subscribe to SSE event stream |
+| `GET` | `/api/v1/measurements` | Required | Build ids with measurement records |
+| `GET` | `/api/v1/measurements/{build}` | Required | Per-publish records (`?summary=1` to reduce) |
 
 ---
 
@@ -3307,7 +3309,53 @@ GitHub Actions and GitLab CI (SaaS and self-hosted).  See Chapter 33 for details
 
 ---
 
-### 35.11 Size limits and timeouts
+### 35.11 GET /api/v1/measurements/{build}
+
+One JSON object per publish, grouped by build id — the exact numbers behind
+the tables in MEASUREMENTS.md. Written by the publisher at each job's terminal
+state (`--measurements-dir`, default `<spool>/measurements`, `off` disables).
+
+These exist because the Prometheus metrics cannot answer the questions a
+comparison table asks: a histogram has no maximum, and a 15 s scrape does not
+see a 0.5 s publish. Metrics stay for trends; these are the measurement.
+
+| | |
+|---|---|
+| `GET /api/v1/measurements` | build ids that have records, newest first |
+| `GET /api/v1/measurements/{build}` | every record of that build |
+| `GET /api/v1/measurements/latest` | the most recently written build |
+| `?job=<id>` | just that job's record |
+| `?path=ingest\|staged\|prepub` | just that publish path |
+| `?summary=1` | counts, window, and exact distributions |
+
+Authenticated like every other API route. A build id of `latest` is resolved
+server-side; jobs published without a coarse build id are grouped by day under
+`nobuild-YYYYMMDD`.
+
+```bash
+# the distribution a measurement section quotes
+curl -sH "$AUTH" $PREPUB/api/v1/measurements/latest?summary=1 | jq '.backend_s'
+
+# the slowest packages of a run
+curl -sH "$AUTH" $PREPUB/api/v1/measurements/15540757 \
+  | jq -r 'sort_by(-.backend_s)[:5] | .[] | "\(.backend_s)s \(.path)"'
+
+# what actually failed, with the real cause
+curl -sH "$AUTH" $PREPUB/api/v1/measurements/latest \
+  | jq -r '.[] | select(.outcome=="failed") | .path + " — " + .error'
+```
+
+Counts are omitted rather than zero when nothing measured them: `objects`
+absent means "not counted", `"objects": 0` means "counted, and it was zero".
+`objects_exact` is always present when a count is: `false` marks a number that
+came from a truncated object list and is a lower bound.
+
+`outcome` is `published`, `failed`, or `incomplete:<state>` — the last for a
+job that reached neither, a package accumulated against a coarse build being
+the normal case. `?summary=1` counts those separately, so a healthy coarse
+build reads `published: 1, incomplete: 170`, not 171 failures.
+
+### 35.12 Size limits and timeouts
 
 | Limit | Value | Notes |
 |---|---|---|

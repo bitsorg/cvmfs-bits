@@ -46,6 +46,7 @@ import (
 	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/internal/httpsig"
 	"cvmfs.io/prepub/internal/lease"
+	"cvmfs.io/prepub/internal/measure"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/pipeline"
 	"cvmfs.io/prepub/internal/provenance"
@@ -122,6 +123,7 @@ func main() {
 	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels). See ADR-0008 D3 [publisher]")
 	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
+	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
 	replaceOnConflict := flag.Bool("replace-on-conflict", false, "REPLACE an already published path when a commit fails on it: confirm the conflict against the published catalogs, delete the existing subtree in its own transaction, and retry the commit once. Destroys the published subtree at the conflicting path (prior revisions keep their objects until GC); off, a conflict stays a terminal error [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
@@ -285,7 +287,7 @@ func main() {
 			debugListen,
 			signatureSkew,
 			ingestPublish, ingestPublishOwner,
-			replaceOnConflict,
+			replaceOnConflict, measurementsDir,
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc, prefetchLimit, prefetch,
@@ -316,7 +318,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *signatureSkew, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *replaceOnConflict, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *signatureSkew, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *replaceOnConflict, *measurementsDir, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
@@ -353,6 +355,7 @@ func runPublisher(
 	ingestPublish bool,
 	ingestPublishOwner string,
 	replaceOnConflict bool,
+	measurementsDir string,
 	stratum0URL, repoName, casType, casRoot, casServerConf string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv string,
 	provenanceEnabled bool,
@@ -560,6 +563,26 @@ func runPublisher(
 				"(local + ingest): publishes to one repository are serialised by " +
 				"the per-repo commit lock, different repositories still run in parallel")
 		}
+	}
+
+	// Measurement records (internal/measure). Defaults to <spool>/measurements
+	// so a deployment gets the base without extra configuration; "off"
+	// disables. A failure to create the directory is NOT fatal — losing the
+	// measurements must never cost a publish.
+	measDir := measurementsDir
+	if strings.EqualFold(strings.TrimSpace(measDir), "off") {
+		measDir = ""
+	} else if measDir == "" {
+		measDir = filepath.Join(spoolRoot, "measurements")
+	}
+	measWriter, measErr := measure.NewWriter(measDir)
+	if measErr != nil {
+		obs.Logger.Warn("measurement records disabled: could not create the directory",
+			"dir", measDir, "error", measErr)
+		measWriter = nil
+	} else if measWriter != nil {
+		obs.Logger.Info("measurement records: one line per publish",
+			"dir", measDir, "api", "GET /api/v1/measurements/{build|latest}")
 	}
 
 	if replaceOnConflict {
@@ -787,6 +810,7 @@ func runPublisher(
 		Stratum0URL:        stratum0URL,
 		DirectGraft:        gatewayDirectGraft,
 		ReplaceOnConflict:  replaceOnConflict,
+		Measurements:       measWriter,
 		IngestSwissknife:   ingestSwissknife,
 		IngestConfigPrefix: ingestConfigPrefix,
 		IngestEnv:          splitCSV(ingestEnv),

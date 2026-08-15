@@ -30,6 +30,7 @@ import (
 	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/internal/job"
 	"cvmfs.io/prepub/internal/lease"
+	"cvmfs.io/prepub/internal/measure"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/pipeline"
 	"cvmfs.io/prepub/internal/provenance"
@@ -125,6 +126,12 @@ type Orchestrator struct {
 	// If empty, the catalog merge step is skipped and the commit will use an
 	// empty old_root_hash (only safe for the initial publish of a new repository).
 	Stratum0URL string
+	// Measurements, when non-nil, records one structured line per publish
+	// (internal/measure) so a comparison table is read rather than
+	// reconstructed from prose logs. nil disables recording entirely.
+	Measurements *measure.Writer
+	// measAcc holds the in-flight measurement per job id (map[string]*measAccum).
+	measAcc sync.Map
 	// ReplaceOnConflict authorises the orchestrator to REPLACE an already
 	// published path when a commit fails on it: confirm the conflict against
 	// the published catalogs, delete the existing subtree (the backend's
@@ -1114,6 +1121,16 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	defer span.End()
 
 	logger := o.Obs.Logger.With("job_id", j.ID)
+	// Start recording before the first thing that can fail, so a job rejected
+	// on arrival is measured too: a run's failures are as interesting as its
+	// successes, and the failures are what needed measuring most.
+	o.measBegin(j)
+	// Backstop: whatever exit Run takes, the accumulator is released and a
+	// record is written. The explicit measFinish calls on the success and
+	// abort paths claim the interesting outcomes first; this catches the
+	// rest, including the coarse-publish accumulate return that leaves a job
+	// legitimately unfinished.
+	defer o.measSweep(j)
 
 	// The publish path is checked at submission, but a job can also arrive here
 	// from crash recovery after the deployment's configuration changed. Publish
@@ -1161,6 +1178,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		logger.Info("build finalized", "build_id", j.BuildID,
 			"packages", res.Packages, "published", res.Published, "conflicts", len(res.Conflicts))
 		j.PublishedAt = time.Now()
+		// Record BEFORE the sweep can: a finalize that succeeded is a publish,
+		// and letting the backstop label it "incomplete:published" put a
+		// successful build in the failure column of every summary.
+		o.measFinish(j, "published", nil)
 		return o.transition(ctx, j, job.StatePublished)
 	}
 
@@ -1959,6 +1980,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		DirectGraft: o.graftsAt(j),
 		DirectS3:    j.DirectS3,
 		ObjectList:  j.ObjectList,
+		// The backend fills this in with what only it can know -- the tool's
+		// own duration, the payload it handed over, the objects it confirmed.
+		// nil when nothing is recording.
+		Stats: o.measStats(j),
 	}
 	if j.StagingPrefix != "" {
 		// The producer named the catalog; the receiver downloads it by this hash.
@@ -2070,6 +2095,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		}
 	}
 	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("commit").Observe(time.Since(commitPhaseStart).Seconds())
+	o.measCommit(j, time.Since(commitPhaseStart))
 
 	// The lease/slot is gone once Commit returns — every backend releases it,
 	// successfully or not. Clearing the token stops crash recovery from later
@@ -2202,6 +2228,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	}
 
 	o.Obs.Metrics.JobsCompleted.Inc()
+	o.measFinish(j, "published", nil)
 	logger.Info("job completed successfully",
 		"objects", j.NObjects,
 		"bytes_raw", j.NBytesRaw,
@@ -2346,6 +2373,7 @@ func (o *Orchestrator) replaceOnConflict(ctx context.Context, j *job.Job,
 		return false, nil
 	}
 
+	o.measConflict(j, false) // confirmed occupied; replaced only if the retry lands
 	logger.Warn("replace_on_conflict: path already published — deleting the "+
 		"existing subtree and retrying the commit once",
 		"repo", j.Repo, "path", j.Path,
@@ -2371,6 +2399,7 @@ func (o *Orchestrator) replaceOnConflict(ctx context.Context, j *job.Job,
 			"the retried commit failed — the path is now ABSENT until "+
 			"republished: %w", j.Repo, j.Path, retryErr)
 	}
+	o.measConflict(j, true)
 	logger.Info("replace_on_conflict: replaced", "repo", j.Repo, "path", j.Path)
 	return true, nil
 }
@@ -2388,6 +2417,10 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	o.Obs.Metrics.JobFailuresByClass.WithLabelValues(class.String()).Inc()
 
 	o.Obs.Logger.Error("job failed", "job_id", j.ID, "error", err, "class", class)
+	// Record BEFORE j.Error is replaced with the generic operator-facing
+	// string: the measurement wants the real cause, which is the whole reason
+	// these records exist instead of another grep over the service log.
+	o.measFinish(j, "failed", err)
 	j.Error = "job processing failed — see service logs for details"
 	// Record which FSM state the job was in when it failed.  This is used by
 	// the console miniPipeline view to highlight the correct pipeline step.

@@ -161,6 +161,7 @@ type applyTestVars struct {
 	ingestPublish                                           bool
 	ingestPublishOwner                                      string
 	replaceOnConflict                                       bool
+	measurementsDir                                         string
 	ingestSwissknife, ingestConfigPrefix, ingestEnv         string
 	chunkMin, chunkAvg, chunkMax                            int64
 	pipelineWorkers, pipelineUploadConc, prefetchLimit      int
@@ -198,7 +199,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.debugListen,
 		&v.signatureSkew,
 		&v.ingestPublish, &v.ingestPublishOwner,
-		&v.replaceOnConflict,
+		&v.replaceOnConflict, &v.measurementsDir,
 		&v.ingestSwissknife, &v.ingestConfigPrefix, &v.ingestEnv,
 		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
 		&v.pipelineWorkers, &v.pipelineUploadConc, &v.prefetchLimit, &v.prefetch,

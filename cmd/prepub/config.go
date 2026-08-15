@@ -87,6 +87,10 @@ type fileConfig struct {
 	// Destructive by design, so it is opt-in and defaults to off.
 	ReplaceOnConflict bool `yaml:"replace_on_conflict"`
 
+	// MeasurementsDir is where per-publish measurement records are written
+	// (--measurements-dir). Empty uses <spool>/measurements; "off" disables.
+	MeasurementsDir string `yaml:"measurements_dir"`
+
 	// Coarse-publish finalize (ADR-0007): one cvmfs_swissknife ingestsql
 	// invocation commits a whole build. Without IngestConfigPrefix the finalize
 	// is DISABLED, and since a sealed build finalizes server-side, that failure
@@ -291,6 +295,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	ingestPublish *bool,
 	ingestPublishOwner *string,
 	replaceOnConflict *bool,
+	measurementsDir *string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv *string,
 	chunkMin, chunkAvg, chunkMax *int64,
 	pipelineWorkers, pipelineUploadConc, prefetchLimit *int,
@@ -421,6 +426,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	if !has("replace-on-conflict") && fc.ReplaceOnConflict {
 		*replaceOnConflict = true
 	}
+	str("measurements-dir", measurementsDir, fc.MeasurementsDir)
 	str("ingest-swissknife", ingestSwissknife, fc.IngestSwissknife)
 	str("ingest-config-prefix", ingestConfigPrefix, fc.IngestConfigPrefix)
 	if !has("ingest-env") && len(fc.IngestEnv) > 0 {

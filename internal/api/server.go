@@ -179,6 +179,14 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	auth.HandleFunc("/{id}/events", s.jobEvents).Methods("GET")
 	auth.HandleFunc("/{id}/log", s.jobLogHandler).Methods("GET")
 
+	// Measurements (internal/measure): the per-publish records behind the
+	// numbers in MEASUREMENTS.md. Authenticated like every other API route —
+	// they carry repository paths and failure causes.
+	meas := s.router.PathPrefix("/api/v1/measurements").Subrouter()
+	meas.Use(s.requireAuth)
+	meas.HandleFunc("", s.measurementBuildsHandler).Methods("GET")
+	meas.HandleFunc("/{build}", s.measurementsHandler).Methods("GET")
+
 	// Fail-fast namespace reservation (POST /api/v1/reserve). Authenticated.
 	reserve := s.router.PathPrefix("/api/v1/reserve").Subrouter()
 	reserve.Use(s.requireAuth)
