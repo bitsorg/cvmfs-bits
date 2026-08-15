@@ -253,6 +253,17 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 		"object_list", req.ObjectList)
 	start := time.Now()
 
+	// Payload size is knowable here and nowhere upstream: the orchestrator
+	// hands over a path, and after the publish the spool may already have
+	// moved. Stat it before the tool runs, and report nothing rather than 0
+	// if it cannot be stated.
+	if req.Stats != nil {
+		if fi, statErr := os.Stat(req.TarPath); statErr == nil {
+			n := fi.Size()
+			req.Stats.TarBytes = &n
+		}
+	}
+
 	// Two shapes, because collecting the list needs Start/Wait around the pipe
 	// and cvmfsServerOutput uses CombinedOutput, which does both itself. The
 	// no-list branch is the pre-existing call, untouched.
@@ -283,8 +294,19 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 		return fmt.Errorf("cvmfs_server ingest into %q: %w (output: %s)",
 			base, err, truncateLog(out))
 	}
+	elapsed := time.Since(start)
+	// Report the SAME number that goes into the log line below, so a
+	// measurement record and the log can never disagree about one publish.
+	if req.Stats != nil {
+		req.Stats.Backend = elapsed
+		if useObjectList {
+			n := listed
+			req.Stats.Objects = &n
+			req.Stats.ObjectsAuthoritative = readToEOF
+		}
+	}
 	fields := []any{
-		"repo", repo, "base", base, "duration", time.Since(start).String(),
+		"repo", repo, "base", base, "duration", elapsed.String(),
 		"direct_s3", req.DirectS3,
 	}
 	if useObjectList {

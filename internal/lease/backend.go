@@ -107,6 +107,42 @@ type CommitRequest struct {
 	// where the tar contents should be extracted (local mode).
 	// Typically: <cvmfsMount>/<repo>/<path>
 	CVMFSDir string
+
+	// Stats, when non-nil, is filled in by the backend with what only it can
+	// know about this publish -- how long the underlying tool actually took,
+	// how much payload it handed over, how many objects it confirmed. The
+	// orchestrator records it; nothing in the publish depends on it.
+	//
+	// It is per-request rather than backend state on purpose: one backend
+	// serves many concurrent jobs, so anything shared would race.
+	//
+	// CONTRACT: a backend may write Stats only from inside Commit, and every
+	// write must happen-before Commit returns. The orchestrator reads it
+	// after Commit on the same goroutine and takes no lock. A backend that
+	// reports from a goroutine outliving Commit introduces a data race -- the
+	// detector does catch it, so a backend doing that will fail -race tests.
+	Stats *PublishStats
+}
+
+// PublishStats is what a backend reports about one publish. Every field is
+// OPTIONAL and zero means "not measured", which is why the counts are
+// pointers: recording 0 objects for a path that never counted them is the
+// kind of confident-but-wrong number these records exist to replace (the
+// ingest path logged objects=0 for real publishes for weeks -- MEASUREMENTS
+// §22, §24).
+type PublishStats struct {
+	// Backend is the tool-level duration: for the ingest path, exactly the
+	// wall clock of `cvmfs_server ingest`, excluding lease and ancestors.
+	Backend time.Duration
+	// TarBytes is the payload handed to the backend, when it takes one.
+	TarBytes *int64
+	// Objects is the number of data objects the backend confirmed. Only the
+	// paths that actually count them set it (ingest: --object-list).
+	Objects *int
+	// ObjectsAuthoritative reports whether Objects is a complete count. A
+	// truncated object-list read yields a number that must not be treated as
+	// the whole set.
+	ObjectsAuthoritative bool
 }
 
 // Backend abstracts CVMFS publish transaction management so the orchestrator

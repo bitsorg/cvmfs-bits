@@ -127,3 +127,62 @@ func TestDeleteSubtree_ReleasesTheSlot(t *testing.T) {
 	}
 	b.release(tok)
 }
+
+// The measurement records are only as good as what the backend reports, and
+// nothing else in the suite exercises the PublishStats sink: a mock backend
+// that ignores it would keep every other test green while the numbers went
+// missing (the review found exactly this hole).
+//
+// NEGATIVE CONTROL: delete the `req.Stats` assignments in Commit and this
+// fails on all three assertions.
+func TestCommit_FillsPublishStats(t *testing.T) {
+	fakeCvmfsServerWithOutput(t, "Changes submitted to repository gateway", 0)
+	b := NewIngestBackend(IngestOptions{CVMFSMount: "/cvmfs", SkipAncestorDirs: true},
+		newTestObs(t))
+
+	tar := filepath.Join(t.TempDir(), "payload.tar")
+	if err := os.WriteFile(tar, make([]byte, 4096), 0o644); err != nil {
+		t.Fatalf("write tar: %v", err)
+	}
+	token, err := b.Acquire(context.Background(), "test.cvmfs.io", "a/b")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	var stats PublishStats
+	err = b.Commit(context.Background(), CommitRequest{
+		Token:    token,
+		TarPath:  tar,
+		CVMFSDir: "/cvmfs/test.cvmfs.io/a/b",
+		Stats:    &stats,
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if stats.Backend <= 0 {
+		t.Error("backend duration not reported")
+	}
+	if stats.TarBytes == nil || *stats.TarBytes != 4096 {
+		t.Errorf("tar bytes = %v, want 4096", stats.TarBytes)
+	}
+	// Without --object-list nothing counts objects, and the sink must stay
+	// empty rather than claim zero.
+	if stats.Objects != nil {
+		t.Errorf("objects reported without an object list: %v", *stats.Objects)
+	}
+}
+
+// A nil sink is the disabled case and must not panic or change the publish.
+func TestCommit_NilStatsSinkIsFine(t *testing.T) {
+	fakeCvmfsServerWithOutput(t, "Changes submitted to repository gateway", 0)
+	b := NewIngestBackend(IngestOptions{CVMFSMount: "/cvmfs", SkipAncestorDirs: true},
+		newTestObs(t))
+	tar := filepath.Join(t.TempDir(), "payload.tar")
+	_ = os.WriteFile(tar, make([]byte, 16), 0o644)
+	token, _ := b.Acquire(context.Background(), "test.cvmfs.io", "a/b")
+	if err := b.Commit(context.Background(), CommitRequest{
+		Token: token, TarPath: tar, CVMFSDir: "/cvmfs/test.cvmfs.io/a/b", Stats: nil,
+	}); err != nil {
+		t.Fatalf("Commit with a nil stats sink: %v", err)
+	}
+}
