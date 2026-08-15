@@ -509,6 +509,63 @@ func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3, objectL
 	return append(args, repo)
 }
 
+// DeleteSubtree removes a published nested-catalog subtree at the repo-relative
+// path, in its own gateway transaction, via `cvmfs_server ingest -f <path>`.
+//
+// It exists for conflict remediation (replace_on_conflict): the tar-based
+// publish paths ADD, they never replace — an occupied path dies in swissknife
+// on the catalog.md5path UNIQUE constraint — so a re-publish must first drop
+// the existing subtree and then run the unchanged, proven publish.
+//
+// Fast delete (-f) is deliberate and load-bearing: it is catalog-driven, so it
+// works on a MOUNTLESS publisher where a plain -d is refused for lacking the
+// rdonly view. It requires the target to be a nested-catalog mountpoint, which
+// every path this backend publishes is (NestedCatalog / -C true), and it
+// requires a cvmfs_server whose SyncMediator dispatches the delete on the
+// catalog when the filesystem cannot type the entry. On a server WITHOUT that
+// fix the delete "succeeds" with a warning and removes nothing — which is why
+// the warning is treated as an error here rather than trusted exit status.
+//
+// The repository slot is taken for the duration, so this publisher never runs
+// two `cvmfs_server ingest` invocations on one repository concurrently.
+func (b *IngestBackend) DeleteSubtree(ctx context.Context, repo, relPath string) error {
+	base := strings.Trim(relPath, "/")
+	if base == "" {
+		return fmt.Errorf("ingest backend: refusing to delete the repository "+
+			"root of %q: conflict remediation replaces one published path, "+
+			"never a repository", repo)
+	}
+	token, err := b.Acquire(ctx, repo, base)
+	if err != nil {
+		return fmt.Errorf("ingest backend: acquiring slot to delete %q from %q: %w",
+			base, repo, err)
+	}
+	defer b.release(token)
+
+	b.obs.Logger.Info("ingest backend: deleting published subtree",
+		"repo", repo, "base", base)
+	// Repository last — cvmfs_server's option loop takes $1 as the repository
+	// once the flags run out (see commitArgs).
+	out, err := b.cvmfsServerOutput(ctx, "ingest", "-f", base, repo)
+	if err != nil {
+		return fmt.Errorf("ingest backend: cvmfs_server ingest -f %q (repo %q): %w "+
+			"(output: %s)", base, repo, err, truncateLog(out))
+	}
+	// Exit 0 does not mean deleted: on an unfixed server, or for a target that
+	// is not a nested-catalog mountpoint, the sync warns and commits an EMPTY
+	// revision. Retrying the publish after that would just re-fail on the same
+	// conflict, so surface it as the delete failing.
+	if strings.Contains(out, "cannot be deleted") {
+		return fmt.Errorf("ingest backend: cvmfs_server ingest -f %q (repo %q) "+
+			"exited 0 but refused the deletion — the target is not a "+
+			"nested-catalog mountpoint, or the server predates the mountless "+
+			"fast-delete fix (output: %s)", base, repo, truncateLog(out))
+	}
+	b.obs.Logger.Info("ingest backend: published subtree deleted",
+		"repo", repo, "base", base)
+	return nil
+}
+
 // Abort releases the repository slot. `cvmfs_server ingest` is atomic from this
 // backend's point of view — it either committed or it did not — so there is
 // nothing to roll back.
