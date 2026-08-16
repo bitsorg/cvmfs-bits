@@ -84,6 +84,7 @@ type fakeCAS struct {
 	calls     []string // staging aliases, in order
 	result    cas.PromoteResult
 	err       error
+	workers   []int // the concurrency each promotion was asked for
 	promotes  int
 	puts      int
 	adds      []string        // what a successful promotion lands in the store
@@ -96,10 +97,11 @@ func newFakeCAS(adds ...string) *fakeCAS {
 		result: cas.PromoteResult{Copied: len(adds), Bytes: 4096}}
 }
 
-func (f *fakeCAS) PromoteFrom(_ context.Context, alias string, _ int) (cas.PromoteResult, error) {
+func (f *fakeCAS) PromoteFrom(_ context.Context, alias string, workers int) (cas.PromoteResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, alias)
+	f.workers = append(f.workers, workers)
 	f.promotes++
 	if f.err != nil {
 		return cas.PromoteResult{}, f.err
@@ -392,5 +394,42 @@ func TestRun_UnstagedJobNeitherPromotesNorGrafts(t *testing.T) {
 		if req.DirectGraft {
 			t.Error("an ordinary ingest job must not be grafted")
 		}
+	}
+}
+
+// The configured concurrency must reach PromoteFrom, and an Orchestrator that
+// never sets it must still pass 0 so cas.PromoteFrom applies its own default.
+// A knob that silently keeps the built-in 16 is worse than no knob: the
+// experiment it exists for would report "no effect".
+//
+// NEGATIVE CONTROL: restore the literal 0 at the PromoteFrom call site and the
+// first case fails with "workers = [0], want [32]".
+func TestRun_StagedPublishUsesConfiguredPromoteWorkers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  int
+		want int
+	}{
+		{"configured", 32, 32},
+		{"unset means the CAS default", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, orch := newTestServer(t)
+			fc := newFakeCAS(stagedCatalog)
+			cb := &capturingBackend{promotedBy: fc.count}
+			orch.CAS = fc
+			orch.Lease = &noopBackend{}
+			orch.PromoteWorkers = tc.set
+			orch.PublishPaths = map[string]lease.Backend{
+				StagedPublishPath: cb, "ingest": cb}
+
+			j := stagedJob(t, orch, "staging/host7/job-workers")
+			if err := runStaged(t, orch, j); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if len(fc.workers) != 1 || fc.workers[0] != tc.want {
+				t.Errorf("workers = %v, want [%d]", fc.workers, tc.want)
+			}
+		})
 	}
 }

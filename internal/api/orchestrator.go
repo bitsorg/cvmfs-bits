@@ -144,6 +144,12 @@ type Orchestrator struct {
 	// This is deliberately an explicit switch — deletion of published state
 	// must never be a side effect nobody asked for.
 	ReplaceOnConflict bool
+
+	// PromoteWorkers is the concurrency of the staged path's server-side copy
+	// (--promote-workers). Zero keeps cas.PromoteFrom's own default, so an
+	// Orchestrator built without setting it behaves exactly as before.
+	PromoteWorkers int
+
 	// DirectGraft enables the fast-path commit on the receiver side.
 	//
 	// When true, the finalise step POSTs to the dedicated gateway graft
@@ -1730,7 +1736,8 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 						"(cas.type: s3); this prepub has %T", o.CAS))
 			}
 			promoteStart := time.Now()
-			res, promoteErr := p.PromoteFrom(ctx, j.StagingPrefix, 0)
+			res, promoteErr := p.PromoteFrom(ctx, j.StagingPrefix,
+				o.PromoteWorkers)
 			if promoteErr != nil {
 				span.RecordError(promoteErr)
 				return o.abortJob(ctx, j, fmt.Errorf(
@@ -1739,7 +1746,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			logger.Info("staged publish: promoted objects into the CAS",
 				"prefix", j.StagingPrefix, "copied", res.Copied, "skipped", res.Skipped,
 				"rejected", res.Rejected, "bytes", res.Bytes,
-				"duration", time.Since(promoteStart).String())
+				"duration", time.Since(promoteStart).String(),
+				// Without the setting the duration cannot be interpreted
+				// afterwards, which is the whole point of a tunable.
+				"workers", o.PromoteWorkers)
 
 			// Record what moved (ADR-0011 D6). Without this a staged publish
 			// reports objects=0 bytes=0 on completion and in every accounting

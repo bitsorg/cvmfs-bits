@@ -24,11 +24,19 @@ type PromoteResult struct {
 	Bytes    int64 // bytes of the copied objects, as reported by the listing
 }
 
-// maxPromoteWorkers bounds the fan-out. The shared transport is sized for
+// MaxPromoteWorkers bounds the fan-out. The shared transport is sized for
 // maxIdleConnsPerHost; letting a caller ask for tens of thousands of workers
 // would reproduce the ephemeral-port exhaustion that once failed 64 of 170 jobs
 // in a 39 s window.
-const maxPromoteWorkers = 256
+//
+// Exported so a caller that offers this as a knob can reject or clamp at the
+// edge, where the operator sees it, instead of silently here.
+const MaxPromoteWorkers = 256
+
+// DefaultPromoteWorkers is used when a caller passes a non-positive count.
+// Exported for the same reason: a flag default that hard-codes its own 16
+// silently desynchronises from this one.
+const DefaultPromoteWorkers = 16
 
 // PromoteFrom copies every object under a staging prefix into this CAS, using
 // server-side copies so no object data passes through this process.
@@ -81,7 +89,7 @@ func (s *S3) PromoteFrom(ctx context.Context, stagingAlias string, workers int) 
 			"a promotion must move objects between two prefixes", stagingAlias)
 	}
 	if workers < 1 {
-		workers = 16
+		workers = DefaultPromoteWorkers
 	}
 
 	srcPrefix := stagingAlias + "/data/"
@@ -133,8 +141,8 @@ func (s *S3) PromoteFrom(ctx context.Context, stagingAlias string, workers int) 
 	if workers > len(todo) {
 		workers = len(todo)
 	}
-	if workers > maxPromoteWorkers {
-		workers = maxPromoteWorkers
+	if workers > MaxPromoteWorkers {
+		workers = MaxPromoteWorkers
 	}
 
 	var (

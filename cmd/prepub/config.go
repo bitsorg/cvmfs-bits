@@ -87,6 +87,10 @@ type fileConfig struct {
 	// Destructive by design, so it is opt-in and defaults to off.
 	ReplaceOnConflict bool `yaml:"replace_on_conflict"`
 
+	// PromoteWorkers is the concurrency of the staged path's server-side copy
+	// into the CAS (--promote-workers). Zero/omitted keeps the CLI default.
+	PromoteWorkers int `yaml:"promote_workers"`
+
 	// MeasurementsDir is where per-publish measurement records are written
 	// (--measurements-dir). Empty uses <spool>/measurements; "off" disables.
 	MeasurementsDir string `yaml:"measurements_dir"`
@@ -298,7 +302,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	measurementsDir *string,
 	ingestSwissknife, ingestConfigPrefix, ingestEnv *string,
 	chunkMin, chunkAvg, chunkMax *int64,
-	pipelineWorkers, pipelineUploadConc, prefetchLimit *int,
+	pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers *int,
 	prefetch *bool,
 ) {
 	has := func(name string) bool { return explicit[name] }
@@ -351,6 +355,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	i("pipeline-workers", pipelineWorkers, fc.Pipeline.Workers)
 	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)
 	i("prefetch-limit", prefetchLimit, fc.Pipeline.PrefetchLimit)
+	i("promote-workers", promoteWorkers, fc.PromoteWorkers)
 	if !has("prefetch") && fc.Pipeline.Prefetch != nil {
 		*prefetch = *fc.Pipeline.Prefetch
 	}

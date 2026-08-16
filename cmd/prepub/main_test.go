@@ -73,10 +73,20 @@ publish_mode: gateway
 gateway:
   url: http://gw.example.com:4929
 log_level: debug
+promote_workers: 32
 `)
 	fc, err := loadFileConfig(path)
 	if err != nil {
 		t.Fatalf("loadFileConfig: %v", err)
+	}
+	// The key must be exercised through YAML, not just through a Go literal:
+	// loadFileConfig does a plain Unmarshal with no KnownFields, so a typo in
+	// the struct tag makes the operator's setting a silent no-op.
+	//
+	// NEGATIVE CONTROL: change the tag to `yaml:"promote_workerz"` and this
+	// fails with "PromoteWorkers = 0; want 32".
+	if fc.PromoteWorkers != 32 {
+		t.Errorf("PromoteWorkers = %d; want 32", fc.PromoteWorkers)
 	}
 	if fc.SpoolRoot != "/custom/spool" {
 		t.Errorf("SpoolRoot = %q; want /custom/spool", fc.SpoolRoot)
@@ -165,6 +175,7 @@ type applyTestVars struct {
 	ingestSwissknife, ingestConfigPrefix, ingestEnv         string
 	chunkMin, chunkAvg, chunkMax                            int64
 	pipelineWorkers, pipelineUploadConc, prefetchLimit      int
+	promoteWorkers                                          int
 	prefetch                                                bool
 }
 
@@ -202,7 +213,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.replaceOnConflict, &v.measurementsDir,
 		&v.ingestSwissknife, &v.ingestConfigPrefix, &v.ingestEnv,
 		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
-		&v.pipelineWorkers, &v.pipelineUploadConc, &v.prefetchLimit, &v.prefetch,
+		&v.pipelineWorkers, &v.pipelineUploadConc, &v.prefetchLimit, &v.promoteWorkers, &v.prefetch,
 	)
 }
 
@@ -284,5 +295,24 @@ func TestApplyFileConfig_ReplaceOnConflict(t *testing.T) {
 	v2.apply(fc, map[string]bool{"replace-on-conflict": true})
 	if v2.replaceOnConflict {
 		t.Error("explicit --replace-on-conflict=false was overridden by config")
+	}
+}
+
+// The config file supplies the promote concurrency only when the flag was not
+// given; an explicit --promote-workers wins. Same rule as every other int.
+func TestApplyFileConfig_PromoteWorkers(t *testing.T) {
+	fc := &fileConfig{PromoteWorkers: 32}
+	v := defaultApplyVars()
+	v.promoteWorkers = 16
+	v.apply(fc, map[string]bool{})
+	if v.promoteWorkers != 32 {
+		t.Errorf("promoteWorkers = %d; want 32 from config", v.promoteWorkers)
+	}
+
+	v2 := defaultApplyVars()
+	v2.promoteWorkers = 64
+	v2.apply(fc, map[string]bool{"promote-workers": true})
+	if v2.promoteWorkers != 64 {
+		t.Errorf("promoteWorkers = %d; explicit flag must win", v2.promoteWorkers)
 	}
 }

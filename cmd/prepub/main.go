@@ -125,6 +125,7 @@ func main() {
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
 	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
 	replaceOnConflict := flag.Bool("replace-on-conflict", false, "REPLACE an already published path when a commit fails on it: confirm the conflict against the published catalogs, delete the existing subtree in its own transaction, and retry the commit once. Destroys the published subtree at the conflicting path (prior revisions keep their objects until GC); off, a conflict stays a terminal error [publisher]")
+	promoteWorkers := flag.Int("promote-workers", cas.DefaultPromoteWorkers, "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (MEASUREMENTS.md §26: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
 	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
@@ -290,7 +291,7 @@ func main() {
 			replaceOnConflict, measurementsDir,
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
-			pipelineWorkers, pipelineUploadConc, prefetchLimit, prefetch,
+			pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers, prefetch,
 		)
 	}
 
@@ -323,7 +324,7 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
-			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *prefetch,
+			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *promoteWorkers, *prefetch,
 			*chunkMin, *chunkAvg, *chunkMax,
 			*warmQuorum, *preWarm,
 			*brokerCACert,
@@ -365,6 +366,7 @@ func runPublisher(
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineWorkers, pipelineUploadConc, pipelineCompressLevel int,
 	prefetchLimit int,
+	promoteWorkers int,
 	prefetch bool,
 	chunkMin, chunkAvg, chunkMax int64,
 	warmQuorum float64,
@@ -583,6 +585,19 @@ func runPublisher(
 	} else if measWriter != nil {
 		obs.Logger.Info("measurement records: one line per publish",
 			"dir", measDir, "api", "GET /api/v1/measurements/{build|latest}")
+	}
+
+	// Validate at the edge. cas.PromoteFrom clamps silently three packages
+	// away, so an operator running the A/B this knob exists for would get 16
+	// (or 256) while believing otherwise, and conclude the setting did nothing.
+	if promoteWorkers < 1 {
+		obs.Logger.Error("promote-workers must be at least 1",
+			"got", promoteWorkers)
+		os.Exit(1)
+	}
+	if promoteWorkers > cas.MaxPromoteWorkers {
+		obs.Logger.Warn("promote-workers above the transport's limit; clamping",
+			"got", promoteWorkers, "using", cas.MaxPromoteWorkers)
 	}
 
 	if replaceOnConflict {
@@ -810,6 +825,7 @@ func runPublisher(
 		Stratum0URL:        stratum0URL,
 		DirectGraft:        gatewayDirectGraft,
 		ReplaceOnConflict:  replaceOnConflict,
+		PromoteWorkers:     promoteWorkers,
 		Measurements:       measWriter,
 		IngestSwissknife:   ingestSwissknife,
 		IngestConfigPrefix: ingestConfigPrefix,

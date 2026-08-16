@@ -3544,6 +3544,36 @@ Whether it runs and how much it may run are deliberately separate settings:
 pointer internally so that an absent key ("use the default") stays
 distinguishable from an explicit `prefetch: false`.
 
+### Promote concurrency (staged publish path)
+
+`--promote-workers` (config `promote_workers`, default 16) sets how many
+server-side copies run at once when a **staged** job's objects are promoted
+from its staging prefix into the CAS. It applies only to that path; nothing
+else calls `PromoteFrom`. The key is top level rather than under `pipeline:`
+because promotion is not part of the compress/upload pipeline — it happens
+before the lease is taken and moves no bytes through this process.
+
+The work is latency-bound, not bandwidth-bound: each object costs a HEAD plus
+a COPY, about 22 ms per object per worker, so throughput tracks the worker
+count almost linearly. Measured at the default: 45 766 objects / 1.82 GB in
+63.6 s, ≈720 objects/s at 16 workers (MEASUREMENTS.md §26). Object *count*
+sets the cost, not size — 4 296 objects totalling 1.64 GB finished in 6.4 s.
+
+**Raising it is not free.** Jobs promote concurrently, so requests in flight
+are `promote_workers × concurrent staged jobs`, sharing one keep-alive pool of
+256 per host (`internal/cas/s3.go`) with the upload path. Overshooting the pool
+does not queue — it dials fresh connections that cannot park, and each one
+lands in a 60 s TIME_WAIT. That is what once exhausted the ephemeral port range
+and lost 64 of 170 jobs inside 39 seconds. Values below 1 are refused at
+startup; above `cas.MaxPromoteWorkers` (256) the copy clamps, with a warning.
+
+Promotion also competes with the producer for the same object store, and on the
+staged path the producer is usually the slower half — 49% of one measured
+publish window was prepub sitting idle waiting for it. So a higher setting can
+buy nothing while costing connections. Measure both sides: the promote
+`duration` and `workers` appear together in the `promoted objects into the CAS`
+log line, and the producer's pace shows up as the gap between job arrivals.
+
 Before tuning any of this, check whether the spool device is the ceiling —
 `vmstat 1` (`b` counts processes blocked on I/O, `wa` is I/O wait) and
 `iostat -x 1` (`r_await`, `%util`). If `wa` is high and CPU is idle, no
