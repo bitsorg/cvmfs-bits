@@ -538,8 +538,12 @@ func runPublisher(
 	// The registry is keyed by path name now and becomes (repo, path) when one
 	// instance serves several repositories (ADR-0008 D1).
 	publishPaths := map[string]lease.Backend{}
+	// Declared out here so the staged path can borrow its DeleteSubtree for
+	// replace_on_conflict: deleting a published subtree is repository-level
+	// work, not a property of how the content arrived.
+	var ib *lease.IngestBackend
 	if ingestPublish {
-		ib := lease.NewIngestBackend(lease.IngestOptions{
+		ib = lease.NewIngestBackend(lease.IngestOptions{
 			CVMFSMount: cvmfsMount,
 			// A nested catalog per published package keeps the root catalog
 			// small and is what lets ingest publish into a path that already
@@ -613,7 +617,7 @@ func runPublisher(
 	// naming it on a local-mode node is rejected at submission rather than
 	// published some other way.
 	if gwClient != nil {
-		publishPaths[api.StagedPublishPath] = lease.NewStagedBackend(gwClient)
+		publishPaths[api.StagedPublishPath] = lease.NewStagedBackend(gwClient, ib)
 		obs.Logger.Info("publish path available: " + api.StagedPublishPath +
 			" (producer-prepared objects, promoted and grafted — no payload)")
 	}

@@ -97,7 +97,7 @@ func TestStagedJobReachesTheGatewayGraftEndpoint(t *testing.T) {
 	client := lease.NewClient(gw.srv.URL, "key", "secret", orch.Obs)
 	orch.Lease = &noopBackend{}
 	orch.PublishPaths = map[string]lease.Backend{
-		StagedPublishPath: lease.NewStagedBackend(client),
+		StagedPublishPath: lease.NewStagedBackend(client, nil),
 	}
 	fc := newFakeCAS(stagedCatalog)
 	orch.CAS = fc
@@ -136,7 +136,7 @@ func TestStagedJobReachesTheGatewayGraftEndpoint(t *testing.T) {
 func TestStagedBackendOverrides(t *testing.T) {
 	_, _, orch := newTestServer(t)
 	gw := newFakeGateway(t)
-	b := lease.NewStagedBackend(lease.NewClient(gw.srv.URL, "key", "secret", orch.Obs))
+	b := lease.NewStagedBackend(lease.NewClient(gw.srv.URL, "key", "secret", orch.Obs), nil)
 
 	// NeedsPipeline false, or the orchestrator demands a tar that cannot exist.
 	if b.NeedsPipeline() {

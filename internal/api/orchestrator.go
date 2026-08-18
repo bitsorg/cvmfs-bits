@@ -2321,17 +2321,20 @@ var pathExistsFn = cvmfscatalog.PathExists
 //
 // Implementing this is NOT just about being able to delete. The remediation
 // retries by calling Commit with the same CommitRequest, so a backend may
-// only implement it when all three hold — today they do for IngestBackend,
-// and for nothing else:
+// only implement it when all three hold — today they hold for IngestBackend
+// and StagedBackend:
 //
 //  1. Commit is self-contained: no catalog/objects were uploaded in an
-//     earlier phase. The gateway path commits via CommitFinalizeOnly with a
-//     request that deliberately carries no hashes, so a plain Commit retry
-//     would publish nothing.
+//     earlier phase that a plain Commit retry would omit. Ingest re-ingests
+//     the spool tar; the staged retry re-grafts objects already promoted into
+//     the store, so both republish in full.
 //  2. Heartbeat is a no-op: the remediation does not restart one, so a
-//     backend holding a renewable lease would retry unattended.
+//     backend holding a renewable lease would retry unattended. The staged
+//     path's heartbeat is already cancelled before the commit.
 //  3. Commit does not depend on OldRootHash: the delete advances the
-//     repository root, so any root read before it is stale.
+//     repository root, so any root read before it is stale — and the graft
+//     does NOT enforce old_root_hash (proven, MEASUREMENTS §29), so the stale
+//     value the retry still carries is harmless.
 type subtreeDeleter interface {
 	DeleteSubtree(ctx context.Context, repo, relPath string) error
 }
@@ -2390,7 +2393,31 @@ func (o *Orchestrator) replaceOnConflict(ctx context.Context, j *job.Job,
 		"repo", j.Repo, "path", j.Path,
 		"destroys", "the published subtree at this path only; prior revisions "+
 			"keep their objects until GC")
+	// Release the job's lease before deleting. A failed staged graft returns
+	// merge_error WITHOUT releasing its gateway lease (StagedBackend.Commit ->
+	// CommitFinalizeOnly), and DeleteSubtree acquires a gateway lease on the
+	// same path, so a still-open lease makes the delete fail path_busy
+	// (MEASUREMENTS §29). On the ingest path Commit already freed the slot and
+	// IngestBackend.Abort is an idempotent no-op, so this is safe there too.
+	if j.LeaseToken != "" {
+		if relErr := backend.Abort(ctx, j.LeaseToken); relErr != nil {
+			return true, fmt.Errorf("replace_on_conflict: could not release the "+
+				"conflicting lease on %s/%s before deleting the subtree: %w",
+				j.Repo, j.Path, relErr)
+		}
+		j.LeaseToken = ""
+	}
 	if delErr := deleter.DeleteSubtree(ctx, j.Repo, j.Path); delErr != nil {
+		// A backend that implements the method but cannot do the work in this
+		// deployment declines exactly as one without the method does. The
+		// staged path is such a backend: it borrows the capability from the
+		// ingest path, which may not be enabled.
+		if errors.Is(delErr, lease.ErrSubtreeDeleteUnsupported) {
+			logger.Info("replace_on_conflict: conflict-shaped failure, but this "+
+				"deployment cannot delete a subtree — leaving the error terminal",
+				"path", j.Path, "publish_path", j.PublishPath, "reason", delErr)
+			return false, nil
+		}
 		return true, fmt.Errorf("replace_on_conflict: commit failed on occupied "+
 			"path %s/%s (%v); deleting the existing subtree then also failed: %w",
 			j.Repo, j.Path, commitErr, delErr)
