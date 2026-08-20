@@ -316,3 +316,22 @@ func TestApplyFileConfig_PromoteWorkers(t *testing.T) {
 		t.Errorf("promoteWorkers = %d; explicit flag must win", v2.promoteWorkers)
 	}
 }
+
+func TestEnvInt(t *testing.T) {
+	const k = "PREPUB_TEST_ENVINT_XYZ"
+	os.Unsetenv(k)
+	if got := envInt(k, 7); got != 7 { // unset -> builtin
+		t.Fatalf("unset: want 7, got %d", got)
+	}
+	os.Setenv(k, "  32 ")
+	defer os.Unsetenv(k)
+	if got := envInt(k, 7); got != 32 { // valid, trimmed -> parsed
+		t.Fatalf("valid: want 32, got %d", got)
+	}
+	for _, bad := range []string{"notanumber", "", "  "} { // garbage/empty -> builtin
+		os.Setenv(k, bad)
+		if got := envInt(k, 7); got != 7 {
+			t.Fatalf("bad %q: want builtin 7, got %d", bad, got)
+		}
+	}
+}

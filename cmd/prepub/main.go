@@ -31,6 +31,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -81,6 +82,19 @@ import (
 // can set --job-timeout, having seen their own storage.
 const defaultJobTimeout = 0
 
+// envInt is the default for a tuning flag, read from an env var so it can be set
+// from the testbed .env (like PREPUB_API_TOKEN already is) without editing the
+// compose or passing flags. Precedence stays flag > config file > env > builtin:
+// an explicit flag or a config value still wins. Empty/garbage keeps the builtin.
+func envInt(name string, builtin int) int {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return builtin
+}
+
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────
 	// Subcommand: prepub revoke <node> -- revoke a receiver's control-plane
@@ -125,7 +139,7 @@ func main() {
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
 	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
 	replaceOnConflict := flag.Bool("replace-on-conflict", false, "REPLACE an already published path when a commit fails on it: confirm the conflict against the published catalogs, delete the existing subtree in its own transaction, and retry the commit once. Destroys the published subtree at the conflicting path (prior revisions keep their objects until GC); off, a conflict stays a terminal error [publisher]")
-	promoteWorkers := flag.Int("promote-workers", cas.DefaultPromoteWorkers, "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (MEASUREMENTS.md §26: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half [publisher]")
+	promoteWorkers := flag.Int("promote-workers", envInt("PREPUB_PROMOTE_WORKERS", cas.DefaultPromoteWorkers), "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (MEASUREMENTS.md §26: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half. Env: PREPUB_PROMOTE_WORKERS [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
 	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
@@ -173,7 +187,7 @@ func main() {
 	// Pipeline performance tuning.
 	prefetch := flag.Bool("prefetch", true, "Run pipeline phase 0 (the tar scan) ahead of the job's concurrency slot. Turn OFF on I/O-bound storage: the look-ahead spills the unpacked tar to disk and the pipeline reads it back, which doubles I/O on the resource that is already the bottleneck to buy overlap nothing is waiting for. Off, each archive is read exactly once, inline [publisher]")
 	prefetchLimit := flag.Int("prefetch-limit", 8, "Budget for concurrent tar scans (pipeline phase 0), in units of 128 MiB. Phase 0 runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Each scan is charged by its tar size, so N ordinary packages or one N*128 MiB package may run at once; over budget, phase 0 runs inline under the job's own slot [publisher]")
-	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
+	pipelineUploadConc := flag.Int("pipeline-upload-conc", envInt("PREPUB_PIPELINE_UPLOAD_CONC", 4), "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes). Env: PREPUB_PIPELINE_UPLOAD_CONC [publisher]")
 	// PEAK MEMORY IS DRIVEN BY THIS. unpack reads each file whole into RAM
 	// (unpack.go io.ReadAll) and every compress worker holds one file plus its
 	// compressed chunks, so resident size scales with
@@ -181,7 +195,7 @@ func main() {
 	// A host publishing large trees (Clang, Python-modules) on limited RAM —
 	// especially one also running the gateway — should lower this. Observed:
 	// 4 workers reached 6.7 GB RSS and were OOM-killed on an 8 GB node.
-	pipelineWorkers := flag.Int("pipeline-workers", 4, "Concurrent compress workers per job. Peak memory scales with this: each worker holds one whole file plus its compressed chunks. Lower it (1-2) on memory-constrained hosts [publisher]")
+	pipelineWorkers := flag.Int("pipeline-workers", envInt("PREPUB_PIPELINE_WORKERS", 4), "Concurrent compress workers per job. Peak memory scales with this: each worker holds one whole file plus its compressed chunks. Lower it (1-2) on memory-constrained hosts. Env: PREPUB_PIPELINE_WORKERS [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
 	// Default to FIXED cvmfsdescriptor.ChunkGrid chunking (min==avg==max): the
 	// xor32 chunker then cuts at fixed grid boundaries, which coarse publish
