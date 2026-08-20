@@ -174,8 +174,8 @@ func main() {
 	//
 	// Effective slots = max(min, numCPU - load1min), clamped to [min, max].
 	// As load drops, waiting jobs are released without any delay.
-	minConcurrentJobs := flag.Int("min-concurrent-jobs", 4, "Minimum (guaranteed) number of concurrent jobs regardless of load; 0 = disable dynamic limiting [publisher]")
-	maxConcurrentJobs := flag.Int("max-concurrent-jobs", 0, "Maximum concurrent jobs ceiling (0 = runtime.NumCPU()); effective slots adapt between min and max based on 1-min load average [publisher]")
+	minConcurrentJobs := flag.Int("min-concurrent-jobs", envInt("PREPUB_MIN_CONCURRENT_JOBS", 4), "Minimum (guaranteed) number of concurrent jobs regardless of load; 0 = disable dynamic limiting. Env: PREPUB_MIN_CONCURRENT_JOBS [publisher]")
+	maxConcurrentJobs := flag.Int("max-concurrent-jobs", envInt("PREPUB_MAX_CONCURRENT_JOBS", 0), "Maximum concurrent jobs ceiling (0 = runtime.NumCPU()); effective slots adapt between min and max based on 1-min load average. Env: PREPUB_MAX_CONCURRENT_JOBS [publisher]")
 
 	// Lease path_busy retry window — how long Acquire() will keep retrying when
 	// the gateway reports another publisher holds the lease.  Should be set to
