@@ -180,10 +180,12 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	auth.HandleFunc("/{id}/log", s.jobLogHandler).Methods("GET")
 
 	// Measurements (internal/measure): the per-publish records behind the
-	// numbers in MEASUREMENTS.md. Authenticated like every other API route —
-	// they carry repository paths and failure causes.
+	// numbers in MEASUREMENTS.md. PUBLIC by design — read-only performance
+	// stats a CI run or a person fetches without a token, so they can be
+	// captured per build without log scraping. They expose repository paths,
+	// object/byte counts and failure causes, judged non-sensitive; nothing
+	// here mutates state (GET only).
 	meas := s.router.PathPrefix("/api/v1/measurements").Subrouter()
-	meas.Use(s.requireAuth)
 	meas.HandleFunc("", s.measurementBuildsHandler).Methods("GET")
 	meas.HandleFunc("/{build}", s.measurementsHandler).Methods("GET")
 

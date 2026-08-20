@@ -45,6 +45,32 @@ func getJSON(t *testing.T, srv *Server, url string, into any) int {
 	return rec.Code
 }
 
+// The measurements endpoint is public by design: a CI run or a person fetches
+// per-build stats with no token. This pins that — and, as a negative control,
+// that a protected route on the SAME server is still 401 without a token, so
+// the exemption is deliberate, not a disabled auth mode.
+func TestMeasurementsAPI_PublicWithoutToken(t *testing.T) {
+	srv, orch := authTestServer(t, AuthBearer) // auth enforced on /api/v1/jobs
+	w := withMeasurements(t, orch)
+	if err := w.Append(measure.Record{
+		BuildID: "b1", JobID: "j1", PublishPath: "staged", Outcome: "published", TotalS: 1,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	var recs []measure.Record
+	if code := getJSON(t, srv, "/api/v1/measurements/b1", &recs); code != http.StatusOK {
+		t.Fatalf("measurements must be reachable without a token, got %d", code)
+	}
+	if len(recs) != 1 {
+		t.Errorf("want 1 record, got %d", len(recs))
+	}
+	rec := httptest.NewRecorder()
+	srv.router.ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/jobs", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("protected route should be 401 without a token, got %d", rec.Code)
+	}
+}
+
 func TestMeasurementsAPI_ReturnsRecordsAndFilters(t *testing.T) {
 	srv, _, orch := newTestServer(t)
 	w := withMeasurements(t, orch)
