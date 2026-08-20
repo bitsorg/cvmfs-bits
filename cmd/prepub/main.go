@@ -618,6 +618,15 @@ func runPublisher(
 			"got", promoteWorkers, "using", cas.MaxPromoteWorkers)
 	}
 
+	// Tuning banner: the knobs a sweep varies, in one line, so each run's log
+	// self-documents which settings produced its window (all .env-overridable).
+	obs.Logger.Info("publisher tuning",
+		"pipeline_upload_conc", pipelineUploadConc,
+		"pipeline_workers", pipelineWorkers,
+		"promote_workers", promoteWorkers,
+		"max_concurrent_jobs", maxConcurrentJobs,
+		"min_concurrent_jobs", minConcurrentJobs)
+
 	if replaceOnConflict {
 		obs.Logger.Warn("replace_on_conflict ENABLED: a commit that fails on an " +
 			"already published path deletes the existing subtree and retries once " +
