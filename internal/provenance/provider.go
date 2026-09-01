@@ -61,6 +61,13 @@ func New(cfg Config, spoolDir string, obs *observe.Provider) (*Provider, error) 
 		return p, nil
 	}
 
+	// Fail closed: with OIDC issuers configured, an audience is mandatory
+	// (issuers are global; an unset audience lets any workflow obtain
+	// Verified=true). Refuse to start rather than silently accepting such tokens.
+	if err := cfg.checkOIDCAudience(); err != nil {
+		return nil, fmt.Errorf("provenance: %w", err)
+	}
+
 	keyPath := cfg.SigningKeyPath
 	if keyPath == "" {
 		keyPath = filepath.Join(spoolDir, "provenance.key")
