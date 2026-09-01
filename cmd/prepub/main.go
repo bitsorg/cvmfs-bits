@@ -95,12 +95,53 @@ func envInt(name string, builtin int) int {
 	return builtin
 }
 
+// nodeKeyHex returns a receiver's per-node broker enrollment key (hex), derived
+// as HMAC-SHA256(secret, node). It is the pure, testable core of `prepub node-key`.
+// "publisher" is reserved (the publisher mints its own token) and the empty node
+// is rejected; the master must be at least 16 bytes.
+func nodeKeyHex(secret []byte, node string) (string, error) {
+	if node == "" || node == "publisher" {
+		return "", fmt.Errorf("node must be a receiver id, not empty or 'publisher'")
+	}
+	if len(secret) < 16 {
+		return "", fmt.Errorf("PREPUB_HMAC_SECRET (>= 16 bytes) is required")
+	}
+	return hex.EncodeToString(deriveNodeKey(secret, node)), nil
+}
+
+// runNodeKey implements `prepub node-key <node>`: print the receiver's per-node
+// enrollment key so an operator on the publisher can provision it as the
+// receiver's PREPUB_NODE_KEY (H2 — the receiver never holds the master secret).
+func runNodeKey(args []string) {
+	node := ""
+	for _, a := range args {
+		if node == "" && !strings.HasPrefix(a, "-") {
+			node = a
+		}
+	}
+	out, err := nodeKeyHex([]byte(os.Getenv("PREPUB_HMAC_SECRET")), node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "usage: PREPUB_HMAC_SECRET=<master> prepub node-key <node>")
+		fmt.Fprintln(os.Stderr, "  "+err.Error())
+		os.Exit(2)
+	}
+	fmt.Println(out)
+}
+
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────
 	// Subcommand: prepub revoke <node> -- revoke a receiver's control-plane
 	// access (denylist + active disconnect) via the publisher's TLS endpoint.
 	if len(os.Args) > 1 && os.Args[1] == "revoke" {
 		runRevoke(os.Args[2:])
+		return
+	}
+	// Subcommand: prepub node-key <node> -- print a receiver's per-node broker
+	// enrollment key (hex), derived from PREPUB_HMAC_SECRET on the publisher, so it
+	// can be provisioned to that receiver as PREPUB_NODE_KEY (H2: receivers never
+	// hold the master secret).
+	if len(os.Args) > 1 && os.Args[1] == "node-key" {
+		runNodeKey(os.Args[2:])
 		return
 	}
 	mode := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
@@ -1099,16 +1140,10 @@ func runReceiver(
 	brokerURL := ""
 	brokerClientCert := ""
 	brokerClientKey := ""
-	// Load the HMAC shared secret from the environment.  In DevMode the
-	// receiver skips HMAC verification entirely, so the secret is not required.
-	hmacSecret := os.Getenv("PREPUB_HMAC_SECRET")
-	if hmacSecret == "" && !devMode {
-		obs.Logger.Error("PREPUB_HMAC_SECRET environment variable must be set (or use --dev for testing)")
-		os.Exit(1)
-	}
-	if hmacSecret == "" && devMode {
-		obs.Logger.Warn("SECURITY: PREPUB_HMAC_SECRET not set — HMAC verification disabled (development mode only)")
-	}
+	// H2: a receiver does NOT hold the master secret. Announce authenticity comes
+	// from the authenticated control-plane broker (token + ACL) and TLS, not a
+	// shared HMAC — so PREPUB_HMAC_SECRET is neither read nor required here. The
+	// receiver's only key is its own per-node PREPUB_NODE_KEY (see --broker-auth).
 
 	// Validate TLS configuration early so the error is reported before any
 	// listeners are bound.  In DevMode TLS is not used.
@@ -1182,9 +1217,11 @@ func runReceiver(
 
 	var brokerCreds func() (string, string)
 	if brokerAuth {
-		// Per-node enrollment key: prefer the provisioned PREPUB_NODE_KEY (hex) so
-		// the receiver never holds the master secret; fall back to deriving it from
-		// the master (legacy / dev).
+		// Per-node enrollment key: the receiver is provisioned with its own
+		// PREPUB_NODE_KEY (hex) and NEVER holds the master secret (H2). There is no
+		// fallback to deriving it from PREPUB_HMAC_SECRET — a compromised receiver
+		// could otherwise derive any node's key and mint publisher tokens. Generate
+		// the key on the publisher with `prepub node-key <node>`.
 		var nodeKey []byte
 		if nk := strings.TrimSpace(os.Getenv("PREPUB_NODE_KEY")); nk != "" {
 			b, derr := hex.DecodeString(nk)
@@ -1194,12 +1231,8 @@ func runReceiver(
 			}
 			nodeKey = b
 		} else {
-			secret := []byte(os.Getenv("PREPUB_HMAC_SECRET"))
-			if len(secret) < 16 {
-				obs.Logger.Error("--broker-auth requires PREPUB_NODE_KEY (hex) or PREPUB_HMAC_SECRET (>= 16 bytes)")
-				os.Exit(1)
-			}
-			nodeKey = deriveNodeKey(secret, nodeID)
+			obs.Logger.Error("--broker-auth requires PREPUB_NODE_KEY (hex); provision it on the publisher with `PREPUB_HMAC_SECRET=<master> prepub node-key " + nodeID + "` and set it on this receiver")
+			os.Exit(1)
 		}
 		if discoveryURL == "" {
 			obs.Logger.Error("--broker-auth requires --discovery-url (the enroll endpoint base)")
@@ -1234,7 +1267,6 @@ func runReceiver(
 		DataHost:                  dataHost,
 		TLSCert:                   tlsCert,
 		TLSKey:                    tlsKey,
-		HMACSecret:                hmacSecret,
 		CASRoot:                   casRoot,
 		SessionTTL:                sessionTTL,
 		DiskHeadroom:              diskHeadroom,

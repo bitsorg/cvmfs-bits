@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -12,6 +13,30 @@ import (
 
 	"cvmfs.io/prepub/internal/distribute/credential"
 )
+
+// H2: `prepub node-key <node>` prints the receiver's per-node enrollment key so it
+// can be provisioned as PREPUB_NODE_KEY (the receiver never holds the master).
+func TestNodeKeyHex(t *testing.T) {
+	secret := []byte("0123456789abcdef") // 16 bytes
+	got, err := nodeKeyHex(secret, "receiver-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := hex.EncodeToString(deriveNodeKey(secret, "receiver-1")); got != want {
+		t.Fatalf("nodeKeyHex = %s, want %s", got, want)
+	}
+	if other, _ := nodeKeyHex(secret, "receiver-2"); other == got {
+		t.Fatal("different nodes must yield different keys")
+	}
+	for _, tc := range []struct {
+		node string
+		sec  []byte
+	}{{"", secret}, {"publisher", secret}, {"receiver-1", []byte("short")}} {
+		if _, err := nodeKeyHex(tc.sec, tc.node); err == nil {
+			t.Fatalf("expected error for node=%q secretlen=%d", tc.node, len(tc.sec))
+		}
+	}
+}
 
 func TestBrokerAuthHook(t *testing.T) {
 	secret := []byte("test-secret-at-least-32-bytes-long!!")

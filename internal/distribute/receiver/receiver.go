@@ -67,11 +67,6 @@ type Config struct {
 	// Required unless DevMode is true.
 	TLSKey string
 
-	// HMACSecret is the shared secret used to verify HMAC-SHA256 signatures on
-	// announce requests.  Must be identical on the sender and all receivers.
-	// Ignored when DevMode is true.
-	HMACSecret string
-
 	// CASRoot is the local CAS root directory where received objects are stored.
 	// Objects are written to {CASRoot}/{hash[0:2]}/{hash}C.
 	CASRoot string
@@ -247,12 +242,8 @@ func New(cfg Config) (*Receiver, error) {
 	if cfg.CASRoot == "" {
 		return nil, fmt.Errorf("receiver: CASRoot must not be empty")
 	}
-	// HMACSecret is required unless DevMode disables HMAC verification.
 	// TLS cert/key are only required at Start time when actually binding a server;
 	// they are not checked here so that unit tests can call handlers directly.
-	if !cfg.DevMode && cfg.HMACSecret == "" {
-		return nil, fmt.Errorf("receiver: HMACSecret must not be empty (set DevMode to skip HMAC)")
-	}
 	if cfg.ControlAddr == "" {
 		cfg.ControlAddr = ":9100"
 	}
