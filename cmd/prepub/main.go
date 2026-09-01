@@ -111,7 +111,7 @@ func nodeKeyHex(secret []byte, node string) (string, error) {
 
 // runNodeKey implements `prepub node-key <node>`: print the receiver's per-node
 // enrollment key so an operator on the publisher can provision it as the
-// receiver's PREPUB_NODE_KEY (H2 — the receiver never holds the master secret).
+// receiver's S1_NODE_KEY (H2 — the receiver never holds the master secret).
 func runNodeKey(args []string) {
 	node := ""
 	for _, a := range args {
@@ -138,7 +138,7 @@ func main() {
 	}
 	// Subcommand: prepub node-key <node> -- print a receiver's per-node broker
 	// enrollment key (hex), derived from PREPUB_HMAC_SECRET on the publisher, so it
-	// can be provisioned to that receiver as PREPUB_NODE_KEY (H2: receivers never
+	// can be provisioned to that receiver as S1_NODE_KEY (H2: receivers never
 	// hold the master secret).
 	if len(os.Args) > 1 && os.Args[1] == "node-key" {
 		runNodeKey(os.Args[2:])
@@ -1143,7 +1143,7 @@ func runReceiver(
 	// H2: a receiver does NOT hold the master secret. Announce authenticity comes
 	// from the authenticated control-plane broker (token + ACL) and TLS, not a
 	// shared HMAC — so PREPUB_HMAC_SECRET is neither read nor required here. The
-	// receiver's only key is its own per-node PREPUB_NODE_KEY (see --broker-auth).
+	// receiver's only key is its own per-node S1_NODE_KEY (see --broker-auth).
 
 	// Validate TLS configuration early so the error is reported before any
 	// listeners are bound.  In DevMode TLS is not used.
@@ -1218,20 +1218,20 @@ func runReceiver(
 	var brokerCreds func() (string, string)
 	if brokerAuth {
 		// Per-node enrollment key: the receiver is provisioned with its own
-		// PREPUB_NODE_KEY (hex) and NEVER holds the master secret (H2). There is no
+		// S1_NODE_KEY (hex) and NEVER holds the master secret (H2). There is no
 		// fallback to deriving it from PREPUB_HMAC_SECRET — a compromised receiver
 		// could otherwise derive any node's key and mint publisher tokens. Generate
 		// the key on the publisher with `prepub node-key <node>`.
 		var nodeKey []byte
-		if nk := strings.TrimSpace(os.Getenv("PREPUB_NODE_KEY")); nk != "" {
+		if nk := strings.TrimSpace(os.Getenv("S1_NODE_KEY")); nk != "" {
 			b, derr := hex.DecodeString(nk)
 			if derr != nil || len(b) == 0 {
-				obs.Logger.Error("PREPUB_NODE_KEY must be non-empty hex")
+				obs.Logger.Error("S1_NODE_KEY must be non-empty hex")
 				os.Exit(1)
 			}
 			nodeKey = b
 		} else {
-			obs.Logger.Error("--broker-auth requires PREPUB_NODE_KEY (hex); provision it on the publisher with `PREPUB_HMAC_SECRET=<master> prepub node-key " + nodeID + "` and set it on this receiver")
+			obs.Logger.Error("--broker-auth requires S1_NODE_KEY (hex); provision it on the publisher with `PREPUB_HMAC_SECRET=<master> prepub node-key " + nodeID + "` and set it on this receiver")
 			os.Exit(1)
 		}
 		if discoveryURL == "" {

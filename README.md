@@ -117,7 +117,7 @@ make test-pull-wss
   --pull-object-base-url https://s0.example.org/cvmfs
 
 # Run a Stratum 1 receiver in pull mode (holds no master secret)
-PREPUB_NODE_KEY=<hex per-node key> \
+S1_NODE_KEY=<hex per-node key> \
 ./cvmfs-prepub --mode receiver --distribute-mode pull \
   --node-id stratum1-a --repos test.cvmfs.io \
   --discovery-url https://s0.example.org:8080 \
@@ -135,7 +135,7 @@ containerised cluster.
 ## Security at a glance
 
 The master secret (`PREPUB_HMAC_SECRET`) lives **only on the Stratum 0 publisher**.
-Each receiver is provisioned with just its own per-node key (`PREPUB_NODE_KEY =
+Each receiver is provisioned with just its own per-node key (`S1_NODE_KEY =
 HMAC(master, node)`) and the Ed25519 discovery **public** key — so a compromised
 receiver can enrol only as itself and cannot mint publisher tokens, forge commit
 notifications, verify-and-forge discovery, or revoke peers. Full trust-boundary

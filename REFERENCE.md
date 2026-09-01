@@ -1601,7 +1601,7 @@ cvmfs-prepub --mode receiver \
   --receiver-stratum0-url http://cvmfs-prepub:8080/cvmfs \
   --repos software.example.org,other.example.org \
   --cas-root /srv/cvmfs/stratum1/cas
-# PREPUB_NODE_KEY=<hex per-node key, provisioned on Stratum 0> in the environment
+# S1_NODE_KEY=<hex per-node key, provisioned on Stratum 0> in the environment
 ```
 
 The receiver:
@@ -2080,7 +2080,7 @@ On Stratum 0:
 - export the master secret `PREPUB_HMAC_SECRET` (Stratum 0 only — receivers
   never hold it);
 - for each receiver node `N`, compute its per-node key
-  `PREPUB_NODE_KEY = HMAC-SHA256(master, N)` and hand it to that receiver over a
+  `S1_NODE_KEY = HMAC-SHA256(master, N)` and hand it to that receiver over a
   separate channel;
 - mint the broker server certificate and the CA; receivers mount only the CA
   cert (`--broker-ca-cert`) and the discovery public key.
@@ -2158,7 +2158,7 @@ Use this checklist before deploying.  Full detail is in Chapter 34.
       enroll endpoint (HTTPS), discovery endpoint, and object store — no inbound
       ports required at Stratum 1
 - [ ] `PREPUB_HMAC_SECRET` (master) on the publisher **only**; per-node
-      `PREPUB_NODE_KEY` provisioned to each receiver (Recipe 7)
+      `S1_NODE_KEY` provisioned to each receiver (Recipe 7)
 - [ ] Ed25519 discovery keypair (private on publisher, public on receivers) and
       broker server TLS cert/key + CA
 - [ ] CAS root directory on each receiver with enough headroom (default 1.2×
@@ -2287,7 +2287,7 @@ connections and needs no inbound ports.
 | `--dev` | `false` | Development mode: relaxes security checks (never use in production) |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
-The per-node enrollment key is read from the **`PREPUB_NODE_KEY`** environment
+The per-node enrollment key is read from the **`S1_NODE_KEY`** environment
 variable (hex-encoded `HMAC-SHA256(master, node)`, provisioned on Stratum 0 and
 handed to the receiver out of band — see Recipe 7). **Receivers hold no master
 secret.**
@@ -2338,7 +2338,7 @@ of forging a discovery document.
 ### 31.3 Enrollment and Broker Authentication
 
 Enrollment proves possession of the per-node key
-`PREPUB_NODE_KEY = HMAC-SHA256(master, node)` without transmitting it, and is
+`S1_NODE_KEY = HMAC-SHA256(master, node)` without transmitting it, and is
 carried entirely over TLS so the issued bearer token is never exposed:
 
 1. `GET /control/challenge?node={node}` returns a **stateless** nonce

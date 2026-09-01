@@ -15,7 +15,7 @@ import (
 )
 
 // H2: `prepub node-key <node>` prints the receiver's per-node enrollment key so it
-// can be provisioned as PREPUB_NODE_KEY (the receiver never holds the master).
+// can be provisioned as S1_NODE_KEY (the receiver never holds the master).
 func TestNodeKeyHex(t *testing.T) {
 	secret := []byte("0123456789abcdef") // 16 bytes
 	got, err := nodeKeyHex(secret, "receiver-1")
