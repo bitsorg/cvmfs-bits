@@ -145,3 +145,68 @@ func PathExists(ctx context.Context, client *http.Client, stratum0URL, repo, lea
 	}
 	return false, fmt.Errorf("nested-catalog walk exceeded max depth for %q", abs)
 }
+
+// ReadPublishedFile returns the content of the regular file at relPath in the
+// published repository, walking nested catalogs like PathExists. found is false
+// when the repository, the path or its content hash is absent. Meant for small
+// unchunked files such as a package's .meta.json. client may be nil.
+func ReadPublishedFile(ctx context.Context, client *http.Client, stratum0URL, repo, relPath string) (data []byte, found bool, err error) {
+	abs := normalizeLeasePathForNested(relPath)
+	if abs == "" {
+		return nil, false, nil
+	}
+	rootSuffixed, err := FetchManifestRootHash(ctx, client, stratum0URL, repo)
+	if err != nil {
+		return nil, false, fmt.Errorf("fetching manifest root hash: %w", err)
+	}
+	if rootSuffixed == "" {
+		return nil, false, nil
+	}
+	curHash := strings.TrimSuffix(rootSuffixed, "C")
+
+	tmpDir, err := os.MkdirTemp("", "cvmfs-read-*")
+	if err != nil {
+		return nil, false, fmt.Errorf("creating temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	for depth := 0; depth < 64; depth++ {
+		dbPath := filepath.Join(tmpDir, curHash+".db")
+		if dlErr := DownloadCatalog(ctx, client, stratum0URL, repo, curHash, dbPath); dlErr != nil {
+			if errors.Is(dlErr, ErrCatalogNotFound) {
+				return nil, false, nil
+			}
+			return nil, false, fmt.Errorf("downloading catalog %s: %w", curHash, dlErr)
+		}
+		cat, openErr := Open(dbPath)
+		if openErr != nil {
+			return nil, false, fmt.Errorf("opening catalog %s: %w", curHash, openErr)
+		}
+		mount, childHash, nested, ancErr := cat.longestNestedAncestor(abs)
+		if ancErr != nil {
+			cat.Close()
+			return nil, false, ancErr
+		}
+		if nested && mount != abs {
+			cat.Close()
+			_ = os.Remove(dbPath)
+			curHash = childHash
+			continue
+		}
+		if nested { // abs is a nested-catalog root: a directory, not a file
+			cat.Close()
+			return nil, false, nil
+		}
+		hashHex, algo, ok, lkErr := cat.LookupFileHash(abs)
+		cat.Close()
+		if lkErr != nil || !ok {
+			return nil, false, lkErr
+		}
+		obj, objErr := DownloadObject(ctx, client, stratum0URL, repo, hashHex, algo)
+		if objErr != nil {
+			return nil, false, fmt.Errorf("downloading %s: %w", abs, objErr)
+		}
+		return obj, true, nil
+	}
+	return nil, false, fmt.Errorf("nested-catalog walk exceeded max depth for %q", abs)
+}

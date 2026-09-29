@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -315,5 +316,23 @@ func TestListJobs_IncludesAccumulated(t *testing.T) {
 	}
 	if states["job-acc"] != "accumulated" || states["job-pub"] != "published" {
 		t.Errorf("want both jobs listed, got %v", states)
+	}
+}
+
+// TestPublishedHandler_NeedsRepoPathAndStratum0: bad bodies are 400, and with no
+// stratum0 to read from the answer is 501 (the producer then just publishes).
+func TestPublishedHandler_NeedsRepoPathAndStratum0(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	for body, want := range map[string]int{
+		`{"repo":"repo.cern.ch"}`:            http.StatusBadRequest,
+		`not json`:                           http.StatusBadRequest,
+		`{"repo":"repo.cern.ch","path":"a"}`: http.StatusNotImplemented,
+	} {
+		rec := httptest.NewRecorder()
+		srv.publishedHandler(rec, httptest.NewRequest("POST", "/api/v1/published",
+			strings.NewReader(body)))
+		if rec.Code != want {
+			t.Errorf("%s: got %d, want %d (%s)", body, rec.Code, want, rec.Body.String())
+		}
 	}
 }

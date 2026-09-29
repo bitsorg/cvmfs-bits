@@ -194,6 +194,12 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	reserve.Use(s.requireAuth)
 	reserve.HandleFunc("", s.reserveHandler).Methods("POST")
 
+	// Is a path already published, and by which build (POST /api/v1/published)?
+	// Lets a producer skip a package that is already there. Authenticated.
+	published := s.router.PathPrefix("/api/v1/published").Subrouter()
+	published.Use(s.requireAuth)
+	published.HandleFunc("", s.publishedHandler).Methods("POST")
+
 	// Coarse publish finalize (ADR-0007): publish a whole build's accumulated
 	// packages in one commit. Authenticated.
 	builds := s.router.PathPrefix("/api/v1/builds").Subrouter()
@@ -280,6 +286,69 @@ func (s *Server) publishAuthorized(repo, subPath string) bool {
 		}
 	}
 	return false
+}
+
+// publishedHandler handles POST /api/v1/published {"repo","path"}. Answers
+// {"exists": false} or {"exists": true, "hash": "<build hash>"}; the hash is
+// the package hash from <path>/.meta.json, empty when there is none (e.g. a
+// modulefile). 501 without a stratum0 to read from, 502 when it cannot be read.
+func (s *Server) publishedHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := s.obs.Tracer.Start(r.Context(), "api.published")
+	defer span.End()
+	w.Header().Set("Content-Type", "application/json")
+
+	var req struct {
+		Repo string `json:"repo"`
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Repo == "" || req.Path == "" || broker.ValidateRepo(req.Repo) != nil ||
+		validateSubPath(req.Path) != nil {
+		http.Error(w, `{"error":"a valid repo and path are required"}`, http.StatusBadRequest)
+		return
+	}
+	if !s.publishAuthorized(req.Repo, req.Path) {
+		http.Error(w, `{"error":"forbidden: target path is outside this deployment's authorized CVMFS namespace"}`, http.StatusForbidden)
+		return
+	}
+	if s.orch.Stratum0URL == "" {
+		http.Error(w, `{"error":"no stratum0 configured"}`, http.StatusNotImplemented)
+		return
+	}
+	exists, err := cvmfscatalog.PathExists(ctx, nil, s.orch.Stratum0URL, req.Repo, req.Path)
+	if err != nil {
+		s.obs.Logger.Warn("published: lookup failed", "repo", req.Repo, "path", req.Path, "error", err)
+		http.Error(w, `{"error":"cannot read the published repository"}`, http.StatusBadGateway)
+		return
+	}
+	resp := struct {
+		Exists bool   `json:"exists"`
+		Hash   string `json:"hash,omitempty"`
+	}{Exists: exists}
+	if exists {
+		data, found, rerr := cvmfscatalog.ReadPublishedFile(ctx, nil, s.orch.Stratum0URL,
+			req.Repo, strings.TrimSuffix(req.Path, "/")+"/.meta.json")
+		if rerr != nil {
+			// Unknown, not "exists with no hash": the producer then publishes.
+			s.obs.Logger.Warn("published: .meta.json read failed", "repo", req.Repo, "path", req.Path, "error", rerr)
+			http.Error(w, `{"error":"cannot read the published .meta.json"}`, http.StatusBadGateway)
+			return
+		}
+		if found {
+			var meta struct {
+				Package struct {
+					Hash string `json:"hash"`
+				} `json:"package"`
+			}
+			if json.Unmarshal(data, &meta) == nil {
+				resp.Hash = meta.Package.Hash
+			}
+		}
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 // reserveHandler handles POST /api/v1/reserve. Fail-fast namespace check:
