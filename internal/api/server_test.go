@@ -286,3 +286,34 @@ func TestAbortHandler_NotRunning(t *testing.T) {
 		t.Errorf("want 409, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestListJobs_IncludesAccumulated: coarse-publish package jobs end in
+// "accumulated"; the job list must show them (the console charts count them).
+func TestListJobs_IncludesAccumulated(t *testing.T) {
+	srv, sp, _ := newTestServer(t)
+	for id, st := range map[string]job.State{
+		"job-acc": job.StateAccumulated, "job-pub": job.StatePublished} {
+		j := job.NewJob(id, "repo.cern.ch", "", "")
+		j.State = st
+		if err := sp.WriteManifest(j); err != nil {
+			t.Fatalf("WriteManifest: %v", err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	srv.listJobs(rec, httptest.NewRequest("GET", "/api/v1/jobs", nil))
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	states := map[string]any{}
+	for _, j := range got {
+		states[j["job_id"].(string)] = j["state"]
+		// Unset timestamps are omitted, not sent as year 1.
+		if _, ok := j["published_at"]; ok {
+			t.Errorf("%v: zero published_at was sent: %v", j["job_id"], j["published_at"])
+		}
+	}
+	if states["job-acc"] != "accumulated" || states["job-pub"] != "published" {
+		t.Errorf("want both jobs listed, got %v", states)
+	}
+}

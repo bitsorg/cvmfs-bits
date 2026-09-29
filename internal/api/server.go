@@ -479,6 +479,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		job.StateDistributing,
 		job.StateLeased,
 		job.StateCommitting,
+		job.StateAccumulated, // coarse-publish package jobs (committed by their build's finalize)
 		job.StatePublished,
 		job.StateFailed,
 		job.StateAborted,
@@ -507,16 +508,18 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		CreatedAt     time.Time `json:"created_at"`
 		UpdatedAt     time.Time `json:"updated_at"`
 		// Pipeline stage timestamps — omitted when zero (bits-method jobs only).
+		// omitzero, not omitempty: omitempty never omits a struct, so a zero
+		// time went out as "0001-01-01T00:00:00Z" and looked set to the console.
 		// Used by the console Monitoring chart to build per-job stage breakdowns.
-		PipelineStartedAt time.Time `json:"pipeline_started_at,omitempty"`
-		PipelineEndedAt   time.Time `json:"pipeline_ended_at,omitempty"`
-		LeasedAt          time.Time `json:"leased_at,omitempty"`
-		PublishedAt       time.Time `json:"published_at,omitempty"`
+		PipelineStartedAt time.Time `json:"pipeline_started_at,omitzero"`
+		PipelineEndedAt   time.Time `json:"pipeline_ended_at,omitzero"`
+		LeasedAt          time.Time `json:"leased_at,omitzero"`
+		PublishedAt       time.Time `json:"published_at,omitzero"`
 		// Distribution timestamps and counters for S1 backlog display in the console.
 		// DistributingStartedAt / DistributingEndedAt use omitempty so zero-value
 		// time.Time values are omitted; the JS checks for field presence.
-		DistributingStartedAt time.Time `json:"distributing_started_at,omitempty"`
-		DistributingEndedAt   time.Time `json:"distributing_ended_at,omitempty"`
+		DistributingStartedAt time.Time `json:"distributing_started_at,omitzero"`
+		DistributingEndedAt   time.Time `json:"distributing_ended_at,omitzero"`
 		DistributionConfirmed int       `json:"distribution_confirmed,omitempty"`
 		DistributionTotal     int       `json:"distribution_total,omitempty"`
 	}
