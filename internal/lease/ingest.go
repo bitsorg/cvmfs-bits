@@ -4,11 +4,9 @@
 package lease
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -19,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"cvmfs.io/prepub/pkg/cvmfscatalog"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
@@ -72,13 +69,10 @@ type IngestBackend struct {
 	skipAncestorDirs bool
 	// mounted reports whether a repository is mounted at a path (mount table,
 	// not a directory test: an unmounted mountpoint is an empty directory).
-	mounted func(path string) bool
-	// pathExists answers "is this repo-relative path published?" from the
-	// stratum0 catalogs; nil without a stratum0 URL. Used on a mountless host.
-	pathExists func(ctx context.Context, repo, rel string) (bool, error)
-	knownMu    sync.Mutex
-	known      map[string]bool // repo+"/"+rel of parents confirmed published
-	obs        *observe.Provider
+	mounted  func(path string) bool
+	warnedMu sync.Mutex
+	warned   map[string]bool // repos already warned about (mountless)
+	obs      *observe.Provider
 
 	mu    sync.Mutex
 	repos map[string]*repoSlot // repo → 1-slot queue
@@ -107,12 +101,6 @@ type IngestOptions struct {
 	// is a full payload upload followed by a gateway panic. Set it only where
 	// the prefixes are known to be created by something else.
 	SkipAncestorDirs bool
-	// Stratum0URL (e.g. http://s3/cvmfs) lets a MOUNTLESS host find which
-	// ancestors of a target are published, so it can create the rest through
-	// the gateway. Without it a mountless host cannot check (see ensureAncestors).
-	Stratum0URL string
-	// HTTPClient for the stratum0 lookups; nil uses the catalog package default.
-	HTTPClient *http.Client
 }
 
 // NewIngestBackend constructs an IngestBackend.
@@ -121,23 +109,16 @@ func NewIngestBackend(opt IngestOptions, obs *observe.Provider) *IngestBackend {
 	if mount == "" {
 		mount = "/cvmfs"
 	}
-	b := &IngestBackend{
+	return &IngestBackend{
 		cvmfsMount:       mount,
 		nestedCatalog:    opt.NestedCatalog,
 		owner:            opt.Owner,
 		skipAncestorDirs: opt.SkipAncestorDirs,
 		mounted:          isMountPoint,
-		known:            make(map[string]bool),
+		warned:           make(map[string]bool),
 		obs:              obs,
 		repos:            make(map[string]*repoSlot),
 	}
-	if s0 := opt.Stratum0URL; s0 != "" {
-		client := opt.HTTPClient
-		b.pathExists = func(ctx context.Context, repo, rel string) (bool, error) {
-			return cvmfscatalog.PathExists(ctx, client, s0, repo, rel)
-		}
-	}
-	return b
 }
 
 // queueFor returns the slot for a repository, creating it on first use.
@@ -318,9 +299,6 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 				"repo", repo, "base", base,
 				"object_list_lines", listed, "object_list_authoritative", false)
 		}
-		// The repository may have changed under us (e.g. wiped): re-check the
-		// ancestors next time instead of trusting what was seen before.
-		b.forgetKnown(repo)
 		return fmt.Errorf("cvmfs_server ingest into %q: %w (output: %s)",
 			base, err, truncateLog(out))
 	}
@@ -420,18 +398,10 @@ func (b *IngestBackend) ensureAncestors(ctx context.Context, repo, cvmfsDir stri
 	if parent == root || !strings.HasPrefix(parent, root+"/") {
 		return nil
 	}
-	// No repository mount: a MOUNTLESS publisher (connect-gw -P). Ask the
-	// stratum0 which ancestors exist and create the rest through the gateway.
-	// Decided from the mount table: a registration that was once mounted
-	// leaves an empty /cvmfs/<repo> behind, and treating that as a mount sent
-	// every publish into a local transaction that cannot mount.
-	if !b.mounted(root) && b.pathExists != nil {
-		return b.ensureAncestorsMountless(ctx, repo, strings.TrimPrefix(parent, root+"/"))
-	}
 	if isDir(parent) {
 		return nil
 	}
-	// No repository mount and no stratum0 to ask.
+	// No repository mount: this is a MOUNTLESS publisher.
 	//
 	// `cvmfs_server connect-gw -P` registers a repository for gateway publishing
 	// without mounting it — that is the whole point of the -P registration, and
@@ -444,15 +414,27 @@ func (b *IngestBackend) ensureAncestors(ctx context.Context, repo, cvmfsDir stri
 	// gateway panic this function exists to prevent — and it would fail the
 	// common case (prefix already present) as loudly as the rare one.
 	//
-	// Warn rather than stay silent: on a mountless publisher, a first publish
-	// into a brand-new prefix will still hit the receiver panic, and the log
-	// line is what connects that panic back to here.
+	// Warn rather than stay silent: unless the gateway creates the parents, a
+	// first publish into a brand-new prefix hits the receiver panic, and the
+	// log line is what connects that panic back to here.
+	//
+	// Decided from the mount table: a registration that was once mounted
+	// leaves an empty /cvmfs/<repo> behind, and treating that as a mount sent
+	// every publish into a local transaction that cannot mount. On a mountless
+	// host the gateway creates missing parents (CVMFS_GW_MKDIR_PARENTS=true in
+	// its server.conf, cvmfs fork); warned once per repository.
 	if !b.mounted(root) {
-		b.obs.Logger.Warn("ingest backend: no repository mount — cannot verify or create ancestors",
-			"repo", repo, "mount", root, "parent", parent,
-			"note", "mountless publisher (connect-gw -P); a first publish into a new "+
-				"prefix may fail in the gateway with 'failed to graft nested catalog' "+
-				"or 'catalog for directory ... cannot be found'")
+		b.warnedMu.Lock()
+		first := !b.warned[repo]
+		b.warned[repo] = true
+		b.warnedMu.Unlock()
+		if first {
+			b.obs.Logger.Warn("ingest backend: no repository mount — parents are left to the gateway",
+				"repo", repo, "mount", root,
+				"note", "mountless publisher (connect-gw -P): the gateway needs "+
+					"CVMFS_GW_MKDIR_PARENTS=true, or a first publish into a new prefix "+
+					"fails with 'failed to graft nested catalog'")
+		}
 		return nil
 	}
 
@@ -483,112 +465,6 @@ func (b *IngestBackend) ensureAncestors(ctx context.Context, repo, cvmfsDir stri
 	b.obs.Logger.Info("ingest backend: ancestor directories created",
 		"repo", repo, "parent", parent)
 	return nil
-}
-
-// ensureAncestorsMountless makes sure the repo-relative directory rel is
-// published, without a mount: it finds the deepest published ancestor from the
-// stratum0 catalogs and ingests a tar holding only the missing directories
-// there, in its own gateway transaction. A lookup error is logged and the
-// publish proceeds, as on a mounted host that cannot check.
-func (b *IngestBackend) ensureAncestorsMountless(ctx context.Context, repo, rel string) error {
-	if b.isKnown(repo, rel) {
-		return nil
-	}
-	base := rel
-	for base != "" {
-		ok, err := b.pathExists(ctx, repo, base)
-		if err != nil {
-			b.obs.Logger.Warn("ingest backend: cannot check published ancestors — proceeding",
-				"repo", repo, "path", base, "error", err)
-			return nil
-		}
-		if ok {
-			break
-		}
-		if base = path.Dir(base); base == "." {
-			base = ""
-		}
-	}
-	if base == rel {
-		b.remember(repo, rel)
-		return nil
-	}
-	missing := strings.TrimPrefix(strings.TrimPrefix(rel, base), "/")
-	tarPath, err := writeDirChainTar(missing)
-	if err != nil {
-		return fmt.Errorf("ingest backend: building ancestor tar for %q: %w", rel, err)
-	}
-	defer os.Remove(tarPath)
-
-	ingestBase := base
-	if ingestBase == "" {
-		ingestBase = "/"
-	}
-	b.obs.Logger.Info("ingest backend: creating missing ancestor directories (mountless)",
-		"repo", repo, "base", ingestBase, "missing", missing)
-	// No -c: these are plain directories inside an existing catalog.
-	args := []string{"ingest", "-t", tarPath, "-b", ingestBase}
-	if b.owner != "" {
-		args = append(args, "-u", b.owner)
-	}
-	if out, err := b.cvmfsServerOutput(ctx, append(args, repo)...); err != nil {
-		return fmt.Errorf("ingest backend: creating %q under %q: %w (output: %s)",
-			missing, ingestBase, err, truncateLog(out))
-	}
-	b.remember(repo, rel)
-	b.obs.Logger.Info("ingest backend: ancestor directories created", "repo", repo, "path", rel)
-	return nil
-}
-
-// writeDirChainTar writes a tar holding the directory chain rel ("a/b/c" gives
-// a/, a/b/, a/b/c/) to a temp file and returns its path.
-func writeDirChainTar(rel string) (string, error) {
-	f, err := os.CreateTemp("", "ancestors-*.tar")
-	if err != nil {
-		return "", err
-	}
-	tw := tar.NewWriter(f)
-	name := ""
-	for _, part := range strings.Split(rel, "/") {
-		name += part + "/"
-		hdr := &tar.Header{Typeflag: tar.TypeDir, Name: name, Mode: 0o755, ModTime: time.Now()}
-		if err = tw.WriteHeader(hdr); err != nil {
-			break
-		}
-	}
-	if cerr := tw.Close(); err == nil {
-		err = cerr
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-func (b *IngestBackend) isKnown(repo, rel string) bool {
-	b.knownMu.Lock()
-	defer b.knownMu.Unlock()
-	return b.known[repo+"/"+rel]
-}
-
-func (b *IngestBackend) remember(repo, rel string) {
-	b.knownMu.Lock()
-	b.known[repo+"/"+rel] = true
-	b.knownMu.Unlock()
-}
-
-func (b *IngestBackend) forgetKnown(repo string) {
-	b.knownMu.Lock()
-	for k := range b.known {
-		if strings.HasPrefix(k, repo+"/") {
-			delete(b.known, k)
-		}
-	}
-	b.knownMu.Unlock()
 }
 
 // isMountPoint reports whether p is a mount point in /proc/self/mountinfo.

@@ -605,9 +605,6 @@ func runPublisher(
 			// holds nested sub-catalogs.
 			NestedCatalog: true,
 			Owner:         ingestPublishOwner,
-			// A mountless host asks the stratum0 which parent directories
-			// are published and creates the missing ones via the gateway.
-			Stratum0URL: stratum0URL,
 		}, obs)
 		if err := ib.Probe(context.Background()); err != nil {
 			obs.Logger.Error("--ingest-publish requested but the ingest backend is unusable", "error", err)
