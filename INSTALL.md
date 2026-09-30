@@ -451,6 +451,22 @@ This creates the `cvmfs-prepub` system user, `/var/spool/cvmfs-prepub` (0700)
 with its `tmp/` subdirectory, `/etc/cvmfs-prepub/{config.yaml,env}`, and the
 systemd unit. It does not overwrite an existing config.
 
+To run the service as an existing account instead (e.g. the repository owner,
+which `cvmfs_server ingest` needs), or with the spool on another volume:
+
+```sh
+sudo ./install.sh --user cvbits --spool-dir /mnt/cvmfs-prepub
+```
+
+The account is added to the `cvmfs-prepub` group, which owns the config and
+credential files (`/etc/cvmfs-prepub`, `/etc/cvmfs/keys/<repo>.s3.conf`), and
+the spool and CAS directories are given to it. A spool path that is a symlink
+is resolved: systemd refuses (226/NAMESPACE) a symlink it may not follow under
+SELinux, so the unit names the real directory. Without these options a re-run,
+`update` and `uninstall` keep the user the unit runs as (drop-ins included) and
+the spool from `config.yaml`; `--spool-dir` must agree with an existing
+`spool_root`. `uninstall` never removes an account given with `--user`.
+
 ### Step 4 — copy the repository's own credentials from the gateway node
 
 prepub reads these files directly, so they must exist on this host:
@@ -974,6 +990,9 @@ sudo ./install.sh --mode receiver
 
 # 6. Upgrade an existing host later — keeps all configuration (see §9)
 sudo ./install.sh update
+
+# 7. Run as an existing account, spool on another volume (see Step 3 above)
+sudo ./install.sh --user cvbits --spool-dir /mnt/cvmfs-prepub
 ```
 
 After installation, edit the generated config templates before starting the

@@ -35,6 +35,17 @@
 #                       flag the script warns and prompts interactively.
 #   --legacy-spool DIR  Path to legacy spool root (default: /mnt/build/bits/spool)
 #
+# ── INSTALL / UPDATE OPTIONS ───────────────────────────────────────────────────
+#   --user NAME         Run the services as NAME. Default: the user an installed
+#                       unit already runs as (drop-ins included), else the
+#                       cvmfs-prepub system account, created if missing. Any
+#                       other account (e.g. the repository owner) must exist;
+#                       it is added to the cvmfs-prepub group, which keeps read
+#                       access to the config and credential files.
+#   --spool-dir DIR     Spool root. Default: spool_root from an existing
+#                       config.yaml, else /var/spool/cvmfs-prepub. A symlink is
+#                       resolved: the units name the real directory.
+#
 # ── UNINSTALL OPTIONS ──────────────────────────────────────────────────────────
 #   --mode MODE         What to uninstall:
 #                         publisher  (default)
@@ -42,7 +53,8 @@
 #                         all
 #   --keep-spool        Preserve /var/spool/cvmfs-prepub (job history + WAL).
 #   --keep-cas          Preserve the local CAS data directory.
-#   --keep-user         Preserve the cvmfs-prepub system account.
+#   --keep-user         Preserve the cvmfs-prepub system account. An account
+#                       given with --user is never removed.
 #
 # ── COMMON OPTIONS ─────────────────────────────────────────────────────────────
 #   --dry-run           Print every action that would be taken; make no changes.
@@ -86,10 +98,13 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # cvmfs-prepub install targets
 readonly BINARY_DIR="/usr/local/bin"
 readonly CONFIG_DIR="/etc/cvmfs-prepub"
-readonly SPOOL_DIR="/var/spool/cvmfs-prepub"
+readonly DEFAULT_SPOOL_DIR="/var/spool/cvmfs-prepub"
 readonly DEFAULT_CAS_PUB="/srv/cvmfs/cas"
 readonly DEFAULT_CAS_RCV="/srv/cvmfs/stratum1/cas"
-readonly SERVICE_USER="cvmfs-prepub"
+readonly DEFAULT_USER="cvmfs-prepub"
+# Group that may read the config and credential files (config dir, env,
+# /etc/cvmfs/keys/<repo>.s3.conf): the service user is always a member.
+readonly ACCESS_GROUP="cvmfs-prepub"
 readonly SVC_PUB="cvmfs-prepub"
 readonly SVC_RCV="cvmfs-prepub-receiver"
 readonly UNIT_DIR="/etc/systemd/system"
@@ -112,6 +127,11 @@ BIN_DIR="${SCRIPT_DIR}/bin"
 SKIP_SERVICE=false
 PURGE_LEGACY=false
 LEGACY_SPOOL_DIR="$LEGACY_SPOOL_DEFAULT"
+
+# install/update: resolved after argument parsing (see "service identity")
+SERVICE_USER=""
+SERVICE_GROUP=""
+SPOOL_DIR=""
 
 # uninstall-specific
 KEEP_SPOOL=false
@@ -263,6 +283,17 @@ ensure_dir() {
     run "Set mode $path → $mode"       chmod "$mode"  "$path"
 }
 
+# yaml_scalar — strip a trailing comment and surrounding quotes from stdin.
+yaml_scalar() {
+    sed 's/[[:space:]]#.*//; s/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//'
+}
+
+# in_group USER GROUP — exact membership test ("cvmfs" must not match
+# "cvmfs-prepub", which grep -w would: "-" is not a word character).
+in_group() {
+    id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$2"
+}
+
 # read_cas_root CFG DEFAULT — extract cas.root from a YAML config file.
 read_cas_root() {
     local cfg="$1" default="$2"
@@ -272,7 +303,7 @@ read_cas_root() {
                in_cas && /^[^ ]/{in_cas=0}
                in_cas && /root[[:space:]]*:/{
                    sub(/.*root[[:space:]]*:[[:space:]]*/,""); print; exit
-               }' "$cfg" 2>/dev/null || true)
+               }' "$cfg" 2>/dev/null | yaml_scalar || true)
     echo "${val:-$default}"
 }
 
@@ -294,6 +325,8 @@ while [[ $# -gt 0 ]]; do
         --skip-service)    SKIP_SERVICE=true ;;
         --purge-legacy)    PURGE_LEGACY=true ;;
         --legacy-spool)    shift; LEGACY_SPOOL_DIR="${1:-}" ;;
+        --user)            shift; SERVICE_USER="${1:-}" ;;
+        --spool-dir)       shift; SPOOL_DIR="${1:-}" ;;
         # uninstall options
         --keep-spool)      KEEP_SPOOL=true ;;
         --keep-cas)        KEEP_CAS=true ;;
@@ -403,6 +436,8 @@ install_account() {
     header "Service Account"
     if id "$SERVICE_USER" &>/dev/null 2>&1; then
         skip "Account '${SERVICE_USER}' — already exists"
+    elif [[ "$SERVICE_USER" != "$DEFAULT_USER" ]]; then
+        die "Account '${SERVICE_USER}' (--user) does not exist — create it first."
     else
         run "Create system account '${SERVICE_USER}'" \
             useradd -r -s /sbin/nologin \
@@ -410,9 +445,21 @@ install_account() {
                     -c "cvmfs-prepub service" \
                     "$SERVICE_USER"
     fi
+    # A service user of its own (--user) joins the access group, so the
+    # root:cvmfs-prepub config and credential files stay readable to it.
+    if [[ "$SERVICE_USER" != "$ACCESS_GROUP" ]]; then
+        getent group "$ACCESS_GROUP" &>/dev/null ||
+            run "Create group '${ACCESS_GROUP}'" groupadd -r "$ACCESS_GROUP"
+        if in_group "$SERVICE_USER" "$ACCESS_GROUP"; then
+            skip "Account '${SERVICE_USER}' already in group '${ACCESS_GROUP}'"
+        else
+            run "Add '${SERVICE_USER}' to group '${ACCESS_GROUP}' (config and credentials)" \
+                usermod -aG "$ACCESS_GROUP" "$SERVICE_USER"
+        fi
+    fi
     # For local publish mode: add to cvmfs group so cvmfs_server can be called
     if getent group cvmfs &>/dev/null; then
-        if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw "cvmfs"; then
+        if in_group "$SERVICE_USER" cvmfs; then
             skip "Account '${SERVICE_USER}' already in group 'cvmfs'"
         else
             run "Add '${SERVICE_USER}' to group 'cvmfs' (required for local publish mode)" \
@@ -429,21 +476,21 @@ install_dirs() {
 
     case "$MODE" in
         publisher|all)
-            ensure_dir "$SPOOL_DIR"   "${SERVICE_USER}:${SERVICE_USER}" "0700"
+            ensure_dir "$SPOOL_DIR"   "${SERVICE_USER}:${SERVICE_GROUP}" "0700"
             # Temporaries live on the spool volume, never on /tmp: catalog
             # downloads and finalize work dirs are far larger than a typical
             # /tmp, which under systemd PrivateTmp may even be RAM-backed.
-            ensure_dir "${SPOOL_DIR}/tmp" "${SERVICE_USER}:${SERVICE_USER}" "0700"
-            ensure_dir "$CONFIG_DIR"  "root:${SERVICE_USER}"            "0750"
-            ensure_dir "${CONFIG_DIR}/tls" "root:${SERVICE_USER}"       "0750"
-            ensure_dir "$DEFAULT_CAS_PUB" "${SERVICE_USER}:${SERVICE_USER}" "0750"
+            ensure_dir "${SPOOL_DIR}/tmp" "${SERVICE_USER}:${SERVICE_GROUP}" "0700"
+            ensure_dir "$CONFIG_DIR"  "root:${ACCESS_GROUP}"            "0750"
+            ensure_dir "${CONFIG_DIR}/tls" "root:${ACCESS_GROUP}"       "0750"
+            ensure_dir "$CAS_PUB"     "${SERVICE_USER}:${SERVICE_GROUP}" "0750"
             ;;
     esac
     case "$MODE" in
         receiver|all)
-            ensure_dir "$CONFIG_DIR"  "root:${SERVICE_USER}"            "0750"
-            ensure_dir "${CONFIG_DIR}/tls" "root:${SERVICE_USER}"       "0750"
-            ensure_dir "$DEFAULT_CAS_RCV" "${SERVICE_USER}:${SERVICE_USER}" "0750"
+            ensure_dir "$CONFIG_DIR"  "root:${ACCESS_GROUP}"            "0750"
+            ensure_dir "${CONFIG_DIR}/tls" "root:${ACCESS_GROUP}"       "0750"
+            ensure_dir "$CAS_RCV"     "${SERVICE_USER}:${SERVICE_GROUP}" "0750"
             ;;
     esac
 }
@@ -516,6 +563,7 @@ repositories:
     gc:
       enabled: false
 CFGEOF
+    sed -i "s|^spool_root: .*|spool_root: ${SPOOL_DIR}|" "$1"
 }
 
 install_config_template() {
@@ -530,7 +578,7 @@ install_config_template() {
             dry "Write config template → ${cfg}"
         else
             write_config_template_to "$cfg"
-            chown "root:${SERVICE_USER}" "$cfg"
+            chown "root:${ACCESS_GROUP}" "$cfg"
             chmod 0640 "$cfg"
             ok "Config template written: ${cfg}"
         fi
@@ -557,7 +605,7 @@ cas:
   type: localfs
   root: /srv/cvmfs/stratum1/cas
 EOF
-            chown "root:${SERVICE_USER}" "$rcfg"
+            chown "root:${ACCESS_GROUP}" "$rcfg"
             chmod 0640 "$rcfg"
             ok "Receiver config template written: ${rcfg}"
         fi
@@ -593,7 +641,7 @@ EOF
 # Override gateway key_id at runtime (optional; value in config.yaml takes precedence)
 # CVMFS_GATEWAY_KEY_ID=
 EOF
-        chown "root:${SERVICE_USER}" "$env_file"
+        chown "root:${ACCESS_GROUP}" "$env_file"
         chmod 0600 "$env_file"
         ok "Secrets env skeleton written: ${env_file}"
     fi
@@ -606,6 +654,10 @@ EOF
 # so the two can never drift.
 write_units_to() {
     local dir="$1"
+    # Another primary group than the access group: add it explicitly.
+    local groups="Group=${SERVICE_GROUP}"
+    [[ "$SERVICE_GROUP" != "$ACCESS_GROUP" ]] &&
+        groups+=$'\n'"SupplementaryGroups=${ACCESS_GROUP}"
 
     if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
         cat > "${dir}/${SVC_PUB}.service" <<EOF
@@ -616,7 +668,7 @@ After=network.target
 [Service]
 Type=simple
 User=${SERVICE_USER}
-Group=${SERVICE_USER}
+${groups}
 ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/config.yaml
 Restart=on-failure
 RestartSec=5s
@@ -641,7 +693,9 @@ MemoryMax=3G
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
-ReadWritePaths=${SPOOL_DIR} ${DEFAULT_CAS_PUB}
+# "-": the CAS directory is optional (a node serving only the ingest path has
+# none); a missing listed path would stop the unit at step NAMESPACE.
+ReadWritePaths=${SPOOL_DIR} -${CAS_PUB}
 
 [Install]
 WantedBy=multi-user.target
@@ -657,7 +711,7 @@ After=network.target
 [Service]
 Type=simple
 User=${SERVICE_USER}
-Group=${SERVICE_USER}
+${groups}
 ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/receiver.yaml --mode receiver
 Restart=on-failure
 RestartSec=5s
@@ -665,7 +719,7 @@ EnvironmentFile=${CONFIG_DIR}/env
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
-ReadWritePaths=${DEFAULT_CAS_RCV}
+ReadWritePaths=${CAS_RCV}
 
 [Install]
 WantedBy=multi-user.target
@@ -926,6 +980,7 @@ do_update() {
         done
     fi
 
+    install_account     # idempotent; a --user account joins the access group
     install_dirs        # idempotent; restores a missing directory
     install_binaries    # the actual update
     update_units
@@ -1033,9 +1088,44 @@ do_install() {
 # UNINSTALL
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Resolve CAS paths from installed config before config dir might be removed.
+# ── service identity and paths (resolved once, used by every action) ─────────
+# CAS and spool come from the installed config when there is one, so install,
+# update and uninstall act on the directories the service really uses.
 CAS_PUB="$(read_cas_root "${CONFIG_DIR}/config.yaml"   "${DEFAULT_CAS_PUB}")"
 CAS_RCV="$(read_cas_root "${CONFIG_DIR}/receiver.yaml" "${DEFAULT_CAS_RCV}")"
+
+# read_spool_root CFG — spool_root from a config file; empty when unset.
+read_spool_root() {
+    [ -f "$1" ] || return 0
+    sed -n 's/^spool_root:[[:space:]]*//p' "$1" | head -1 | yaml_scalar
+}
+
+if [ -z "$SERVICE_USER" ]; then
+    # Keep the user an installed unit runs as (drop-ins included): update must
+    # not hand the spool back to the default account behind the service's back.
+    _unit="$SVC_PUB"; [[ "$MODE" == "receiver" ]] && _unit="$SVC_RCV"
+    has_systemd && SERVICE_USER="$(systemctl show -p User --value "${_unit}.service" 2>/dev/null || true)"
+    SERVICE_USER="${SERVICE_USER:-$DEFAULT_USER}"
+fi
+# Files are owned by the user's primary group (its own, for a new account).
+SERVICE_GROUP="$(id -gn "$SERVICE_USER" 2>/dev/null || echo "$SERVICE_USER")"
+
+_cfg_spool="$(read_spool_root "${CONFIG_DIR}/config.yaml")"
+if [[ -n "$SPOOL_DIR" && -n "$_cfg_spool" && "$ACTION" != uninstall ]] &&
+   [[ "$(readlink -m "$SPOOL_DIR")" != "$(readlink -m "$_cfg_spool")" ]]; then
+    # config.yaml is never rewritten, so the unit and the service would disagree.
+    die "--spool-dir ${SPOOL_DIR} differs from spool_root ${_cfg_spool} in ${CONFIG_DIR}/config.yaml — change it there first."
+fi
+SPOOL_DIR="${SPOOL_DIR:-${_cfg_spool:-$DEFAULT_SPOOL_DIR}}"
+[[ "$SPOOL_DIR" == /* ]] || die "Spool directory must be an absolute path: ${SPOOL_DIR}"
+# systemd follows symlinks (in any path component) while building the unit's
+# mount namespace and SELinux may refuse that (226/NAMESPACE): name the real
+# directory. -m: also when parts of it do not exist yet.
+_real="$(readlink -m "$SPOOL_DIR")"
+if [[ "$_real" != "$SPOOL_DIR" ]]; then
+    info "Spool ${SPOOL_DIR} resolves through a symlink — using ${_real}"
+    SPOOL_DIR="$_real"
+fi
 
 do_publisher_uninstall() {
     header "Services (publisher)"
@@ -1097,6 +1187,10 @@ do_account_uninstall() {
         skip "Account '${SERVICE_USER}' — preserved (--keep-user)"
         return
     fi
+    if [[ "$SERVICE_USER" != "$DEFAULT_USER" ]]; then
+        skip "Account '${SERVICE_USER}' — not created by ${PROG}, preserved"
+        return
+    fi
     if id "$SERVICE_USER" &>/dev/null 2>&1; then
         run "Remove system account '${SERVICE_USER}'" userdel "$SERVICE_USER"
     else
@@ -1136,7 +1230,7 @@ do_uninstall() {
             fi
             ;;
     esac
-    if ! $KEEP_USER; then
+    if ! $KEEP_USER && [[ "$SERVICE_USER" == "$DEFAULT_USER" ]]; then
         manifest+=("System account: ${SERVICE_USER}")
     fi
 
