@@ -576,6 +576,12 @@ cvmfs_server connect-gw -P -K \
 
 `connect-gw` state is per publisher and does not travel with the config.
 
+On a mountless host prepub creates missing parent directories of a publish
+target (e.g. `<group>/<arch>/Packages`) through the gateway too, which needs
+`stratum0_url` set: it looks up which parents are already published and ingests
+the missing ones. Without it, a first publish into a new area can fail on the
+gateway with "failed to graft nested catalog".
+
 ### Step 9 — start, verify, cut over
 
 ```sh

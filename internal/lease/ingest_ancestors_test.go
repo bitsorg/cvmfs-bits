@@ -51,7 +51,9 @@ func newAncestorBackend(t *testing.T, repo string) (*IngestBackend, string) {
 	if err := os.MkdirAll(filepath.Join(mount, repo), 0o755); err != nil {
 		t.Fatalf("mkdir repo root: %v", err)
 	}
-	return NewIngestBackend(IngestOptions{CVMFSMount: mount}, newTestObs(t)), mount
+	b := NewIngestBackend(IngestOptions{CVMFSMount: mount}, newTestObs(t))
+	b.mounted = isDir // a temp dir stands in for the mounted repository
+	return b, mount
 }
 
 // TestEnsureAncestors_CreatesMissingChain is the regression test for the
