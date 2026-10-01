@@ -199,7 +199,7 @@ func TestIngestBackend_CommitArgsPutRepoLast(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := NewIngestBackend(tc.opt, newTestObs(t))
-			got := b.commitArgs("repo.example.org", "pkg/1.0", "/spool/p.tar", false, false)
+			got := b.commitArgs("repo.example.org", "pkg/1.0", "/spool/p.tar", false, false, false)
 			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
 				t.Errorf("commitArgs =\n  %v\nwant\n  %v", got, tc.want)
 			}
@@ -247,4 +247,24 @@ func TestIngestBackend_ConcurrentQueueForIsSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// An existing base already is its nested catalog: asking for another one
+// aborts the ingest on the duplicate .cvmfscatalog entry.
+func TestCommitArgs_NoNewCatalogOnExistingBase(t *testing.T) {
+	b := NewIngestBackend(IngestOptions{NestedCatalog: true}, nil)
+	has := func(args []string) bool {
+		for _, a := range args {
+			if a == "-c" {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(b.commitArgs("r", "base", "/t.tar", false, false, false)) {
+		t.Error("new base: want -c")
+	}
+	if has(b.commitArgs("r", "base", "/t.tar", false, false, true)) {
+		t.Error("existing base: want no -c")
+	}
 }

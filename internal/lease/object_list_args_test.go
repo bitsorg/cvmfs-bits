@@ -14,7 +14,7 @@ func objectListArgv(t *testing.T, directS3, objectList bool) string {
 	t.Helper()
 	b := &IngestBackend{}
 	return strings.Join(
-		b.commitArgs("test.cvmfs.io", "base", "/tmp/p.tar", directS3, objectList), " ")
+		b.commitArgs("test.cvmfs.io", "base", "/tmp/p.tar", directS3, objectList, false), " ")
 }
 
 // The acceptance criterion for this feature: with the flag off, argv is what it

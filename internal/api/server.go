@@ -273,6 +273,22 @@ func (s *Server) SetAllowedPublishPrefixes(prefixes []string) {
 	s.allowedPublishPrefixes = out
 }
 
+// validateIdentityPath accepts an empty identity, or one at or under the job's
+// path: a job may only claim to be satisfied by content inside its own lease.
+func validateIdentityPath(subPath, identity string) error {
+	if identity == "" {
+		return nil
+	}
+	if err := validateSubPath(identity); err != nil {
+		return fmt.Errorf("identity_path: %w", err)
+	}
+	id, base := path.Clean(identity), path.Clean(subPath)
+	if subPath == "" || id == base || strings.HasPrefix(id, base+"/") {
+		return nil
+	}
+	return fmt.Errorf("identity_path %q is not at or under path %q", identity, subPath)
+}
+
 // validateSubPath rejects a job path that is not repository-relative.
 //
 // The submitted path is joined onto /cvmfs/<repo> everywhere downstream, and
@@ -373,24 +389,14 @@ func (s *Server) publishedHandler(w http.ResponseWriter, r *http.Request) {
 		Hash   string `json:"hash,omitempty"`
 	}{Exists: exists}
 	if exists {
-		data, found, rerr := cvmfscatalog.ReadPublishedFile(ctx, nil, s.orch.Stratum0URL,
-			req.Repo, strings.TrimSuffix(req.Path, "/")+"/.meta.json")
+		hash, _, rerr := publishedPackageHash(ctx, s.orch.Stratum0URL, req.Repo, req.Path)
 		if rerr != nil {
 			// Unknown, not "exists with no hash": the producer then publishes.
 			s.obs.Logger.Warn("published: .meta.json read failed", "repo", req.Repo, "path", req.Path, "error", rerr)
 			http.Error(w, `{"error":"cannot read the published .meta.json"}`, http.StatusBadGateway)
 			return
 		}
-		if found {
-			var meta struct {
-				Package struct {
-					Hash string `json:"hash"`
-				} `json:"package"`
-			}
-			if json.Unmarshal(data, &meta) == nil {
-				resp.Hash = meta.Package.Hash
-			}
-		}
+		resp.Hash = hash
 	}
 	json.NewEncoder(w).Encode(resp)
 }
@@ -723,6 +729,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		catalogHash               string   // suffixed subtree catalog hash to graft
 		publishPath               string   // optional: "prepub" (default) or "ingest"
 		preWarm                   *bool    // optional: nil = node default
+		identityPath              string   // optional: see job.IdentityPath
+		identityHash              string   // optional: see job.IdentityHash
 	)
 
 	jobID := uuid.New().String()
@@ -1106,6 +1114,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			buildExpect = n
 		}
 		publishPath = field("publish_path")
+		identityPath = strings.TrimSpace(field("identity_path")) // optional
+		identityHash = strings.TrimSpace(field("identity_hash")) // optional
 		// prewarm is tri-state: absent means "use the node default", so an
 		// unset field must NOT be read as false.
 		if raw := field("prewarm"); raw != "" {
@@ -1198,6 +1208,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			os.RemoveAll(jobDir)
 			s.obs.Logger.Warn("submit: malformed target path",
 				"repo", repo, "path", subPath, "error", err)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		if err := validateIdentityPath(subPath, identityPath); err != nil {
+			os.RemoveAll(jobDir)
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
 		}
@@ -1413,6 +1428,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.PreloadPaths = preloadPaths
 	j.PublishPath = publishPath
 	j.PreWarm = preWarm
+	if identityPath != "" {
+		j.IdentityPath = path.Clean(identityPath)
+		j.IdentityHash = identityHash
+	}
 
 	// Record the original filename and size for the console tooltip.
 	// Use Stat on the spool copy since the original may have been moved.

@@ -340,6 +340,16 @@ type Job struct {
 	// prepub publish path can pre-warm — the ingest path commits through the
 	// gateway, so there is nothing to announce before the catalog flip.
 	PreWarm *bool `json:"prewarm,omitempty"`
+	// IdentityPath is the repo-relative path whose presence means this job's
+	// content is already published (the package directory, or one modulefile
+	// inside a shared modules directory). Optional; at or under Path. A job
+	// whose identity has appeared since submission (a rerun queued behind the
+	// original) finishes as published without committing.
+	IdentityPath string `json:"identity_path,omitempty"`
+	// IdentityHash is the build hash the content at IdentityPath must carry
+	// (its .meta.json) to count as this job's. Optional; a different hash
+	// there fails the job instead of passing another build's content as it.
+	IdentityHash string `json:"identity_hash,omitempty"`
 
 	// ── Per-stage timestamps (gateway/bits path only) ─────────────────────────
 	// All times are zero-value when the stage was not reached or not applicable.

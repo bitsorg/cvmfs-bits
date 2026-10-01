@@ -9,6 +9,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -2035,6 +2036,31 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	cancelHeartbeat() // stop renewal before committing (idempotent; defer fires again at return)
 	leaseCancel()     // release leaseCtx resources early; Commit uses the parent ctx
 
+	// Holding the repository's slot here, so every earlier commit has landed.
+	skip, preErr := o.preCommitChecks(ctx, j, &req, logger)
+	if preErr != nil || skip {
+		if abErr := o.abortLeaseDetachedErr(j, token); abErr != nil {
+			logger.Warn("releasing the unused lease failed", "error", abErr)
+		}
+		j.LeaseToken = ""
+		if o.GatewayQueue != nil {
+			o.GatewayQueue.NotifyRelease(j.Repo)
+		}
+		if preErr != nil {
+			span.RecordError(preErr)
+			return o.abortJob(ctx, j, preErr)
+		}
+		j.PublishedAt = time.Now()
+		if err := o.transition(ctx, j, job.StatePublished); err != nil {
+			span.RecordError(err)
+			return err
+		}
+		o.webhookPublished(j)
+		o.Obs.Metrics.JobsCompleted.Inc()
+		o.measFinish(j, "already_published", nil)
+		return nil
+	}
+
 	logger.Info("committing")
 	commitPhaseStart := time.Now()
 
@@ -2224,19 +2250,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	}
 
 	// ── Webhook (async, non-fatal) ────────────────────────────────────────────
-	if o.Notify != nil && j.WebhookURL != "" {
-		webhookCtx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		o.webhookWg.Add(1)
-		go func() {
-			defer o.webhookWg.Done()
-			defer wcancel()
-			notify.DeliverWebhook(webhookCtx, j.WebhookURL, notify.Event{
-				JobID: j.ID,
-				State: job.StatePublished,
-				Time:  time.Now(),
-			}, o.Obs)
-		}()
-	}
+	o.webhookPublished(j)
 
 	o.Obs.Metrics.JobsCompleted.Inc()
 	o.measFinish(j, "published", nil)
@@ -2309,6 +2323,96 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 	// Recover runs outside the server semaphore (it is called at startup, not
 	// from a job goroutine).  Pass nil so Run skips the early-release hook.
 	return o.Run(ctx, j, nil)
+}
+
+// webhookPublished tells the job's webhook, if any, that it was published.
+// Async and non-fatal.
+func (o *Orchestrator) webhookPublished(j *job.Job) {
+	if o.Notify == nil || j.WebhookURL == "" {
+		return
+	}
+	webhookCtx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	o.webhookWg.Add(1)
+	go func() {
+		defer o.webhookWg.Done()
+		defer wcancel()
+		notify.DeliverWebhook(webhookCtx, j.WebhookURL, notify.Event{
+			JobID: j.ID,
+			State: job.StatePublished,
+			Time:  time.Now(),
+		}, o.Obs)
+	}()
+}
+
+// preCommitChecks looks at the published catalogs just before a commit, with
+// the repository's slot held so they reflect every earlier commit. It returns
+// true when the job's identity is already published -- a rerun queued behind
+// the original, which committing would only fail on the existing entries --
+// and an error when it is published by a different build (IdentityHash does
+// not match), which must not pass as this one. Otherwise it sets
+// req.BaseExists for the ingest path. Lookup failures leave things as they
+// were: commit, and ask for the nested catalog.
+func (o *Orchestrator) preCommitChecks(ctx context.Context, j *job.Job, req *lease.CommitRequest, logger *slog.Logger) (bool, error) {
+	if o.Stratum0URL == "" {
+		return false, nil
+	}
+	// Not with replace_on_conflict, whose point is to overwrite.
+	if j.IdentityPath != "" && !o.ReplaceOnConflict {
+		exists, err := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, j.IdentityPath)
+		switch {
+		case err != nil:
+			logger.Warn("identity check failed — committing anyway",
+				"identity_path", j.IdentityPath, "error", err)
+		case exists && j.IdentityHash != "":
+			got, found, herr := publishedHashFn(ctx, o.Stratum0URL, j.Repo, j.IdentityPath)
+			if herr != nil {
+				logger.Warn("identity hash check failed — committing anyway",
+					"identity_path", j.IdentityPath, "error", herr)
+				break
+			}
+			if !found || got != j.IdentityHash {
+				return false, fmt.Errorf("%s is already published by another build "+
+					"(hash %q, this job %q); not overwriting it", j.IdentityPath, got, j.IdentityHash)
+			}
+			logger.Info("already published since submission — skipping the commit",
+				"identity_path", j.IdentityPath)
+			return true, nil
+		case exists:
+			logger.Info("already published since submission — skipping the commit",
+				"identity_path", j.IdentityPath)
+			return true, nil
+		}
+	}
+	// The exact entry a second nested catalog would collide with.
+	if _, ingest := o.leaseFor(j).(*lease.IngestBackend); ingest && j.Path != "" {
+		marker := strings.TrimSuffix(j.Path, "/") + "/.cvmfscatalog"
+		if exists, err := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, marker); err == nil {
+			req.BaseExists = exists
+		}
+	}
+	return false, nil
+}
+
+// publishedHashFn is a test seam for the published package hash.
+var publishedHashFn = publishedPackageHash
+
+// publishedPackageHash reads the package hash bits records in
+// <path>/.meta.json. found is false when there is no such file.
+func publishedPackageHash(ctx context.Context, stratum0URL, repo, p string) (string, bool, error) {
+	data, found, err := cvmfscatalog.ReadPublishedFile(ctx, nil, stratum0URL, repo,
+		strings.TrimSuffix(p, "/")+"/.meta.json")
+	if err != nil || !found {
+		return "", false, err
+	}
+	var meta struct {
+		Package struct {
+			Hash string `json:"hash"`
+		} `json:"package"`
+	}
+	if json.Unmarshal(data, &meta) != nil {
+		return "", true, nil
+	}
+	return meta.Package.Hash, true, nil
 }
 
 // pathExistsFn is a test seam; production resolves against the published

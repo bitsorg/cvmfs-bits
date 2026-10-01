@@ -130,7 +130,7 @@ func TestIngestCommit_NoObjectListFlagWhenDisabled(t *testing.T) {
 
 	b := &IngestBackend{obs: newTestObs(t)}
 	if _, err := b.cvmfsServerOutput(context.Background(),
-		b.commitArgs("test.cvmfs.io", "base", "/tmp/p.tar", true, false)...); err != nil {
+		b.commitArgs("test.cvmfs.io", "base", "/tmp/p.tar", true, false, false)...); err != nil {
 		t.Fatalf("commit failed: %v", err)
 	}
 	if argv := readArgv(t, argvFile); strings.Contains(argv, "object-list") {

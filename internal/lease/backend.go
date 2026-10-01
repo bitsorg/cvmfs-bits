@@ -99,6 +99,12 @@ type CommitRequest struct {
 	// Passed to the gateway commit body; ignored when TagName is empty.
 	TagDescription string
 
+	// BaseExists reports that the target directory is already published. The
+	// ingest path then does not ask for a new nested catalog there: the one it
+	// already is carries its .cvmfscatalog marker, and adding a second one
+	// aborts the ingest on the catalog's unique constraint.
+	BaseExists bool
+
 	// ── Local mode ───────────────────────────────────────────────────────────
 
 	// TarPath is the absolute path to the spool tar file to unpack (local mode).

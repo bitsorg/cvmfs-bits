@@ -251,7 +251,7 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 		b.obs.Logger.Warn("ingest backend: object_list ignored without direct_s3",
 			"repo", repo, "base", base)
 	}
-	args := b.commitArgs(repo, base, req.TarPath, req.DirectS3, useObjectList)
+	args := b.commitArgs(repo, base, req.TarPath, req.DirectS3, useObjectList, req.BaseExists)
 
 	// direct_s3 is logged on both lines because its failure mode is silence:
 	// when it does not take effect the publish still succeeds, via the gateway,
@@ -558,9 +558,10 @@ func truncateLog(s string) string {
 // commitArgs exposes the argument vector for testing: the ordering constraint
 // it encodes is enforced by a shell script in another project, so it deserves a
 // test rather than a comment alone.
-func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3, objectList bool) []string {
+func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3, objectList, baseExists bool) []string {
 	args := []string{"ingest", "-t", tarPath, "-b", base}
-	if b.nestedCatalog {
+	// An existing base already is its nested catalog (see BaseExists).
+	if b.nestedCatalog && !baseExists {
 		args = append(args, "-c")
 	}
 	if b.owner != "" {
