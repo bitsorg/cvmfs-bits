@@ -37,6 +37,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"cvmfs.io/prepub/internal/api"
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
@@ -463,6 +465,11 @@ func runPublisher(
 	if err != nil {
 		obs.Logger.Error("failed to create spool", "error", err)
 		os.Exit(1)
+	}
+	// Jobs per spool state and the host's load, memory and spool disk, on
+	// /api/v1/metrics, for the console's publisher row.
+	if reg, ok := obs.Registry.(prometheus.Registerer); ok {
+		reg.MustRegister(spool.NewCollector(sp))
 	}
 
 	// Keep every temporary file inside the spool filesystem. /tmp is small on a
