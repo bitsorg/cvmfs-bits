@@ -275,6 +275,8 @@ func main() {
 	rekorServer := flag.String("rekor-server", provenance.DefaultRekorServer, "Rekor transparency log URL [publisher]")
 	rekorSigningKey := flag.String("rekor-signing-key", "", "Path to Ed25519 private key (PEM/PKCS#8) for signing Rekor entries; auto-generated if absent [publisher]")
 	oidcIssuers := flag.String("oidc-issuers", "", "Comma-separated list of allowed OIDC issuer URLs for CI token validation [publisher]")
+	maxTarSizeGiB := flag.Int("max-tar-size-gib", 10, "Largest package tar one submission may carry, in GiB; a bigger upload is refused with 413 [publisher]")
+	spoolMinFreeGiB := flag.Int("spool-min-free-gib", 20, "Free space, in GiB, an upload must leave on the spool filesystem, else it is refused with 507; 0 disables the check [publisher]")
 	allowedPublishPrefixes := flag.String("allowed-publish-prefix", "", "Comma-separated CVMFS group-root paths this deployment may publish into, e.g. /cvmfs/repo.cern.ch/lcg,/cvmfs/repo.cern.ch/cms. A reserve/submit whose target falls outside every root is rejected 403. Empty disables the check (publish anywhere) [publisher]")
 
 	// ── Receiver-mode flags ────────────────────────────────────────────────────
@@ -347,6 +349,7 @@ func main() {
 			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers, prefetch,
+			maxTarSizeGiB, spoolMinFreeGiB,
 		)
 	}
 
@@ -378,6 +381,7 @@ func main() {
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
+			*maxTarSizeGiB, *spoolMinFreeGiB,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *promoteWorkers, *prefetch,
 			*chunkMin, *chunkAvg, *chunkMax,
@@ -417,6 +421,7 @@ func runPublisher(
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
 	allowedPublishPrefixes string,
+	maxTarSizeGiB, spoolMinFreeGiB int,
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineWorkers, pipelineUploadConc, pipelineCompressLevel int,
@@ -965,6 +970,8 @@ func runPublisher(
 		obs.Logger.Warn("API auth: bearer or signed (migration setting) — the bearer path still " +
 			"puts the shared secret on the wire; switch to auth_mode=hmac once publishers sign, then rotate the token")
 	}
+	apiServer.SetUploadLimits(int64(maxTarSizeGiB)<<30, int64(spoolMinFreeGiB)<<30)
+	obs.Logger.Info("upload limits", "max_tar_size_gib", maxTarSizeGiB, "spool_min_free_gib", spoolMinFreeGiB)
 	if allowedPublishPrefixes != "" {
 		apiServer.SetAllowedPublishPrefixes(strings.Split(allowedPublishPrefixes, ","))
 		obs.Logger.Info("publish namespace containment enabled", "allowed_prefixes", allowedPublishPrefixes)

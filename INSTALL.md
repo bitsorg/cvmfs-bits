@@ -523,7 +523,16 @@ pipeline:
 
 allowed_publish_prefixes:
   - /cvmfs/<repo>/<group>      # containment: publishes may not escape this
+
+max_tar_size_gib: 10           # largest package tar per submission (413 above)
+spool_min_free_gib: 20         # an upload must leave this free on the spool (507)
 ```
+
+A published job's `payload.tar` is deleted once it is committed; failed and
+aborted jobs keep theirs under `failed/` and `aborted/` for inspection, so
+clear those by hand. Older prepub versions kept every payload; after upgrading,
+reclaim that space once with
+`find <spool_root>/published <spool_root>/accumulated -mindepth 2 -maxdepth 2 -name payload.tar -delete`.
 
 Add `ingest_publish: true` to also offer the gateway ingest path (step 8).
 

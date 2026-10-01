@@ -171,6 +171,16 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 	// Record metric
 	s.obs.Metrics.SpoolTransitions.WithLabelValues(string(entry.From), string(entry.To)).Inc()
 
+	// Nothing reads a published or accumulated (coarse member) job's payload
+	// again, and keeping every one fills the spool. Failed and aborted jobs
+	// keep theirs for inspection.
+	if to == job.StatePublished || to == job.StateAccumulated {
+		tar := filepath.Join(newDir, "payload.tar")
+		if rmErr := os.Remove(tar); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			s.obs.Logger.Warn("cannot remove published payload", "job_id", j.ID, "path", tar, "error", rmErr)
+		}
+	}
+
 	return nil
 }
 

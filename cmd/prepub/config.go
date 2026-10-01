@@ -204,6 +204,14 @@ type fileConfig struct {
 	// list the group ROOT so both are covered. Equivalent to --allowed-publish-prefix.
 	AllowedPublishPrefixes []string `yaml:"allowed_publish_prefixes"`
 
+	// MaxTarSizeGiB is the largest package tar one submission may carry
+	// (default 10). Equivalent to --max-tar-size-gib.
+	MaxTarSizeGiB int `yaml:"max_tar_size_gib"`
+	// SpoolMinFreeGiB is the free space an upload must leave on the spool
+	// filesystem, else it is refused with 507 (default 20; 0 here keeps the
+	// default, --spool-min-free-gib=0 disables). Equivalent to --spool-min-free-gib.
+	SpoolMinFreeGiB int `yaml:"spool_min_free_gib"`
+
 	// Chunking overrides the CVMFS content-defined (xor32) chunk sizes in
 	// bytes. Zero/omitted fields keep the CLI defaults, which are pinned to a
 	// FIXED cvmfsdescriptor.ChunkGrid (6 MiB, min==avg==max) for coarse-publish
@@ -304,6 +312,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	chunkMin, chunkAvg, chunkMax *int64,
 	pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers *int,
 	prefetch *bool,
+	maxTarSizeGiB, spoolMinFreeGiB *int,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -356,6 +365,8 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	i("pipeline-upload-conc", pipelineUploadConc, fc.Pipeline.UploadConcurrency)
 	i("prefetch-limit", prefetchLimit, fc.Pipeline.PrefetchLimit)
 	i("promote-workers", promoteWorkers, fc.PromoteWorkers)
+	i("max-tar-size-gib", maxTarSizeGiB, fc.MaxTarSizeGiB)
+	i("spool-min-free-gib", spoolMinFreeGiB, fc.SpoolMinFreeGiB)
 	if !has("prefetch") && fc.Pipeline.Prefetch != nil {
 		*prefetch = *fc.Pipeline.Prefetch
 	}

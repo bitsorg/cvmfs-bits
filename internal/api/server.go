@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,8 +42,9 @@ import (
 	"cvmfs.io/prepub/pkg/observe"
 )
 
-// maxTarSize is the maximum accepted tar body (10 GiB).
-const maxTarSize = 10 << 30
+// defaultMaxTarSize is the largest accepted tar unless SetUploadLimits
+// raises it (10 GiB).
+const defaultMaxTarSize = 10 << 30
 
 // Limits for streamed multipart submissions.  ParseMultipartForm applied its
 // own implicit bounds; since submitJob now reads the parts itself, the bounds
@@ -98,6 +100,11 @@ type Server struct {
 	notifyBus *notify.Bus
 	// spoolRoot is the root directory for job state storage.
 	spoolRoot string
+	// maxTarSize is the largest tar a submission may carry.
+	maxTarSize int64
+	// spoolMinFree is the free space an upload must leave on the spool
+	// filesystem; 0 disables the check.
+	spoolMinFree int64
 	// stagingRoot is the operator-configured directory from which tar_path
 	// references (JSON submissions) are allowed.  Empty disables JSON/tar_path
 	// mode — callers must upload the tar as multipart/form-data instead.
@@ -137,6 +144,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 		notifyBus:   nb,
 		spoolRoot:   spoolRoot,
 		stagingRoot: stagingRoot,
+		maxTarSize:  defaultMaxTarSize,
 		httpServer: &http.Server{
 			Handler: router,
 			// Slowloris defenses (the control plane may be internet-exposed; do not
@@ -214,6 +222,42 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	builds.HandleFunc("/{id}", s.buildStatus).Methods("GET")
 
 	return s
+}
+
+// SetUploadLimits sets the largest accepted tar and the free space an upload
+// must leave on the spool. maxTar <= 0 keeps the default; minFree <= 0
+// disables the free-space check.
+func (s *Server) SetUploadLimits(maxTar, minFree int64) {
+	if maxTar > 0 {
+		s.maxTarSize = maxTar
+	}
+	s.spoolMinFree = max(minFree, 0)
+}
+
+// uploadRefusal says why a multipart body of the declared size (-1 when
+// unknown) cannot be stored, or "" when it can. Refusing on the header stores
+// nothing; a client that waits for the answer (curl, Expect: 100-continue) is
+// told why, one that keeps sending may still only see the connection close,
+// so producers should also check max_tar_size from /api/v1/health. Each
+// upload is checked on its own, so concurrent ones can overshoot the floor.
+func (s *Server) uploadRefusal(size int64) (string, int) {
+	if size > s.maxTarSize+maxFormFieldSize*maxMultipartParts {
+		return fmt.Sprintf(`{"error":"upload of %d bytes exceeds this node's limit of %d bytes (max_tar_size_gib)"}`,
+			size, s.maxTarSize), http.StatusRequestEntityTooLarge
+	}
+	if s.spoolMinFree == 0 {
+		return "", 0
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(s.spoolRoot, &st); err != nil {
+		return "", 0 // cannot tell: let the write itself fail if it must
+	}
+	free := int64(st.Bavail) * int64(st.Bsize)
+	if free-max(size, 0) < s.spoolMinFree {
+		return fmt.Sprintf(`{"error":"spool full: %d bytes free, upload of %d bytes would leave less than %d (spool_min_free_gib)"}`,
+			free, max(size, 0), s.spoolMinFree), http.StatusInsufficientStorage
+	}
+	return "", 0
 }
 
 // SetAllowedPublishPrefixes configures the authorized CVMFS roots (full paths).
@@ -843,7 +887,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		// stops us from STORING more than maxTarSize, while multipart.Part.Close
 		// drains whatever remains, so without this a client could make the
 		// server read an unbounded stream after the limit had already tripped.
-		r.Body = http.MaxBytesReader(w, r.Body, maxTarSize+maxFormFieldSize*maxMultipartParts)
+		if msg, code := s.uploadRefusal(r.ContentLength); msg != "" {
+			http.Error(w, msg, code)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, s.maxTarSize+maxFormFieldSize*maxMultipartParts)
 
 		mr, mrErr := r.MultipartReader()
 		if mrErr != nil {
@@ -932,12 +980,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			// Always hash: tar_sha256 may not have been seen yet (field order
 			// is the client's choice), and hashing a stream we are already
 			// writing costs far less than a second pass over the file.
-			n, copyErr := io.Copy(io.MultiWriter(spoolFile, hasher), io.LimitReader(part, maxTarSize+1))
+			n, copyErr := io.Copy(io.MultiWriter(spoolFile, hasher), io.LimitReader(part, s.maxTarSize+1))
 			closeErr := spoolFile.Close()
 			// Reject an oversized payload BEFORE part.Close(), which drains the
 			// remainder of the part — otherwise the server reads the entire
 			// body it has just decided to refuse.
-			if n > maxTarSize {
+			if n > s.maxTarSize {
 				os.RemoveAll(jobDir)
 				http.Error(w, `{"error":"tar exceeds maximum allowed size"}`, http.StatusRequestEntityTooLarge)
 				return
@@ -2185,6 +2233,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		// published here. False means uploads succeed and the commit never
 		// happens, which is invisible to a producer that has already exited.
 		FinalizeReady bool `json:"finalize_ready"`
+		// MaxTarSize lets a producer refuse an oversized package itself
+		// instead of uploading it to be cut off.
+		MaxTarSize int64 `json:"max_tar_size"`
 		// ReplayCache surfaces the fail-closed counter: a non-zero
 		// rejected_full means signed requests are being refused for capacity
 		// reasons, which looks like an auth problem from the client side and
@@ -2193,7 +2244,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 			Entries      int    `json:"entries"`
 			RejectedFull uint64 `json:"rejected_full"`
 		} `json:"replay_cache"`
-	}{Status: "healthy", AuthMode: string(s.authMode)}
+	}{Status: "healthy", AuthMode: string(s.authMode), MaxTarSize: s.maxTarSize}
 	body.ReplayCache.Entries = nonces
 	body.ReplayCache.RejectedFull = rejectedFull
 	if s.orch != nil {
