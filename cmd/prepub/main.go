@@ -275,6 +275,7 @@ func main() {
 	rekorServer := flag.String("rekor-server", provenance.DefaultRekorServer, "Rekor transparency log URL [publisher]")
 	rekorSigningKey := flag.String("rekor-signing-key", "", "Path to Ed25519 private key (PEM/PKCS#8) for signing Rekor entries; auto-generated if absent [publisher]")
 	oidcIssuers := flag.String("oidc-issuers", "", "Comma-separated list of allowed OIDC issuer URLs for CI token validation [publisher]")
+	retryWindow := flag.Duration("retry-window", 24*time.Hour, "How long from submission a job that fails for a retryable reason (network, gateway, storage, timeout, unknown tool failure) is retried with backoff before it is failed; conflicts and unreadable payloads fail at once. 0 disables retries [publisher]")
 	maxTarSizeGiB := flag.Int("max-tar-size-gib", 10, "Largest package tar one submission may carry, in GiB; a bigger upload is refused with 413 [publisher]")
 	spoolMinFreeGiB := flag.Int("spool-min-free-gib", 20, "Free space, in GiB, an upload must leave on the spool filesystem, else it is refused with 507; 0 disables the check [publisher]")
 	allowedPublishPrefixes := flag.String("allowed-publish-prefix", "", "Comma-separated CVMFS group-root paths this deployment may publish into, e.g. /cvmfs/repo.cern.ch/lcg,/cvmfs/repo.cern.ch/cms. A reserve/submit whose target falls outside every root is rejected 403. Empty disables the check (publish anywhere) [publisher]")
@@ -350,6 +351,7 @@ func main() {
 			chunkMin, chunkAvg, chunkMax,
 			pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers, prefetch,
 			maxTarSizeGiB, spoolMinFreeGiB,
+			retryWindow,
 		)
 	}
 
@@ -382,6 +384,7 @@ func main() {
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
 			*allowedPublishPrefixes,
 			*maxTarSizeGiB, *spoolMinFreeGiB,
+			*retryWindow,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *promoteWorkers, *prefetch,
 			*chunkMin, *chunkAvg, *chunkMax,
@@ -422,6 +425,7 @@ func runPublisher(
 	rekorServer, rekorSigningKey, oidcIssuers string,
 	allowedPublishPrefixes string,
 	maxTarSizeGiB, spoolMinFreeGiB int,
+	retryWindow time.Duration,
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
 	pipelineWorkers, pipelineUploadConc, pipelineCompressLevel int,
@@ -904,6 +908,7 @@ func runPublisher(
 		IngestConfigPrefix: ingestConfigPrefix,
 		IngestEnv:          splitCSV(ingestEnv),
 		JobTimeout:         jobTimeout,
+		RetryWindow:        retryWindow,
 		BrokerConfig:       publishBrokerCfg,
 		Pipeline: pipeline.Config{
 			Workers:       pipelineWorkers,

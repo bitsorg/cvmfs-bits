@@ -526,13 +526,22 @@ allowed_publish_prefixes:
 
 max_tar_size_gib: 10           # largest package tar per submission (413 above)
 spool_min_free_gib: 20         # an upload must leave this free on the spool (507)
+retry_window: 24h              # how long an accepted job is retried
 ```
 
-A published job's `payload.tar` is deleted once it is committed; failed and
-aborted jobs keep theirs under `failed/` and `aborted/` for inspection, so
-clear those by hand. Older prepub versions kept every payload; after upgrading,
-reclaim that space once with
-`find <spool_root>/published <spool_root>/accumulated -mindepth 2 -maxdepth 2 -name payload.tar -delete`.
+An accepted job is published eventually unless its failure is permanent. A
+failed attempt for any reason other than a conflict with already published
+content, an unreadable payload or an operator abort puts the job back in
+`incoming/` and retries it after 1, 2, 4, 8, 16, then every 30 minutes, until
+`retry_window` (counted from submission) runs out. `GET /api/v1/jobs/{id}`
+shows `attempts`, `last_error` and `next_attempt_at`; a restart keeps the
+schedule. `--retry-window=0` turns retries off.
+
+A job's `payload.tar` is deleted once the job is final (published or failed);
+the cause of a failure stays in its manifest, the log and the measurements.
+Older prepub versions kept every payload; after upgrading, reclaim that space
+once with
+`find <spool_root>/{published,accumulated,failed,aborted} -mindepth 2 -maxdepth 2 -name payload.tar -delete`.
 
 Add `ingest_publish: true` to also offer the gateway ingest path (step 8).
 

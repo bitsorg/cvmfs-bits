@@ -108,6 +108,11 @@ type Orchestrator struct {
 	// zero disables the per-job timeout (backward-compatible default).
 	// Recommended starting value: 30m for gateway mode, 60m for large repos.
 	JobTimeout time.Duration
+
+	// RetryWindow is how long, from submission, a job whose attempts fail for
+	// a retryable reason keeps being retried before it is failed for good.
+	// Zero disables retries: every failure is final (the old behaviour).
+	RetryWindow time.Duration
 	// CVMFSMount is the filesystem root where CVMFS repositories are mounted
 	// (e.g. "/cvmfs").  Only used in local publish mode; ignored by the
 	// gateway backend.
@@ -212,6 +217,8 @@ type Orchestrator struct {
 	// reaches a terminal state.  CancelJob uses this to abort a running job.
 	runningMu sync.Mutex
 	running   map[string]context.CancelFunc
+	// cancelled marks jobs an operator aborted, so their failure is final.
+	cancelled sync.Map
 
 	// finalizeWg tracks in-flight auto-finalize goroutines.  They are detached
 	// from the job goroutine that spawned them (an ingestsql commit outlives the
@@ -930,6 +937,7 @@ func (o *Orchestrator) unregisterJob(id string) {
 	o.runningMu.Lock()
 	defer o.runningMu.Unlock()
 	delete(o.running, id)
+	o.cancelled.Delete(id)
 }
 
 // CancelJob cancels a running job and returns true.  Returns false if the job
@@ -939,6 +947,7 @@ func (o *Orchestrator) CancelJob(id string) bool {
 	cancel, ok := o.running[id]
 	o.runningMu.Unlock()
 	if ok {
+		o.cancelled.Store(id, true)
 		cancel()
 	}
 	return ok
@@ -1138,6 +1147,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// rest, including the coarse-publish accumulate return that leaves a job
 	// legitimately unfinished.
 	defer o.measSweep(j)
+	j.NextAttemptAt = nil // due now; persisted with the next state change
 
 	// The publish path is checked at submission, but a job can also arrive here
 	// from crash recovery after the deployment's configuration changed. Publish
@@ -2113,12 +2123,12 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 						// path cannot delete a subtree, or when the remediation's
 						// own existence check was inconclusive. The Info/Warn
 						// logged by replaceOnConflict says which.
-						clearErr := fmt.Errorf(
+						clearErr := Classify(ErrClassPermanent, fmt.Errorf(
 							"already published: %s/%s already exists in the repository; "+
 								"a package/version publishes once, and it was not replaced "+
 								"(replacement is off, unsupported on this publish path, or "+
 								"was not applicable — see the preceding log lines)",
-							j.Repo, j.Path)
+							j.Repo, j.Path))
 						span.RecordError(clearErr)
 						logger.Error("commit rejected: target already published",
 							"repo", j.Repo, "path", j.Path)
@@ -2279,15 +2289,23 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 	logger := o.Obs.Logger.With("job_id", j.ID, "state", j.State,
 		"recovery_count", j.RecoveryCount, "interrupt_count", j.InterruptCount)
 
+	// A job that was waiting for a retry was not interrupted: it resumes
+	// waiting, uncounted.
+	if j.State == job.StateIncoming && j.NextAttemptAt != nil {
+		logger.Info("resuming a job waiting to retry",
+			"attempt", j.Attempts, "next_attempt_at", j.NextAttemptAt.Format(time.RFC3339))
+		return o.runRetrying(ctx, j)
+	}
+
 	if !afterCleanShutdown && j.RecoveryCount >= MaxRecoveries {
-		err := fmt.Errorf("job %s has reached the maximum recovery limit (%d attempts)", j.ID, MaxRecoveries)
+		err := Classify(ErrClassPermanent, fmt.Errorf("job %s has reached the maximum recovery limit (%d attempts)", j.ID, MaxRecoveries))
 		span.RecordError(err)
 		logger.Error("job exceeded max recovery attempts — marking as failed")
 		_ = o.abortJob(ctx, j, err)
 		return err
 	}
 	if afterCleanShutdown && j.InterruptCount >= MaxInterrupts {
-		err := fmt.Errorf("job %s has been interrupted by a service restart %d times", j.ID, MaxInterrupts)
+		err := Classify(ErrClassPermanent, fmt.Errorf("job %s has been interrupted by a service restart %d times", j.ID, MaxInterrupts))
 		span.RecordError(err)
 		logger.Error("job interrupted too many times — marking as failed")
 		_ = o.abortJob(ctx, j, err)
@@ -2320,9 +2338,32 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 	}
 
 	logger.Info("job reset to incoming — restarting")
-	// Recover runs outside the server semaphore (it is called at startup, not
-	// from a job goroutine).  Pass nil so Run skips the early-release hook.
-	return o.Run(ctx, j, nil)
+	return o.runRetrying(ctx, j)
+}
+
+// runRetrying runs a recovered job until it no longer asks for a retry.
+// Recover runs outside the server semaphore (it is called at startup, not
+// from a job goroutine), so Run gets nil for the early-release hook. When ctx
+// ends while the job waits, it stays in incoming for the next start.
+// Registered like a submitted job, so the abort endpoint reaches it too.
+func (o *Orchestrator) runRetrying(ctx context.Context, j *job.Job) error {
+	jobCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	o.registerJob(j.ID, cancel)
+	defer o.unregisterJob(j.ID)
+	for {
+		if !WaitForAttempt(jobCtx, j) {
+			if o.Aborted(j.ID) {
+				return o.abortJob(context.Background(), j,
+					fmt.Errorf("aborted while waiting to retry: %w", jobCtx.Err()))
+			}
+			return nil // shutdown: the job stays in incoming for the next start
+		}
+		err := o.Run(jobCtx, j, nil)
+		if !errors.Is(err, ErrRetryScheduled) {
+			return err
+		}
+	}
 }
 
 // webhookPublished tells the job's webhook, if any, that it was published.
@@ -2371,8 +2412,8 @@ func (o *Orchestrator) preCommitChecks(ctx context.Context, j *job.Job, req *lea
 				break
 			}
 			if !found || got != j.IdentityHash {
-				return false, fmt.Errorf("%s is already published by another build "+
-					"(hash %q, this job %q); not overwriting it", j.IdentityPath, got, j.IdentityHash)
+				return false, Classify(ErrClassPermanent, fmt.Errorf("%s is already published by another build "+
+					"(hash %q, this job %q); not overwriting it", j.IdentityPath, got, j.IdentityHash))
 			}
 			logger.Info("already published since submission — skipping the commit",
 				"identity_path", j.IdentityPath)
@@ -2546,14 +2587,25 @@ func (o *Orchestrator) replaceOnConflict(ctx context.Context, j *job.Job,
 	return true, nil
 }
 
-// abortJob records the failure, writes the manifest, and transitions the job
-// to StateFailed.  It always returns its err argument so callers can use it
-// in a return statement.
+// abortJob ends a failed attempt. A retryable failure within the retry window
+// puts the job back in incoming (see retryAt) and returns err wrapped in
+// ErrRetryScheduled; otherwise it records the failure, writes the manifest,
+// transitions the job to StateFailed and returns err. Either way callers can
+// use it in a return statement.
 //
 // Context independence: ctx may already be cancelled when abortJob is called.
 // All cleanup I/O uses a fresh context so it is not short-circuited.
 func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) error {
+	if next, ok := o.retryAt(j, err); ok {
+		if rqErr := o.scheduleRetry(j, err, next); rqErr == nil {
+			return fmt.Errorf("%w: %w", ErrRetryScheduled, err)
+		} else {
+			o.Obs.Logger.Error("could not requeue the job for a retry — failing it",
+				"job_id", j.ID, "error", rqErr)
+		}
+	}
 	o.Obs.Metrics.JobsFailed.Inc()
+	j.LastError = truncateErr(err)
 
 	class := ClassOf(err)
 	o.Obs.Metrics.JobFailuresByClass.WithLabelValues(class.String()).Inc()
@@ -2647,6 +2699,96 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	}
 
 	return err
+}
+
+// Retry backoff: the first retry after retryBase, doubling up to retryMax.
+// Variables only so tests can shorten them.
+var (
+	retryBase = time.Minute
+	retryMax  = 30 * time.Minute
+)
+
+// retryAt decides whether a failed attempt is retried, and when. Not when
+// retries are off, for a coarse member or finalize (their build accounting
+// has no notion of a retry), for an operator abort, for a permanent failure,
+// or when the next attempt would fall outside the retry window.
+func (o *Orchestrator) retryAt(j *job.Job, err error) (time.Time, bool) {
+	if o.RetryWindow <= 0 || j.IsCoarse() || j.Finalize || job.IsTerminal(j.State) {
+		return time.Time{}, false
+	}
+	if _, aborted := o.cancelled.Load(j.ID); aborted || isPermanent(err) {
+		return time.Time{}, false
+	}
+	delay := retryMax
+	if j.Attempts < 5 { // 1, 2, 4, 8, 16 minutes, then the cap
+		delay = min(retryBase<<j.Attempts, retryMax)
+	}
+	next := time.Now().Add(delay)
+	if next.After(j.CreatedAt.Add(o.RetryWindow)) {
+		return time.Time{}, false
+	}
+	return next, true
+}
+
+// scheduleRetry releases what the failed attempt held and puts the job back
+// in incoming, due at next. The job keeps its payload.
+func (o *Orchestrator) scheduleRetry(j *job.Job, err error, next time.Time) error {
+	if j.LeaseToken != "" {
+		if abErr := o.abortLeaseDetachedErr(j, j.LeaseToken); abErr != nil {
+			o.Obs.Logger.Error("lease abort failed — stale lease left on gateway",
+				"job_id", j.ID, "token", j.LeaseToken, "error", abErr)
+		}
+		if o.GatewayQueue != nil {
+			o.GatewayQueue.NotifyRelease(j.Repo)
+		}
+	}
+	j.Attempts++
+	j.LastError = truncateErr(err)
+	j.NextAttemptAt = &next
+	if rqErr := o.Spool.Requeue(j); rqErr != nil {
+		j.Attempts-- // not retried after all: abortJob fails it
+		j.NextAttemptAt = nil
+		return rqErr
+	}
+	o.measFinish(j, "retry", err)
+	o.Obs.Logger.Warn("job attempt failed — will retry", "job_id", j.ID,
+		"attempt", j.Attempts, "next_attempt_at", next.Format(time.RFC3339), "error", err)
+	if o.Notify != nil {
+		o.Notify.Publish(notify.Event{JobID: j.ID, State: job.StateIncoming, Error: j.LastError, Time: time.Now()})
+	}
+	return nil
+}
+
+// Aborted reports whether an operator asked to abort the job.
+func (o *Orchestrator) Aborted(id string) bool {
+	_, ok := o.cancelled.Load(id)
+	return ok
+}
+
+// truncateErr keeps an error message to a size fit for a manifest.
+func truncateErr(err error) string {
+	const max = 4000
+	s := err.Error()
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
+}
+
+// WaitForAttempt blocks until a job waiting to retry is due. It returns false
+// when ctx ends first; the job then stays in incoming for whoever runs next.
+func WaitForAttempt(ctx context.Context, j *job.Job) bool {
+	if j.NextAttemptAt == nil {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(time.Until(*j.NextAttemptAt))
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // leaseAbortTimeout bounds a rollback issued on a detached context.

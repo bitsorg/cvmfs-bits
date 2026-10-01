@@ -12,8 +12,8 @@ import (
 	"cvmfs.io/prepub/internal/job"
 )
 
-// A published or accumulated job's payload is deleted (nothing reads it again, and keeping
-// them filled the spool); a failed job keeps it for inspection.
+// A job's payload is deleted once it is terminal: nothing reads it again, and
+// keeping them filled the spool.
 func TestTransition_PublishedDropsPayload(t *testing.T) {
 	for _, tc := range []struct {
 		to   job.State
@@ -21,7 +21,7 @@ func TestTransition_PublishedDropsPayload(t *testing.T) {
 	}{
 		{job.StatePublished, false},
 		{job.StateAccumulated, false},
-		{job.StateFailed, true},
+		{job.StateFailed, false},
 	} {
 		t.Run(string(tc.to), func(t *testing.T) {
 			s := newTestSpool(t)
@@ -47,5 +47,28 @@ func TestTransition_PublishedDropsPayload(t *testing.T) {
 				t.Errorf("job record after transition: %v, %v", got, err)
 			}
 		})
+	}
+}
+
+// Requeue moves a job back to incoming without touching its recovery
+// counters: a retry is neither a crash nor an interruption.
+func TestRequeue_KeepsCountersAndPayload(t *testing.T) {
+	s := newTestSpool(t)
+	j := &job.Job{ID: "j2", Repo: "r.example.org", Path: "p", State: job.StateCommitting, RecoveryCount: 1}
+	if err := s.WriteManifest(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.JobDir(j), "payload.tar"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Requeue(j); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+	got, err := s.FindJob("j2")
+	if err != nil || got.State != job.StateIncoming || got.RecoveryCount != 1 || got.InterruptCount != 0 {
+		t.Fatalf("after Requeue: %+v, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.JobDir(j), "payload.tar")); err != nil {
+		t.Errorf("payload not kept: %v", err)
 	}
 }

@@ -227,7 +227,7 @@ func prefetchFromReader(ctx context.Context, r io.Reader, spillRoot string, obs 
 			for range collectChan { //nolint:revive
 			}
 			<-collectErrCh
-			return nil, fmt.Errorf("duplicate path %q in tar — each path must appear exactly once", entry.Path)
+			return nil, fmt.Errorf("%w: duplicate path %q in tar — each path must appear exactly once", unpack.ErrInvalidArchive, entry.Path)
 		}
 		seenPaths[entry.Path] = struct{}{}
 		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && entry.Size > 0 {
@@ -330,7 +330,7 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 			for range collectChan { //nolint:revive
 			}
 			<-collectErrCh
-			err := fmt.Errorf("duplicate path %q in tar — each path must appear exactly once", entry.Path)
+			err := fmt.Errorf("%w: duplicate path %q in tar — each path must appear exactly once", unpack.ErrInvalidArchive, entry.Path)
 			span.RecordError(err)
 			return nil, err
 		}
@@ -477,8 +477,8 @@ func RunFromArchiveList(ctx context.Context, archives []ArchiveSource, cfg Confi
 				for range entryCh { //nolint:revive
 				}
 				dupErr = fmt.Errorf(
-					"duplicate path %q in archive %q — each path must appear exactly once across all archives",
-					entry.Path, archPath)
+					"%w: duplicate path %q in archive %q — each path must appear exactly once across all archives",
+					unpack.ErrInvalidArchive, entry.Path, archPath)
 				break
 			}
 			seenPaths[entry.Path] = struct{}{}

@@ -112,6 +112,10 @@ type Server struct {
 	// jobWg tracks all background job goroutines so Shutdown can wait for them
 	// to reach a terminal state before the process exits.
 	jobWg sync.WaitGroup
+	// stop ends when Shutdown starts, so jobs waiting to retry stop waiting
+	// (they stay in incoming for the next start) instead of holding it up.
+	stop       context.Context
+	stopCancel context.CancelFunc
 	// dynaSem limits the number of concurrently active jobs and adjusts its
 	// effective slot count dynamically with the system load (non-nil when
 	// minConcurrentJobs > 0 was passed to New).  Jobs wait in StateIncoming
@@ -156,6 +160,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 			IdleTimeout:       120 * time.Second,
 		},
 	}
+	s.stop, s.stopCancel = context.WithCancel(context.Background())
 	s.nonces.SetPressureHook(s.noncePressure)
 	s.stopNonceSweeper = s.nonces.StartSweeper()
 	if minConcurrentJobs > 0 {
@@ -520,6 +525,7 @@ func (s *Server) ListenAndServe(addr string) error {
 // transfers finish their current attempt.  Pending spool items are retried on
 // the next start.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopCancel()
 	// Stop the dynamic semaphore load-poller first so it doesn't interfere
 	// with the graceful drain below.
 	if s.dynaSem != nil {
@@ -1500,69 +1506,100 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		defer s.orch.unregisterJob(jobID)
 		defer abortCancel()
 
-		// ── Wait for a concurrency slot (if the limit is configured) ──────────
-		// The semaphore limits concurrent pipeline (compress/upload) workers.
-		// The slot is released EARLY — before the per-repo commit mutex — by the
-		// onStagingComplete hook passed to Run().  This lets the next queued job
-		// start its own compress pipeline while this job does its gateway commit.
-		// The defer below is a safety net: if Run() returns without ever calling
-		// the hook (e.g. early error during staging, local mode) the slot is
-		// still released exactly once via sync.Once.
-		var semOnce sync.Once
-		// grantedWeight is the admission cost this job was charged; Release must
-		// return exactly that, not a recomputed value — the effective limit (and
-		// hence the clamp inside jobWeight) can change while the job runs.
-		grantedWeight := 0
-		releaseSem := func() {
-			semOnce.Do(func() {
-				if s.dynaSem != nil {
-					s.dynaSem.Release(grantedWeight)
-					s.obs.Logger.Info("released concurrency slot (pipeline complete)",
-						"job_id", jobID)
-				}
-			})
-		}
+		// One attempt: wait for a slot, run, release. A retryable failure
+		// leaves the job in incoming with a due time; wait for it and go again.
+		attempt := func() error {
+			// ── Wait for a concurrency slot (if the limit is configured) ──────
+			// The semaphore limits concurrent pipeline (compress/upload) workers.
+			// The slot is released EARLY — before the per-repo commit mutex — by
+			// the onStagingComplete hook passed to Run().  This lets the next
+			// queued job start its own compress pipeline while this job does its
+			// gateway commit. The defer below is a safety net: if Run() returns
+			// without ever calling the hook (e.g. early error during staging,
+			// local mode) the slot is still released exactly once via sync.Once.
+			var semOnce sync.Once
+			// grantedWeight is the admission cost this job was charged; Release must
+			// return exactly that, not a recomputed value — the effective limit (and
+			// hence the clamp inside jobWeight) can change while the job runs.
+			grantedWeight := 0
+			releaseSem := func() {
+				semOnce.Do(func() {
+					if s.dynaSem != nil {
+						s.dynaSem.Release(grantedWeight)
+						s.obs.Logger.Info("released concurrency slot (pipeline complete)",
+							"job_id", jobID)
+					}
+				})
+			}
 
-		if s.dynaSem != nil {
-			s.obs.Logger.Info("job queued — waiting for concurrency slot",
-				"job_id", jobID, "repo", j.Repo)
-			// Use abortCtx so that a manual abort unblocks the wait
-			// immediately rather than holding the slot indefinitely.
-			gw, err := s.dynaSem.Acquire(abortCtx, j.TarSize)
-			if err != nil {
-				// abortCancel fired (operator abort or server shutdown) while
-				// the job was queued; mark it as aborted without running.
-				s.obs.Logger.Info("job aborted while waiting for slot",
-					"job_id", jobID, "error", err)
-				_ = s.orch.abortJob(context.Background(), j,
-					fmt.Errorf("aborted while waiting for concurrency slot: %w", err))
+			if s.dynaSem != nil {
+				s.obs.Logger.Info("job queued — waiting for concurrency slot",
+					"job_id", jobID, "repo", j.Repo)
+				// Use abortCtx so that a manual abort unblocks the wait
+				// immediately rather than holding the slot indefinitely.
+				gw, err := s.dynaSem.Acquire(abortCtx, j.TarSize)
+				if err != nil {
+					// abortCancel fired (operator abort or server shutdown) while
+					// the job was queued; mark it as aborted without running.
+					s.obs.Logger.Info("job aborted while waiting for slot",
+						"job_id", jobID, "error", err)
+					return s.orch.abortJob(context.Background(), j,
+						fmt.Errorf("aborted while waiting for concurrency slot: %w", err))
+				}
+				grantedWeight = gw
+				s.obs.Logger.Info("job acquired concurrency slot",
+					"job_id", jobID, "weight", gw, "tar_bytes", j.TarSize)
+			}
+			defer releaseSem() // safety net — no-op if hook already fired
+
+			// ── Build the execution context (timeout starts here, not at submit) ──
+			var runCtx context.Context
+			var runCancel context.CancelFunc
+			if s.orch.JobTimeout > 0 {
+				runCtx, runCancel = context.WithTimeout(abortCtx, s.orch.JobTimeout)
+			} else {
+				runCtx, runCancel = context.WithCancel(abortCtx)
+			}
+			defer runCancel()
+
+			// Re-register with the timeout-aware cancel so abortJobHandler also
+			// cancels the execution context (not just the abort context).
+			s.orch.registerJob(jobID, runCancel)
+
+			err := s.orch.Run(runCtx, j, releaseSem)
+			switch {
+			case err == nil, errors.Is(err, ErrRetryScheduled):
+				// published, or scheduleRetry has said what happens next
+			case s.orch.JobTimeout > 0 && runCtx.Err() != nil:
+				s.obs.Logger.Error("background job timed out", "job_id", jobID, "timeout", s.orch.JobTimeout, "error", err)
+			default:
+				s.obs.Logger.Error("background job failed", "job_id", jobID, "error", err)
+			}
+			return err
+		}
+		for {
+			err := attempt()
+			if !errors.Is(err, ErrRetryScheduled) {
 				return
 			}
-			grantedWeight = gw
-			s.obs.Logger.Info("job acquired concurrency slot",
-				"job_id", jobID, "weight", gw, "tar_bytes", j.TarSize)
-		}
-		defer releaseSem() // safety net — no-op if hook already fired
-
-		// ── Build the execution context (timeout starts here, not at submit) ──
-		var runCtx context.Context
-		var runCancel context.CancelFunc
-		if s.orch.JobTimeout > 0 {
-			runCtx, runCancel = context.WithTimeout(abortCtx, s.orch.JobTimeout)
-		} else {
-			runCtx, runCancel = context.WithCancel(abortCtx)
-		}
-		defer runCancel()
-
-		// Re-register with the timeout-aware cancel so abortJobHandler also
-		// cancels the execution context (not just the abort context).
-		s.orch.registerJob(jobID, runCancel)
-
-		if err := s.orch.Run(runCtx, j, releaseSem); err != nil {
-			if s.orch.JobTimeout > 0 && runCtx.Err() != nil {
-				s.obs.Logger.Error("background job timed out", "job_id", jobID, "timeout", s.orch.JobTimeout, "error", err)
-			} else {
-				s.obs.Logger.Error("background job failed", "job_id", jobID, "error", err)
+			// The attempt registered its own cancel; an abort while waiting
+			// must reach this wait instead. One that landed in between
+			// cancelled the finished attempt only, and is honoured here.
+			s.orch.registerJob(jobID, abortCancel)
+			if s.orch.Aborted(jobID) {
+				abortCancel()
+			}
+			waitCtx, waitCancel := context.WithCancel(abortCtx)
+			stop := context.AfterFunc(s.stop, waitCancel)
+			due := WaitForAttempt(waitCtx, j)
+			stop()
+			waitCancel()
+			if !due {
+				if abortCtx.Err() != nil {
+					_ = s.orch.abortJob(context.Background(), j,
+						fmt.Errorf("aborted while waiting to retry: %w", abortCtx.Err()))
+				}
+				return // shutdown: the job stays in incoming for the next start
 			}
 		}
 	}()
@@ -1702,6 +1739,11 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		Error            string    `json:"error,omitempty"`
 		CreatedAt        time.Time `json:"created_at"`
 		UpdatedAt        time.Time `json:"updated_at"`
+		// Retries: how many attempts failed, the latest cause (also the cause
+		// of a final failure), and when a waiting job runs again.
+		Attempts      int        `json:"attempts,omitempty"`
+		LastError     string     `json:"last_error,omitempty"`
+		NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
 	}
 
 	resp := response{
@@ -1716,6 +1758,9 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		Error:            j.Error,
 		CreatedAt:        j.CreatedAt,
 		UpdatedAt:        j.UpdatedAt,
+		Attempts:         j.Attempts,
+		LastError:        j.LastError,
+		NextAttemptAt:    j.NextAttemptAt,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

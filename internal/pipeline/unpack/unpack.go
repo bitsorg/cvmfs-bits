@@ -7,6 +7,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -50,6 +51,10 @@ func spillEntry(dir string, seq int, r io.Reader) (string, int64, error) {
 // paxXattrPrefix is the standard prefix that GNU tar uses when encoding
 // extended attributes in PAX records: SCHILY.xattr.<xattr-name>.
 const paxXattrPrefix = "SCHILY.xattr."
+
+// ErrInvalidArchive marks a payload that breaks the archive rules (bad paths,
+// links or sizes, duplicate entries): publishing it again cannot succeed.
+var ErrInvalidArchive = errors.New("invalid archive")
 
 // MaxFileSize is the default per-entry size limit (1 GiB).
 // Callers may pass a custom limit via ExtractWithOptions.
@@ -174,12 +179,17 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 			return nil
 		}
 		if err != nil {
+			// A malformed or cut-short archive stays so on every read; other
+			// read errors (I/O) may not.
+			if errors.Is(err, tar.ErrHeader) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return fmt.Errorf("%w: reading tar header: %w", ErrInvalidArchive, err)
+			}
 			return fmt.Errorf("reading tar header: %w", err)
 		}
 
 		// Critical #2: Validate path to prevent Zip Slip / path traversal.
 		if err := validatePath(header.Name); err != nil {
-			return fmt.Errorf("invalid tar entry path %q: %w", header.Name, err)
+			return fmt.Errorf("%w: invalid tar entry path %q: %w", ErrInvalidArchive, header.Name, err)
 		}
 
 		cleanPath := filepath.Clean(header.Name)
@@ -221,11 +231,11 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 			// Bug fix: reject negative sizes from malformed tar headers before
 			// any allocation or LimitReader arithmetic.
 			if header.Size < 0 {
-				return fmt.Errorf("tar entry %q has negative size: %d", header.Name, header.Size)
+				return fmt.Errorf("%w: tar entry %q has negative size: %d", ErrInvalidArchive, header.Name, header.Size)
 			}
 			// Critical #3: Enforce per-entry size limit before allocating.
 			if header.Size > maxSize {
-				return fmt.Errorf("tar entry %q exceeds size limit: %d > %d bytes",
+				return fmt.Errorf("%w: tar entry %q exceeds size limit: %d > %d bytes", ErrInvalidArchive,
 					header.Name, header.Size, maxSize)
 			}
 			// Spill large entries to disk rather than buffering them. The
@@ -239,7 +249,7 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 					return serr
 				}
 				if n > maxSize {
-					return fmt.Errorf("tar entry %q body exceeds size limit (%d bytes)",
+					return fmt.Errorf("%w: tar entry %q body exceeds size limit (%d bytes)", ErrInvalidArchive,
 						header.Name, n)
 				}
 				entry.ContentPath = path
@@ -251,7 +261,7 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 					return fmt.Errorf("reading file %s: %w", header.Name, err)
 				}
 				if int64(len(data)) > maxSize {
-					return fmt.Errorf("tar entry %q body exceeds size limit (%d bytes)",
+					return fmt.Errorf("%w: tar entry %q body exceeds size limit (%d bytes)", ErrInvalidArchive,
 						header.Name, maxSize)
 				}
 				entry.Data = data
@@ -265,12 +275,12 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 			// Bug fix: previously silently skipped, causing data loss in the
 			// catalog for hard-linked paths.
 			if header.Linkname == "" {
-				return fmt.Errorf("hard link %q has empty target", header.Name)
+				return fmt.Errorf("%w: hard link %q has empty target", ErrInvalidArchive, header.Name)
 			}
 			target := filepath.Clean(header.Linkname)
 			c, ok := seenFiles[target]
 			if !ok {
-				return fmt.Errorf("hard link %q refers to unknown target %q (forward references not supported)",
+				return fmt.Errorf("%w: hard link %q refers to unknown target %q (forward references not supported)", ErrInvalidArchive,
 					header.Name, header.Linkname)
 			}
 			// Reference the target's content; for a spilled target this shares
@@ -291,7 +301,7 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 			// directory so that valid relative references like ../sibling are
 			// accepted while true escapes like ../../etc/passwd are rejected.
 			if err := validateSymlinkTarget(cleanPath, header.Linkname); err != nil {
-				return fmt.Errorf("invalid symlink target %q in entry %q: %w",
+				return fmt.Errorf("%w: invalid symlink target %q in entry %q: %w", ErrInvalidArchive,
 					header.Linkname, header.Name, err)
 			}
 			entry.LinkTarget = header.Linkname

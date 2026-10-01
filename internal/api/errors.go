@@ -8,7 +8,33 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
+
+	"cvmfs.io/prepub/internal/pipeline/unpack"
 )
+
+// ErrRetryScheduled marks a failed attempt that was put back in incoming to
+// run again later, rather than failed.
+var ErrRetryScheduled = errors.New("attempt failed, retry scheduled")
+
+// isPermanent reports a failure no retry can fix: one classified permanent,
+// a payload that breaks the archive rules, a conflict with content already
+// published (swissknife's unique-constraint abort), or a payload cvmfs_server
+// cannot read. Everything else -- network, gateway, storage, timeouts, unknown
+// tool failures -- is worth retrying: those are mostly deployment problems
+// that an operator fixes.
+func isPermanent(err error) bool {
+	if ClassOf(err) == ErrClassPermanent || errors.Is(err, unpack.ErrInvalidArchive) {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{"UNIQUE constraint", "Impossible to open the archive"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
 
 // ErrClass categorises a job error so operators can set targeted alerts:
 //

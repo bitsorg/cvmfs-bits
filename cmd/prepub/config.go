@@ -207,6 +207,9 @@ type fileConfig struct {
 	// MaxTarSizeGiB is the largest package tar one submission may carry
 	// (default 10). Equivalent to --max-tar-size-gib.
 	MaxTarSizeGiB int `yaml:"max_tar_size_gib"`
+	// RetryWindow is how long from submission a job failing for a retryable
+	// reason is retried (default 24h; --retry-window=0 disables retries).
+	RetryWindow yamlDuration `yaml:"retry_window"`
 	// SpoolMinFreeGiB is the free space an upload must leave on the spool
 	// filesystem, else it is refused with 507 (default 20; 0 here keeps the
 	// default, --spool-min-free-gib=0 disables). Equivalent to --spool-min-free-gib.
@@ -313,6 +316,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers *int,
 	prefetch *bool,
 	maxTarSizeGiB, spoolMinFreeGiB *int,
+	retryWindow *time.Duration,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -367,6 +371,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	i("promote-workers", promoteWorkers, fc.PromoteWorkers)
 	i("max-tar-size-gib", maxTarSizeGiB, fc.MaxTarSizeGiB)
 	i("spool-min-free-gib", spoolMinFreeGiB, fc.SpoolMinFreeGiB)
+	dur("retry-window", retryWindow, fc.RetryWindow)
 	if !has("prefetch") && fc.Pipeline.Prefetch != nil {
 		*prefetch = *fc.Pipeline.Prefetch
 	}

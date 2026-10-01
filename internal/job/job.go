@@ -351,6 +351,16 @@ type Job struct {
 	// there fails the job instead of passing another build's content as it.
 	IdentityHash string `json:"identity_hash,omitempty"`
 
+	// Attempts counts the runs that ended in a retryable failure. Such a job
+	// goes back to incoming and runs again at NextAttemptAt, until it publishes
+	// or its retry window (counted from CreatedAt) runs out.
+	Attempts int `json:"attempts,omitempty"`
+	// NextAttemptAt is when a job waiting to retry runs again; nil otherwise.
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	// LastError is the cause of the latest failed attempt (truncated). Error
+	// keeps the generic operator-facing text.
+	LastError string `json:"last_error,omitempty"`
+
 	// ── Per-stage timestamps (gateway/bits path only) ─────────────────────────
 	// All times are zero-value when the stage was not reached or not applicable.
 	// Callers can compute per-phase duration from successive timestamps.

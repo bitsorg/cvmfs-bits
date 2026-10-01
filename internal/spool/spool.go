@@ -171,10 +171,10 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 	// Record metric
 	s.obs.Metrics.SpoolTransitions.WithLabelValues(string(entry.From), string(entry.To)).Inc()
 
-	// Nothing reads a published or accumulated (coarse member) job's payload
-	// again, and keeping every one fills the spool. Failed and aborted jobs
-	// keep theirs for inspection.
-	if to == job.StatePublished || to == job.StateAccumulated {
+	// Nothing reads a terminal or accumulated (coarse member) job's payload
+	// again, and keeping every one fills the spool. A failure's cause is in
+	// the manifest, the log and the measurements.
+	if job.IsTerminal(to) {
 		tar := filepath.Join(newDir, "payload.tar")
 		if rmErr := os.Remove(tar); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 			s.obs.Logger.Warn("cannot remove published payload", "job_id", j.ID, "path", tar, "error", rmErr)
@@ -361,6 +361,29 @@ func (s *Spool) ResetForRecovery(j *job.Job, countAttempt bool) error {
 	} else {
 		j.InterruptCount++
 	}
+	if err := s.moveToIncoming(j, oldDir); err != nil {
+		return err
+	}
+	s.obs.Metrics.JobsRecovered.Inc()
+	return nil
+}
+
+// Requeue puts a job that failed a retryable attempt back in incoming, with
+// its recovery counters untouched: a retry is not a crash or an interruption.
+func (s *Spool) Requeue(j *job.Job) error {
+	if job.IsTerminal(j.State) {
+		return fmt.Errorf("cannot requeue terminal job %s in state %s", j.ID, j.State)
+	}
+	oldDir := s.findJobDir(j.ID, j.State)
+	if oldDir == "" {
+		return fmt.Errorf("requeueing job: cannot find on-disk directory for job %s (state=%s)", j.ID, j.State)
+	}
+	return s.moveToIncoming(j, oldDir)
+}
+
+// moveToIncoming moves the job directory at oldDir to incoming and rewrites
+// its manifest there.
+func (s *Spool) moveToIncoming(j *job.Job, oldDir string) error {
 	j.State = job.StateIncoming
 	j.LeaseToken = ""
 	j.Error = ""
@@ -380,12 +403,10 @@ func (s *Spool) ResetForRecovery(j *job.Job, countAttempt bool) error {
 		}
 	}
 
-	// Rewrite the manifest with the updated state and recovery count.
+	// Rewrite the manifest with the updated state and counters.
 	if err := s.WriteManifest(j); err != nil {
 		return fmt.Errorf("writing recovery manifest: %w", err)
 	}
-
-	s.obs.Metrics.JobsRecovered.Inc()
 	return nil
 }
 
