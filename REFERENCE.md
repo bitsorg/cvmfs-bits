@@ -64,7 +64,7 @@ offers are listed in the startup log and in `publish_paths` of
 | `prepub` (default; also the empty name) with `publish_mode: gateway` | always in gateway mode | Pipeline before the lease: chunk, compress, dedup (`CAS.Exists` per object), write objects to the CAS, build the subtree catalog(s); then lease, upload catalog(s), commit | The only path that can pre-warm Stratum 1s and the only path that accumulates coarse builds |
 | `prepub` with `publish_mode: local` | always in local mode | `cvmfs_server transaction <repo>`, extract the tar under `<cvmfs_mount>/<repo>/<path>`, `cvmfs_server publish <repo>` | No gateway, no CAS, no pipeline; runs on the Stratum 0 with the repository mounted |
 | `ingest` | `--ingest-publish` | `cvmfs_server ingest -t <tar> -b <path> [-c] [-u <owner>] [--direct-s3 [--object-list]] <repo>`; the gateway does chunking, dedup and catalogs | Needs `cvmfs_server` on `PATH` and a mountless gateway registration (`cvmfs_server connect-gw -P`) per repository; one gateway transaction per package; no pre-warming |
-| `staged` | gateway mode | A producer has already written the objects under an S3 `staging_prefix` and built the catalog (`catalog_hash`); cvmfs-prepub promotes the objects into the store with server-side copies and grafts the catalog | No tar payload; needs `cas.type: s3` and a gateway with the graft endpoint; always grafts |
+| `staged` | gateway mode with `cas.type: s3` | A producer has already written the objects under an S3 `staging_prefix` and built the catalog (`catalog_hash`); cvmfs-prepub promotes the objects into the store with server-side copies and grafts the catalog | No tar payload; needs a gateway with the graft endpoint; always grafts |
 
 The commit granularity follows from the path: `ingest`, `staged` and the
 `local` backend commit each package as it arrives; the gateway-mode `prepub`
@@ -180,6 +180,7 @@ A retryable failure does not end in a terminal state: the job goes back to
       payload.tar                     the submitted tar; deleted when the job reaches a terminal state
       upload.log                      CAS upload log of the pipeline
       catalog.db                      pipeline catalog scratch (prepub path)
+      provenance-record.json          exact signed provenance record, mode 0600 (--provenance)
   builds/<build-id>/                  coarse-build accumulator
     <job-id>.json                     one member's catalog entries
     <job-id>.failed                   a member that failed
@@ -190,6 +191,7 @@ A retryable failure does not end in a terminal state: the job goes back to
   measurements/<build-id>.ndjson      per-publish measurement records (nobuild-YYYYMMDD.ndjson without a build id)
   tmp/                                TMPDIR for this process and its children (unless TMPDIR is set and usable)
   provenance.key                      generated Rekor signing key (when --provenance and no --rekor-signing-key)
+  revoked-nodes.json                  persisted receiver denylist (--embedded-broker-auth)
   .clean-shutdown                     written last on a clean exit, consumed at the next start
 ```
 
@@ -208,7 +210,9 @@ fields `t`, `job_id`, `from`, `to`, `run_id` and optionally `note`.
 | Gateway lease | gateway | `path_busy` is retried every second ([Publish backend and gateway](#publish-backend-and-gateway)) |
 | Job timeout | `job_timeout: 0` (off) | When set, counted from slot acquisition; a timed-out job is failed (or retried) |
 
-Jobs re-run by crash recovery are not admitted through the slot limiter.
+Jobs resumed by crash recovery go through the same slot limiter and tar
+look-ahead as new submissions; a job waiting to retry first waits for its
+`next_attempt_at`.
 
 ### Retries
 
@@ -238,11 +242,13 @@ At startup every job in a non-terminal state is recovered:
 3. After a clean shutdown the interruption is counted separately: after 20
    the job is failed.
 4. Any recorded gateway lease is aborted, the job is moved back to
-   `incoming` and run again from the start (each step is idempotent).
+   `incoming` and run again from the start (each step is idempotent), under
+   the normal [admission](#admission-and-concurrency).
 
 On `SIGTERM`/`SIGINT` the publisher stops accepting requests, waits up to
-30 s for running jobs, auto-finalizes and webhook deliveries, then writes
-`.clean-shutdown`. Jobs still running at that point are recovered at the next
+30 s for running jobs (recovered ones included), auto-finalizes and webhook
+deliveries, then writes `.clean-shutdown`. Jobs still queued for a slot stay
+in `incoming`. Jobs still running at that point are recovered at the next
 start as interrupted, not as crashed.
 
 ### Coarse builds
@@ -257,12 +263,16 @@ decision is made once per job at submission:
   enabled), records its catalog entries under `builds/<build-id>/` and ends in
   `accumulated`. It is not retried.
 - Accumulation needs the gateway-mode pipeline and a non-empty `path`. In
-  local mode, or for a root-level path, a coarse job is published on its own.
+  local mode (`publish_mode: local`) no job is coarse, whether inferred from
+  `build_id` or sent with `coarse=true`: each is published on arrival, keeps
+  its retries, and `build_expect` is not recorded. A coarse job with a
+  root-level path is published on its own.
 
 The build is finalized by one `cvmfs_swissknife ingestsql` run against the
 gateway, configured with `ingest_config_prefix`, `ingest_swissknife` and
-`ingest_env`. Without `ingest_config_prefix` the finalize cannot run
-(`finalize_ready: false` in health, a warning at startup). Three triggers:
+`ingest_env`. Without `ingest_config_prefix`, or in local mode, the finalize
+cannot run (`finalize_ready: false` in health; a warning at startup when the
+prefix is missing). Three triggers:
 
 | Trigger | When |
 |---|---|
@@ -313,8 +323,9 @@ YAML rules:
   under `server:`). Unknown keys are ignored without a warning, so check
   spelling against these tables.
 - An empty string or a numeric `0` counts as "not set" and leaves the flag's
-  default in place. To set a number to zero (for example
-  `--spool-min-free-gib=0` or `--retry-window=0`) use the flag.
+  default in place. Exceptions: `retry_window: 0` and `spool_min_free_gib: 0`
+  are applied (they disable retries and the free-space check); leave the key
+  out to keep the default. Any other number set to zero needs the flag.
 - Boolean keys are applied when present, so `false` works
   (`gateway.direct_graft: false`, `pipeline.prefetch: false`).
 - List keys (`repos`, `oidc_issuers`, `allowed_publish_prefixes`,
@@ -334,7 +345,7 @@ A complete example configuration is in
 | `log_level` | `--log-level` | | `info` | `debug`, `info`, `warn`, `error` (unknown values mean `info`) |
 | `dev` | `--dev` | | `false` | Development mode: allows an empty `PREPUB_API_TOKEN` (API unauthenticated), an unset `CVMFS_GATEWAY_SECRET` (insecure placeholder) and a plaintext gateway URL. Never in production |
 | | `--config` | | | Path of the YAML file |
-| `broker_ca_cert` | `--broker-ca-cert` | | system pool | PEM CA used to verify the broker's TLS certificate (the publisher's own loopback broker clients use it too) |
+| `broker_ca_cert` | `--broker-ca-cert` | | system pool | PEM CA used to verify the broker's TLS certificate (the publisher's own loopback broker clients use it too). Receiver use: [section 4](#4-receiver-configuration) |
 
 ### API server
 
@@ -352,8 +363,8 @@ A complete example configuration is in
 |---|---|---|---|---|
 | `spool_root` | `--spool-root` | | `/var/spool/cvmfs-prepub` | Spool directory ([Spool layout](#spool-layout)). Also the parent of `tmp/`, `builds/`, `manifests/`, `measurements/` |
 | `staging_root` | `--staging-root` | | off | Directory from which JSON submissions may reference a tar (`tar_path`). Empty disables JSON submissions (`503`) |
-| `max_tar_size_gib` | `--max-tar-size-gib` | | `10` | Largest tar one submission may carry; larger uploads get `413` |
-| `spool_min_free_gib` | `--spool-min-free-gib` | | `20` | Free space an upload must leave on the spool filesystem, else `507`. `0` (flag only) disables the check |
+| `max_tar_size_gib` | `--max-tar-size-gib` | | `10` | Largest tar one submission may carry; larger uploads get `413`. Also the largest single file inside a tar on the default fixed chunk grid ([Tar archive rules](#tar-archive-rules)) |
+| `spool_min_free_gib` | `--spool-min-free-gib` | | `20` | Free space an upload must leave on the spool filesystem, else `507`. `0` disables the check |
 | `measurements_dir` | `--measurements-dir` | | `<spool_root>/measurements` | Measurement records ([Measurements](#get-apiv1measurements)); `off` disables them |
 
 ### Publish backend and gateway
@@ -366,7 +377,7 @@ A complete example configuration is in
 | `gateway.direct_graft` | `--gateway-direct-graft` | | `true` | Commit through the graft endpoint ([DirectGraft](#directgraft)); `false` for a stock gateway |
 | | `--lease-retry-max` (CLI only) | | `0` (= 12 min) | How long to keep retrying a `path_busy` lease; set above the gateway's `max_lease_time` |
 | `stratum0_url` | `--stratum0-url` | | empty | Stratum 0 HTTP base including `/cvmfs`, e.g. `http://stratum0.example.org/cvmfs`. Needed (gateway mode) to build subtree catalogs, to read the current root hash, for `POST /api/v1/published`, the already-published check of `POST /api/v1/reserve`, `identity_path` and `replace_on_conflict` |
-| `repo_name` | `--repo-name` | | empty | Repository name. Used to find `server.conf` for `cas.type: s3` and as the repository listed in the discovery document |
+| `repo_name` | `--repo-name` | | empty | Repository name. Used to find `server.conf` for `cas.type: s3` and as the repository listed in the discovery document. An invalid name ([Conventions](#conventions)) stops startup |
 | `cvmfs_mount` | `--cvmfs-mount` | | `/cvmfs` | Repository mount root for the `local` backend and the base for `ingest -b` |
 | `replace_on_conflict` | `--replace-on-conflict` | | `false` | When a commit fails on an already published path: confirm the conflict in the published catalogs, delete the subtree in its own transaction and retry once. Destructive; works for the `ingest` and `staged` paths (needs `--ingest-publish` for `cvmfs_server`) |
 
@@ -400,13 +411,13 @@ Gateway credentials are environment variables only:
 | `min_concurrent_jobs` | `--min-concurrent-jobs` | `PREPUB_MIN_CONCURRENT_JOBS` | `4` | Guaranteed job slots; `0` (flag or env) disables the limiter |
 | `max_concurrent_jobs` | `--max-concurrent-jobs` | `PREPUB_MAX_CONCURRENT_JOBS` | `0` (= CPU count) | Slot ceiling ([Admission and concurrency](#admission-and-concurrency)) |
 | `job_timeout` | `--job-timeout` | | `0` (off) | Wall-clock limit per job, counted from slot acquisition |
-| `retry_window` | `--retry-window` | | `24h` | How long after submission retryable failures are retried; `--retry-window=0` disables retries |
+| `retry_window` | `--retry-window` | | `24h` | How long after submission retryable failures are retried; `0` disables retries |
 
 ### Pipeline
 
 | YAML key | Flag | Env | Default | Meaning |
 |---|---|---|---|---|
-| `pipeline.workers` | `--pipeline-workers` | `PREPUB_PIPELINE_WORKERS` | `4` | Compress workers per job. Peak memory scales with this |
+| `pipeline.workers` | `--pipeline-workers` | `PREPUB_PIPELINE_WORKERS` | `4` | Compress workers per job. Peak memory scales with this: on the default fixed grid each worker streams one grid block (about 2 x 6 MiB); a file is held whole in memory only with content-defined chunking, or when the unpacker kept it in memory (with `prefetch`, entries over 64 KiB are spilled to disk; without it, entries up to 1 GiB stay in memory) |
 | `pipeline.upload_concurrency` | `--pipeline-upload-conc` | `PREPUB_PIPELINE_UPLOAD_CONC` | `4` | Dedup+upload workers per job |
 | | `--pipeline-compress-level` (CLI only) | | `0` (= zlib 6) | zlib level 1-9 |
 | `pipeline.prefetch` | `--prefetch` | | `true` | Scan the tar ahead of the job's slot; turn off on I/O-bound spool storage |
@@ -427,10 +438,10 @@ All CLI only. Their use is described in
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--embedded-broker-ws-addr` | off | Run the MQTT broker (WebSocket listener) at this address. Use the `:port` form: the publisher's own clients connect to `ws(s)://localhost<addr>` |
+| `--embedded-broker-ws-addr` | off | Run the MQTT broker (WebSocket listener) at this `host:port` or `:port` (a value without a port stops startup). The publisher's own clients connect to `ws(s)://localhost:<port>` |
 | `--embedded-broker-tls-cert`, `--embedded-broker-tls-key` | off | Broker certificate and key; enables `wss://`. The certificate must also be valid for `localhost` and trusted through `--broker-ca-cert`, because the publisher connects to its own broker that way |
 | `--embedded-broker-auth` | `false` | Require tokens on the broker; enables enrollment. Needs `PREPUB_HMAC_SECRET` (>= 16 bytes) |
-| `--enroll-tls-addr` | off | Serve `/control/challenge`, `/control/enroll` and `/control/revoke` over HTTPS at this address with the broker certificate (needs `--embedded-broker-auth` and the broker cert). Without it enrollment is served on the API listener and there is no revoke endpoint |
+| `--enroll-tls-addr` | off | Serve `/control/challenge`, `/control/enroll`, `/control/revoke` and `/control/unrevoke` over HTTPS at this address with the broker certificate (needs `--embedded-broker-auth` and the broker cert). Without it enrollment is served on the API listener, and revocation is available only through `POST /api/v1/control/revoke` and `POST /api/v1/control/unrevoke` |
 | `--enroll-url` | empty | HTTPS base of `--enroll-tls-addr` as receivers reach it; advertised in discovery |
 | `--control-plane-url` | empty | Broker URL advertised to receivers, e.g. `wss://s0.example.org:1882`. Setting it mounts the discovery document and requires `--discovery-signing-key`; a `wss://` URL requires the broker cert |
 | `--discovery-signing-key` | empty | PEM PKCS#8 Ed25519 private key that signs the discovery document |
@@ -450,10 +461,10 @@ All CLI only. Their use is described in
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `PREPUB_API_TOKEN` | publisher | The API secret: compared as a bearer token and used as the HMAC key for `X-Bits-Auth`. Required unless `--dev` |
+| `PREPUB_API_TOKEN` | publisher, `revoke --api-url` | The API secret: compared as a bearer token and used as the HMAC key for `X-Bits-Auth`. Required unless `--dev` |
 | `CVMFS_GATEWAY_SECRET` | publisher, gateway mode | Gateway HMAC secret. Required unless `--dev` |
 | `CVMFS_GATEWAY_KEY_ID` | publisher, gateway mode | Gateway key id; default `cvmfs-prepub`; must match the gateway key file |
-| `PREPUB_HMAC_SECRET` | publisher (`--embedded-broker-auth`), `node-key`, `revoke` | Control-plane master secret, >= 16 bytes: signs broker tokens and derives node keys. Never give it to a receiver |
+| `PREPUB_HMAC_SECRET` | publisher (`--embedded-broker-auth`), `node-key`, `revoke --enroll-url` | Control-plane master secret, >= 16 bytes: signs broker tokens and derives node keys. Never give it to a receiver |
 | `S1_NODE_KEY` | receiver (`--broker-auth`) | The receiver's own enrollment key (hex), from `cvmfs-prepub node-key <node>` |
 | `PREPUB_OIDC_AUDIENCE` | publisher (`--provenance` with issuers) | Audience OIDC tokens must carry |
 | `PREPUB_PROMOTE_WORKERS`, `PREPUB_MIN_CONCURRENT_JOBS`, `PREPUB_MAX_CONCURRENT_JOBS`, `PREPUB_PIPELINE_WORKERS`, `PREPUB_PIPELINE_UPLOAD_CONC` | publisher | Defaults for the matching flags (integers; invalid values are ignored) |
@@ -467,14 +478,18 @@ The installed units read secrets from `/etc/cvmfs-prepub/env`
 | Command | Meaning |
 |---|---|
 | `cvmfs-prepub [flags]` | Run the service (`--mode publisher` or `--mode receiver`) |
+| `cvmfs-prepub --version` | Print `cvmfs-prepub <version>` and exit. The version is the one `make build` stamps in, else the Go toolchain's VCS stamp (`<12-char revision>[-dirty] (<commit time>)`), else `dev`. The startup log line `starting cvmfs-prepub` carries it as `version` |
 | `PREPUB_HMAC_SECRET=<master> cvmfs-prepub node-key <node>` | Print the receiver's enrollment key, `hex(HMAC-SHA256(master, node))`. `publisher` and the empty name are refused. Provision the output as that receiver's `S1_NODE_KEY` |
-| `PREPUB_HMAC_SECRET=<master> cvmfs-prepub revoke <node> [--enroll-url https://host:8443] [--ca-cert ca.pem]` | Revoke a receiver: mints a one-minute publisher token and calls `POST /control/revoke` on the TLS enroll endpoint (default `https://localhost:8443`) |
+| `PREPUB_HMAC_SECRET=<master> cvmfs-prepub revoke [--undo] <node> [--enroll-url https://host:8443] [--ca-cert ca.pem]` | Revoke a receiver (`POST /control/revoke`) or, with `--undo`, lift the revocation (`POST /control/unrevoke`) through the TLS enroll endpoint (default `https://localhost:8443`), with a one-minute publisher token. `--ca-cert` is the only CA trusted |
+| `PREPUB_API_TOKEN=<token> cvmfs-prepub revoke [--undo] <node> --api-url http://host:8080` | The same through `POST /api/v1/control/revoke` (`--undo`: `POST /api/v1/control/unrevoke`) on the API listener, signed with `X-Bits-Auth` (so `auth_mode` must be `both` or `hmac`) |
 
 Two helper programs are built from the same module but are not part of the
 service: `cmd/prepub-finalize` (runs a coarse finalize from a spool on a
 release-manager host: `-spool-root`, `-build`, `-swissknife`,
 `-config-prefix`, `-lease-path`, `-keep`) and `cmd/distbench` (a benchmark of
-pull bundling). `make build` builds only `bin/cvmfs-prepub`.
+pull bundling). `make build` builds only `bin/cvmfs-prepub`, stamping the
+version from `git describe --tags --always --dirty` (override with
+`make build VERSION=...`).
 
 ---
 
@@ -490,14 +505,14 @@ serves and pulls objects into `--cas-root`.
 | `mode` | `--mode` | `publisher` | Must be `receiver` |
 | `log_level` | `--log-level` | `info` | As for the publisher |
 | `control_addr` | `--control-addr` | `:9100` | Plain-HTTP listener for `GET /metrics` |
-| `node_id` | `--node-id` | host name | Stable node id: MQTT client id (`<node_id>-receiver`), presence topic, enrollment identity. Must not contain `/`, `+`, `#` |
-| `repos` | `--repos` | empty | Repositories this receiver serves. Announces and `published` messages for other repositories are ignored. Discovery is fetched for the first one, so at least one is needed for the receiver to connect |
+| `node_id` | `--node-id` | host name | Stable node id: MQTT client id (`<node_id>-receiver`), presence topic, enrollment identity. Must not contain `/`, `+`, `#` or NUL |
+| `repos` | `--repos` | required | Repositories this receiver serves (valid names, see [Conventions](#conventions)); an empty list or an invalid name stops startup. Announces and `published` messages for other repositories are ignored. Discovery is fetched for the first one |
 | `receiver_stratum0_url` | `--receiver-stratum0-url` | empty | Publisher base URL, e.g. `http://stratum0.example.org:8080`. The receiver fetches `{url}/s1/{txn}/manifest`, `{url}/s1/bundle` and, after a commit, `{url}/cvmfs/{repo}/data/...`. Without it nothing is pulled |
 | `cas.root` | `--cas-root` | `/var/lib/cvmfs-prepub/cas` | Local store; objects land in `data/xx/<rest>`. Normally the Stratum 1's storage directory for the repository |
-| `broker_ca_cert` | `--broker-ca-cert` | system pool | CA for the broker's `wss://` certificate and for an `https://` enroll URL (required in that case) |
+| `broker_ca_cert` | `--broker-ca-cert` | system pool | CA for the broker's `wss://` certificate; also trusted, in addition to the system pool, for the discovery fetch; the only CA trusted for an `https://` enroll URL (required in that case) |
 | | `--discovery-url` (CLI only) | empty | Publisher base serving `GET {url}/cvmfs/{repo}/.cvmfsbits`. Without it the receiver never connects to a broker |
-| | `--discovery-verify-key` (CLI only) | empty | PEM Ed25519 public key matching the publisher's `--discovery-signing-key`. Required with `--broker-auth`; the signature is checked only in that case |
-| | `--broker-auth` (CLI only) | `false` | Enroll and present a token to the broker. Needs `S1_NODE_KEY` and `--discovery-url` |
+| | `--discovery-verify-key` (CLI only) | empty | PEM Ed25519 public key matching the publisher's `--discovery-signing-key`. When set, the discovery signature is checked and a bad one stops the receiver; without it a warning is logged. Required with `--broker-auth` |
+| | `--broker-auth` (CLI only) | `false` | Enroll and present a token to the broker. Needs `S1_NODE_KEY`, `--discovery-url` and `--discovery-verify-key` |
 | | `--pull-concurrency` (CLI only) | `0` (= 16) | Parallel object fetches or bundle requests per transaction |
 | | `--pull-files-per-request` (CLI only) | `0` (= 1) | Objects per bundle request; `> 1` switches to `POST /s1/bundle` |
 | | `--pull-auto` (CLI only) | `false` | Measure the RTT to `{receiver_stratum0_url}/api/v1/health` and choose unset values: < 5 ms: 32/1; < 50 ms: 16/8; < 150 ms: 8/32; otherwise 8/64 (concurrency/files per request) |
@@ -539,6 +554,9 @@ interrupted writes are swept from the CAS at startup.
   (`/s1/...`, objects, `/control/...`) answer errors in plain text.
 - A request with a method a route does not support gets `405`; an unknown
   path gets `404`.
+- Repository names (the `repo` field, `repo_name`, receiver `repos`) must be
+  valid CVMFS names: at most 60 characters of `A-Z a-z 0-9 . _ -`, starting
+  with a letter or digit, not ending in `.` and without `..`.
 
 ### Authentication
 
@@ -676,6 +694,9 @@ differ from the signature).
 | `GET /api/v1/measurements` | none | unless `measurements_dir: off` | Build ids with records |
 | `GET /api/v1/measurements/{build}` | none | unless `measurements_dir: off` | Measurement records |
 | `POST`/`PUT /api/v1/distribute/manifests` | yes | always | Register a pull manifest |
+| `POST /api/v1/control/revoke` | yes | with `--embedded-broker-auth` and a non-empty `PREPUB_API_TOKEN` | Revoke a receiver ([Enrollment and broker authentication](#enrollment-and-broker-authentication)) |
+| `POST /api/v1/control/unrevoke` | yes | as above | Lift a receiver's revocation |
+
 The routes receivers use (pull manifests, objects, bundles, discovery,
 enrollment and revocation) are listed with their conditions in
 [Publisher endpoints](#publisher-endpoints).
@@ -700,7 +721,7 @@ Always `200`:
 | `status` | Always `healthy` when the process answers |
 | `publish_paths` | Paths a job may name ([Publish backends and paths](#publish-backends-and-paths)) |
 | `auth_mode` | `bearer`, `both` or `hmac` |
-| `finalize_ready` | `true` when `ingest_config_prefix` is set, i.e. coarse builds can be finalized |
+| `finalize_ready` | `true` when `ingest_config_prefix` is set and the default backend is gateway mode, i.e. coarse builds can be finalized; always `false` in local mode |
 | `max_tar_size` | Largest accepted tar, bytes |
 | `replay_cache.entries`, `replay_cache.rejected_full` | Nonces held; signed requests refused because the cache was full |
 
@@ -726,7 +747,7 @@ parts in total).
 | `tar_sha256` | hex | SHA-256 of the tar; verified if present; required on signed uploads |
 | `publish_path` | string | `prepub` (default), `ingest` or `staged`; must be offered by the node |
 | `build_id` | string | CI run identity: groups measurements and, on the default path, makes the job a coarse-build member |
-| `coarse` | bool | Override the coarse decision; `true` requires `build_id` and the default path |
+| `coarse` | bool | Override the coarse decision; `true` requires `build_id` and the default path. In local mode `coarse=true` is treated as `false`, but without `build_id` it is still refused with `400` |
 | `build_expect` | integer >= 0 | Number of jobs in this build; cvmfs-prepub finalizes when that many are terminal |
 | `finalize` | `true` | Finalize job for `build_id`: carries no payload (a sent tar is dropped) |
 | `prewarm` | bool | Pre-warm Stratum 1s for this job (default: node's `--prewarm`); `true` only on the default path |
@@ -734,7 +755,7 @@ parts in total).
 | `identity_hash` | string | Expected `package.hash` in `<identity_path>/.meta.json`; a different hash fails the job instead of skipping |
 | `tag_name` | string | Named snapshot tag for the commit; up to 255 characters of `A-Z a-z 0-9 . _ -` |
 | `tag_description` | string | Tag description |
-| `webhook_url` | URL | Called when the job is published or fails ([Webhooks](#webhooks)) |
+| `webhook_url` | URL | Absolute `http://` or `https://` URL with a host; called when the job is published or fails ([Webhooks](#webhooks)) |
 | `preload_exe` | string | Repository-relative executable; with `preload_paths`, the pipeline writes a `.<name>.cvmfspreload` list next to it |
 | `preload_paths` | JSON array of strings | Repository-relative paths the executable opens at startup |
 | `direct_s3` | bool | `ingest` path only: pass `--direct-s3` to `cvmfs_server ingest` |
@@ -749,9 +770,11 @@ URL query parameters are never read.
 A `curl` example is in [README.md](README.md#quick-start).
 
 **JSON (`application/json`), for a tar already on the server.** Requires
-`staging_root`; the tar must be inside it. The tar is moved into the spool
-(rename, else hard link, else copy) and removed from the staging directory.
-Body at most 1 MiB.
+`staging_root`; the tar must be inside it. Only after every check has passed
+(shape, containment, publish path, field checks, and `tar_sha256` last) is the
+tar moved into the spool (rename, else hard link, else copy) and removed from
+the staging directory; a refused request leaves it where it was. Body at most
+1 MiB.
 
 | Field | Meaning |
 |---|---|
@@ -767,7 +790,7 @@ Body at most 1 MiB.
 | Status | When |
 |---|---|
 | `202` | Accepted: `{"job_id":"..."}` |
-| `400` | Missing `repo`; invalid repository name (contains `/`, `+`, `#` or NUL); malformed path, `identity_path`, tag, boolean or integer; missing `tar`; `tar_sha256` mismatch; publish path not offered; a field used on the wrong path (`direct_s3`, `object_list`, `staging_prefix`, `catalog_hash`, `prewarm`, `coarse`); `staging_prefix` without `catalog_hash` or the reverse; staged job with a tar; `finalize` or `coarse` without `build_id`; too many parts; duplicate `tar` part; broken multipart; invalid JSON; `tar_path` outside `staging_root` or missing; signed upload without `tar_sha256` |
+| `400` | Missing `repo`; invalid repository name ([Conventions](#conventions)); invalid `webhook_url`; malformed path, `identity_path`, tag, boolean or integer; missing `tar`; `tar_sha256` mismatch; publish path not offered; a field used on the wrong path (`direct_s3`, `object_list`, `staging_prefix`, `catalog_hash`, `prewarm`, `coarse`); `staging_prefix` without `catalog_hash` or the reverse; staged job with a tar; `finalize` or `coarse` without `build_id`; too many parts; duplicate `tar` part; broken multipart; invalid JSON; `tar_path` outside `staging_root` or missing; signed upload without `tar_sha256` |
 | `401` | Authentication failed, or the signature does not match the fields or payload |
 | `403` | Target outside `allowed_publish_prefixes` (finalize jobs are exempt) |
 | `413` | Tar larger than `max_tar_size_gib` (refused from `Content-Length` before reading when possible), or a field over 1 MiB |
@@ -799,8 +822,9 @@ unreadable records are skipped. There is no paging or filtering. Each entry has
 `n_bytes_raw`, `n_bytes_compressed`, `new_root_hash`, `error`,
 `failed_at_state` (state the job was in when it failed),
 `pipeline_started_at`, `pipeline_ended_at`, `leased_at`, `published_at` and
-`distributing_started_at`. (`tar_name` is the spool file name,
-`payload.tar`.)
+`distributing_started_at`. `tar_name` is the uploaded file name (the
+multipart part's filename, or the base name of `tar_path`), reduced to a base
+name without control characters and at most 255 bytes.
 
 ### GET /api/v1/jobs/{id}/log
 
@@ -820,7 +844,8 @@ The `job` object is the spool record. Most keys are snake_case (`build_id`,
 `publish_path`, `attempts`, `provenance`, ...), but the core fields use their
 Go names: `ID`, `Repo`, `Path`, `PackageName`, `TarPath`, `TarSHA256`,
 `State`, `CreatedAt`, `UpdatedAt`, `LeaseToken`, `NObjects`, `NNewObjects`,
-`NBytesRaw`, `NBytesCompressed`.
+`NBytesRaw`, `NBytesCompressed`. In this response `LeaseToken` is always
+empty and `webhook_url` is cut to `<scheme>://<host>/[redacted]`.
 
 ### POST /api/v1/jobs/{id}/abort
 
@@ -836,19 +861,19 @@ is aborted, and it is not retried.
 ### Server-Sent Events
 
 `GET /api/v1/jobs/{id}/events` returns `text/event-stream` (`404` for an
-unknown job). Each state change of the job is sent as:
+unknown job). The job's current state is sent first, then each state
+change, all in this form:
 
 ```
 event: state_change
 data: {"job_id":"…","state":"uploading","time":"2026-10-01T12:00:41.123Z"}
 ```
 
-`error` is added on failure events and on the `incoming` event sent when a
-retry is scheduled. The stream ends after a terminal state (`published`,
-`accumulated`, `failed`, `aborted`) or when the client disconnects. Only
-changes after the subscription are sent and there is no initial event, so
-read `GET /api/v1/jobs/{id}` after subscribing; a subscription to a job that
-is already terminal stays silent. Slow subscribers may miss events (32-event
+`error` is added when the job has one: on failure events, on the `incoming`
+event sent when a retry is scheduled, and on the first event of a failed job.
+The stream ends after a terminal state (`published`, `accumulated`, `failed`,
+`aborted`), so a subscription to a finished job gets one event and closes,
+or when the client disconnects. Slow subscribers may miss events (32-event
 buffer). The response sets `X-Accel-Buffering: no` for nginx.
 
 ### Webhooks
@@ -921,16 +946,20 @@ Coarse builds are described in [Coarse builds](#coarse-builds).
 
 `expect` is 0 when no count was declared; `finalizing` means the finalize has
 been claimed (running, finished or crashed); `result` appears once a finalize
-outcome has been recorded and has `error` when it failed. An unknown build id
-returns zeros.
+outcome has been recorded and has `error` when it failed. In local mode the
+status also has `"per_package": true`: packages are published on arrival and
+nothing accumulates. An unknown build id returns zeros.
 
 **`POST /api/v1/builds/{id}/seal`** with body `{"expect": N}` declares that
 the producer has submitted N jobs for the build. If they are all terminal
 already, the finalize starts now; otherwise it starts when the last one
-finishes. Re-sealing with the same count is harmless.
+finishes. Re-sealing with the same count is harmless. In local mode a seal
+is a no-op: it is answered `200` with the build status (`per_package: true`)
+before the body is read, and nothing is recorded or finalized.
 
 | Status | When |
 |---|---|
+| `200` | Local mode: no-op, body is the build status |
 | `202` | Recorded; body is the build status as above |
 | `400` | Invalid JSON, or `expect` not a positive integer |
 | `409` | `expect` is below the number of jobs already terminal, or below an earlier declaration (a seal may not shrink a build) |
@@ -946,7 +975,7 @@ commit has finished.
 | `400` | `{"build_id","error"}`: nothing was published (finalize not configured, no accumulated packages, packages from several repositories, objects missing from the CAS) |
 | `500` | `{"build_id","error","packages","published","conflicts","output"}`: the commit ran and failed; `output` is the `ingestsql` output |
 
-`conflicts` is a list of `{"Path": "...", "Reason": "..."}` for packages left
+`conflicts` is a list of `{"path": "...", "reason": "..."}` for packages left
 out because another member at the same path had different content.
 
 ### GET /api/v1/measurements
@@ -996,7 +1025,9 @@ job's `provenance` record ([section 8](#8-provenance)):
 | `X-OIDC-Token` | CI OIDC token (JWT). A JWT-shaped `Authorization: Bearer` value is also tried |
 
 These headers are not covered by `X-Bits-Auth`. Only a validated OIDC token
-sets `verified: true`; header values alone are recorded as unverified.
+sets `verified: true`; it then replaces all of these header values
+([What is recorded](#what-is-recorded)). Header values alone are recorded as
+unverified.
 
 ### Limits
 
@@ -1009,7 +1040,7 @@ sets `verified: true`; header values alone are recorded as unverified.
 | JSON bodies (submission, reserve, published) | 1 MiB | `400` |
 | Seal body | 64 KiB | `400` |
 | Signed body (non-multipart) | 1 MiB; 256 MiB for distribute manifests | `401` |
-| Single file inside a tar (default path) | 1 GiB | job fails ([Tar archive rules](#tar-archive-rules)) |
+| Single file inside a tar (default path) | `max_tar_size_gib` on the default fixed chunk grid, otherwise 1 GiB | job fails ([Tar archive rules](#tar-archive-rules)) |
 | Manifest ingest body | 256 MiB | `400` |
 | Bundle request | 8 MiB body, 100 000 hashes | `400` / `413` |
 | Concurrent connections | 1024 | queued by the kernel |
@@ -1061,7 +1092,10 @@ do not send it.
 | `GET /cvmfs/{repo}/.cvmfsbits` | API | with `--control-plane-url` | none | Discovery document |
 | `GET /control/challenge?node=<node>` | API, or TLS enroll listener | with `--embedded-broker-auth`; on the API listener only without `--enroll-tls-addr` | none | Enrollment nonce |
 | `POST /control/enroll` | API, or TLS enroll listener | as above | node key (MAC) | Redeem nonce and MAC for a broker token |
-| `POST /control/revoke` | TLS enroll listener only | with `--enroll-tls-addr` | publisher token | Revoke a node |
+| `POST /control/revoke` | TLS enroll listener | with `--enroll-tls-addr` | publisher token | Revoke a node |
+| `POST /control/unrevoke` | TLS enroll listener | with `--enroll-tls-addr` | publisher token | Lift a node's revocation |
+| `POST /api/v1/control/revoke` | API | with `--embedded-broker-auth` and a non-empty `PREPUB_API_TOKEN` | API secret | Revoke a node |
+| `POST /api/v1/control/unrevoke` | API | as above | API secret | Lift a node's revocation |
 | `ws(s)://<host>:<port>` | `--embedded-broker-ws-addr` | when set | token with `--embedded-broker-auth` | MQTT broker |
 | `GET /s1/{txn}/manifest` | API | always | none | Pull manifest for transaction `{txn}` (the job id) |
 | `GET`/`HEAD /cvmfs/{repo}/data/{xx}/{rest}` | API | gateway mode | none | One object from the CAS |
@@ -1094,10 +1128,11 @@ requests/s, burst 10) and globally (100/s, burst 200); excess requests get
 
 The receiver fetches the document for the first repository in `--repos`,
 retrying for up to 60 s (1 s backoff doubling to 8 s), and exits if it cannot
-get it. With `--broker-auth` it verifies the signature with
-`--discovery-verify-key` and exits on failure. It refuses a transport other
-than `mqtt` and an empty URL. The document is fetched with the system CA
-pool, so an `https://` discovery URL needs a publicly trusted certificate.
+get it. Whenever `--discovery-verify-key` is set it verifies the signature
+and exits on failure (the key is required with `--broker-auth`). It refuses a
+transport other than `mqtt` and an empty URL. An `https://` discovery URL is
+verified against the system CA pool plus the `--broker-ca-cert` CA, and the
+proxy environment (`HTTPS_PROXY`, `NO_PROXY`) applies.
 
 ### Enrollment and broker authentication
 
@@ -1144,18 +1179,30 @@ Without `--embedded-broker-auth` the broker accepts every connection and
 every publish.
 
 Revocation: `cvmfs-prepub revoke <node>` posts `{"node":"<node>"}` to
-`POST /control/revoke` with a publisher token. The node is denied new tokens
-and broker connections, and its live sessions are disconnected. Answer:
-`{"revoked":"<node>","sessions_dropped":<n>}`; `403` without a valid
-publisher token, `400` for `publisher` or an empty node. The denylist is kept
-in memory only: after a publisher restart the node can enroll again, so a
-permanent revocation also needs a new `PREPUB_HMAC_SECRET` (and new node keys
-for every other receiver).
+`POST /control/revoke` on the TLS enroll listener (publisher token), or with
+`--api-url` to `POST /api/v1/control/revoke` (API secret; the route exists
+only when `PREPUB_API_TOKEN` is set). The node is denied new tokens and
+broker connections, and its live sessions are disconnected. Answer:
+`{"revoked":"<node>","sessions_dropped":<n>}`. The denylist is saved to
+`<spool_root>/revoked-nodes.json` and survives restarts; if it cannot be
+saved the answer is `500` and the revocation holds only until the next
+restart. `cvmfs-prepub revoke --undo <node>` posts the same body to the
+matching unrevoke route (`POST /control/unrevoke` or
+`POST /api/v1/control/unrevoke`), which answers `{"unrevoked":"<node>"}`; if
+the list cannot be saved the answer is `500` and the node stays revoked. The
+command fails unless the answer confirms the action for that node, so an
+older publisher without the unrevoke route (`404`) is reported, not
+silently treated as a revoke. The body names exactly one node; other fields
+are refused. Errors: `403` without a valid publisher token (TLS listener) or
+`401` without valid API credentials; `400` for `publisher`, an unknown
+field, or a node name that is not a valid node id (empty, or containing `/`,
+`+`, `#` or NUL).
 
 ### Topics and messages
 
-All messages are JSON, QoS 1. Topic segments (`{repo}`, `{node_id}`) may not
-be empty or contain `/`, `+`, `#` or NUL.
+All messages are JSON, QoS 1. `{repo}` is a valid repository name
+([Conventions](#conventions)); `{node_id}` may not be empty or contain `/`,
+`+`, `#` or NUL.
 
 | Topic | Direction | Retained | Payload |
 |---|---|---|---|
@@ -1286,8 +1333,8 @@ give communities separate rights, use separate gateway keys and
 - Unauthenticated routes: health, metrics, the web console pages, measurements,
   and the distribution data routes (objects, bundles, pull manifests,
   discovery). Enrollment needs the node key; revocation needs a publisher
-  token. Objects and manifests of every repository in the CAS can be
-  read by anyone who reaches the port; for repositories that are not public,
+  token or the API secret. Objects and manifests of every repository in the
+  CAS can be read by anyone who reaches the port; for repositories that are not public,
   restrict these routes in the reverse proxy. Measurement records include
   repository paths and the real error text of failed publishes.
 - The web console is static; the browser stores the token in `localStorage`
@@ -1299,8 +1346,8 @@ give communities separate rights, use separate gateway keys and
 - `tar_path` submissions can only use files under `staging_root`.
 - `webhook_url` is called from the publisher host to whatever URL a submitter
   gives; restrict outbound traffic if that matters on your network.
-- `GET /api/v1/jobs/{id}/log` returns the full record, including the gateway
-  lease token while a lease is held.
+- `GET /api/v1/jobs/{id}/log` returns the full record except the gateway
+  lease token, and with the `webhook_url` path and query redacted.
 - `--dev` turns off the API token and gateway secret requirements and the
   HTTPS requirement for the gateway.
 
@@ -1326,14 +1373,14 @@ path are checked against the [Tar archive rules](#tar-archive-rules).
   broker port can send announces and `published` messages to receivers and
   impersonate presence.
 - Serve enrollment over TLS (`--enroll-tls-addr`) so tokens do not travel in
-  clear text; this is also the only way to get a revoke endpoint.
+  clear text.
 - Receivers hold only their node key. A receiver cannot mint tokens for
   other nodes or for the publisher, and can publish only its own presence.
 - The discovery document is Ed25519-signed so a receiver does not need a
-  shared secret to trust the broker URL. The signature is checked only when
-  the receiver runs with `--broker-auth`.
-- Revocation is in memory (see
-  [Enrollment and broker authentication](#enrollment-and-broker-authentication)).
+  shared secret to trust the broker URL. The signature is checked whenever
+  the receiver has `--discovery-verify-key` (required with `--broker-auth`).
+- Revocations persist across restarts in `<spool_root>/revoked-nodes.json`
+  (see [Enrollment and broker authentication](#enrollment-and-broker-authentication)).
 - A manipulated announce or manifest can at most make a receiver fetch and
   store objects whose bytes match their names; it cannot change what clients
   see, which is decided by the signed repository manifest.
@@ -1360,23 +1407,21 @@ At submission, the request's provenance headers
 ([Provenance headers](#provenance-headers)) are stored in the job's
 `provenance` block. If an OIDC token is present and `oidc_issuers` is set,
 the token is validated (issuer in the list, signature against the issuer's
-JWKS, audience equal to `PREPUB_OIDC_AUDIENCE`); on success its claims
-replace the header values and `verified` is `true`:
+JWKS, audience equal to `PREPUB_OIDC_AUDIENCE`); on success all header
+values are discarded, the record holds only what the token's claims provide
+(a field the token lacks stays empty), and `verified` is `true`:
 
 | Record field | GitHub Actions claim | GitLab CI claim |
 |---|---|---|
-| `git_repo` | `repository` | `project_path` (if not set by GitHub claims) |
-| `git_sha` | `sha` | |
-| `git_ref` | `ref` | |
+| `git_repo` | `repository` | `project_path` |
+| `git_sha` | `sha` | `sha` |
+| `git_ref` | `ref` | `ref` |
 | `actor` | `actor` | `user_login` |
 | `pipeline_id` | `run_id` | `pipeline_id` |
 | `build_system` | `github-actions` (when `workflow` is set) | `gitlab-ci` (when `ci_config_ref_uri` is set) |
 | `oidc_issuer`, `oidc_subject` | `iss`, `sub` | `iss`, `sub` |
 
-GitHub claims overwrite header values. GitLab claims (and the derived
-`build_system`) only fill fields that are still empty, so with a GitLab token
-any `X-Provenance-*` header sent alongside takes precedence over the claim
-while the record is still marked `verified: true`. A token that fails
+When a token carries both, the GitHub claim wins. A token that fails
 validation is logged and the header values are kept with `verified: false`.
 
 ### Rekor submission
@@ -1405,7 +1450,10 @@ first use) and submitted to `POST {rekor_server}/api/v1/log/entries` as a
 `hashedrekord` entry whose hash is the SHA-256 of the record JSON. The
 returned UUID, log index, integrated time and Signed Entry Timestamp are
 stored in the job's `provenance` block as `rekor_server`, `rekor_uuid`,
-`rekor_log_index`, `rekor_integrated_time` and `rekor_set`.
+`rekor_log_index`, `rekor_integrated_time` and `rekor_set`. The exact signed
+bytes are kept in `<job dir>/provenance-record.json` (mode 0600, moves with
+the job directory); the block names it in `signed_record_file` and holds its
+SHA-256 (the hash in the Rekor entry) as `signed_record_sha256`.
 
 ### Chain and verification
 
@@ -1416,11 +1464,10 @@ The chain is: published file -> CVMFS object hash (in the catalog) -> job
 Limits to keep in mind when verifying:
 
 - Rekor stores only the SHA-256 of the record and the signature, not the
-  record itself, and cvmfs-prepub does not keep the exact signed bytes. The job's
-  `provenance` block keeps the identity fields and the Rekor receipt, but not
-  `catalog_hash`, `object_hashes` or `published_at`. Rekor therefore cannot
-  be searched by a file's content hash, and the record hash cannot be
-  recomputed from the spool afterwards.
+  record itself, so Rekor cannot be searched by a file's content hash. The
+  full record, including `catalog_hash`, `object_hashes` and
+  `published_at`, is in the job's `provenance-record.json`; its SHA-256 must
+  equal `signed_record_sha256` and the hash in the Rekor entry.
 - What can be checked: fetch the entry by `rekor_uuid`
   (`rekor-cli get --uuid <uuid>`), confirm the log index and integrated time,
   that the public key in the entry is this publisher's provenance key, and
@@ -1535,7 +1582,7 @@ permanently.
 | Entry | Rule |
 |---|---|
 | Paths | No absolute paths; no `..` component |
-| Regular files | At most 1 GiB per file; negative or inconsistent sizes are refused |
+| Regular files | At most `max_tar_size_gib` per file on the default fixed chunk grid (larger files are spilled to disk under the spool, not held in memory); 1 GiB with content-defined chunking or `--chunk-avg 0`, as those files are read whole into memory. Negative or inconsistent sizes are refused |
 | Symlinks | Target must be relative, non-empty and stay inside the archive |
 | Hard links | Target must be an earlier entry of the archive |
 | Duplicates | The same path twice is refused |

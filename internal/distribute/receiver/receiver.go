@@ -121,6 +121,11 @@ func New(cfg Config) (*Receiver, error) {
 	if cfg.ControlAddr == "" {
 		cfg.ControlAddr = ":9100"
 	}
+	for _, repo := range cfg.Repos {
+		if err := broker.ValidateRepo(repo); err != nil {
+			return nil, fmt.Errorf("receiver: %w", err)
+		}
+	}
 
 	// Build the local CAS backend used to answer "do I already hold this hash?"
 	// during announce processing.  This is the single source of truth for the

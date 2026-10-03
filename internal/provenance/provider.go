@@ -132,50 +132,48 @@ func (p *Provider) ExtractFromRequest(r *http.Request) *Record {
 			p.obs.Logger.Warn("provenance: OIDC token validation failed — using caller-supplied headers",
 				"error", err)
 		} else {
-			// Verified OIDC claims take precedence over caller-supplied headers.
-			rec.Verified = true
-			if iss, err := claims.GetIssuer(); err == nil {
-				rec.OIDCIssuer = iss
-			}
-			if sub, err := claims.GetSubject(); err == nil {
-				rec.OIDCSubject = sub
-			}
-			// GitHub Actions claims.
-			if claims.Repository != "" {
-				rec.GitRepo = claims.Repository
-			}
-			if claims.SHA != "" {
-				rec.GitSHA = claims.SHA
-			}
-			if claims.Ref != "" {
-				rec.GitRef = claims.Ref
-			}
-			if claims.Actor != "" {
-				rec.Actor = claims.Actor
-			}
-			if claims.RunID != "" {
-				rec.PipelineID = claims.RunID
-			}
-			if rec.BuildSystem == "" && claims.Workflow != "" {
-				rec.BuildSystem = "github-actions"
-			}
-			// GitLab CI claims (override GitHub ones only if set).
-			if claims.ProjectPath != "" && rec.GitRepo == "" {
-				rec.GitRepo = claims.ProjectPath
-			}
-			if claims.PipelineID != "" && rec.PipelineID == "" {
-				rec.PipelineID = claims.PipelineID
-			}
-			if claims.UserLogin != "" && rec.Actor == "" {
-				rec.Actor = claims.UserLogin
-			}
-			if rec.BuildSystem == "" && claims.CIConfigRef != "" {
-				rec.BuildSystem = "gitlab-ci"
-			}
+			applyClaims(rec, claims)
 		}
 	}
 
 	return rec
+}
+
+// applyClaims marks rec verified and fills the build identity from the token
+// only. GitHub claims are preferred over GitLab ones.
+func applyClaims(rec *Record, claims *OIDCClaims) {
+	// Clear every caller-supplied header value first, so none stands beside
+	// Verified=true -- not even for a field the token lacks. build_system is
+	// cleared too: a header-chosen CI name on a verified record would read
+	// as attested; it is set below only from the token.
+	rec.GitRepo, rec.GitSHA, rec.GitRef = "", "", ""
+	rec.Actor, rec.PipelineID, rec.BuildSystem = "", "", ""
+	rec.Verified = true
+	if iss, err := claims.GetIssuer(); err == nil && iss != "" {
+		rec.OIDCIssuer = iss
+	}
+	if sub, err := claims.GetSubject(); err == nil && sub != "" {
+		rec.OIDCSubject = sub
+	}
+	set := func(dst *string, vals ...string) {
+		for _, v := range vals {
+			if v != "" {
+				*dst = v
+				return
+			}
+		}
+	}
+	set(&rec.GitRepo, claims.Repository, claims.ProjectPath)
+	set(&rec.GitSHA, claims.SHA)
+	set(&rec.GitRef, claims.Ref)
+	set(&rec.Actor, claims.Actor, claims.UserLogin)
+	set(&rec.PipelineID, claims.RunID, claims.PipelineID)
+	switch {
+	case claims.Workflow != "":
+		rec.BuildSystem = "github-actions"
+	case claims.CIConfigRef != "":
+		rec.BuildSystem = "gitlab-ci"
+	}
 }
 
 // Submit serialises the Record, signs it, and submits it to Rekor.  The Record
@@ -212,6 +210,7 @@ func (p *Provider) Submit(ctx context.Context, rec *Record) error {
 		return fmt.Errorf("provenance: Rekor submission: %w", err)
 	}
 
+	rec.SignedPayload = payload
 	rec.RekorUUID = uuid
 	rec.RekorLogIndex = logIndex
 	rec.RekorIntegratedTime = integratedTime

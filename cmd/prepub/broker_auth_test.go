@@ -5,6 +5,8 @@ package main
 
 import (
 	"encoding/hex"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -141,5 +143,57 @@ func TestBrokerAuthHookConnectionIdentity(t *testing.T) {
 	h.OnDisconnect(recvCl, nil, true) // unrelated disconnect must not affect pubCl
 	if !h.OnACLCheck(pubCl, "cvmfs/repos/r/announce", true) {
 		t.Error("publisher must remain authorized to publish announce after an unrelated disconnect")
+	}
+}
+
+// TestRevocationPersists: a revocation is saved (0600, atomically) and is
+// still in force after the list is reloaded, as on a publisher restart.
+func TestRevocationPersists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "revoked-nodes.json")
+	r, err := loadRevocation(path)
+	if err != nil {
+		t.Fatalf("missing file must load as empty: %v", err)
+	}
+	if err := r.Revoke("stratum1-a"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 1 {
+		t.Errorf("temp files left behind: %d entries", len(ents))
+	}
+
+	again, err := loadRevocation(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.IsRevoked("stratum1-a") || again.IsRevoked("stratum1-b") {
+		t.Error("reloaded denylist does not match what was revoked")
+	}
+	if _, ok := (&derivedEnrollStore{secret: []byte("s"), revoc: again}).Key("stratum1-a"); ok {
+		t.Error("revoked node can enroll again after reload")
+	}
+
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadRevocation(path); err == nil {
+		t.Error("a corrupt list must fail closed")
+	}
+
+	// Saving fails: the node is still revoked now, and the caller is told.
+	bad := &revocation{set: map[string]bool{}, path: filepath.Join(dir, "missing", "x.json")}
+	if err := bad.Revoke("stratum1-c"); err == nil || !bad.IsRevoked("stratum1-c") {
+		t.Errorf("err=%v revoked=%v; want an error and the in-memory revocation", err, bad.IsRevoked("stratum1-c"))
+	}
+	// An un-revoke that cannot be saved leaves the node revoked (fail closed).
+	if err := bad.Unrevoke("stratum1-c"); err == nil || !bad.IsRevoked("stratum1-c") {
+		t.Errorf("err=%v revoked=%v; want an error and the node still revoked", err, bad.IsRevoked("stratum1-c"))
 	}
 }

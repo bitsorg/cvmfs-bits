@@ -43,9 +43,9 @@ symbolic link, or special file).
 | `parent_1`   | INTEGER | `md5path_1` of the parent directory. The repository root entry has `parent_1 = parent_2 = 0`; the root entry of a nested catalog points to its real parent directory. |
 | `parent_2`   | INTEGER | `md5path_2` of the parent directory. |
 | `hardlinks`  | INTEGER | Packed encoding: `(hardlink_group << 32) | link_count`. For normal (non-hardlinked) files: `(0 << 32) | 1 = 1`. |
-| `hash`       | BLOB    | Raw bytes of the content hash. NULL for directories and symbolic links. For regular files the hash algorithm is encoded in `flags` bits 8–10. |
+| `hash`       | BLOB    | Raw bytes of the content hash of a whole-file object. NULL for directories, symbolic links, special files and chunked files (see §2.2). The hash algorithm is encoded in `flags` bits 8–10. |
 | `size`       | INTEGER | Uncompressed file size in bytes. For directories, the size from the tar header (placeholder root entries use 4096). |
-| `mode`       | INTEGER | Unix file mode: type bits (`0o040000` dir, `0o120000` symlink, `0o100000` regular) OR'd with permission bits (including setuid/setgid/sticky). |
+| `mode`       | INTEGER | Unix file mode: type bits (`0o040000` dir, `0o120000` symlink, `0o100000` regular, `0o010000` FIFO, `0o140000` socket, `0o020000` character device, `0o060000` block device) OR'd with permission bits (including setuid/setgid/sticky). |
 | `mtime`      | INTEGER | Modification time, Unix epoch seconds. |
 | `mtimens`    | INTEGER | Nanosecond part of `mtime`. Currently written as 0. |
 | `flags`      | INTEGER | Packed bit field (see §3). |
@@ -85,10 +85,12 @@ md5path_2 = int64(LittleEndian(digest[8:16]))
 
 ### 2.2 `chunks` — file chunks for large files
 
-Files larger than the chunk size are split into pieces (*chunked files*):
-fixed 6 MiB pieces by default, content-defined boundaries when the chunk
-minimum, average and maximum are configured to differ. Each chunk is a separate CAS object. This table stores the
-chunk map.
+With chunking enabled (the default) every regular file is stored as one or
+more chunks (*chunked files*): fixed 6 MiB pieces by default, content-defined
+boundaries when the chunk minimum, average and maximum are configured to
+differ. A file smaller than one chunk is a single chunk. Each chunk is a
+separate CAS object. Only with chunking disabled (`--chunk-avg 0`) are files
+stored as whole-file objects. This table stores the chunk map.
 
 | Column      | Type    | Description |
 |-------------|---------|-------------|
@@ -104,10 +106,9 @@ chunk map.
 CREATE UNIQUE INDEX idx_chunks_path_offset ON chunks (md5path_1, md5path_2, offset);
 ```
 
-When a file is chunked, `catalog.hash` holds the *bulk hash* (SHA-1 of the
-full uncompressed content) and `FlagFileChunk` is set in `catalog.flags`.
-The CVMFS client reads such a file from the chunks listed in this table; no
-object is stored under the bulk hash.
+When a file is chunked, `FlagFileChunk` is set in `catalog.flags` and
+`catalog.hash` is NULL (no bulk hash, as in CVMFS's own ingestion). The CVMFS
+client reads such a file from the chunks listed in this table.
 
 ### 2.3 `nested_catalogs` — nested catalog mount points
 
@@ -171,7 +172,7 @@ compression algorithm, and several boolean attributes. Bit layout (from LSB):
 | 0     | 1     | `FlagDir`            | 1 = directory |
 | 1     | 1     | `FlagDirNestedMount` | 1 = directory is a nested catalog mount point |
 | 2     | 1     | `FlagFile`           | 1 = regular file (or special file) |
-| 3     | 1     | `FlagLink`           | 1 = symbolic link |
+| 3     | 1     | `FlagLink`           | 1 = symbolic link — written together with `FlagFile` (flags `12`), as CVMFS does |
 | 4     | 1     | `FlagFileSpecial`    | 1 = special file (device, pipe, socket) — set together with `FlagFile` |
 | 5     | 1     | `FlagDirNestedRoot`  | 1 = this entry is the root of a nested catalog |
 | 6     | 1     | `FlagFileChunk`      | 1 = file content is split into chunks (see `chunks` table) |
@@ -195,9 +196,10 @@ leaving bits 8–10 at zero. To decode: `algorithm = ((flags >> 8) & 7) + 1`.
 | SHAKE-128       | 2                  | `-shake128` |
 
 cvmfs-bits writes SHA-1 for all content. The Go constants in
-`pkg/cvmfscatalog` call ids 2 and 3 `HashSha256` and `HashRipeMD160`, and
-`HashSuffix()` maps them to `-` and `~`; those names and suffixes do not match
-CVMFS, but no content hash uses them (see §9 for the one place id 2 appears).
+`pkg/cvmfscatalog` use the CVMFS ids (`HashSha1` = 1, `HashRipeMD160` = 2,
+`HashShake128` = 3), and `HashSuffix()` returns the CVMFS suffixes. Entries
+without content (directories, the placeholder root entry) leave bits 8–10 at
+zero.
 
 **Compression algorithm encoding (bits 11–13):**
 
@@ -206,21 +208,20 @@ CVMFS, but no content hash uses them (see §9 for the one place id 2 appears).
 | 0 (CompZlib)  | 0               | zlib deflate |
 | 1 (CompNone)  | 1               | No compression (verbatim) |
 
-**Important:** `FlagXattr` (bit 17) is an *internal cvmfs-bits flag* used only
+**Important:** `FlagXattr` (bit 30) is an *internal cvmfs-bits flag* used only
 for in-memory statistics tracking. It is **never written to the SQLite `flags`
 column**: it is masked out before every insert. Extended attribute presence is
-determined exclusively by whether the `xattr` BLOB column is NULL. (CVMFS itself
-uses bit 17 for `kFlagBundleTrigger`; because `FlagXattr` never reaches the
-database, the two do not collide.)
+determined exclusively by whether the `xattr` BLOB column is NULL. (Bit 17 is
+CVMFS's `kFlagBundleTrigger`; cvmfs-bits does not set it.)
 
 ---
 
 ## 4. Content Hash Conventions
 
-### 4.1 Regular (non-chunked) files
+### 4.1 Whole-file objects
 
-The content pipeline compresses each file with zlib (default level 6) and
-computes the SHA-1 of the *compressed* bytes:
+With chunking disabled, the content pipeline compresses each file with zlib
+(default level 6) and computes the SHA-1 of the *compressed* bytes:
 
 ```
 CAS key = SHA-1(zlib(raw content))
@@ -231,16 +232,13 @@ in CAS at `data/XY/hash[2:]` (where `XY` = first two hex characters).
 
 ### 4.2 Chunked files
 
-Files above the chunk size are split into pieces (see §2.2). Each chunk is
-independently compressed and hashed:
+Chunked files (see §2.2; the default) are split into pieces, and each chunk
+is independently compressed and hashed:
 
 ```
 chunk CAS key   = SHA-1(zlib(chunk_bytes))    → stored in chunks.hash
-file bulk hash  = SHA-1(raw_full_content)      → stored in catalog.hash
+catalog.hash    = NULL
 ```
-
-The bulk hash covers the *uncompressed* full-file content. No object is stored
-under it; the client reads the file from its chunks.
 
 ### 4.3 Catalogs
 
@@ -329,7 +327,8 @@ cvmfs-bits merges two sources of extended attributes into each file entry:
   (`SCHILY.xattr.<name>` records, any namespace).
 - **Synthetic xattrs** injected by `cvmfscatalog.SyntheticAttrs()` for every
   regular file (they replace a tar xattr of the same name):
-  - `user.cvmfs.hash` — hex content hash (SHA-1, so no suffix).
+  - `user.cvmfs.hash` — hex content hash (SHA-1, so no suffix); whole-file
+    objects only, as chunked files have no bulk hash.
   - `user.cvmfs.compression` — `"zlib"` or `"none"`.
   - `user.cvmfs.chunk_list` — chunked files only; one line per chunk,
     `offset:uncompressed_size:hex_hash`, lines separated by `\n`.
@@ -346,8 +345,8 @@ existing repository tree at commit time.
 ### 7.1 Input
 
 `BuildSubtree(ctx, SubtreeConfig, []Entry)` receives a flat slice of
-`cvmfscatalog.Entry` values from the pipeline, with `Hash` populated from the
-compress stage and `Chunks` populated for chunked files. `FullPath` is
+`cvmfscatalog.Entry` values from the pipeline, with `Hash` populated for
+whole-file objects and `Chunks` for chunked files. `FullPath` is
 tar-relative (e.g. `usr/lib/foo.so`, or `.` for the tar root); `BuildSubtree`
 prefixes the lease path to make it absolute (e.g. `/atlas/24.0/usr/lib/foo.so`).
 
@@ -454,11 +453,3 @@ raw SQLite bytes. The SQLite file may contain unused pages if entries were
 deleted or replaced. For typical publish workloads this has negligible effect
 on catalog size, but long-lived incremental catalogs could benefit from
 periodic compaction.
-
-**Placeholder root entry hash bits.** `Create()` writes its placeholder root
-directory entry with algorithm id 2 (named `HashSha256` in the code), which sets
-bits 8–10 to `1` — RIPEMD-160 in CVMFS terms — while all content uses SHA-1.
-The entry has no content hash, so this does not affect correctness, and
-`BuildSubtree` replaces the placeholder with the real directory entry whenever
-the payload has one. It can still be confusing when inspecting the raw `flags`
-column.

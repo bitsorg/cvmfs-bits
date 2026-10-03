@@ -29,12 +29,12 @@ Contents: [Why](#why) · [What it does](#what-it-does) ·
   catalog is built natively in Go ([CATALOG.md](CATALOG.md)).
 - **Offers several publish paths.** `prepub` (the default) is the pipeline
   described above. `ingest` hands the tar to `cvmfs_server ingest`. `staged`
-  (gateway mode) grafts objects and a catalog that the producer has prepared.
-  A local backend (`publish_mode: local`) runs `cvmfs_server` on the same
-  host, with no gateway.
-- **Publishes whole builds at once.** On the default path, jobs that carry a
-  `build_id` accumulate, and the build is committed in one transaction when it
-  is finalized.
+  (gateway mode with an S3 CAS) grafts objects and a catalog that the producer
+  has prepared. A local backend (`publish_mode: local`) runs `cvmfs_server` on
+  the same host, with no gateway.
+- **Publishes whole builds at once.** On the default path in gateway mode, jobs
+  that carry a `build_id` accumulate, and the build is committed in one
+  transaction when it is finalized.
 - **Survives crashes.** Every job lives in an on-disk spool with a journal.
   After a restart, jobs resume. Retryable failures are retried with backoff
   for up to `retry_window` (24 hours by default).

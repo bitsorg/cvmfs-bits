@@ -57,6 +57,11 @@ type Config struct {
 	CAS cas.Backend
 	// SpoolDir is the temporary directory for catalog.db and upload.log.
 	SpoolDir string
+	// MaxEntrySize caps the size of any single file in the tar; 0 uses
+	// unpack.MaxFileSize. The service sets it to the maximum tar size. It is
+	// only honoured above unpack.MaxFileSize where files stream (see
+	// EntryLimit).
+	MaxEntrySize int64
 	// Obs provides logging, tracing, and metrics.
 	Obs *observe.Provider
 	// PreloadExe is the repo-relative path to the application binary whose
@@ -68,6 +73,27 @@ type Config struct {
 	// run.  Only paths present in the submitted tar produce CAS hashes in the
 	// preload file.  Ignored when PreloadExe is empty.
 	PreloadPaths []string
+}
+
+// EntryLimit is the per-file size limit this configuration can process. Only
+// when large files are both spilled to disk and compressed by streaming (a
+// SpoolDir and a fixed chunk grid) may it exceed unpack.MaxFileSize; the other
+// paths read a file whole into memory, so they keep the 1 GiB cap.
+func (c Config) EntryLimit() int64 {
+	cc := compress.Config{SpillDir: c.SpoolDir, ChunkMin: c.ChunkMin, ChunkAvg: c.ChunkAvg, ChunkMax: c.ChunkMax}
+	if cc.Streaming() && c.MaxEntrySize > 0 {
+		return c.MaxEntrySize
+	}
+	return inMemoryLimit(c.MaxEntrySize)
+}
+
+// inMemoryLimit is the per-file limit for a path that holds files in memory:
+// n (0 = default), but never above unpack.MaxFileSize.
+func inMemoryLimit(n int64) int64 {
+	if n <= 0 || n > unpack.MaxFileSize {
+		return unpack.MaxFileSize
+	}
+	return n
 }
 
 // Result is returned after a successful pipeline run.
@@ -179,28 +205,33 @@ func PrefetchWithSpill(ctx context.Context, tarPath, spillRoot string, obs *obse
 		return nil, fmt.Errorf("opening tar for prefetch %q: %w", tarPath, err)
 	}
 	defer f.Close()
-	return prefetchFromReader(ctx, f, spillRoot, obs)
+	return prefetchFromReader(ctx, f, spillRoot, 0, obs)
 }
 
 // PrefetchFromReader performs Phase 0 from an io.Reader.
 // It is the same collect+validate+sort logic used by RunFromReader, extracted
 // so it can run before the concurrency slot is acquired.
 func PrefetchFromReader(ctx context.Context, r io.Reader, obs *observe.Provider) (*PrefetchResult, error) {
-	return prefetchFromReader(ctx, r, "", obs)
+	return prefetchFromReader(ctx, r, "", 0, obs)
 }
 
 // PrefetchFromReaderWithSpill is PrefetchFromReader with a spill root, for
 // callers that already hold an open handle on the tar (preserving a stable
 // inode reference across a concurrent rename) and still want large entries
-// written to disk rather than held in memory.
-func PrefetchFromReaderWithSpill(ctx context.Context, r io.Reader, spillRoot string, obs *observe.Provider) (*PrefetchResult, error) {
-	return prefetchFromReader(ctx, r, spillRoot, obs)
+// written to disk rather than held in memory. maxEntrySize is the per-file
+// limit (0 = unpack.MaxFileSize; pass Config.EntryLimit); without a spill
+// root it is capped at unpack.MaxFileSize, as entries then stay in memory.
+func PrefetchFromReaderWithSpill(ctx context.Context, r io.Reader, spillRoot string, maxEntrySize int64, obs *observe.Provider) (*PrefetchResult, error) {
+	return prefetchFromReader(ctx, r, spillRoot, maxEntrySize, obs)
 }
 
-func prefetchFromReader(ctx context.Context, r io.Reader, spillRoot string, obs *observe.Provider) (*PrefetchResult, error) {
+func prefetchFromReader(ctx context.Context, r io.Reader, spillRoot string, maxEntrySize int64, obs *observe.Provider) (*PrefetchResult, error) {
 	spillDir, serr := newSpillDir(spillRoot)
 	if serr != nil {
 		return nil, serr
+	}
+	if spillDir == "" {
+		maxEntrySize = inMemoryLimit(maxEntrySize)
 	}
 	// Any error path below must not leave spilled content behind: the caller
 	// gets no PrefetchResult and therefore no handle to Cleanup with.
@@ -215,7 +246,7 @@ func prefetchFromReader(ctx context.Context, r io.Reader, spillRoot string, obs 
 	collectErrCh := make(chan error, 1)
 	go func() {
 		collectErrCh <- unpack.ExtractWithOptions(ctx, r, collectChan,
-			unpack.Options{SpillDir: spillDir})
+			unpack.Options{SpillDir: spillDir, MaxEntrySize: maxEntrySize})
 		close(collectChan)
 	}()
 
@@ -314,10 +345,24 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 	// Duplicate-path detection and .cvmfsdirtab capture move here from the
 	// fan-out goroutine so the collect phase remains the single owner of the
 	// raw entry slice.
+	// Files up to unpack.MaxFileSize stay in memory as they always have; a
+	// larger one (allowed by EntryLimit only when it streams) is spilled
+	// under SpoolDir, so a higher limit never means a larger allocation.
+	spillDir, serr := newSpillDir(cfg.SpoolDir)
+	if serr != nil {
+		return nil, serr
+	}
+	if spillDir != "" {
+		defer os.RemoveAll(spillDir)
+	}
 	collectChan := make(chan unpack.FileEntry, 256)
 	collectErrCh := make(chan error, 1)
 	go func() {
-		collectErrCh <- unpack.Extract(ctx, r, collectChan)
+		collectErrCh <- unpack.ExtractWithOptions(ctx, r, collectChan, unpack.Options{
+			MaxEntrySize:  cfg.EntryLimit(),
+			SpillDir:      spillDir,
+			InlineMaxSize: unpack.MaxFileSize,
+		})
 		close(collectChan)
 	}()
 
@@ -377,7 +422,7 @@ type ArchiveSource struct {
 // peeking at the first two magic bytes (0x1f 0x8b), and streams all
 // FileEntry values produced by unpack.Extract to out.
 // The file is closed before streamArchive returns.
-func streamArchive(ctx context.Context, path string, out chan<- unpack.FileEntry) error {
+func streamArchive(ctx context.Context, path string, maxEntrySize int64, out chan<- unpack.FileEntry) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening archive %q: %w", path, err)
@@ -397,7 +442,7 @@ func streamArchive(ctx context.Context, path string, out chan<- unpack.FileEntry
 		defer gr.Close()
 		r = gr
 	}
-	return unpack.Extract(ctx, r, out)
+	return unpack.ExtractWithOptions(ctx, r, out, unpack.Options{MaxEntrySize: maxEntrySize})
 }
 
 // RunFromArchiveList processes a list of (possibly compressed) archives through
@@ -465,7 +510,8 @@ func RunFromArchiveList(ctx context.Context, archives []ArchiveSource, cfg Confi
 		extractErrCh := make(chan error, 1)
 		archPath := arch.Path
 		go func() {
-			extractErrCh <- streamArchive(ctx, archPath, entryCh)
+			// No spill here: entries stay in memory, so the 1 GiB cap holds.
+			extractErrCh <- streamArchive(ctx, archPath, inMemoryLimit(cfg.MaxEntrySize), entryCh)
 			close(entryCh)
 		}()
 
@@ -884,15 +930,20 @@ func runFromSortedEntries(
 			continue
 		}
 
-		hashBytes, err := hex.DecodeString(fm.bulkHash)
-		if err != nil {
-			return nil, fmt.Errorf("decoding hash for %s: %w", e.FullPath, err)
-		}
-		result.CatalogEntries[i].Hash = hashBytes
 		result.CatalogEntries[i].HashAlgo = cvmfscatalog.HashSha1
 		result.CatalogEntries[i].CompAlgo = cvmfscatalog.CompZlib
 
-		// For chunked files: populate chunk records.
+		// Whole-file objects: the catalog hash is the CAS key.
+		if len(fm.chunks) == 0 {
+			hashBytes, err := hex.DecodeString(fm.bulkHash)
+			if err != nil {
+				return nil, fmt.Errorf("decoding hash for %s: %w", e.FullPath, err)
+			}
+			result.CatalogEntries[i].Hash = hashBytes
+		}
+
+		// Chunked files: the content lives in the chunks only and the bulk
+		// hash stays NULL, as CVMFS writes it without legacy bulk chunks.
 		if len(fm.chunks) > 0 {
 			chunks := make([]cvmfscatalog.ChunkRecord, len(fm.chunks))
 			for j, ch := range fm.chunks {

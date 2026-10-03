@@ -63,21 +63,15 @@ func TestValidateTLSScheme_MalformedURL(t *testing.T) {
 	}
 }
 
-// TestNew_RejectsTCPWithClientCert is a regression test for HIGH #8: connecting
-// with a tcp:// URL + client cert must fail at New() time, not silently succeed
-// with the cert ignored.
-//
-// We use a non-existent cert path so the error happens in buildTLSConfig (before
-// the scheme check), which is fine — the point is that we never get a connected
-// client with a plain-TCP URL when certs are supplied.
-func TestNew_RejectsTCPWithClientCert(t *testing.T) {
+// TestNew_RejectsTCPWithCACert: connecting with a tcp:// URL + CA cert must
+// fail at New() time, not silently succeed with the CA ignored.
+func TestNew_RejectsTCPWithCACert(t *testing.T) {
 	_, err := New(Config{
-		BrokerURL:  "tcp://localhost:1883",
-		ClientCert: "/nonexistent/cert.pem",
-		ClientKey:  "/nonexistent/key.pem",
+		BrokerURL: "tcp://localhost:1883",
+		CACert:    "/nonexistent/ca.pem",
 	})
 	if err == nil {
-		t.Fatal("New() with tcp:// + client cert should return an error, got nil")
+		t.Fatal("New() with tcp:// + CACert should return an error, got nil")
 	}
 }
 

@@ -44,7 +44,8 @@ type CommitRequest struct {
 	// CatalogHash is the SHA-1 hash of the CVMFS root catalog (gateway mode).
 	// Unused when AllCatalogHashes are passed via ObjectHashes.
 	CatalogHash string
-	// OldRootHash is the plain hex SHA-1 of the previous root catalog (no suffix).
+	// OldRootHash is the previous root catalog hash as FetchManifestRootHash
+	// returns it: hex digest, algorithm suffix (none for SHA-1), then "C".
 	OldRootHash string
 	// NewRootHashSuffixed is the SHA-1 root catalog hash with CVMFS catalog
 	// content-type suffix 'C' appended (e.g. "abc123...C", 41 chars).  This is

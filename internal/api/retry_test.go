@@ -46,7 +46,11 @@ func TestRetryAt(t *testing.T) {
 		{name: "coarse member", window: 24 * time.Hour, err: transient, coarse: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			o, _ := minimalOrch(t, &noopBackend{})
+			var be lease.Backend = &noopBackend{}
+			if tc.coarse {
+				be = &pipelineBackend{} // only a pipeline backend accumulates
+			}
+			o, _ := minimalOrch(t, be)
 			o.RetryWindow = tc.window
 			j := &job.Job{ID: "j", State: job.StateCommitting, Attempts: tc.attempts,
 				CreatedAt: time.Now().Add(-tc.age)}
@@ -180,12 +184,16 @@ func TestRecover_ResumesWaitingJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	j.TarPath = filepath.Join(sp.JobDir(j), "payload.tar")
-	if err := o.Recover(context.Background(), j, true); err != nil {
-		t.Fatalf("Recover: %v", err)
+	srv := New(o.Obs, "", o, sp, o.Notify, sp.Root, "", 0, 0)
+	if err := srv.RecoverJob(context.Background(), j, true); err != nil {
+		t.Fatalf("RecoverJob: %v", err)
 	}
-	got, err := sp.FindJob("w")
-	if err != nil || got.State != job.StatePublished || got.InterruptCount != 0 {
-		t.Fatalf("after Recover: %+v, %v", got, err)
+	got := waitTerminal(t, sp, "w")
+	if got.State != job.StatePublished || got.InterruptCount != 0 {
+		t.Fatalf("after RecoverJob: %+v", got)
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

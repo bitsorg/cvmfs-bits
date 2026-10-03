@@ -5,6 +5,8 @@ package main
 
 import (
 	"crypto/tls"
+	"fmt"
+	"net"
 
 	mqttbroker "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -12,6 +14,21 @@ import (
 
 	"cvmfs.io/prepub/pkg/observe"
 )
+
+// localBrokerURL is the URL the publisher's own clients use to reach the
+// embedded broker listening on wsAddr: always localhost, on the listener's
+// port, whatever host it is bound to (":1882", "0.0.0.0:1882", "[::]:1882").
+func localBrokerURL(wsAddr string, useTLS bool) (string, error) {
+	_, port, err := net.SplitHostPort(wsAddr)
+	if err != nil || port == "" {
+		return "", fmt.Errorf("embedded broker address %q: want host:port or :port", wsAddr)
+	}
+	scheme := "ws"
+	if useTLS {
+		scheme = "wss"
+	}
+	return scheme + "://" + net.JoinHostPort("localhost", port), nil
+}
 
 // startEmbeddedBroker starts an in-process Mochi MQTT broker exposing a single
 // WebSocket listener, so the pull control plane runs ON Stratum 0 with no

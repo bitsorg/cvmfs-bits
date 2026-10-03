@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/pkg/observe"
 )
@@ -31,6 +32,10 @@ type staticDiscovery struct {
 }
 
 func (d *staticDiscovery) Discovery(_ context.Context, repo string) (serve.Discovery, bool, error) {
+	// Never sign a document naming an invalid repository.
+	if broker.ValidateRepo(repo) != nil {
+		return serve.Discovery{}, false, nil
+	}
 	// The control-plane endpoint is identical for every repo this Stratum 0
 	// serves, so answer for any requested repo (the receiver only needs
 	// ControlPlane.URL). Repos echoes the configured list when known.
@@ -49,7 +54,7 @@ func (d *staticDiscovery) Discovery(_ context.Context, repo string) (serve.Disco
 // fetchDiscovery GETs the signed discovery document for repo from the fixed S0
 // endpoint base, e.g. base + "/cvmfs/<repo>/.cvmfsbits". A per-request timeout
 // bounds the call.
-func fetchDiscovery(ctx context.Context, base, repo string) (serve.Discovery, error) {
+func fetchDiscovery(ctx context.Context, client *http.Client, base, repo string) (serve.Discovery, error) {
 	url := strings.TrimRight(base, "/") + "/cvmfs/" + repo + "/.cvmfsbits"
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -57,7 +62,7 @@ func fetchDiscovery(ctx context.Context, base, repo string) (serve.Discovery, er
 	if err != nil {
 		return serve.Discovery{}, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return serve.Discovery{}, err
 	}
@@ -74,13 +79,13 @@ func fetchDiscovery(ctx context.Context, base, repo string) (serve.Discovery, er
 
 // fetchDiscoveryWithRetry retries with capped exponential backoff so the
 // receiver tolerates the publisher coming up after it (~60s ceiling).
-func fetchDiscoveryWithRetry(ctx context.Context, base, repo string, obs *observe.Provider) (serve.Discovery, error) {
+func fetchDiscoveryWithRetry(ctx context.Context, client *http.Client, base, repo string, obs *observe.Provider) (serve.Discovery, error) {
 	const maxWait = 60 * time.Second
 	backoff := 1 * time.Second
 	deadline := time.Now().Add(maxWait)
 	var lastErr error
 	for {
-		d, err := fetchDiscovery(ctx, base, repo)
+		d, err := fetchDiscovery(ctx, client, base, repo)
 		if err == nil {
 			return d, nil
 		}
@@ -98,6 +103,47 @@ func fetchDiscoveryWithRetry(ctx context.Context, base, repo string, obs *observ
 			backoff *= 2
 		}
 	}
+}
+
+// discoveryHTTPClient returns the client for the discovery GET: it trusts the
+// system pool plus the --broker-ca-cert CA when set, since the discovery URL
+// may be fronted by a publicly trusted server while the broker uses a private
+// CA. With --discovery-verify-key the document is authenticated by its
+// signature, not by TLS.
+func discoveryHTTPClient(caPath string) (*http.Client, error) {
+	if caPath == "" {
+		return &http.Client{Timeout: 15 * time.Second}, nil
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	return pemHTTPClient(caPath, pool)
+}
+
+// checkReceiverAuthConfig refuses --broker-auth without a discovery verify key:
+// the token would otherwise go to whatever broker an unverified document names.
+func checkReceiverAuthConfig(brokerAuth bool, verifyKey string) error {
+	if brokerAuth && verifyKey == "" {
+		return fmt.Errorf("--discovery-verify-key is required when --broker-auth is set")
+	}
+	return nil
+}
+
+// verifyDiscovery checks d's Ed25519 signature against the public key at
+// verifyKey. An empty verifyKey skips the check (unauthenticated dev setup).
+func verifyDiscovery(d serve.Discovery, verifyKey string) error {
+	if verifyKey == "" {
+		return nil
+	}
+	vf, err := ed25519VerifierFromFile(verifyKey)
+	if err != nil {
+		return fmt.Errorf("loading discovery verify key: %w", err)
+	}
+	if !d.Verify(vf) {
+		return fmt.Errorf("discovery signature verification FAILED — refusing advertised broker (possible MITM)")
+	}
+	return nil
 }
 
 // --- Asymmetric (Ed25519) discovery signing ------------------------------------

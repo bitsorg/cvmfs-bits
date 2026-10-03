@@ -6,6 +6,7 @@ package cvmfscatalog
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -197,14 +198,27 @@ func ReadPublishedFile(ctx context.Context, client *http.Client, stratum0URL, re
 			cat.Close()
 			return nil, false, nil
 		}
-		hashHex, algo, ok, lkErr := cat.LookupFileHash(abs)
+		hashHex, algo, chunks, ok, lkErr := cat.fileContent(abs)
 		cat.Close()
 		if lkErr != nil || !ok {
 			return nil, false, lkErr
 		}
-		obj, objErr := DownloadObject(ctx, client, stratum0URL, repo, hashHex, algo)
-		if objErr != nil {
-			return nil, false, fmt.Errorf("downloading %s: %w", abs, objErr)
+		if len(chunks) == 0 {
+			obj, objErr := DownloadObject(ctx, client, stratum0URL, repo, hashHex, algo)
+			if objErr != nil {
+				return nil, false, fmt.Errorf("downloading %s: %w", abs, objErr)
+			}
+			return obj, true, nil
+		}
+		// Chunked file: concatenate its chunks (CAS suffix 'P'), as the client does.
+		var obj []byte
+		for _, ch := range chunks {
+			part, objErr := fetchObject(ctx, client, stratum0URL, repo,
+				hex.EncodeToString(ch.Hash)+HashSuffix(algo)+"P")
+			if objErr != nil {
+				return nil, false, fmt.Errorf("downloading %s chunk at %d: %w", abs, ch.Offset, objErr)
+			}
+			obj = append(obj, part...)
 		}
 		return obj, true, nil
 	}

@@ -87,3 +87,51 @@ func TestReadPublishedFile(t *testing.T) {
 		}
 	}
 }
+
+// A chunked file (NULL bulk hash) is read by concatenating its 'P' chunks.
+func TestReadPublishedChunkedFile(t *testing.T) {
+	repoDir := t.TempDir()
+	parts := [][]byte{[]byte(`{"package":`), []byte(`{"hash":"abc"}}`)}
+	var chunks []ChunkRecord
+	var off int64
+	for _, p := range parts {
+		var zb bytes.Buffer
+		zw := zlib.NewWriter(&zb)
+		zw.Write(p)
+		zw.Close()
+		h, _, err := cvmfshash.HashReader(bytes.NewReader(zb.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		objPath := filepath.Join(repoDir, cvmfshash.ObjectPath(h)+"P")
+		os.MkdirAll(filepath.Dir(objPath), 0o755)
+		os.WriteFile(objPath, zb.Bytes(), 0o644)
+		raw, _ := hex.DecodeString(h)
+		chunks = append(chunks, ChunkRecord{Offset: off, Size: int64(len(p)), Hash: raw})
+		off += int64(len(p))
+	}
+
+	root := newTestCatalog(t)
+	if err := root.Upsert(Entry{FullPath: "/meta.json", Name: "meta.json", HashAlgo: HashSha1,
+		Size: off, Mode: 0o644, Mtime: time.Now().Unix(), LinkCount: 1, Chunks: chunks}); err != nil {
+		t.Fatal(err)
+	}
+	rootHash, _, err := root.Finalize(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repo/.cvmfspublished" {
+			w.Write([]byte("C" + rootHash + "\nNrepo\nS1\n--\n"))
+			return
+		}
+		http.StripPrefix("/repo/", http.FileServer(http.Dir(repoDir))).ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	got, found, err := ReadPublishedFile(context.Background(), srv.Client(), srv.URL, "repo", "meta.json")
+	want := append(append([]byte{}, parts[0]...), parts[1]...)
+	if err != nil || !found || !bytes.Equal(got, want) {
+		t.Fatalf("got (%q, %v, %v), want %q", got, found, err, want)
+	}
+}

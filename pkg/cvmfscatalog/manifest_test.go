@@ -43,48 +43,6 @@ signature and other stuff here
 	}
 }
 
-func TestParseManifestWithSHA256Suffix(t *testing.T) {
-	// Manifest with SHA-256 suffix (-)
-	manifestContent := []byte(`C713ca8a74dd20682338da781e314ac2b8ce883e4-
-D3600
-Ntestmigration.cern.ch
-S2
---
-signature
-`)
-
-	m, err := ParseManifest(manifestContent)
-	if err != nil {
-		t.Fatalf("ParseManifest failed: %v", err)
-	}
-
-	// Should strip the suffix
-	if m.RootHash != "713ca8a74dd20682338da781e314ac2b8ce883e4" {
-		t.Errorf("Expected RootHash '713ca8a74dd20682338da781e314ac2b8ce883e4', got '%s'", m.RootHash)
-	}
-}
-
-func TestParseManifestWithRipeMDSuffix(t *testing.T) {
-	// Manifest with RipeMD-160 suffix (~)
-	manifestContent := []byte(`Caabbccddeeff1122334455667788990011223344~
-D3600
-Ntestmigration.cern.ch
-S1
---
-signature
-`)
-
-	m, err := ParseManifest(manifestContent)
-	if err != nil {
-		t.Fatalf("ParseManifest failed: %v", err)
-	}
-
-	// Should strip the suffix
-	if m.RootHash != "aabbccddeeff1122334455667788990011223344" {
-		t.Errorf("Expected RootHash 'aabbccddeeff1122334455667788990011223344', got '%s'", m.RootHash)
-	}
-}
-
 func TestDownloadCatalog(t *testing.T) {
 	tmpdir := t.TempDir()
 
@@ -156,5 +114,19 @@ func TestDownloadCatalogHTTPError(t *testing.T) {
 	err := DownloadCatalog(context.Background(), server.Client(), server.URL, "testrepo", "abc123", destPath)
 	if err == nil {
 		t.Errorf("Expected error for HTTP 404")
+	}
+}
+
+// TestFetchObject_ShortName: a name too short for data/xx/rest is an error,
+// not a slice panic, and makes no request.
+func TestFetchObject_ShortName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("request made for an invalid object name")
+	}))
+	defer srv.Close()
+	for _, name := range []string{"", "a", "ab"} {
+		if _, err := fetchObject(context.Background(), srv.Client(), srv.URL, "r", name); err == nil {
+			t.Errorf("fetchObject(%q): want an error", name)
+		}
 	}
 }

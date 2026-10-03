@@ -7,6 +7,8 @@ package spool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -247,12 +249,18 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 		return fmt.Errorf("marshaling manifest: %w", err)
 	}
 
-	manifestPath := filepath.Join(jobDir, "manifest.json")
-	tmpPath := manifestPath + ".tmp"
+	return s.writeFileAtomic(jobDir, "manifest.json", data)
+}
+
+// writeFileAtomic writes dir/name (mode 0600) via a synced temp file and an
+// atomic rename, so a crash never leaves a partial file, then fsyncs dir.
+func (s *Spool) writeFileAtomic(dir, name string, data []byte) error {
+	path := filepath.Join(dir, name)
+	tmpPath := path + ".tmp"
 
 	// Write to a sibling temp file first.
 	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
-		return fmt.Errorf("writing manifest temp file: %w", err)
+		return fmt.Errorf("writing %s temp file: %w", name, err)
 	}
 
 	// Sync the temp file before renaming so the data is durable on crash.
@@ -262,20 +270,20 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 	f, err := os.OpenFile(tmpPath, os.O_RDWR, 0)
 	if err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("opening manifest temp for sync: %w", err)
+		return fmt.Errorf("opening %s temp for sync: %w", name, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return fmt.Errorf("syncing manifest temp: %w", err)
+		return fmt.Errorf("syncing %s temp: %w", name, err)
 	}
 	f.Close()
 
-	// Atomic rename — the manifest is either the old version or the new one,
+	// Atomic rename — the file is either the old version or the new one,
 	// never a partial write.
-	if err := os.Rename(tmpPath, manifestPath); err != nil {
+	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("renaming manifest: %w", err)
+		return fmt.Errorf("renaming %s: %w", name, err)
 	}
 
 	// Fsync the parent directory so the directory entry for the
@@ -283,15 +291,59 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 	// the next sync could leave the directory pointing at the old inode.
 	// Best-effort: data was already written; a sync failure here does not
 	// corrupt it, but we log it so hardware I/O errors are not silent.
-	if dir, err := os.Open(jobDir); err == nil {
-		if syncErr := dir.Sync(); syncErr != nil {
-			s.obs.Logger.Warn("fsync parent directory after manifest rename failed",
-				"path", jobDir, "error", syncErr)
+	if d, err := os.Open(dir); err == nil {
+		if syncErr := d.Sync(); syncErr != nil {
+			s.obs.Logger.Warn("fsync parent directory after rename failed",
+				"path", dir, "error", syncErr)
 		}
-		dir.Close()
+		d.Close()
 	}
 
 	return nil
+}
+
+// ProvenanceRecordFile is the sidecar, beside manifest.json, holding the
+// exact signed provenance record. It lives in the job directory, so it moves
+// with the job through every state rename.
+const ProvenanceRecordFile = "provenance-record.json"
+
+// WriteProvenanceRecord stores the exact signed provenance record in the
+// job's sidecar and points j.Provenance at it by name and SHA-256, keeping
+// the (possibly large) record out of the manifest. The caller persists the
+// manifest.
+func (s *Spool) WriteProvenanceRecord(j *job.Job, signed []byte) error {
+	if j.Provenance == nil {
+		return fmt.Errorf("job %s has no provenance", j.ID)
+	}
+	if err := s.writeFileAtomic(s.JobDir(j), ProvenanceRecordFile, signed); err != nil {
+		return err
+	}
+	sum := sha256.Sum256(signed)
+	j.Provenance.SignedRecordFile = ProvenanceRecordFile
+	j.Provenance.SignedRecordSHA256 = hex.EncodeToString(sum[:])
+	return nil
+}
+
+// ReadProvenanceRecord returns the job's signed provenance record from its
+// sidecar, checked against the manifest's SHA-256. It returns nil, nil when
+// the job has none.
+func (s *Spool) ReadProvenanceRecord(j *job.Job) ([]byte, error) {
+	p := j.Provenance
+	if p == nil || p.SignedRecordFile == "" {
+		return nil, nil
+	}
+	if filepath.Base(p.SignedRecordFile) != p.SignedRecordFile {
+		return nil, fmt.Errorf("job %s: bad provenance record file name %q", j.ID, p.SignedRecordFile)
+	}
+	data, err := os.ReadFile(filepath.Join(s.JobDir(j), p.SignedRecordFile))
+	if err != nil {
+		return nil, fmt.Errorf("reading provenance record: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != p.SignedRecordSHA256 {
+		return nil, fmt.Errorf("job %s: provenance record does not match its SHA-256", j.ID)
+	}
+	return data, nil
 }
 
 // findJobDir returns the actual on-disk directory for a job, regardless of

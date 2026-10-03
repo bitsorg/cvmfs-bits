@@ -1,12 +1,10 @@
 # docker-compose.yml – cvmfs-bits ↔ cvmfs_gateway integration stack
 #
 # Brings up the minimum needed to exercise cvmfs-prepub publishing against a
-# real cvmfs_gateway + cvmfs_receiver, backed by S3 (Garage).  It combines two
-# fixtures from the cvmfs source tree (checked out at $CVMFS_SRC):
-#
-#   • the S3 backend from  test/common/container/s3-integration      (Garage)
-#   • a MOUNTLESS gateway  test/common/container/publish-mountless   (no FUSE,
-#     no systemd, no privileged) built from cvmfs@devel
+# real cvmfs_gateway + cvmfs_receiver, backed by S3 (Garage).  It reuses the
+# test/common/container/publish-mountless fixture from the cvmfs source tree
+# (checked out at $CVMFS_SRC): its Garage config and setup script, and its
+# MOUNTLESS gateway (no FUSE, no systemd, no privileged) built from cvmfs@devel.
 #
 # Unlike publish-mountless, there is NO cvmfs publisher container here: the
 # publisher is cvmfs-prepub, which talks the gateway lease/payload/commit API

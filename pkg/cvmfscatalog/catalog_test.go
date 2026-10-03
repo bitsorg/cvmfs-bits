@@ -29,17 +29,17 @@ func TestCreateAndUpsert(t *testing.T) {
 	// Upsert a file entry
 	now := time.Now().Unix()
 	fileEntry := Entry{
-		FullPath: "/test.txt",
-		Name:     "test.txt",
-		Hash:     []byte("test_hash_value_1234567890123456"),
-		HashAlgo: HashSha256,
-		CompAlgo: CompZlib,
-		Size:     1024,
-		Mode:     0o100644,
-		Mtime:    now,
-		MtimeNs:  0,
-		UID:      1000,
-		GID:      1000,
+		FullPath:  "/test.txt",
+		Name:      "test.txt",
+		Hash:      []byte("test_hash_value_1234567890123456"),
+		HashAlgo:  HashSha1,
+		CompAlgo:  CompZlib,
+		Size:      1024,
+		Mode:      0o100644,
+		Mtime:     now,
+		MtimeNs:   0,
+		UID:       1000,
+		GID:       1000,
 		LinkCount: 1,
 	}
 
@@ -130,8 +130,21 @@ func TestSymlinkEntry(t *testing.T) {
 	if symlink != "/target" {
 		t.Errorf("Expected symlink '/target', got '%s'", symlink)
 	}
-	if (flags & FlagLink) == 0 {
-		t.Errorf("FlagLink not set in flags: %d", flags)
+	// CVMFS writes symlinks as kFlagFile|kFlagLink (catalog_sql.cc).
+	if flags != FlagFile|FlagLink {
+		t.Errorf("symlink flags = %d, want %d", flags, FlagFile|FlagLink)
+	}
+	// Counted as a symlink, not as a regular file.
+	if cat.delta.SelfSymlink != 1 || cat.delta.SelfRegular != 0 {
+		t.Errorf("delta symlink=%d regular=%d, want 1 and 0",
+			cat.delta.SelfSymlink, cat.delta.SelfRegular)
+	}
+	if err := cat.Remove("/link"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if cat.delta.SelfSymlink != 0 || cat.delta.SelfRegular != 0 {
+		t.Errorf("after remove: symlink=%d regular=%d, want 0 and 0",
+			cat.delta.SelfSymlink, cat.delta.SelfRegular)
 	}
 }
 

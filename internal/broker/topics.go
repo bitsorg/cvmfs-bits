@@ -67,11 +67,32 @@ func validTopicSegment(name, value string) error {
 	return nil
 }
 
-// ValidateRepo returns an error if repo is not a valid MQTT topic segment.
-// Call this at the API boundary (job submission) so that downstream topic
-// constructors — which panic on invalid input — never receive bad data.
+// MaxRepoNameLen is the longest repository name CVMFS accepts
+// (is_valid_repo_name in cvmfs_server, RepositorySanitizer in the client).
+const MaxRepoNameLen = 60
+
+// ValidateRepo returns an error unless repo is a valid CVMFS fully qualified
+// repository name: at most 60 of [A-Za-z0-9._-], starting with a letter or
+// digit, not ending in '.', and without "..". Call it wherever a caller-
+// supplied name reaches a path, URL or topic (topic constructors panic).
 func ValidateRepo(repo string) error {
-	return validTopicSegment("repo", repo)
+	if err := validTopicSegment("repo", repo); err != nil {
+		return err
+	}
+	if len(repo) > MaxRepoNameLen {
+		return fmt.Errorf("broker: repo %q is longer than %d characters", repo, MaxRepoNameLen)
+	}
+	for i := 0; i < len(repo); i++ {
+		c := repo[i]
+		alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+		if !alnum && (i == 0 || (c != '.' && c != '-' && c != '_')) {
+			return fmt.Errorf("broker: repo %q is not a valid repository name (letters, digits, '.', '-', '_'; must start with a letter or digit)", repo)
+		}
+	}
+	if strings.HasSuffix(repo, ".") || strings.Contains(repo, "..") {
+		return fmt.Errorf("broker: repo %q must not end in '.' or contain \"..\"", repo)
+	}
+	return nil
 }
 
 // ValidateNodeID returns an error if nodeID is not a valid MQTT topic segment.

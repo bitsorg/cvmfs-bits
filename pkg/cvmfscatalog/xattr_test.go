@@ -20,7 +20,7 @@ func TestSyntheticAttrsRegularFile(t *testing.T) {
 	e := &Entry{
 		Mode:     0o100644,
 		Hash:     hashBytes,
-		HashAlgo: HashSha256,
+		HashAlgo: HashRipeMD160,
 		CompAlgo: CompZlib,
 	}
 
@@ -29,8 +29,8 @@ func TestSyntheticAttrsRegularFile(t *testing.T) {
 		t.Fatal("SyntheticAttrs returned nil for a regular file with a hash")
 	}
 
-	// user.cvmfs.hash must be hex hash with SHA-256 suffix "-".
-	wantHash := hex.EncodeToString(hashBytes) + "-"
+	// user.cvmfs.hash must be hex hash with the RIPEMD-160 suffix.
+	wantHash := hex.EncodeToString(hashBytes) + "-rmd160"
 	if got := string(m["user.cvmfs.hash"]); got != wantHash {
 		t.Errorf("user.cvmfs.hash: want %q, got %q", wantHash, got)
 	}
@@ -51,7 +51,7 @@ func TestSyntheticAttrsCompNone(t *testing.T) {
 	e := &Entry{
 		Mode:     0o100644,
 		Hash:     []byte("12345678901234567890123456789012"),
-		HashAlgo: HashSha256,
+		HashAlgo: HashSha1,
 		CompAlgo: CompNone,
 	}
 	m := SyntheticAttrs(e)
@@ -68,8 +68,7 @@ func TestSyntheticAttrsChunkedFile(t *testing.T) {
 
 	e := &Entry{
 		Mode:     0o100644,
-		Hash:     []byte("bulk_hash_placeholder_32bytes!!!"),
-		HashAlgo: HashSha256,
+		HashAlgo: HashShake128,
 		CompAlgo: CompZlib,
 		Chunks: []ChunkRecord{
 			{Offset: 0, Size: 4096, Hash: chunk0Hash},
@@ -78,6 +77,10 @@ func TestSyntheticAttrsChunkedFile(t *testing.T) {
 	}
 
 	m := SyntheticAttrs(e)
+	// No bulk hash: like the CVMFS client, no user.cvmfs.hash.
+	if _, ok := m["user.cvmfs.hash"]; ok {
+		t.Error("user.cvmfs.hash must be absent for a chunked file")
+	}
 	cl, ok := m["user.cvmfs.chunk_list"]
 	if !ok {
 		t.Fatal("user.cvmfs.chunk_list missing for chunked file")
@@ -88,12 +91,12 @@ func TestSyntheticAttrsChunkedFile(t *testing.T) {
 		t.Fatalf("expected 2 chunk lines, got %d: %q", len(lines), cl)
 	}
 
-	wantLine0 := "0:4096:" + hex.EncodeToString(chunk0Hash) + "-"
+	wantLine0 := "0:4096:" + hex.EncodeToString(chunk0Hash) + "-shake128"
 	if lines[0] != wantLine0 {
 		t.Errorf("chunk line 0: want %q, got %q", wantLine0, lines[0])
 	}
 
-	wantLine1 := "4096:1024:" + hex.EncodeToString(chunk1Hash) + "-"
+	wantLine1 := "4096:1024:" + hex.EncodeToString(chunk1Hash) + "-shake128"
 	if lines[1] != wantLine1 {
 		t.Errorf("chunk line 1: want %q, got %q", wantLine1, lines[1])
 	}

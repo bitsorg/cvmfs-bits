@@ -346,10 +346,12 @@ func bindingStateFrom(r *http.Request) *bindingState {
 	return st
 }
 
-// signingKeyID is the key identifier this deployment expects. A fixed value is
+// SigningKeyID is the key identifier this deployment expects. A fixed value is
 // enough while there is one shared secret; the field exists so that adding a
 // second key later does not change the wire format.
-func (s *Server) signingKeyID() string { return "prepub" }
+const SigningKeyID = "prepub"
+
+func (s *Server) signingKeyID() string { return SigningKeyID }
 
 // rejectAuth logs and returns 401 with a body that says what to fix. The
 // distinction between "no credential", "wrong credential" and "wrong KIND of

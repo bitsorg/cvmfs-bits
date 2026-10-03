@@ -166,6 +166,33 @@ func TestPipelineChunkedFileMetaIsCorrect(t *testing.T) {
 			t.Errorf("chunk %d: expected non-empty Hash", i)
 		}
 	}
+	// CVMFS leaves a chunked file's bulk hash NULL.
+	if chunkedEntry.Hash != nil {
+		t.Errorf("chunked entry Hash = %x, want nil", chunkedEntry.Hash)
+	}
+	if _, ok := chunkedEntry.Xattr["user.cvmfs.hash"]; ok {
+		t.Error("chunked entry must not carry user.cvmfs.hash")
+	}
+}
+
+// A file below the chunk size keeps its whole-file hash.
+func TestPipelineWholeFileKeepsHash(t *testing.T) {
+	obs := newTestObs(t)
+	cfg := Config{Workers: 1, ChunkSize: 1 << 20, CAS: fakecas.New(obs), SpoolDir: t.TempDir(), Obs: obs}
+	result, err := RunFromReader(context.Background(),
+		bytes.NewReader(buildTar([]struct{ name, content string }{{"small.txt", "hello"}})), cfg)
+	if err != nil {
+		t.Fatalf("RunFromReader: %v", err)
+	}
+	for _, e := range result.CatalogEntries {
+		if e.Name == "small.txt" {
+			if len(e.Hash) != 20 || len(e.Chunks) != 0 {
+				t.Errorf("hash=%x chunks=%d, want a 20-byte hash and no chunks", e.Hash, len(e.Chunks))
+			}
+			return
+		}
+	}
+	t.Fatal("small.txt not found")
 }
 
 // ── Prefetch tests ────────────────────────────────────────────────────────────

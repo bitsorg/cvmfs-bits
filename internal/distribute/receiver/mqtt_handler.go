@@ -46,7 +46,7 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 			"topic", msg.Topic, "payload_id", ann.PayloadID)
 		return
 	}
-	if !r.servesRepo(ann.Repo) {
+	if broker.ValidateRepo(ann.Repo) != nil || !r.servesRepo(ann.Repo) {
 		return
 	}
 	if r.pullCoordinator != nil {
@@ -82,7 +82,8 @@ func (r *Receiver) mqttPublishedHandler(msg *broker.Message) {
 		return
 	}
 
-	if !r.servesRepo(pm.Repo) {
+	// The repo name goes into the pull URL: drop one that is not a valid name.
+	if broker.ValidateRepo(pm.Repo) != nil || !r.servesRepo(pm.Repo) {
 		// Not our repo — ignore silently (topic ACLs should prevent this).
 		return
 	}

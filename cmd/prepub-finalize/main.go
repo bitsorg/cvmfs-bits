@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 CERN
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 
 // Command prepub-finalize publishes a build's accumulated packages in one
 // ingestsql commit (coarse publish). It runs on the release-manager

@@ -50,7 +50,8 @@ and why, start with [README.md](README.md).
   `cvmfs-server` package (`cvmfs_server`, `cvmfs_swissknife`) on the publisher.
 - Spool disk: job state plus the unpacked content of the packages in progress.
   Size it for the largest package times the concurrent jobs, plus
-  `spool_min_free_gib` (default 20 GiB), below which uploads are refused.
+  `spool_min_free_gib` (default 20 GiB; `0` disables the check), below which
+  uploads are refused.
 
 ### 1.3 Ports
 
@@ -58,7 +59,7 @@ and why, start with [README.md](README.md).
 |---|---|---|---|---|
 | REST API, web console, discovery, pull manifests and objects | `:8080` | `--listen` / `server.listen` | producers, Stratum 1 receivers, monitoring | plain HTTP ([section 5.4](#54-tls-in-front-of-the-api)) |
 | Embedded broker (MQTT over WebSocket) | off, e.g. `:1882` | `--embedded-broker-ws-addr` | Stratum 1 receivers | pre-warming only; `wss://` with a certificate |
-| Enroll / revoke (HTTPS) | off, e.g. `:8443` | `--enroll-tls-addr` | Stratum 1 receivers, `cvmfs-prepub revoke` | pre-warming only |
+| Enroll / revoke (HTTPS) | off, e.g. `:8443` | `--enroll-tls-addr` | Stratum 1 receivers, `cvmfs-prepub revoke` | pre-warming only; revoke also works on the API port |
 | pprof debug listener | off, e.g. `127.0.0.1:6060` | `--debug-listen` / `server.debug_listen` | an operator on the host | keep on loopback |
 | Receiver `/metrics` | `:9100` | `--control-addr` / `control_addr` | Prometheus | plain HTTP, receiver mode |
 
@@ -79,6 +80,10 @@ cd cvmfs-bits
 make build            # -> bin/cvmfs-prepub
 ```
 
+`make build` stamps the version from `git describe --tags --always --dirty`
+(override with `make build VERSION=...`); `bin/cvmfs-prepub --version` prints
+it.
+
 Other targets: `make test` (unit tests with the race detector), `make lint`
 (`go fmt`, `go vet`), `make run-sim` (in-process cluster simulation) and
 `make clean`. To build for another platform: `GOOS=linux GOARCH=amd64 make build`.
@@ -95,10 +100,15 @@ sudo ./install.sh --mode receiver --skip-service   # on a Stratum 1
 ```
 
 The action is `install` (default), `update` ([section 11](#11-upgrading)) or
-`uninstall` ([section 12](#12-uninstalling)). Use `--skip-service` on a first
-install: the generated configuration has no secrets yet, so a service started
-straight away exits on the missing `PREPUB_API_TOKEN` and the script's health
-check reports an error.
+`uninstall` ([section 12](#12-uninstalling)). When the run writes
+`config.yaml` or `receiver.yaml` from the template, it enables that unit but
+does not start it: configure it, then `systemctl start` it. An install over an
+existing configuration starts the unit. The script then checks each unit it
+started: the publisher's `/api/v1/health` on `server.listen` (default `:8080`;
+an error if it does not answer), and the receiver's `/metrics` on
+`control_addr` (default `:9100`), retried for up to 60 s because the receiver
+opens it only after discovery succeeds (a warning, not an error, if it stays
+down; check `journalctl`).
 
 | Option | Actions | Meaning |
 |---|---|---|
@@ -109,7 +119,8 @@ check reports an error.
 | `--spool-dir DIR` | install, update | spool root ([section 2.4](#24-service-account-and-spool-location)) |
 | `--purge-legacy` | install, uninstall | remove the legacy bits-console spool daemon without asking ([section 2.5](#25-legacy-bits-console-spool-daemon)) |
 | `--legacy-spool DIR` | install, uninstall | legacy spool location (default `/mnt/build/bits/spool`) |
-| `--keep-spool`, `--keep-cas`, `--keep-user` | uninstall | preserve the spool, the CAS directory, the account |
+| `--keep-spool`, `--keep-user` | uninstall | preserve the spool, the account |
+| `--purge-cas` | uninstall | also delete the CAS directory (kept by default; `--keep-cas` is accepted and does nothing) |
 | `--dry-run` | all | print the actions only |
 | `--yes`, `-y` | all | no confirmation prompts |
 | `--help` | all | full usage |
@@ -122,7 +133,7 @@ check reports an error.
 | `/etc/cvmfs-prepub/` and `/etc/cvmfs-prepub/tls/` | `root:cvmfs-prepub` | 0750 | both modes |
 | `/etc/cvmfs-prepub/config.yaml` (template; never overwritten) | `root:cvmfs-prepub` | 0640 | publisher |
 | `/etc/cvmfs-prepub/receiver.yaml` (template; never overwritten) | `root:cvmfs-prepub` | 0640 | receiver |
-| `/etc/cvmfs-prepub/env` (secrets skeleton; never overwritten) | `root:cvmfs-prepub` | 0600 | both modes |
+| `/etc/cvmfs-prepub/env` (secrets skeleton; never overwritten): `CVMFS_GATEWAY_SECRET`, `PREPUB_API_TOKEN`, `CVMFS_GATEWAY_KEY_ID` for a publisher, `S1_NODE_KEY` (with the `node-key` command) for a receiver, both for `--mode all` | `root:cvmfs-prepub` | 0600 | both modes |
 | spool (default `/var/spool/cvmfs-prepub`) and its `tmp/` | service user | 0700 | publisher |
 | publisher CAS directory (`cas.root`, default `/srv/cvmfs/cas`) | service user | 0750 | publisher |
 | receiver CAS directory (`cas.root`, default `/srv/cvmfs/stratum1/cas`) | service user | 0750 | receiver |
@@ -250,7 +261,7 @@ ingest_env:
   - LD_LIBRARY_PATH=/opt/cvmfs/lib
 
 pipeline:
-  workers: 2                       # peak memory scales with workers x largest file
+  workers: 2                       # peak memory scales with workers (section 10.8)
   upload_concurrency: 4
 
 allowed_publish_prefixes:
@@ -258,8 +269,9 @@ allowed_publish_prefixes:
 ```
 
 Every key is optional: an absent key, an empty string or a zero keeps the flag
-default, and a command-line flag overrides the file (which is read because the
-unit passes `--config`). Unknown keys are ignored without a warning, so check
+default (except `retry_window` and `spool_min_free_gib`, where `0` disables),
+and a command-line flag overrides the file (which is read because the unit
+passes `--config`). Unknown keys are ignored without a warning, so check
 spelling against [REFERENCE.md](REFERENCE.md#3-publisher-configuration), which
 lists every key with its flag, environment variable and default. For a local CAS
 use `cas: {type: localfs, root: /srv/cvmfs/cas}`, pointing at the store the
@@ -346,7 +358,7 @@ list what a node offers:
   compresses and uploads, then takes a short gateway lease for the commit; in
   local mode the tar is extracted inside `cvmfs_server transaction`.
 - `ingest`: offered with `ingest_publish: true` ([section 4.3](#43-the-ingest-path)).
-- `staged`: offered in gateway mode; works only with an S3 CAS
+- `staged`: offered in gateway mode with an S3 CAS
   ([section 4.4](#44-the-staged-path)).
 
 Coarse builds and pre-warming exist only on the `prepub` path in gateway mode;
@@ -379,9 +391,10 @@ gateway secrets are not used.
 The service user must be allowed to run `cvmfs_server` for the repository
 (`install.sh` adds it to the `cvmfs` group when the group exists). Jobs on one
 repository are serialised; different repositories publish in parallel. Coarse
-publishing and pre-warming need the pipeline and therefore gateway mode; have
-producers on a local-mode node submit without coarse accumulation
-(`coarse=false`, or `PREPUB_COARSE=false` in bits-console).
+publishing and pre-warming need the pipeline and therefore gateway mode. Local
+mode publishes every job on arrival even when it carries `build_id` or
+`coarse=true`, and answers a build seal with a harmless `200` (`per_package:
+true`), so producers need no change.
 
 ### 4.3 The ingest path
 
@@ -424,11 +437,11 @@ into a new area fails with "failed to graft nested catalog".
 
 ### 4.4 The staged path
 
-Offered automatically in gateway mode, but it works only with `cas.type: s3`
-(the objects are promoted by server-side copy inside the store). The producer
-prepares the package itself and submits `publish_path=staged` with
-`staging_prefix` and `catalog_hash` and no tar. Producer-side requirements for
-bits-console are listed in the CI template
+Offered in gateway mode with `cas.type: s3` (the objects are promoted by
+server-side copy inside the store); without an S3 CAS it is not offered and a
+staged submission gets `400`. The producer prepares the package itself and
+submits `publish_path=staged` with `staging_prefix` and `catalog_hash` and no
+tar. Producer-side requirements for bits-console are listed in the CI template
 ([section 8](#8-bits-console-integration)). `promote_workers` (default 16) sets
 the copy concurrency ([section 10.8](#108-tuning)).
 
@@ -699,14 +712,15 @@ ExecStart=/usr/local/bin/cvmfs-prepub --config /etc/cvmfs-prepub/receiver.yaml -
 
 Then `sudo systemctl enable --now cvmfs-prepub-receiver`.
 
-`repos` must not be empty: the receiver fetches discovery for the first
-repository listed and acts only on announcements for the listed repositories.
-Always use `--broker-auth` with `--discovery-verify-key`; the discovery
-signature is checked only under `--broker-auth`. Pulled objects are stored under
-`cas.root` in the CVMFS data layout. The receiver's only secret is
-`S1_NODE_KEY`. Transfer tuning (`--pull-concurrency`, `--pull-files-per-request`,
-`--pull-auto`) and all receiver keys are in
-[REFERENCE.md](REFERENCE.md#4-receiver-configuration).
+`repos` is required (the receiver does not start without it): the receiver
+fetches discovery for the first repository listed and acts only on announcements
+for the listed repositories. The discovery signature is checked whenever
+`--discovery-verify-key` is set, and `--broker-auth` requires it.
+`broker_ca_cert` is also trusted, besides the system CAs, for an `https://`
+discovery URL. Pulled objects are stored under `cas.root` in the CVMFS data
+layout. The receiver's only secret is `S1_NODE_KEY`. Transfer tuning
+(`--pull-concurrency`, `--pull-files-per-request`, `--pull-auto`) and all
+receiver keys are in [REFERENCE.md](REFERENCE.md#4-receiver-configuration).
 
 ### 7.5 Verify
 
@@ -719,16 +733,30 @@ signature is checked only under `--broker-auth`. Pulled objects are stored under
 
 ### 7.6 Revoke a receiver
 
+Through the API port (needs `PREPUB_API_TOKEN` set on the publisher and
+`auth_mode` `both` or `hmac`):
+
+```sh
+sudo sh -c 'set -a; . /etc/cvmfs-prepub/env; /usr/local/bin/cvmfs-prepub revoke stratum1-a \
+  --api-url http://localhost:8080'
+```
+
+or through the enroll listener (`--enroll-tls-addr`), signed with
+`PREPUB_HMAC_SECRET`:
+
 ```sh
 sudo sh -c 'set -a; . /etc/cvmfs-prepub/env; /usr/local/bin/cvmfs-prepub revoke stratum1-a \
   --enroll-url https://s0.example.org:8443 --ca-cert /etc/cvmfs-prepub/tls/ca.crt'
 ```
 
-This needs the enroll listener (`--enroll-tls-addr`). The node is put on a
-denylist and its live broker sessions are closed. The denylist is held in
-memory, so it lasts until the publisher restarts; to exclude a node
-permanently, also rotate `PREPUB_HMAC_SECRET`, issue new keys to the remaining
-receivers and restart.
+The node is put on a denylist and its live broker sessions are closed. The
+denylist is saved in `<spool_root>/revoked-nodes.json` and survives restarts
+(an uninstall without `--keep-spool` deletes it). To readmit the node, run
+the same command with `--undo` (`cvmfs-prepub revoke --undo stratum1-a ...`);
+it uses the separate unrevoke route (`/api/v1/control/unrevoke` or
+`/control/unrevoke`) and fails against a publisher that predates it.
+Command and answers are in
+[REFERENCE.md](REFERENCE.md#enrollment-and-broker-authentication).
 
 ---
 
@@ -821,18 +849,18 @@ submission) runs out, unless the failure is permanent (for example a conflict
 with already published content) or the job was aborted. Coarse-build members
 and finalize jobs are not retried. `GET /api/v1/jobs/{id}` shows `attempts`,
 `last_error` and `next_attempt_at`, and `cvmfs_prepub_spool_jobs_waiting_retry`
-counts waiting jobs. Turn retries off with the flag `--retry-window=0` (a zero in
-YAML means "default"). The schedule is in
+counts waiting jobs. Turn retries off with `retry_window: 0` (or
+`--retry-window=0`). The schedule is in
 [REFERENCE.md](REFERENCE.md#2-job-lifecycle).
 
 ### 10.3 Restarts and recovery
 
-A restart is safe: at startup every job in a non-terminal state is resumed, a
-clean stop does not count against the job, and a job that repeatedly crashes the
-service is eventually failed instead of crash-looping it
-([REFERENCE.md](REFERENCE.md#2-job-lifecycle)). On stop the service waits up to
-30 s for requests to drain. The unit has no reload action; configuration
-changes need a restart.
+A restart is safe: at startup every job in a non-terminal state is resumed under
+the normal concurrency limit, a clean stop does not count against the job, and a
+job that repeatedly crashes the service is eventually failed instead of
+crash-looping it ([REFERENCE.md](REFERENCE.md#2-job-lifecycle)). On stop the
+service waits up to 30 s for requests to drain. The unit has no reload action;
+configuration changes need a restart.
 
 ### 10.4 Aborting a job
 
@@ -890,14 +918,19 @@ spool device is saturated, no concurrency setting helps.
 | `pipeline.prefetch` | on | turn off on I/O-bound storage, where the look-ahead doubles disk I/O |
 | `promote_workers` | 16 | staged path only; mind the 256-connection pool per S3 host shared with uploads |
 
-Peak memory scales with `pipeline.workers` times the largest file being
-compressed. The unit's `MemoryHigh=2G` and `MemoryMax=3G` suit `workers: 2` on
-an 8 GB host shared with a gateway; at 4 workers a large package can exceed
-`MemoryMax` and systemd kills the service. On a dedicated host raise the workers
-and both limits together, in a drop-in (`[Service]`, `MemoryHigh=6G`,
-`MemoryMax=8G`). Leave `chunking` at its fixed 6 MiB: coarse publish requires
-it. Job-slot limits, prefetch budget and the environment-variable equivalents are
-in [REFERENCE.md](REFERENCE.md#3-publisher-configuration); the startup line
+Peak memory scales with `pipeline.workers`: on the default fixed chunk grid each
+worker streams one 6 MiB block at a time. With `pipeline.prefetch` off, or a
+job over the prefetch budget, the inline path keeps every file of up to 1 GiB
+in memory for the whole job, i.e. roughly the unpacked package; with
+content-defined chunking each worker also holds a whole file
+([REFERENCE.md](REFERENCE.md#pipeline)). The unit's `MemoryHigh=2G` and
+`MemoryMax=3G` suit `workers: 2` on an 8 GB host shared with a gateway; with
+more workers and files held whole, a large package can exceed `MemoryMax` and
+systemd kills the service. On a dedicated host raise the workers and both limits
+together, in a drop-in (`[Service]`, `MemoryHigh=6G`, `MemoryMax=8G`). Leave
+`chunking` at its fixed 6 MiB: coarse publish requires it. Job-slot limits,
+prefetch budget and the environment-variable equivalents are in
+[REFERENCE.md](REFERENCE.md#3-publisher-configuration); the startup line
 `publisher tuning` shows the values in effect.
 
 ### 10.9 Common problems
@@ -908,7 +941,7 @@ in [REFERENCE.md](REFERENCE.md#3-publisher-configuration); the startup line
 | `gateway URL must use HTTPS` | non-loopback `http://` gateway | HTTPS or `gateway.allow_plaintext: true` |
 | `startup probe failed` or `failed to load S3 settings` | CAS not writable or S3 config missing or too permissive; gateway unreachable or key rejected; `cvmfs_server` missing | read the error; [section 3](#3-deploy-a-publisher) steps 2 and 4 |
 | CI green but nothing published | finalize not configured | set `ingest_config_prefix`; check `finalize_ready` |
-| Every submission 400 naming a publish path | node does not offer that path | `ingest_publish: true`; `staged` is offered in gateway mode but fails at run time without `cas.type: s3` |
+| Every submission 400 naming a publish path | node does not offer that path | `ingest_publish: true`; `staged` needs gateway mode with `cas.type: s3` |
 | 401 on signed requests | token mismatch, clock skew, or a proxy path prefix | compare tokens, check NTP, sign the prefixed path |
 | 403 on submit | target outside `allowed_publish_prefixes` | extend the list or fix the path |
 | Commit fails with a graft error | gateway without the graft endpoint | `gateway.direct_graft: false` |
@@ -922,16 +955,23 @@ in [REFERENCE.md](REFERENCE.md#3-publisher-configuration); the startup line
 git pull && make build
 sudo ./install.sh update --dry-run     # shows exactly what would change
 sudo ./install.sh update
-curl -s http://localhost:8080/api/v1/health | jq
+curl -s http://localhost:8080/api/v1/health | jq     # publisher
+curl -s http://localhost:9100/metrics | head        # receiver (control_addr)
 ```
 
-`update` refuses to run on a host that is not installed and never writes
-configuration. It preserves `config.yaml`, `env`, `receiver.yaml`, TLS material,
-spool, CAS, the service account and each unit's enabled and running state. It
-replaces the binary, and a unit file only if its content differs from the
-shipped template, after copying the old one to `<unit>.bak-<timestamp>`.
-Running services are stopped for the swap and restarted; stopped ones stay
-stopped. If the shipped config template has top-level keys your `config.yaml`
+Without `--mode`, `update` works on the roles whose unit files are installed in
+`/etc/systemd/system` (both units → `all`, one → that role) and refuses to run
+when neither is installed; a unit for a role that is not installed is added
+only when `--mode` names it. `update` prints the installed and the new version
+(`cvmfs-prepub --version`; `(unknown)` for an old binary without the flag), and
+the next steps for the roles updated. It refuses to run on a host that is not
+installed and never writes configuration. It preserves
+`config.yaml`, `env`, `receiver.yaml`, TLS material, spool, CAS, the service
+account and each unit's enabled and running state. It replaces the binary, and a
+unit file only if its content differs from the shipped template, after copying
+the old one to `<unit>.bak-<timestamp>`. Running services are stopped for the
+swap and restarted; stopped ones stay stopped. If a shipped config template
+has top-level keys your `config.yaml` (publisher) or `receiver.yaml` (receiver)
 lacks, `update` lists them; they are optional.
 
 In-flight jobs survive the restart ([section 10.3](#103-restarts-and-recovery)).
@@ -971,9 +1011,9 @@ flags the older version does not define first, or it exits with
   `gateway.heartbeat_interval`, `pipeline.compression`, `repositories`, the
   server TLS keys and any `distribution:` block. The gateway key id now comes
   from `CVMFS_GATEWAY_KEY_ID`.
-- The admin CLI `prepubctl` is no longer built or installed. Delete a leftover
-  `/usr/local/bin/prepubctl`; use the job API and the web console
-  ([section 10.4](#104-aborting-a-job)).
+- The admin CLI `prepubctl` is no longer built or installed; `update` and
+  `uninstall` remove a leftover `/usr/local/bin/prepubctl`. Use the job API and
+  the web console ([section 10.4](#104-aborting-a-job)).
 - Older versions kept every job's payload. Reclaim the space once with
   `sudo find <spool_root>/{published,accumulated,failed,aborted} -mindepth 2 -maxdepth 2 -name payload.tar -delete`.
 
@@ -983,27 +1023,35 @@ flags the older version does not define first, or it exits with
 
 ```sh
 sudo ./install.sh uninstall --dry-run                  # preview
-sudo ./install.sh uninstall --keep-spool --keep-cas    # publisher, keep data
-sudo ./install.sh uninstall --mode receiver            # on a Stratum 1
-sudo ./install.sh uninstall --mode all --yes           # everything, no prompts
+sudo ./install.sh uninstall --keep-spool                 # installed roles, keep data
+sudo ./install.sh uninstall --mode receiver              # only the receiver
+sudo ./install.sh uninstall --mode all --purge-cas --yes # everything, no prompts
 ```
+
+Without `--mode`, `uninstall` removes the roles whose unit files are installed
+(both units → `all`, one → that role); with neither unit installed it refuses
+and asks for `--mode`.
 
 | Removed | publisher | receiver |
 |---|---|---|
 | unit (stopped and disabled first) | `cvmfs-prepub.service` | `cvmfs-prepub-receiver.service` |
-| `/usr/local/bin/cvmfs-prepub` | yes | yes |
-| `/etc/cvmfs-prepub/` (config, env, TLS material) | yes | yes |
-| spool (all job history) | unless `--keep-spool` | no |
-| CAS directory from `cas.root` | unless `--keep-cas` | unless `--keep-cas` |
+| `/usr/local/bin/cvmfs-prepub` | yes* | yes* |
+| `/etc/cvmfs-prepub/` (config, env, TLS material) | yes* | yes* |
+| spool (all job history, the receiver denylist) | unless `--keep-spool` | no |
+| CAS directory from `cas.root` | only with `--purge-cas` | only with `--purge-cas` |
 | `cvmfs-prepub` account | unless `--keep-user`; never an account given with `--user` | same |
 
-Without `--yes` the script lists what it will remove and asks for `yes`.
-`--keep-cas` matters most on a Stratum 1 or wherever
-`cas.root` is the repository's live store: removing it deletes published
-objects. `--mode receiver` removes the shared binary and `/etc/cvmfs-prepub` even
-if a publisher is installed on the same host; use `--mode all` there. Legacy
-bits-console spool artifacts found during uninstall are removed with
-`--purge-legacy` or `--yes`.
+\* Only when the other role's unit is not installed. Otherwise only this
+role's unit, its configuration file (`config.yaml` or `receiver.yaml`) and,
+with `--purge-cas`, its CAS are removed; the binary, `env`, `tls/` and the
+account stay.
+
+Without `--yes` the script lists what it will remove and asks for `yes`. The
+CAS is kept by default because on a local-filesystem publisher or a Stratum 1
+it is the live object store: `--purge-cas` deletes published objects. A
+leftover `/usr/local/bin/prepubctl` is removed too. Legacy bits-console spool
+artifacts found during uninstall are removed with `--purge-legacy` or
+`--yes`.
 
 Files outside the installation (`/etc/cvmfs/keys/*`, `connect-gw` state, the
 ingest config prefix) are not touched.

@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -26,6 +27,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
@@ -112,6 +115,10 @@ type Server struct {
 	// jobWg tracks all background job goroutines so Shutdown can wait for them
 	// to reach a terminal state before the process exits.
 	jobWg sync.WaitGroup
+	// launchMu and draining keep launch from adding to jobWg once Shutdown
+	// has started waiting on it (recovery may still be launching jobs).
+	launchMu sync.Mutex
+	draining bool
 	// stop ends when Shutdown starts, so jobs waiting to retry stop waiting
 	// (they stay in incoming for the next start) instead of holding it up.
 	stop       context.Context
@@ -500,6 +507,30 @@ func (s *Server) MountDiscovery(h http.Handler) {
 	}
 }
 
+// RevokePath and UnrevokePath are the API routes that revoke a receiver's
+// control-plane access and lift that revocation.
+const (
+	RevokePath   = "/api/v1/control/revoke"
+	UnrevokePath = "/api/v1/control/unrevoke"
+)
+
+// MountRevoke mounts revoke at POST RevokePath and unrevoke at POST
+// UnrevokePath behind the normal API auth, so an operator can manage
+// revocations without the separate TLS control listener. It mounts nothing,
+// and returns false, when the API token is empty: auth is then off (dev mode)
+// and anyone could revoke or un-revoke receivers.
+func (s *Server) MountRevoke(revoke, unrevoke http.Handler) bool {
+	if revoke == nil || unrevoke == nil || s.apiToken == "" {
+		return false
+	}
+	for path, h := range map[string]http.Handler{RevokePath: revoke, UnrevokePath: unrevoke} {
+		rv := s.router.PathPrefix(path).Subrouter()
+		rv.Use(s.requireAuth)
+		rv.Handle("", h).Methods(http.MethodPost)
+	}
+	return true
+}
+
 // requireAuth is a middleware that validates the Authorization: Bearer <token> header.
 // If the server was created with an empty token, auth is skipped (dev mode).
 // ListenAndServe starts the HTTP server on addr and blocks until the server
@@ -536,6 +567,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	httpErr := s.httpServer.Shutdown(ctx)
+
+	s.launchMu.Lock()
+	s.draining = true
+	s.launchMu.Unlock()
 
 	// Phase 1: wait for all job goroutines and webhook deliveries.
 	// After this, no new items will be enqueued in DistManager.
@@ -640,13 +675,9 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		PipelineEndedAt   time.Time `json:"pipeline_ended_at,omitzero"`
 		LeasedAt          time.Time `json:"leased_at,omitzero"`
 		PublishedAt       time.Time `json:"published_at,omitzero"`
-		// Distribution timestamps and counters for S1 backlog display in the console.
-		// DistributingStartedAt / DistributingEndedAt use omitempty so zero-value
-		// time.Time values are omitted; the JS checks for field presence.
+		// When S1 pre-warming was launched, for the console's backlog display;
+		// omitted when zero, and the JS checks for field presence.
 		DistributingStartedAt time.Time `json:"distributing_started_at,omitzero"`
-		DistributingEndedAt   time.Time `json:"distributing_ended_at,omitzero"`
-		DistributionConfirmed int       `json:"distribution_confirmed,omitempty"`
-		DistributionTotal     int       `json:"distribution_total,omitempty"`
 	}
 
 	var jobs []jobEntry
@@ -691,9 +722,6 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 				LeasedAt:              j.LeasedAt,
 				PublishedAt:           j.PublishedAt,
 				DistributingStartedAt: j.DistributingStartedAt,
-				DistributingEndedAt:   j.DistributingEndedAt,
-				DistributionConfirmed: j.DistributionConfirmed,
-				DistributionTotal:     j.DistributionTotal,
 			})
 		}
 	}
@@ -722,6 +750,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		repo, subPath, webhookURL string
 		tagName, tagDescription   string
 		spoolTarPath              string   // final path inside the spool
+		stagedTar                 string   // tar_path submission: moved into the spool after validation
+		tarName                   string   // original file name, for display
 		submittedSHA256           string   // caller-supplied; may be empty
 		preloadExe                string   // optional: repo-relative exe path for preload
 		preloadPaths              []string // optional: repo-relative paths opened at startup
@@ -834,6 +864,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
 		}
+		if err := validateWebhookURL(req.WebhookURL); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 
 		// Resolve and validate the path is within stagingRoot.
 		resolvedPath, err := resolveLocalTarPath(s.stagingRoot, req.TarPath)
@@ -842,27 +876,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Verify SHA-256 before touching the spool.
-		if err := verifySHA256(resolvedPath, req.TarSHA256); err != nil {
-			span.RecordError(err)
-			http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: %s"}`, jsonEscape(err.Error())), http.StatusBadRequest)
-			return
-		}
-
-		// Create spool job directory and move/link the tar into it.
-		if err := os.MkdirAll(jobDir, 0700); err != nil {
-			span.RecordError(err)
-			http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
-			return
-		}
-
+		// The file stays where it is until every check below has passed: a
+		// rejected submission must leave the producer's tar in place.
+		stagedTar = resolvedPath
 		spoolTarPath = filepath.Join(jobDir, "payload.tar")
-		if err := moveOrLink(resolvedPath, spoolTarPath); err != nil {
-			span.RecordError(err)
-			os.RemoveAll(jobDir)
-			http.Error(w, `{"error":"internal error moving tar to spool"}`, http.StatusInternalServerError)
-			return
-		}
+		tarName = sanitizeTarName(req.TarPath)
 
 		repo = req.Repo
 		subPath = req.Path
@@ -974,6 +992,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			sawTar = true
+			tarName = sanitizeTarName(part.FileName())
 
 			if err := os.MkdirAll(jobDir, 0700); err != nil {
 				part.Close()
@@ -1153,6 +1172,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := job.ValidateTagName(tagName); err != nil {
+			os.RemoveAll(jobDir)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		if err := validateWebhookURL(webhookURL); err != nil {
 			os.RemoveAll(jobDir)
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
@@ -1402,6 +1426,21 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if finalize {
 		coarse = false
 	}
+	// Local mode publishes every package on arrival. A job marked coarse would
+	// still be published alone, but lose its retries and leave its build
+	// waiting for a finalize that never comes.
+	if coarse && !s.orch.CoarseSupported() {
+		coarse = false
+	}
+
+	// tar_path: the digest is the last check, as it reads the whole file.
+	if stagedTar != "" {
+		if err := verifySHA256(stagedTar, submittedSHA256); err != nil {
+			span.RecordError(err)
+			http.Error(w, fmt.Sprintf(`{"error":"tar_sha256 mismatch: %s"}`, jsonEscape(err.Error())), http.StatusBadRequest)
+			return
+		}
+	}
 
 	// Record the build's expected package count before the job can accumulate,
 	// so that the last package to finish sees a complete declaration and can
@@ -1413,6 +1452,22 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			span.RecordError(err)
 			os.RemoveAll(jobDir)
 			http.Error(w, `{"error":"internal error recording build expectation"}`, http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// tar_path: move the file only now that the request has been accepted,
+	// so a refusal never consumes the producer's tar.
+	if stagedTar != "" {
+		if err := os.MkdirAll(jobDir, 0700); err != nil {
+			span.RecordError(err)
+			http.Error(w, `{"error":"internal error creating job directory"}`, http.StatusInternalServerError)
+			return
+		}
+		if err := moveOrLink(stagedTar, spoolTarPath); err != nil {
+			span.RecordError(err)
+			os.RemoveAll(jobDir)
+			http.Error(w, `{"error":"internal error moving tar to spool"}`, http.StatusInternalServerError)
 			return
 		}
 	}
@@ -1443,7 +1498,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// Use Stat on the spool copy since the original may have been moved.
 	// Finalize jobs carry no payload, so there is nothing to stat.
 	if spoolTarPath != "" {
-		j.TarName = filepath.Base(spoolTarPath)
+		j.TarName = tarName
 		if fi, statErr := os.Stat(spoolTarPath); statErr == nil {
 			j.TarSize = fi.Size()
 		}
@@ -1468,12 +1523,36 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.sp.WriteManifest(j); err != nil {
 		span.RecordError(err)
+		if stagedTar != "" {
+			_ = moveOrLink(spoolTarPath, stagedTar) // hand the producer's file back
+		}
 		os.RemoveAll(jobDir)
 		http.Error(w, `{"error":"internal error writing manifest"}`, http.StatusInternalServerError)
 		return
 	}
 
-	// Launch orchestrator in the background — the caller gets job_id immediately.
+	s.launch(j)
+
+	s.obs.Metrics.JobsSubmitted.Inc()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	fmt.Fprintf(w, `{"job_id":%q}`, jobID)
+}
+
+// launch runs an accepted job in the background: it waits for a concurrency
+// slot, runs, and retries while the job asks for it. New submissions and jobs
+// recovered at startup both go through here, so both obey the same limit.
+func (s *Server) launch(j *job.Job) {
+	s.launchMu.Lock()
+	defer s.launchMu.Unlock()
+	if s.draining {
+		s.obs.Logger.Info("shutting down — job left in incoming for the next start", "job_id", j.ID)
+		return
+	}
+	s.jobWg.Add(1)
+
+	// Runs in the background — a submitter gets its job_id immediately.
 	//
 	// Concurrency-limited path (jobSem != nil):
 	//   The goroutine first waits in StateIncoming for a semaphore slot.
@@ -1490,7 +1569,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// abortJobHandler can interrupt the job at any point — including while
 	// it is waiting for a concurrency slot.
 	abortCtx, abortCancel := context.WithCancel(context.Background())
-	s.orch.registerJob(jobID, abortCancel)
+	s.orch.registerJob(j.ID, abortCancel)
 
 	// Read-ahead Phase 0: start the tar scan NOW, before waiting for the
 	// concurrency slot.  The tar is already on disk in the spool; scanning it
@@ -1498,12 +1577,15 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// scan overlaps with earlier jobs' compress/upload work so that when the
 	// slot opens the compress workers start immediately with sorted entries
 	// already in memory rather than waiting for another full tar read.
-	s.orch.StartPrefetch(abortCtx, j)
+	// Not for a job waiting to retry: its scan would sit on the budget, and
+	// on disk, until the job is due.
+	if j.NextAttemptAt == nil {
+		s.orch.StartPrefetch(abortCtx, j)
+	}
 
-	s.jobWg.Add(1)
 	go func() {
 		defer s.jobWg.Done()
-		defer s.orch.unregisterJob(jobID)
+		defer s.orch.unregisterJob(j.ID)
 		defer abortCancel()
 
 		// One attempt: wait for a slot, run, release. A retryable failure
@@ -1527,28 +1609,37 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 					if s.dynaSem != nil {
 						s.dynaSem.Release(grantedWeight)
 						s.obs.Logger.Info("released concurrency slot (pipeline complete)",
-							"job_id", jobID)
+							"job_id", j.ID)
 					}
 				})
 			}
 
 			if s.dynaSem != nil {
 				s.obs.Logger.Info("job queued — waiting for concurrency slot",
-					"job_id", jobID, "repo", j.Repo)
-				// Use abortCtx so that a manual abort unblocks the wait
-				// immediately rather than holding the slot indefinitely.
-				gw, err := s.dynaSem.Acquire(abortCtx, j.TarSize)
+					"job_id", j.ID, "repo", j.Repo)
+				// A manual abort or a server shutdown ends the wait at once.
+				acqCtx, acqCancel := context.WithCancel(abortCtx)
+				stop := context.AfterFunc(s.stop, acqCancel)
+				gw, err := s.dynaSem.Acquire(acqCtx, j.TarSize)
+				stop()
+				acqCancel()
 				if err != nil {
-					// abortCancel fired (operator abort or server shutdown) while
-					// the job was queued; mark it as aborted without running.
+					if abortCtx.Err() == nil {
+						// Shutdown: the job never ran; it stays in incoming
+						// and recovers on the next start.
+						s.obs.Logger.Info("shutting down — queued job left in incoming for the next start",
+							"job_id", j.ID)
+						return nil
+					}
+					// Operator abort while queued: abort without running.
 					s.obs.Logger.Info("job aborted while waiting for slot",
-						"job_id", jobID, "error", err)
+						"job_id", j.ID, "error", err)
 					return s.orch.abortJob(context.Background(), j,
 						fmt.Errorf("aborted while waiting for concurrency slot: %w", err))
 				}
 				grantedWeight = gw
 				s.obs.Logger.Info("job acquired concurrency slot",
-					"job_id", jobID, "weight", gw, "tar_bytes", j.TarSize)
+					"job_id", j.ID, "weight", gw, "tar_bytes", j.TarSize)
 			}
 			defer releaseSem() // safety net — no-op if hook already fired
 
@@ -1564,31 +1655,22 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 
 			// Re-register with the timeout-aware cancel so abortJobHandler also
 			// cancels the execution context (not just the abort context).
-			s.orch.registerJob(jobID, runCancel)
+			s.orch.registerJob(j.ID, runCancel)
 
 			err := s.orch.Run(runCtx, j, releaseSem)
 			switch {
 			case err == nil, errors.Is(err, ErrRetryScheduled):
 				// published, or scheduleRetry has said what happens next
 			case s.orch.JobTimeout > 0 && runCtx.Err() != nil:
-				s.obs.Logger.Error("background job timed out", "job_id", jobID, "timeout", s.orch.JobTimeout, "error", err)
+				s.obs.Logger.Error("background job timed out", "job_id", j.ID, "timeout", s.orch.JobTimeout, "error", err)
 			default:
-				s.obs.Logger.Error("background job failed", "job_id", jobID, "error", err)
+				s.obs.Logger.Error("background job failed", "job_id", j.ID, "error", err)
 			}
 			return err
 		}
 		for {
-			err := attempt()
-			if !errors.Is(err, ErrRetryScheduled) {
-				return
-			}
-			// The attempt registered its own cancel; an abort while waiting
-			// must reach this wait instead. One that landed in between
-			// cancelled the finished attempt only, and is honoured here.
-			s.orch.registerJob(jobID, abortCancel)
-			if s.orch.Aborted(jobID) {
-				abortCancel()
-			}
+			// Immediate for a new job; a job waiting to retry (including one
+			// recovered at startup) waits for its due time first.
 			waitCtx, waitCancel := context.WithCancel(abortCtx)
 			stop := context.AfterFunc(s.stop, waitCancel)
 			due := WaitForAttempt(waitCtx, j)
@@ -1601,14 +1683,57 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				}
 				return // shutdown: the job stays in incoming for the next start
 			}
+			err := attempt()
+			if !errors.Is(err, ErrRetryScheduled) {
+				return
+			}
+			// The attempt registered its own cancel; an abort while waiting
+			// must reach this wait instead. One that landed in between
+			// cancelled the finished attempt only, and is honoured here.
+			s.orch.registerJob(j.ID, abortCancel)
+			if s.orch.Aborted(j.ID) {
+				abortCancel()
+			}
 		}
 	}()
+}
 
-	s.obs.Metrics.JobsSubmitted.Inc()
+// RecoverJob resumes a job found in flight at startup (see
+// Orchestrator.PrepareRecovery) through the same concurrency limit as a new
+// submission, so a restart with many interrupted jobs does not run them all
+// at once.
+func (s *Server) RecoverJob(ctx context.Context, j *job.Job, afterCleanShutdown bool) error {
+	resume, err := s.orch.PrepareRecovery(ctx, j, afterCleanShutdown)
+	if err != nil || !resume {
+		return err
+	}
+	if j.TarPath != "" {
+		// The reset moved the job directory; prefetch opens this path.
+		j.TarPath = filepath.Join(s.sp.JobDir(j), "payload.tar")
+	}
+	s.launch(j)
+	return nil
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	fmt.Fprintf(w, `{"job_id":%q}`, jobID)
+// sanitizeTarName reduces a client-supplied file name to a display-safe base
+// name: no directories (either separator), no control or non-printable
+// characters, at most 255 bytes. Returns "" when nothing usable remains.
+func sanitizeTarName(name string) string {
+	name = path.Base(strings.ReplaceAll(name, `\`, "/"))
+	name = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if !unicode.IsPrint(r) {
+			return -1
+		}
+		return r
+	}, name))
+	for len(name) > 255 {
+		_, size := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-size]
+	}
+	if name == "." || name == "/" || name == ".." {
+		return ""
+	}
+	return name
 }
 
 // resolveLocalTarPath resolves tarPath to an absolute path and verifies that
@@ -1828,7 +1953,19 @@ func (s *Server) jobEvents(w http.ResponseWriter, r *http.Request) {
 
 	id := mux.Vars(r)["id"]
 
-	if _, err := s.sp.FindJob(id); err != nil {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, `{"error":"streaming not supported by this server"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Subscribe BEFORE reading the job, so a transition between the two is
+	// delivered rather than lost; at worst a state is sent twice.
+	ch, cancel := s.notifyBus.Subscribe(id)
+	defer cancel()
+
+	j, err := s.sp.FindJob(id)
+	if err != nil {
 		if os.IsNotExist(err) {
 			http.Error(w, `{"error":"job not found"}`, http.StatusNotFound)
 			return
@@ -1837,41 +1974,35 @@ func (s *Server) jobEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, `{"error":"streaming not supported by this server"}`, http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // tell nginx not to buffer SSE
 
-	ch, cancel := s.notifyBus.Subscribe(id)
-	defer cancel()
+	// send writes one event and reports whether the stream should end.
+	send := func(e notify.Event) bool {
+		data, err := json.Marshal(e)
+		if err != nil {
+			s.obs.Logger.Warn("SSE: marshal error", "job_id", id, "error", err)
+			return false
+		}
+		fmt.Fprintf(w, "event: state_change\ndata: %s\n\n", data)
+		flusher.Flush()
+		return job.IsTerminal(e.State)
+	}
+
+	// The current state first: a job that has already finished emits no
+	// further events, and the subscriber would otherwise wait forever.
+	if send(notify.Event{JobID: j.ID, State: j.State, Error: j.Error, Time: j.UpdatedAt}) {
+		return
+	}
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-
 		case e, ok := <-ch:
-			if !ok {
-				return
-			}
-
-			data, err := json.Marshal(e)
-			if err != nil {
-				s.obs.Logger.Warn("SSE: marshal error", "job_id", id, "error", err)
-				continue
-			}
-
-			fmt.Fprintf(w, "event: state_change\ndata: %s\n\n", data)
-			flusher.Flush()
-
-			// Close stream once the job is in a terminal state.
-			if job.IsTerminal(e.State) {
+			if !ok || send(e) {
 				return
 			}
 		}
@@ -1915,11 +2046,38 @@ func (s *Server) jobLogHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]any{
-		"job":         j,
+		"job":         redactedJob(j),
 		"transitions": transitions,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// redactedJob returns a copy of j safe to return to API callers: the gateway
+// lease token is dropped and the webhook URL is cut to scheme and host, since
+// its path or query commonly carries the receiver's secret.
+func redactedJob(j *job.Job) *job.Job {
+	c := *j
+	c.LeaseToken = ""
+	if c.WebhookURL != "" {
+		c.WebhookURL = "[redacted]"
+		if u, err := url.Parse(j.WebhookURL); err == nil && u.Host != "" {
+			c.WebhookURL = u.Scheme + "://" + u.Host + "/[redacted]"
+		}
+	}
+	return &c
+}
+
+// validateWebhookURL accepts only an absolute http(s) URL with a host.
+func validateWebhookURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("webhook_url must be an absolute http:// or https:// URL")
+	}
+	return nil
 }
 
 // consoleHandler serves the self-contained Publish Jobs web console.
@@ -2312,7 +2470,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	body.ReplayCache.RejectedFull = rejectedFull
 	if s.orch != nil {
 		body.PublishPaths = s.orch.PublishPathNames()
-		body.FinalizeReady = s.orch.IngestConfigPrefix != ""
+		body.FinalizeReady = s.orch.IngestConfigPrefix != "" && s.orch.CoarseSupported()
 	}
 
 	w.Header().Set("Content-Type", "application/json")

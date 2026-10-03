@@ -73,30 +73,30 @@ func (c *Catalog) UncompressedSize() int64 { return c.uncompressedSize }
 // cvmfs_receiver reads via SqlGetCounter.
 type Statistics struct {
 	// Type counts (matching cvmfs/catalog_counters.h self_* / subtree_*)
-	SelfRegular     int64
-	SelfSymlink     int64
-	SelfDir         int64
-	SelfNested      int64
-	SelfSpecial     int64
-	SelfExternal    int64
-	SelfXattr       int64
+	SelfRegular  int64
+	SelfSymlink  int64
+	SelfDir      int64
+	SelfNested   int64
+	SelfSpecial  int64
+	SelfExternal int64
+	SelfXattr    int64
 	// Chunked-file counters (task #12)
-	SelfChunked    int64 // files that use the chunked-upload path
-	SelfChunks     int64 // total number of chunk records across all chunked files
+	SelfChunked int64 // files that use the chunked-upload path
+	SelfChunks  int64 // total number of chunk records across all chunked files
 	// Size counters (bytes, uncompressed)
 	SelfFileSize         int64 // sum of non-chunked regular file sizes
 	SelfChunkedSize      int64 // sum of chunked file sizes
 	SelfExternalFileSize int64 // sum of external file sizes
 
-	SubtreeRegular  int64
-	SubtreeSymlink  int64
-	SubtreeDir      int64
-	SubtreeNested   int64
-	SubtreeSpecial  int64
-	SubtreeExternal int64
-	SubtreeXattr    int64
-	SubtreeChunked    int64
-	SubtreeChunks     int64
+	SubtreeRegular          int64
+	SubtreeSymlink          int64
+	SubtreeDir              int64
+	SubtreeNested           int64
+	SubtreeSpecial          int64
+	SubtreeExternal         int64
+	SubtreeXattr            int64
+	SubtreeChunked          int64
+	SubtreeChunks           int64
 	SubtreeFileSize         int64
 	SubtreeChunkedSize      int64
 	SubtreeExternalFileSize int64
@@ -269,8 +269,6 @@ CREATE TABLE IF NOT EXISTS properties (
 		UID:          0,
 		GID:          0,
 		LinkCount:    1,
-		HashAlgo:     HashSha256,
-		CompAlgo:     CompZlib,
 		IsNestedRoot: isNestedRoot,
 	}
 
@@ -399,11 +397,60 @@ type entryTrackInfo struct {
 	chunkCount int   // number of chunk records (0 for non-chunked files)
 }
 
+// fileContent returns where a regular file's content lives: its whole-file
+// hash, or its chunks ordered by offset when the entry is chunked.  found is
+// false when the path is absent or is not a regular file with content.
+func (c *Catalog) fileContent(absPath string) (hashHex string, algo HashAlgo, chunks []ChunkRecord, found bool, err error) {
+	p1, p2 := MD5Path(absPath)
+	var hashBlob []byte
+	var flags int
+	var mode int64
+	scanErr := c.db.QueryRow(
+		"SELECT hash, flags, mode FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+	).Scan(&hashBlob, &flags, &mode)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return "", 0, nil, false, nil
+	}
+	if scanErr != nil {
+		return "", 0, nil, false, fmt.Errorf("looking up %q: %w", absPath, scanErr)
+	}
+	if mode&0o170000 != 0o100000 {
+		return "", 0, nil, false, nil
+	}
+	algo = HashAlgoFromFlags(flags)
+	if flags&FlagFileChunk == 0 {
+		if len(hashBlob) == 0 {
+			return "", 0, nil, false, nil
+		}
+		return hex.EncodeToString(hashBlob), algo, nil, true, nil
+	}
+	rows, qErr := c.db.Query(
+		"SELECT offset, size, hash FROM chunks WHERE md5path_1 = ? AND md5path_2 = ? ORDER BY offset", p1, p2)
+	if qErr != nil {
+		return "", 0, nil, false, fmt.Errorf("listing chunks of %q: %w", absPath, qErr)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ch ChunkRecord
+		if err := rows.Scan(&ch.Offset, &ch.Size, &ch.Hash); err != nil {
+			return "", 0, nil, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
+		}
+		chunks = append(chunks, ch)
+	}
+	if err := rows.Err(); err != nil {
+		return "", 0, nil, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
+	}
+	if len(chunks) == 0 {
+		return "", 0, nil, false, nil
+	}
+	return "", algo, chunks, true, nil
+}
+
 // trackAdd increments the appropriate self-counters for a newly inserted entry.
 //
 // Type dispatch order (checked before falling to the default):
 //  1. FlagDir   → directory
-//  2. FlagLink  → symlink
+//  2. FlagLink  → symlink (CVMFS sets FlagFile too, so this precedes the file bits)
 //  3. FlagFileSpecial → device / named pipe / socket
 //  4. FlagFileExternal → external (catalogued without stored content)
 //  5. FlagFileChunk → chunked regular file
@@ -1129,30 +1176,6 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 	_ = os.Remove(c.dbPath) //nolint:errcheck
 
 	return hash, savedDelta, nil
-}
-
-// LookupFileHash returns the content hash and hash algorithm of a regular file
-// stored at absPath in this catalog.  The hash algorithm is extracted from the
-// entry's flags column.  Returns ("", 0, false, nil) when no entry exists for
-// the path or when the stored entry has no content hash (e.g. directories or
-// symlinks that were written without a hash).
-func (c *Catalog) LookupFileHash(absPath string) (hashHex string, algo HashAlgo, found bool, err error) {
-	p1, p2 := MD5Path(absPath)
-	var hashBlob []byte
-	var flags int
-	scanErr := c.db.QueryRow(
-		"SELECT hash, flags FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-	).Scan(&hashBlob, &flags)
-	if errors.Is(scanErr, sql.ErrNoRows) {
-		return "", 0, false, nil
-	}
-	if scanErr != nil {
-		return "", 0, false, fmt.Errorf("looking up %q: %w", absPath, scanErr)
-	}
-	if len(hashBlob) == 0 {
-		return "", 0, false, nil
-	}
-	return hex.EncodeToString(hashBlob), HashAlgoFromFlags(flags), true, nil
 }
 
 // SchemaVersion returns the schema version.

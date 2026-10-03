@@ -43,7 +43,7 @@ var validTransitions = map[State]map[State]bool{
 		StateFailed:       true,
 	},
 	StateDistributing: {
-		StateLeased:      true, // lease acquired HERE — after all replicas have the objects
+		StateLeased:      true, // S1 pre-warming was only enqueued; the lease does not wait for it
 		StateAccumulated: true, // coarse publish: record entries, defer commit to finalize
 		StateAborted:     true,
 		StateFailed:      true,

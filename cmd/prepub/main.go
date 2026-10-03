@@ -147,6 +147,7 @@ func main() {
 		return
 	}
 	mode := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
+	showVersion := flag.Bool("version", false, "Print the version and exit")
 	// Pull distribution: embedded broker, control plane, enrollment, object URLs.
 	embeddedBrokerWSAddr := flag.String("embedded-broker-ws-addr", "", "If set, run an in-process MQTT broker with a WebSocket listener at this address (e.g. :1882); the control plane then runs on S0 with no separate broker [publisher]")
 	controlPlaneURL := flag.String("control-plane-url", "", "Control-plane (broker) URL advertised to receivers via discovery, e.g. ws://cvmfs-prepub:1882 or wss://... [publisher]")
@@ -157,7 +158,7 @@ func main() {
 	enrollTLSAddr := flag.String("enroll-tls-addr", "", "With --embedded-broker-auth and a broker TLS cert, serve enroll/revoke over HTTPS at this bind address (e.g. :8443) so the enrollment token never travels in plaintext [publisher]")
 	enrollURL := flag.String("enroll-url", "", "HTTPS base URL for the TLS enroll/revoke endpoint, advertised to receivers via discovery (e.g. https://cvmfs-prepub:8443) [publisher]")
 	discoverySigningKey := flag.String("discovery-signing-key", "", "PEM Ed25519 private key to sign the discovery document; receivers verify with the matching public key so no shared secret reaches a receiver [publisher]")
-	discoveryVerifyKey := flag.String("discovery-verify-key", "", "PEM Ed25519 public key to verify the signed discovery document [receiver]")
+	discoveryVerifyKey := flag.String("discovery-verify-key", "", "PEM Ed25519 public key; when set, the discovery document must carry a valid signature. Required with --broker-auth [receiver]")
 	pullConcurrencyFlag := flag.Int("pull-concurrency", 0, "Parallel object transfers / bundle requests in pull mode (0 = default 16) [receiver]")
 	pullFilesPerRequest := flag.Int("pull-files-per-request", 0, "Objects per chunked-bundle request in pull mode; >1 enables bundling, 0/1 = per-object [receiver]")
 	pullAuto := flag.Bool("pull-auto", false, "Measure RTT to Stratum 0 and auto-pick --pull-concurrency/--pull-files-per-request from a latency class when they are unset [receiver]")
@@ -191,10 +192,10 @@ func main() {
 	casServerConf := flag.String("cas-server-conf", "", "For --cas-type s3: path to the repository's server.conf; its CVMFS_UPSTREAM_STORAGE supplies the S3 alias, bucket, endpoint and credentials. Default: /etc/cvmfs/repositories.d/<repo-name>/server.conf [publisher]")
 
 	// Per-job wall-clock timeout (publisher) — prevents any phase from hanging
-	// indefinitely.  0 (default) disables the timeout for backward compatibility.
+	// indefinitely.  0 (default) disables it; see defaultJobTimeout for why.
 	// When --max-concurrent-jobs is also set, the timeout starts AFTER the job
 	// acquires a concurrency slot, so queue-wait time does not count against it.
-	jobTimeout := flag.Duration("job-timeout", defaultJobTimeout, "Maximum wall-clock time a single publish job may run before it is cancelled and failed; 0 disables the timeout entirely (not recommended — a job that blocks then holds its concurrency slot forever). The clock starts after the job acquires a slot, so queueing does not count against it [publisher]")
+	jobTimeout := flag.Duration("job-timeout", defaultJobTimeout, "Maximum wall-clock time a single publish job may run before it is cancelled and failed; 0 (the default) disables it, since elapsed time is a poor proxy for a stuck job; with it disabled a job that blocks keeps its concurrency slot. The clock starts after the job acquires a slot, so queueing does not count against it [publisher]")
 
 	// Server-side job concurrency limiter.  Limits how many jobs can run the
 	// pipeline + critical section simultaneously, preventing CPU
@@ -229,14 +230,14 @@ func main() {
 	prefetch := flag.Bool("prefetch", true, "Run pipeline phase 0 (the tar scan) ahead of the job's concurrency slot. Turn OFF on I/O-bound storage: the look-ahead spills the unpacked tar to disk and the pipeline reads it back, which doubles I/O on the resource that is already the bottleneck to buy overlap nothing is waiting for. Off, each archive is read exactly once, inline [publisher]")
 	prefetchLimit := flag.Int("prefetch-limit", 8, "Budget for concurrent tar scans (pipeline phase 0), in units of 128 MiB. Phase 0 runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Each scan is charged by its tar size, so N ordinary packages or one N*128 MiB package may run at once; over budget, phase 0 runs inline under the job's own slot [publisher]")
 	pipelineUploadConc := flag.Int("pipeline-upload-conc", envInt("PREPUB_PIPELINE_UPLOAD_CONC", 4), "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes). Env: PREPUB_PIPELINE_UPLOAD_CONC [publisher]")
-	// PEAK MEMORY IS DRIVEN BY THIS. unpack reads each file whole into RAM
-	// (unpack.go io.ReadAll) and every compress worker holds one file plus its
-	// compressed chunks, so resident size scales with
-	//   workers x (largest file + its compressed form).
-	// A host publishing large trees (Clang, Python-modules) on limited RAM —
-	// especially one also running the gateway — should lower this. Observed:
-	// 4 workers reached 6.7 GB RSS and were OOM-killed on an 8 GB node.
-	pipelineWorkers := flag.Int("pipeline-workers", envInt("PREPUB_PIPELINE_WORKERS", 4), "Concurrent compress workers per job. Peak memory scales with this: each worker holds one whole file plus its compressed chunks. Lower it (1-2) on memory-constrained hosts. Env: PREPUB_PIPELINE_WORKERS [publisher]")
+	// Peak memory scales with this. On the default fixed chunk grid with a
+	// spool dir, each compress worker streams one grid block at a time
+	// (~2 x grid resident). A file is held whole in RAM only when unpack kept
+	// it inline (with prefetch, entries over 64 KiB are spilled to disk;
+	// without it, entries up to 1 GiB stay in memory) or with content-defined
+	// chunking. Before streaming, 4 workers reached 6.7 GB RSS and were
+	// OOM-killed on an 8 GB node.
+	pipelineWorkers := flag.Int("pipeline-workers", envInt("PREPUB_PIPELINE_WORKERS", 4), "Concurrent compress workers per job. Peak memory scales with this: each worker holds one chunk-grid block, or one whole file when that file is kept in memory. Lower it (1-2) on memory-constrained hosts. Env: PREPUB_PIPELINE_WORKERS [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
 	// Default to FIXED cvmfsdescriptor.ChunkGrid chunking (min==avg==max): the
 	// xor32 chunker then cuts at fixed grid boundaries, which coarse publish
@@ -291,7 +292,7 @@ func main() {
 	// --stratum0-url (publisher-mode, a /cvmfs URL) to avoid a flag collision.
 	recvStratum0URL := flag.String("receiver-stratum0-url", "", "cvmfs-prepub publisher base URL, e.g. http://stratum0:8080; the receiver fetches {url}/s1/... (manifests, bundles) and {url}/cvmfs/{repo}/data/... (post-commit objects) [receiver]")
 	discoveryURL := flag.String("discovery-url", "", "Fixed S0 endpoint serving the discovery doc GET {url}/cvmfs/{repo}/.cvmfsbits; the receiver learns its control-plane broker URL from it [receiver]")
-	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs S1_NODE_KEY and --discovery-url [receiver]")
+	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs S1_NODE_KEY, --discovery-url and --discovery-verify-key [receiver]")
 
 	// Removed receiver flags, still accepted (and ignored) for one release so
 	// existing units do not fail with "flag provided but not defined".
@@ -301,9 +302,13 @@ func main() {
 	}
 
 	// Broker CA, shared by publisher and receiver modes.
-	brokerCACert := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker; empty uses system pool [publisher+receiver]")
+	brokerCACert := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker and, on a receiver, the discovery and TLS enroll endpoints; empty uses the system pool (TLS enroll requires it) [publisher+receiver]")
 
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("cvmfs-prepub " + versionString())
+		return
+	}
 
 	// ── Config file (applied after flag.Parse so CLI flags take precedence) ───
 	//
@@ -356,7 +361,7 @@ func main() {
 		Level: parseLogLevel(*logLevel),
 	}))
 
-	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode)
+	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode, "version", versionString())
 	var ignored []string
 	flag.Visit(func(f *flag.Flag) {
 		if slices.Contains(deprecatedFlags, f.Name) {
@@ -444,6 +449,13 @@ func runPublisher(
 	// and no client-cert mTLS — the embedded broker is reached over ws/wss with a
 	// token.
 	brokerURL := ""
+	// The repo name builds the server.conf path and the discovery document.
+	if repoName != "" {
+		if err := broker.ValidateRepo(repoName); err != nil {
+			obs.Logger.Error("invalid --repo-name", "error", err)
+			os.Exit(1)
+		}
+	}
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
 		if devMode {
@@ -689,11 +701,16 @@ func runPublisher(
 	// store, which prepub promotes and grafts. It needs the gateway — grafting
 	// is a gateway endpoint — so it is offered only in gateway mode, and a job
 	// naming it on a local-mode node is rejected at submission rather than
-	// published some other way.
-	if gwClient != nil {
+	// published some other way. It also needs a CAS that can promote the
+	// producer's prefix, which only the S3 CAS can.
+	switch {
+	case gwClient != nil && api.CanPromote(casBackend):
 		publishPaths[api.StagedPublishPath] = lease.NewStagedBackend(gwClient, ib)
 		obs.Logger.Info("publish path available: " + api.StagedPublishPath +
 			" (producer-prepared objects, promoted and grafted — no payload)")
+	case gwClient != nil:
+		obs.Logger.Info("publish path not offered: " + api.StagedPublishPath +
+			" (needs cas type s3)")
 	}
 
 	// Startup probe: confirm backends are reachable before accepting jobs.
@@ -782,6 +799,7 @@ func runPublisher(
 	var revoc *revocation
 	var ctrlTLSClose func()
 	var enrollOverTLS bool
+	var apiRevoke, apiUnrevoke http.Handler // on the API router; nil without broker auth
 	if embeddedBrokerWSAddr != "" {
 		// Build the broker's server TLS config (real wss://). When no cert is
 		// configured the listener stays plaintext ws:// (dev), but advertising a
@@ -805,7 +823,14 @@ func runPublisher(
 				os.Exit(1)
 			}
 			ctrlSecret = secret
-			revoc = newRevocation()
+			revPath := filepath.Join(spoolRoot, "revoked-nodes.json")
+			rv, rerr := loadRevocation(revPath)
+			if rerr != nil {
+				obs.Logger.Error("embedded broker: cannot load the revocation list", "path", revPath, "error", rerr)
+				os.Exit(1)
+			}
+			rv.logger = obs.Logger
+			revoc = rv
 			minter := credential.NewMinter(secret)
 			authHook = newBrokerAuthHook(credential.NewVerifier(secret), "publisher", revoc, obs)
 			enrollSrv = credential.NewEnrollServer(&derivedEnrollStore{secret: secret, revoc: revoc},
@@ -826,6 +851,10 @@ func runPublisher(
 			os.Exit(1)
 		}
 		brokerClose = c
+		if revoc != nil {
+			apiRevoke = revokeCore(revoc, authHook, brokerSrv, obs, false)
+			apiUnrevoke = revokeCore(revoc, authHook, brokerSrv, obs, true)
+		}
 		// Serve enroll/revoke over TLS so the enrollment token never travels in plaintext.
 		if embeddedBrokerAuth && enrollTLSAddr != "" {
 			if brokerTLS == nil {
@@ -843,11 +872,12 @@ func runPublisher(
 			enrollOverTLS = true
 		}
 		if brokerURL == "" {
-			scheme := "ws"
-			if brokerTLS != nil {
-				scheme = "wss"
+			u, uerr := localBrokerURL(embeddedBrokerWSAddr, brokerTLS != nil)
+			if uerr != nil {
+				obs.Logger.Error(uerr.Error())
+				os.Exit(1)
 			}
-			brokerURL = scheme + "://localhost" + embeddedBrokerWSAddr
+			brokerURL = u
 		}
 	}
 
@@ -920,7 +950,9 @@ func runPublisher(
 			ChunkMax:      chunkMax,
 			CAS:           casBackend,
 			SpoolDir:      spoolRoot,
-			Obs:           obs,
+			// One setting governs both: no file in a tar can exceed the tar.
+			MaxEntrySize: int64(maxTarSizeGiB) << 30,
+			Obs:          obs,
 		},
 		PublishPaths:      publishPaths,
 		Distribute:        distCfg,
@@ -981,6 +1013,15 @@ func runPublisher(
 	if allowedPublishPrefixes != "" {
 		apiServer.SetAllowedPublishPrefixes(strings.Split(allowedPublishPrefixes, ","))
 		obs.Logger.Info("publish namespace containment enabled", "allowed_prefixes", allowedPublishPrefixes)
+	}
+
+	if apiRevoke != nil {
+		if apiServer.MountRevoke(apiRevoke, apiUnrevoke) {
+			obs.Logger.Info("control-plane: revoke available on the API",
+				"routes", "POST "+api.RevokePath+", POST "+api.UnrevokePath)
+		} else {
+			obs.Logger.Warn("control-plane: API revoke routes not mounted: PREPUB_API_TOKEN is empty (API auth off)")
+		}
 	}
 
 	// Control-plane DoS limiter (internet-exposed; no firewall assumed).
@@ -1058,7 +1099,7 @@ func runPublisher(
 		recoveryWg.Add(1)
 		go func() {
 			defer recoveryWg.Done()
-			if err := orch.Recover(recoverCtx, j, afterCleanShutdown); err != nil {
+			if err := apiServer.RecoverJob(recoverCtx, j, afterCleanShutdown); err != nil {
 				obs.Logger.Error("job recovery failed", "job_id", j.ID, "error", err)
 			}
 		}()
@@ -1116,6 +1157,26 @@ func runPublisher(
 	obs.Logger.Info("shutdown complete")
 }
 
+// parseReceiverRepos parses the comma-separated --repos value. At least one
+// repository is required: without one the receiver never fetches discovery
+// and so never connects.
+func parseReceiverRepos(reposFlag string) ([]string, error) {
+	var repoList []string
+	for _, r := range strings.Split(reposFlag, ",") {
+		if trimmed := strings.TrimSpace(r); trimmed != "" {
+			if err := broker.ValidateRepo(trimmed); err != nil {
+				return nil, fmt.Errorf("invalid --repos entry: %w", err)
+			}
+			repoList = append(repoList, trimmed)
+		}
+	}
+	if len(repoList) == 0 {
+		return nil, fmt.Errorf("receiver mode requires at least one repository: " +
+			"set --repos (comma-separated) or `repos` in the config file")
+	}
+	return repoList, nil
+}
+
 // runReceiver starts the Stratum 1 pull receiver.  It never returns normally;
 // it blocks until a SIGINT or SIGTERM is received and then performs a graceful
 // shutdown.
@@ -1142,22 +1203,30 @@ func runReceiver(
 	// shared HMAC — so PREPUB_HMAC_SECRET is neither read nor required here. The
 	// receiver's only key is its own per-node S1_NODE_KEY (see --broker-auth).
 
+	if err := checkReceiverAuthConfig(brokerAuth, discoveryVerifyKey); err != nil {
+		obs.Logger.Error("control-plane: " + err.Error())
+		os.Exit(1)
+	}
+
 	if nodeID == "" {
 		nodeID, _ = os.Hostname()
 	}
 
-	// Parse --repos flag into a slice of repository names.
-	var repoList []string
-	for _, r := range strings.Split(reposFlag, ",") {
-		if trimmed := strings.TrimSpace(r); trimmed != "" {
-			repoList = append(repoList, trimmed)
-		}
+	repoList, err := parseReceiverRepos(reposFlag)
+	if err != nil {
+		obs.Logger.Error(err.Error())
+		os.Exit(1)
 	}
 
 	enrollBase := discoveryURL
 	if discoveryURL != "" && len(repoList) > 0 {
+		discoHTTP, herr := discoveryHTTPClient(brokerCACert)
+		if herr != nil {
+			obs.Logger.Error("control-plane: loading discovery CA", "error", herr)
+			os.Exit(1)
+		}
 		discoCtx, discoStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		d, derr := fetchDiscoveryWithRetry(discoCtx, discoveryURL, repoList[0], obs)
+		d, derr := fetchDiscoveryWithRetry(discoCtx, discoHTTP, discoveryURL, repoList[0], obs)
 		discoStop()
 		if derr != nil {
 			if discoCtx.Err() != nil {
@@ -1167,21 +1236,13 @@ func runReceiver(
 			obs.Logger.Error("control-plane: discovery failed", "error", derr)
 			os.Exit(1)
 		}
-		if brokerAuth {
-			if discoveryVerifyKey == "" {
-				obs.Logger.Error("control-plane: --discovery-verify-key is required under --broker-auth (Ed25519-only discovery)")
-				os.Exit(1)
-			}
-			vf, verr := ed25519VerifierFromFile(discoveryVerifyKey)
-			if verr != nil {
-				obs.Logger.Error("loading discovery verify key", "error", verr)
-				os.Exit(1)
-			}
-			verified := d.Verify(vf)
-			if !verified {
-				obs.Logger.Error("control-plane: discovery signature verification FAILED — refusing advertised broker (possible MITM)")
-				os.Exit(1)
-			}
+		// Verified whenever a key is configured, not only under --broker-auth.
+		if verr := verifyDiscovery(d, discoveryVerifyKey); verr != nil {
+			obs.Logger.Error("control-plane: " + verr.Error())
+			os.Exit(1)
+		}
+		if discoveryVerifyKey == "" {
+			obs.Logger.Warn("control-plane: discovery document NOT verified (no --discovery-verify-key)")
 		}
 		if d.ControlPlane.Type != "" && d.ControlPlane.Type != "mqtt" {
 			obs.Logger.Error("control-plane: discovery advertised unsupported transport", "type", d.ControlPlane.Type)

@@ -329,7 +329,7 @@ func TestSubmitJob_BuildIDOnAlternativePathDeclaresNoBuild(t *testing.T) {
 // all: a build id there still means accumulate. Old producers are unaffected.
 func TestSubmitJob_DefaultPathStillInfersCoarseFromBuildID(t *testing.T) {
 	srv, sp, orch := newTestServer(t)
-	orch.Lease = &noopBackend{}
+	orch.Lease = &pipelineBackend{} // coarse needs the gateway pipeline
 
 	rec := httptest.NewRecorder()
 	srv.submitJob(rec, newMultipartRequest(t, map[string]string{

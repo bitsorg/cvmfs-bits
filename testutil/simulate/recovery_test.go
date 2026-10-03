@@ -87,6 +87,28 @@ func statesUpTo(target job.State) []job.State {
 	return out
 }
 
+// recoverAndWait recovers j the way the service does (Server.RecoverJob, which
+// queues it like a new submission) and waits until it is terminal. It returns
+// the job as persisted in the spool.
+func recoverAndWait(t *testing.T, ctx context.Context, cluster *Cluster, orch *api.Orchestrator, j *job.Job, afterCleanShutdown bool) (*job.Job, error) {
+	t.Helper()
+	srv := api.New(cluster.Obs, "", orch, orch.Spool, orch.Notify, cluster.SpoolRoot, "", 0, 0)
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+	if err := srv.RecoverJob(ctx, j, afterCleanShutdown); err != nil {
+		return nil, err
+	}
+	for {
+		if got, err := orch.Spool.FindJob(j.ID); err == nil && job.IsTerminal(got.State) {
+			return got, nil
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("job %s never became terminal: %v", j.ID, ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // TestRecovery_FromIncoming verifies that a job interrupted before any state
 // transition is recovered and eventually published.
 func TestRecovery_FromIncoming(t *testing.T) {
@@ -106,8 +128,9 @@ func TestRecovery_FromIncoming(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j, false); err != nil {
-		t.Fatalf("Recover: %v", err)
+	j, err := recoverAndWait(t, ctx, cluster, orch, j, false)
+	if err != nil {
+		t.Fatalf("RecoverJob: %v", err)
 	}
 
 	if j.State != job.StatePublished {
@@ -140,8 +163,9 @@ func TestRecovery_FromLeased(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j, false); err != nil {
-		t.Fatalf("Recover: %v", err)
+	j, err := recoverAndWait(t, ctx, cluster, orch, j, false)
+	if err != nil {
+		t.Fatalf("RecoverJob: %v", err)
 	}
 
 	if j.State != job.StatePublished {
@@ -174,8 +198,9 @@ func TestRecovery_FromStaging(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j, false); err != nil {
-		t.Fatalf("Recover: %v", err)
+	j, err := recoverAndWait(t, ctx, cluster, orch, j, false)
+	if err != nil {
+		t.Fatalf("RecoverJob: %v", err)
 	}
 
 	if j.State != job.StatePublished {
@@ -206,8 +231,9 @@ func TestRecovery_FromUploading(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := orch.Recover(ctx, j, false); err != nil {
-		t.Fatalf("Recover: %v", err)
+	j, err := recoverAndWait(t, ctx, cluster, orch, j, false)
+	if err != nil {
+		t.Fatalf("RecoverJob: %v", err)
 	}
 
 	if j.State != job.StatePublished {
@@ -215,7 +241,7 @@ func TestRecovery_FromUploading(t *testing.T) {
 	}
 }
 
-// TestRecovery_CountIncremented verifies that each Recover call increments
+// TestRecovery_CountIncremented verifies that each recovery increments
 // RecoveryCount, and that a job can be recovered multiple times up to the limit.
 func TestRecovery_CountIncremented(t *testing.T) {
 	cluster := NewCluster(t, 0)
@@ -238,8 +264,9 @@ func TestRecovery_CountIncremented(t *testing.T) {
 			t.Fatalf("attempt %d WriteManifest: %v", attempt, err)
 		}
 
-		if err := orch.Recover(ctx, j, false); err != nil {
-			t.Fatalf("attempt %d Recover: %v", attempt, err)
+		j, err := recoverAndWait(t, ctx, cluster, orch, j, false)
+		if err != nil {
+			t.Fatalf("attempt %d RecoverJob: %v", attempt, err)
 		}
 
 		if j.RecoveryCount != attempt {
@@ -270,9 +297,9 @@ func TestRecovery_MaxRecoveries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := orch.Recover(ctx, j, false)
+	_, err := recoverAndWait(t, ctx, cluster, orch, j, false)
 	if err == nil {
-		t.Fatal("expected Recover to return an error when recovery limit is reached")
+		t.Fatal("expected RecoverJob to return an error when recovery limit is reached")
 	}
 
 	// The job should have been moved to a terminal failed state.

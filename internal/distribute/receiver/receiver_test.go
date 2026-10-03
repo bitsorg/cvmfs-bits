@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -309,5 +310,38 @@ func TestPullFromS0_RejectsMalformedRootHash(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(r.cfg.CASRoot, "x")); !os.IsNotExist(err) {
 		t.Errorf("malformed root hash wrote outside the CAS layout: %v", err)
+	}
+}
+
+// TestInvalidRepoNamesRejected: a repo name that is not a CVMFS repository
+// name is refused as configuration and never reaches a pull URL from MQTT.
+func TestInvalidRepoNamesRejected(t *testing.T) {
+	obs, shutdown, err := observe.New("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shutdown)
+	if _, err := New(Config{CASRoot: t.TempDir(), Repos: []string{"a..b"}, Obs: obs}); err == nil {
+		t.Error("New accepted --repos entry \"a..b\"")
+	}
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, req)
+	}))
+	defer srv.Close()
+	r := newPullReceiver(t, srv.URL) // no --repos: every valid name is served
+	for _, repo := range []string{"..", "a..b", ".x"} {
+		pm, _ := json.Marshal(broker.PublishedMessage{Repo: repo, NewRootHash: "abcdef"})
+		r.mqttPublishedHandler(&broker.Message{Topic: "cvmfs/repos/x/published", Payload: pm})
+		r.mqttAnnounceHandler(fakeMQTTMessage(t, broker.AnnounceMessage{PayloadID: "p-" + repo, PublisherID: "pub", Repo: repo}))
+		if _, ok := r.pullInflight.Load("p-" + repo); ok {
+			t.Errorf("announce for invalid repo %q started a pull", repo)
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // a published pull would run on a goroutine
+	if n := hits.Load(); n != 0 {
+		t.Errorf("invalid repo names reached the network (%d requests)", n)
 	}
 }

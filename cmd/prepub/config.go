@@ -192,12 +192,13 @@ type fileConfig struct {
 	// (default 10). Equivalent to --max-tar-size-gib.
 	MaxTarSizeGiB int `yaml:"max_tar_size_gib"`
 	// RetryWindow is how long from submission a job failing for a retryable
-	// reason is retried (default 24h; --retry-window=0 disables retries).
-	RetryWindow yamlDuration `yaml:"retry_window"`
+	// reason is retried (default 24h; 0 disables retries). A pointer, like the
+	// bools, so that an explicit 0 is distinguishable from an absent key.
+	RetryWindow *yamlDuration `yaml:"retry_window"`
 	// SpoolMinFreeGiB is the free space an upload must leave on the spool
-	// filesystem, else it is refused with 507 (default 20; 0 here keeps the
-	// default, --spool-min-free-gib=0 disables). Equivalent to --spool-min-free-gib.
-	SpoolMinFreeGiB int `yaml:"spool_min_free_gib"`
+	// filesystem, else it is refused with 507 (default 20; 0 disables).
+	// A pointer for the same reason. Equivalent to --spool-min-free-gib.
+	SpoolMinFreeGiB *int `yaml:"spool_min_free_gib"`
 
 	// Chunking overrides the CVMFS content-defined (xor32) chunk sizes in
 	// bytes. Zero/omitted fields keep the CLI defaults, which are pinned to a
@@ -267,7 +268,7 @@ func loadFileConfig(path string) (*fileConfig, error) {
 //
 // String/numeric zero values and absent bool keys are treated as "not set"
 // and leave the flag at its default; a bool key present as true or false is
-// applied.
+// applied, as is a retry_window or spool_min_free_gib present as 0.
 func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	mode, logLevel *string,
 	devMode *bool,
@@ -319,6 +320,17 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 			*dst = val
 		}
 	}
+	// Pointer-typed settings: present (even as 0) is applied, absent is not.
+	durP := func(flag string, dst *time.Duration, val *yamlDuration) {
+		if !has(flag) && val != nil {
+			*dst = val.Duration
+		}
+	}
+	iP := func(flag string, dst *int, val *int) {
+		if !has(flag) && val != nil {
+			*dst = *val
+		}
+	}
 	i64 := func(flag string, dst *int64, val int64) {
 		if !has(flag) && val != 0 {
 			*dst = val
@@ -348,8 +360,8 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	i("prefetch-limit", prefetchLimit, fc.Pipeline.PrefetchLimit)
 	i("promote-workers", promoteWorkers, fc.PromoteWorkers)
 	i("max-tar-size-gib", maxTarSizeGiB, fc.MaxTarSizeGiB)
-	i("spool-min-free-gib", spoolMinFreeGiB, fc.SpoolMinFreeGiB)
-	dur("retry-window", retryWindow, fc.RetryWindow)
+	iP("spool-min-free-gib", spoolMinFreeGiB, fc.SpoolMinFreeGiB)
+	durP("retry-window", retryWindow, fc.RetryWindow)
 	bl("prefetch", prefetch, fc.Pipeline.Prefetch)
 	dur("job-timeout", jobTimeout, fc.JobTimeout)
 	if !has("min-concurrent-jobs") && fc.MinConcurrentJobs != 0 {

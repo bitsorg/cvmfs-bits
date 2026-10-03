@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 CERN
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 
 package api
 
@@ -374,6 +374,17 @@ func (s *Server) finalizeBuild(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sealBuild(w http.ResponseWriter, r *http.Request) {
 	buildID := mux.Vars(r)["id"]
 
+	// Nothing accumulates in local mode: every package was published on
+	// arrival. A seal is a no-op there, answered with the status marked
+	// per_package, so a producer left in coarse mode does not fail.
+	if !s.orch.CoarseSupported() {
+		st := buildset.GetStatus(s.spoolRoot, buildID)
+		st.PerPackage = true
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(st)
+		return
+	}
+
 	var req struct {
 		Expect int `json:"expect"`
 	}
@@ -443,6 +454,7 @@ func (s *Server) sealBuild(w http.ResponseWriter, r *http.Request) {
 // upload and, if it wants confirmation at all, make a single call here.
 func (s *Server) buildStatus(w http.ResponseWriter, r *http.Request) {
 	st := buildset.GetStatus(s.spoolRoot, mux.Vars(r)["id"])
+	st.PerPackage = !s.orch.CoarseSupported()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(st)
 }

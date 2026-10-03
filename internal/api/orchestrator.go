@@ -74,6 +74,13 @@ type promoter interface {
 	PromoteFrom(ctx context.Context, stagingAlias string, workers int) (cas.PromoteResult, error)
 }
 
+// CanPromote reports whether b can serve the staged publish path (only the S3
+// CAS can promote a staging prefix).
+func CanPromote(b cas.Backend) bool {
+	_, ok := b.(promoter)
+	return ok
+}
+
 // Orchestrator manages the end-to-end lifecycle of a publish job.
 // It coordinates pipeline stages, distribution to Stratum 1 endpoints,
 // transaction/lease acquisition, and commit operations via a pluggable
@@ -451,6 +458,24 @@ func (o *Orchestrator) HasPublishPath(name string) bool {
 	return ok && b != nil
 }
 
+// CoarseSupported reports whether this deployment can accumulate coarse
+// builds: only the default path does, and only with a pipeline backend (not in
+// local mode, which publishes every package on arrival).
+func (o *Orchestrator) CoarseSupported() bool {
+	return o.Lease != nil && o.Lease.NeedsPipeline()
+}
+
+// isCoarse is j.IsCoarse() limited to what j's backend can do, so a job
+// recorded as coarse is never treated as one where nothing accumulates. No
+// backend at all means not coarse.
+func (o *Orchestrator) isCoarse(j *job.Job) bool {
+	if !j.IsCoarse() {
+		return false
+	}
+	b := o.leaseFor(j)
+	return b != nil && b.NeedsPipeline()
+}
+
 // PublishPathNames lists the publish paths this deployment can serve, for
 // startup logging and error messages.
 func (o *Orchestrator) PublishPathNames() []string {
@@ -624,7 +649,7 @@ func (o *Orchestrator) StartPrefetch(ctx context.Context, j *job.Job) {
 		// holds the ENTIRE uncompressed package in memory until the job runs,
 		// which is what OOM-killed the service on an 8 GB host. Read from the
 		// handle opened above, not the path, to keep the stable inode reference.
-		result, err := pipeline.PrefetchFromReaderWithSpill(ctx, f, o.Pipeline.SpoolDir, o.Obs)
+		result, err := pipeline.PrefetchFromReaderWithSpill(ctx, f, o.Pipeline.SpoolDir, o.Pipeline.EntryLimit(), o.Obs)
 		if err != nil {
 			o.Obs.Logger.Warn("prefetch failed — Run() will fall back to pipeline.Run()",
 				"job_id", j.ID, "error", err)
@@ -1124,8 +1149,8 @@ func (o *Orchestrator) publishAnnounce(j *job.Job, repo, payloadID string, total
 // commit serialisation mutex.  The server uses this hook to release the concurrency
 // semaphore slot early so a new job can start its own staging phase while this job
 // waits for the mutex and executes the commit POST.  For local mode (no pipeline),
-// it is called immediately before the Commit call.  Passing nil is safe (Recover
-// uses nil since it runs outside the server semaphore).
+// it is called immediately before the Commit call.  Passing nil is safe (a
+// caller outside the server semaphore has no slot to release).
 func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete func()) error {
 	ctx, span := o.Obs.Tracer.Start(ctx, "orchestrator.run")
 	defer span.End()
@@ -1288,7 +1313,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		if shouldDistribute {
 			logger.Info("enqueuing S1 pre-warming (non-blocking)",
 				"objects", len(pipelineResult.ObjectHashes),
-				"new_objects", len(pipelineResult.ObjectHashes))
+				"new_objects", len(pipelineResult.NewObjectHashes))
 
 			if err := o.transition(ctx, j, job.StateDistributing); err != nil {
 				span.RecordError(err)
@@ -1367,7 +1392,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// set in one gateway commit via ingestsql. Keyed on the job's coarse
 	// decision, not on having a build id: the id is the run's identity and is
 	// carried on every path, including the ones that commit on arrival.
-	if j.IsCoarse() && pipelineResult != nil && j.Path != "" {
+	if o.isCoarse(j) && pipelineResult != nil && j.Path != "" {
 		if onStagingComplete != nil {
 			onStagingComplete()
 		}
@@ -2139,7 +2164,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 
 	// The lease/slot is gone once Commit returns — every backend releases it,
 	// successfully or not. Clearing the token stops crash recovery from later
-	// "releasing" it again: Recover aborts any job it finds carrying a token,
+	// "releasing" it again: PrepareRecovery aborts any job it finds carrying a token,
 	// and for a slot-based backend that abort would free whichever job holds
 	// the slot at that moment, not this long-finished one.
 	j.LeaseToken = ""
@@ -2238,6 +2263,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			j.Provenance.RekorLogIndex = rec.RekorLogIndex
 			j.Provenance.RekorIntegratedTime = rec.RekorIntegratedTime
 			j.Provenance.RekorSET = rec.RekorSET
+			if err := o.Spool.WriteProvenanceRecord(j, rec.SignedPayload); err != nil {
+				logger.Warn("provenance: writing signed record failed (continuing)", "job_id", j.ID, "error", err)
+			}
 			if err := o.Spool.WriteManifest(j); err != nil {
 				logger.Warn("best-effort manifest write failed (rekor receipt)", "job_id", j.ID, "error", err)
 			}
@@ -2257,9 +2285,11 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	return nil
 }
 
-// Recover attempts to re-process a job found in a non-terminal state at
-// service startup.  Stale transactions are aborted before the job is reset.
-// After MaxRecoveries attempts, jobs are moved to StateFailed.
+// PrepareRecovery decides the fate of a job found in a non-terminal state at
+// service startup and resets it to incoming; Server.RecoverJob then runs it
+// under the normal concurrency limit. It reports whether the job should run
+// again; when it should not, the job has already been failed and the error
+// says why. Stale transactions are aborted before the job is reset.
 //
 // afterCleanShutdown distinguishes the two cases. False (a crash) counts the
 // attempt against MaxRecoveries, so a job that kills the service is eventually
@@ -2267,7 +2297,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 // was interrupted, which is not evidence of anything wrong with it. Conflating
 // them meant three routine `systemctl restart`s during one debugging session
 // terminally failed every in-flight job of a 174-package build.
-func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdown bool) error {
+func (o *Orchestrator) PrepareRecovery(ctx context.Context, j *job.Job, afterCleanShutdown bool) (bool, error) {
 	ctx, span := o.Obs.Tracer.Start(ctx, "orchestrator.recover")
 	defer span.End()
 
@@ -2279,7 +2309,7 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 	if j.State == job.StateIncoming && j.NextAttemptAt != nil {
 		logger.Info("resuming a job waiting to retry",
 			"attempt", j.Attempts, "next_attempt_at", j.NextAttemptAt.Format(time.RFC3339))
-		return o.runRetrying(ctx, j)
+		return true, nil
 	}
 
 	if !afterCleanShutdown && j.RecoveryCount >= MaxRecoveries {
@@ -2287,14 +2317,14 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 		span.RecordError(err)
 		logger.Error("job exceeded max recovery attempts — marking as failed")
 		_ = o.abortJob(ctx, j, err)
-		return err
+		return false, err
 	}
 	if afterCleanShutdown && j.InterruptCount >= MaxInterrupts {
 		err := Classify(ErrClassPermanent, fmt.Errorf("job %s has been interrupted by a service restart %d times", j.ID, MaxInterrupts))
 		span.RecordError(err)
 		logger.Error("job interrupted too many times — marking as failed")
 		_ = o.abortJob(ctx, j, err)
-		return err
+		return false, err
 	}
 
 	if afterCleanShutdown {
@@ -2306,7 +2336,7 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 	// Release any stale transaction.  The token may have already been
 	// released or expired — Abort is idempotent and errors are non-fatal here.
 	if j.LeaseToken != "" {
-		// Detached context: Recover runs at startup and during shutdown, where
+		// Detached context: recovery runs at startup and during shutdown, where
 		// the caller's ctx is routinely already cancelled — an abort issued on
 		// it is a silent no-op and strands the lease until the gateway expires
 		// it. Same reason as the rollback paths in ensureParentDirs.
@@ -2319,36 +2349,11 @@ func (o *Orchestrator) Recover(ctx context.Context, j *job.Job, afterCleanShutdo
 
 	if err := o.Spool.ResetForRecovery(j, !afterCleanShutdown); err != nil {
 		span.RecordError(err)
-		return fmt.Errorf("resetting job for recovery: %w", err)
+		return false, fmt.Errorf("resetting job for recovery: %w", err)
 	}
 
 	logger.Info("job reset to incoming — restarting")
-	return o.runRetrying(ctx, j)
-}
-
-// runRetrying runs a recovered job until it no longer asks for a retry.
-// Recover runs outside the server semaphore (it is called at startup, not
-// from a job goroutine), so Run gets nil for the early-release hook. When ctx
-// ends while the job waits, it stays in incoming for the next start.
-// Registered like a submitted job, so the abort endpoint reaches it too.
-func (o *Orchestrator) runRetrying(ctx context.Context, j *job.Job) error {
-	jobCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	o.registerJob(j.ID, cancel)
-	defer o.unregisterJob(j.ID)
-	for {
-		if !WaitForAttempt(jobCtx, j) {
-			if o.Aborted(j.ID) {
-				return o.abortJob(context.Background(), j,
-					fmt.Errorf("aborted while waiting to retry: %w", jobCtx.Err()))
-			}
-			return nil // shutdown: the job stays in incoming for the next start
-		}
-		err := o.Run(jobCtx, j, nil)
-		if !errors.Is(err, ErrRetryScheduled) {
-			return err
-		}
-	}
+	return true, nil
 }
 
 // webhookPublished tells the job's webhook, if any, that it was published.
@@ -2652,7 +2657,7 @@ func (o *Orchestrator) abortJob(ctx context.Context, j *job.Job, err error) erro
 	// sealed build can still reach a decision.  Without this the declared count
 	// is never met and the build waits forever for a package that will never
 	// arrive — with the producer long gone, nobody would notice.
-	if j.IsCoarse() {
+	if o.isCoarse(j) {
 		if mErr := buildset.MarkFailed(o.Spool.Root, j.BuildID, j.ID, ClassOf(err).String()); mErr != nil {
 			o.Obs.Logger.Warn("could not mark build member failed",
 				"build_id", j.BuildID, "job_id", j.ID, "error", mErr)
@@ -2698,7 +2703,7 @@ var (
 // has no notion of a retry), for an operator abort, for a permanent failure,
 // or when the next attempt would fall outside the retry window.
 func (o *Orchestrator) retryAt(j *job.Job, err error) (time.Time, bool) {
-	if o.RetryWindow <= 0 || j.IsCoarse() || j.Finalize || job.IsTerminal(j.State) {
+	if o.RetryWindow <= 0 || o.isCoarse(j) || j.Finalize || job.IsTerminal(j.State) {
 		return time.Time{}, false
 	}
 	if _, aborted := o.cancelled.Load(j.ID); aborted || isPermanent(err) {

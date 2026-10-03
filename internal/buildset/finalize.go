@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 CERN
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 
 package buildset
 

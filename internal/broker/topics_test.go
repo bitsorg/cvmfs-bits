@@ -88,14 +88,15 @@ func TestAnnounceTopic_PanicsOnSpecialChars(t *testing.T) {
 // ValidateRepo is called by server.go to reject bad repo names before they reach
 // the topic constructors (which panic on invalid input).
 func TestValidateRepo(t *testing.T) {
-	valid := []string{"atlas.cern.ch", "cms", "repo-with-dashes", "1234"}
+	valid := []string{"atlas.cern.ch", "cms", "repo-with-dashes", "1234", "test_1-dash.cern.ch", strings.Repeat("a", 60)}
 	for _, r := range valid {
 		if err := ValidateRepo(r); err != nil {
 			t.Errorf("ValidateRepo(%q) = %v; want nil", r, err)
 		}
 	}
 
-	invalid := []string{"", "repo/injected", "repo+wild", "repo#hash", "repo\x00nul"}
+	invalid := []string{"", "repo/injected", "repo+wild", "repo#hash", "repo\x00nul",
+		"..", "a..b", ".hidden", "_test.cern.ch", "-x", "repo.", "re po", "test_@1.cern.ch", strings.Repeat("a", 61)}
 	for _, r := range invalid {
 		if err := ValidateRepo(r); err == nil {
 			t.Errorf("ValidateRepo(%q) = nil; want error", r)

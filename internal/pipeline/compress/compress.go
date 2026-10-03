@@ -85,6 +85,12 @@ type Config struct {
 	SpillDir string
 }
 
+// Streaming reports whether files are compressed without being read whole
+// into memory: a spill dir and a fixed chunk grid.
+func (c Config) Streaming() bool {
+	return c.SpillDir != "" && c.ChunkAvg > 0 && c.ChunkMin == c.ChunkAvg && c.ChunkAvg == c.ChunkMax
+}
+
 // Chunk represents a single compressed chunk of a larger file.
 //
 // Exactly one of Compressed / Path carries the data. Path is used by the
@@ -162,8 +168,7 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 
 	// Stream when the grid is fixed and a spill dir is configured: peak memory
 	// then depends on the grid, not on the largest file in the tree.
-	streaming := cfg.SpillDir != "" && cfg.ChunkAvg > 0 &&
-		cfg.ChunkMin == cfg.ChunkAvg && cfg.ChunkAvg == cfg.ChunkMax
+	streaming := cfg.Streaming()
 	if streaming {
 		obs.Logger.InfoContext(ctx, "compress: streaming mode",
 			"grid_bytes", cfg.ChunkAvg, "workers", workers)

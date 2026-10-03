@@ -166,6 +166,12 @@ type Provenance struct {
 	RekorLogIndex       int64  `json:"rekor_log_index,omitempty"`
 	RekorIntegratedTime int64  `json:"rekor_integrated_time,omitempty"`
 	RekorSET            string `json:"rekor_set,omitempty"`
+	// SignedRecordFile names the sidecar in the job directory holding the
+	// exact record JSON whose SHA-256 is in the Rekor entry, so the hash can
+	// be recomputed; SignedRecordSHA256 is that hash (hex). The record is kept
+	// out of the manifest because it lists every object hash.
+	SignedRecordFile   string `json:"signed_record_file,omitempty"`
+	SignedRecordSHA256 string `json:"signed_record_sha256,omitempty"`
 }
 
 // Job represents a single CVMFS publish job, with persistent state that survives
@@ -373,13 +379,6 @@ type Job struct {
 	// Distribution runs asynchronously — the job proceeds to StateLeased
 	// without waiting for it to complete.
 	DistributingStartedAt time.Time `json:"distributing_started_at,omitempty"`
-	// DistributingEndedAt is when background S1 pre-warming finished.
-	// May be after PublishedAt since distribution is fire-and-forget.
-	DistributingEndedAt time.Time `json:"distributing_ended_at,omitempty"`
-	// DistributionConfirmed is the number of S1 endpoints that confirmed all objects.
-	DistributionConfirmed int `json:"distribution_confirmed,omitempty"`
-	// DistributionTotal is the total number of S1 endpoints attempted.
-	DistributionTotal int `json:"distribution_total,omitempty"`
 	// LeasedAt is when the gateway lease was successfully acquired.
 	LeasedAt time.Time `json:"leased_at,omitempty"`
 	// CommittingAt is when the commit phase started (after catalog merge).

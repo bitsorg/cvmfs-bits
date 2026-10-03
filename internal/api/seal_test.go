@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 CERN
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 
 package api
 
@@ -30,7 +30,8 @@ func sealRequest(buildID, body string) *http.Request {
 }
 
 func TestSealBuild_RejectsNonPositive(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, orch := newTestServer(t)
+	orch.Lease = &pipelineBackend{} // coarse builds need a pipeline backend
 
 	for _, body := range []string{`{"expect":0}`, `{"expect":-3}`, `{}`} {
 		rec := httptest.NewRecorder()
@@ -45,7 +46,8 @@ func TestSealBuild_RejectsNonPositive(t *testing.T) {
 // already finished would finalize a subset and then remove the accumulator, so
 // members still in flight would be dropped without trace.
 func TestSealBuild_CannotShrinkBuild(t *testing.T) {
-	srv, sp, _ := newTestServer(t)
+	srv, sp, orch := newTestServer(t)
+	orch.Lease = &pipelineBackend{} // coarse builds need a pipeline backend
 
 	for _, id := range []string{"j1", "j2", "j3"} {
 		if err := buildset.Record(sp.Root, "b1", buildset.Member{

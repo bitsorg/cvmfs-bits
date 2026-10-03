@@ -4,6 +4,7 @@
 package job
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -117,5 +118,31 @@ func TestValidateTagName_Boundary(t *testing.T) {
 	exactly256 := strings.Repeat("x", 256)
 	if err := ValidateTagName(exactly256); err == nil {
 		t.Error("ValidateTagName(256-char name) = nil; want error")
+	}
+}
+
+// TestProvenanceSidecarFieldsRoundTrip: the sidecar reference survives the
+// manifest encoding, and a manifest written before it existed still decodes.
+func TestProvenanceSidecarFieldsRoundTrip(t *testing.T) {
+	j := &Job{ID: "j", Provenance: &Provenance{RekorUUID: "u",
+		SignedRecordFile: "provenance-record.json", SignedRecordSHA256: "abc"}}
+	b, err := json.MarshalIndent(j, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Job
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if *back.Provenance != *j.Provenance {
+		t.Errorf("provenance changed in the round trip: %+v", back.Provenance)
+	}
+
+	var old Job
+	if err := json.Unmarshal([]byte(`{"ID":"j","provenance":{"rekor_uuid":"u"}}`), &old); err != nil {
+		t.Fatalf("old manifest: %v", err)
+	}
+	if old.Provenance.RekorUUID != "u" || old.Provenance.SignedRecordFile != "" {
+		t.Errorf("old manifest decoded wrongly: %+v", old.Provenance)
 	}
 }

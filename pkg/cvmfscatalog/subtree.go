@@ -19,10 +19,11 @@ package cvmfscatalog
 // publish are silently removed.  This matches cvmfs_server ingest semantics
 // and is correct for complete-version software publishing.
 //
-// Both subtree paths (LeasePath != "") and root-level publishes (LeasePath == "")
-// use BuildSubtree.  The gateway (cvmfs_receiver) grafts the resulting catalog
-// into the existing repository at LeasePath during the commit step, so this
-// function never needs to download or modify the existing repository catalog.
+// The orchestrator calls BuildSubtree only for subtree publishes
+// (LeasePath != ""); root-level publishes commit without a catalog of their
+// own.  The gateway (cvmfs_receiver) grafts the resulting catalog into the
+// existing repository at LeasePath during the commit step, so this function
+// never needs to download or modify the existing repository catalog.
 
 import (
 	"context"
@@ -487,18 +488,18 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		}
 
 		// Propagate child statistics into parent delta.
-		parentCat.delta.SubtreeRegular  += delta.SelfRegular  + delta.SubtreeRegular
-		parentCat.delta.SubtreeSymlink  += delta.SelfSymlink  + delta.SubtreeSymlink
-		parentCat.delta.SubtreeDir      += delta.SelfDir      + delta.SubtreeDir
-		parentCat.delta.SubtreeNested   += delta.SelfNested   + delta.SubtreeNested
-		parentCat.delta.SubtreeXattr    += delta.SelfXattr    + delta.SubtreeXattr
+		parentCat.delta.SubtreeRegular += delta.SelfRegular + delta.SubtreeRegular
+		parentCat.delta.SubtreeSymlink += delta.SelfSymlink + delta.SubtreeSymlink
+		parentCat.delta.SubtreeDir += delta.SelfDir + delta.SubtreeDir
+		parentCat.delta.SubtreeNested += delta.SelfNested + delta.SubtreeNested
+		parentCat.delta.SubtreeXattr += delta.SelfXattr + delta.SubtreeXattr
 		parentCat.delta.SubtreeExternal += delta.SelfExternal + delta.SubtreeExternal
-		parentCat.delta.SubtreeSpecial  += delta.SelfSpecial  + delta.SubtreeSpecial
+		parentCat.delta.SubtreeSpecial += delta.SelfSpecial + delta.SubtreeSpecial
 		// Chunked-file and size counters (task #12).
-		parentCat.delta.SubtreeChunked          += delta.SelfChunked          + delta.SubtreeChunked
-		parentCat.delta.SubtreeChunks           += delta.SelfChunks           + delta.SubtreeChunks
-		parentCat.delta.SubtreeFileSize         += delta.SelfFileSize         + delta.SubtreeFileSize
-		parentCat.delta.SubtreeChunkedSize      += delta.SelfChunkedSize      + delta.SubtreeChunkedSize
+		parentCat.delta.SubtreeChunked += delta.SelfChunked + delta.SubtreeChunked
+		parentCat.delta.SubtreeChunks += delta.SelfChunks + delta.SubtreeChunks
+		parentCat.delta.SubtreeFileSize += delta.SelfFileSize + delta.SubtreeFileSize
+		parentCat.delta.SubtreeChunkedSize += delta.SelfChunkedSize + delta.SubtreeChunkedSize
 		parentCat.delta.SubtreeExternalFileSize += delta.SelfExternalFileSize + delta.SubtreeExternalFileSize
 	}
 

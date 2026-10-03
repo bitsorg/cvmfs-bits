@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 CERN
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 
 // Package buildset implements the coarse, publish-at-end-of-build model:
 // per-package publish jobs record their catalog entries (already
@@ -289,6 +289,9 @@ type Status struct {
 	Failed      []string `json:"failed,omitempty"`
 	Finalizing  bool     `json:"finalizing"` // finalize claimed (running, done, or crashed)
 	Result      *Result  `json:"result,omitempty"`
+	// PerPackage is set when the prepub publishes every package on arrival
+	// (local mode): nothing accumulates, and there is no finalize to wait for.
+	PerPackage bool `json:"per_package,omitempty"`
 }
 
 // Result is the outcome of a finalize, persisted outside the accumulator
@@ -358,8 +361,8 @@ func GetStatus(spoolRoot, buildID string) Status {
 
 // Conflict records a package excluded from the assembled build.
 type Conflict struct {
-	Path   string
-	Reason string
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // Assemble merges members into a single, repo-relative []Entry ready for the

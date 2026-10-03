@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 CERN
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 
 package cvmfsdescriptor
 
@@ -28,9 +28,9 @@ func TestWriteDescriptor(t *testing.T) {
 		{FullPath: "pkg/foo/1.0", Mode: fs.ModeDir | 0o755, Mtime: 100, UID: 0, GID: 0, IsNestedRoot: true},
 		{FullPath: "pkg/foo/1.0/bin", Mode: fs.ModeDir | 0o755, Mtime: 100},
 		{FullPath: "pkg/foo/1.0/bin/foo", Mode: 0o755, Size: 12, Mtime: 100,
-			Hash: h(0xaa), HashAlgo: cvmfscatalog.HashSha256, CompAlgo: cvmfscatalog.CompZlib},
+			Hash: h(0xaa), HashAlgo: cvmfscatalog.HashSha1, CompAlgo: cvmfscatalog.CompZlib},
 		{FullPath: "pkg/foo/1.0/README", Mode: 0o644, Size: 5, Mtime: 100,
-			Hash: h(0xbb), HashAlgo: cvmfscatalog.HashSha256, CompAlgo: cvmfscatalog.CompNone},
+			Hash: h(0xbb), HashAlgo: cvmfscatalog.HashSha1, CompAlgo: cvmfscatalog.CompNone},
 		{FullPath: "pkg/foo/1.0/bin/foo-link", Mode: fs.ModeSymlink | 0o777, Mtime: 100, Symlink: "foo"},
 		{FullPath: "pkg/foo/1.0/big", Mode: 0o644, Size: ChunkGrid + 1, Mtime: 100,
 			CompAlgo: cvmfscatalog.CompZlib,
@@ -137,7 +137,7 @@ func TestWriteDescriptor(t *testing.T) {
 func TestWriteRejectsMismatchedChunking(t *testing.T) {
 	entries := []cvmfscatalog.Entry{
 		{FullPath: "pkg/x", Mode: 0o644, Size: ChunkGrid + 1,
-			Hash: h(0xcc), HashAlgo: cvmfscatalog.HashSha256, CompAlgo: cvmfscatalog.CompZlib},
+			Hash: h(0xcc), HashAlgo: cvmfscatalog.HashSha1, CompAlgo: cvmfscatalog.CompZlib},
 	}
 	err := Write(filepath.Join(t.TempDir(), "bad.db"), entries)
 	if err == nil {
