@@ -1358,9 +1358,11 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// Job continues immediately to the serialised commit section below.
 		}
 	} else {
-		logger.Info("local publish mode — skipping pipeline, tar will be extracted during Commit")
-		// Local mode has no CPU-intensive staging phase.  Release the concurrency
-		// slot immediately so the next queued job can start.
+		// The backend (ingest, local) takes the tar as is at commit time.
+		logger.Info("no prepub pipeline for this backend — the tar is handed to the backend at commit",
+			"backend", fmt.Sprintf("%T", o.leaseFor(j)))
+		// No CPU-intensive staging phase here.  Release the concurrency slot
+		// immediately so the next queued job can start.
 		if onStagingComplete != nil {
 			onStagingComplete()
 		}
