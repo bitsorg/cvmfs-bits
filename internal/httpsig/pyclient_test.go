@@ -181,7 +181,7 @@ print(httpsig.HEADER_NAME)
 print(httpsig.SCHEME)
 print(httpsig.CANONICAL_PREFIX)
 print(httpsig.NO_BODY)
-print(httpsig.NO_FIELDS)
+print(httpsig.fields_digest({}))  # the empty field set; no named constant
 `, repo)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -192,7 +192,7 @@ print(httpsig.NO_FIELDS)
 	if len(got) != len(want) {
 		t.Fatalf("expected %d constants, got %v", len(want), got)
 	}
-	names := []string{"HEADER_NAME", "SCHEME", "CANONICAL_PREFIX", "NO_BODY", "NO_FIELDS"}
+	names := []string{"HEADER_NAME", "SCHEME", "CANONICAL_PREFIX", "NO_BODY", "fields_digest({})"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("%s: client %q, server %q", names[i], got[i], want[i])
