@@ -1,1473 +1,1009 @@
-# cvmfs-prepub — Installation and Deployment Guide
+# cvmfs-prepub — Installation and Operations Guide
+
+This guide takes an operator from a fresh host to a working cvmfs-prepub
+publisher, optionally with Stratum 1 pre-warming and bits-console integration,
+and covers day-to-day operation, upgrades and removal. It is task oriented:
+configuration keys, flags and API fields are listed once, in
+[REFERENCE.md](REFERENCE.md), and linked from here. For what the service does
+and why, start with [README.md](README.md).
 
 ## Contents
 
-1. [Prerequisites](#1-prerequisites)
-2. [Building from Source](#2-building-from-source)
-3. [Directory Layout and Permissions](#3-directory-layout-and-permissions)
-4. [Configuration](#4-configuration)
-5. [Option A — Single-Node Deployment](#5-option-a--single-node-deployment)
-   - [5.1 Local Mode (no cvmfs\_gateway)](#51-local-mode-no-cvmfs_gateway)
-   - [5.2 Setting up a new prepub node](#52-setting-up-a-new-prepub-node)
-6. [Option B — Distributed Deployment with Stratum 1 Pre-Warming](#6-option-b--distributed-deployment-with-stratum-1-pre-warming)
-   - [6.3 MQTT Control Plane (optional)](#63-mqtt-control-plane-optional)
-7. [Systemd Setup](#7-systemd-setup)
-8. [Health Check and Smoke Test](#8-health-check-and-smoke-test)
-9. [Upgrading](#9-upgrading)
-10. [Installing and Uninstalling](#10-installing-and-uninstalling)
+1. [Roles and ports](#1-roles-and-ports)
+2. [Build and install](#2-build-and-install)
+3. [Deploy a publisher](#3-deploy-a-publisher)
+4. [Publish backends and paths](#4-publish-backends-and-paths)
+5. [API authentication and secrets](#5-api-authentication-and-secrets)
+6. [Verify the installation](#6-verify-the-installation)
+7. [Stratum 1 pre-warming](#7-stratum-1-pre-warming)
+8. [bits-console integration](#8-bits-console-integration)
+9. [Several communities on one instance](#9-several-communities-on-one-instance)
+10. [Operations and troubleshooting](#10-operations-and-troubleshooting)
+11. [Upgrading](#11-upgrading)
+12. [Uninstalling](#12-uninstalling)
 
 ---
 
-## 1. Prerequisites
+## 1. Roles and ports
 
-**Required on the pre-publisher node:**
+### 1.1 Roles
 
-- Go 1.22 or later (`go version`)
-- `cvmfs_gateway` ≥ 1.2 reachable from the pre-publisher node
-  (for the lease-and-payload API: `POST /api/v1/leases`, `POST /api/v1/payloads`)
-- Write access to the CAS backend:
-  - *Local filesystem:* the directory must be on the same host as the Stratum 0 CAS (`/srv/cvmfs/cas` or equivalent)
-  - *S3-compatible:* credentials with `s3:PutObject`, `s3:HeadObject`, `s3:ListObjectsV2` on the CAS bucket
-- `make` and standard POSIX shell tools
+- **Publisher**: `cvmfs-prepub` in publisher mode (unit `cvmfs-prepub`) with the
+  REST API, pipeline, spool and optional embedded control-plane broker. It may
+  run on the gateway host or on its own host.
+- **Gateway mode** also needs `cvmfs_gateway`, the Stratum 0 web server that
+  serves `.cvmfspublished` and catalogs, and the repository's object store (a
+  local directory or its S3 bucket).
+- **Stratum 1 receivers** (pre-warming only): `cvmfs-prepub --mode receiver`
+  (unit `cvmfs-prepub-receiver`).
+- **Producers**: build runners (bits, bits-console CI) that submit tars over HTTP.
 
-**Required for Option B (HTTP path) only:**
+### 1.2 Prerequisites
 
-- Each Stratum 1 node must run the receiver agent (see §6)
-- Network connectivity from the pre-publisher to every configured Stratum 1 HTTPS endpoint (inbound port 9100 on each S1)
+- Build host: Go 1.24 or later (see `go.mod`) and `make`. Publisher: Linux with
+  systemd; `curl` and `jq` for the checks in this guide.
+- Gateway mode: a reachable `cvmfs_gateway` and a gateway key for the
+  repositories. The default commit path (direct graft) needs a gateway with the
+  graft endpoint (cvmfs PR #4296); with a stock gateway set
+  `gateway.direct_graft: false` ([section 4.1](#41-gateway-mode-default)).
+- Local mode, the ingest path or the coarse-publish finalize: the
+  `cvmfs-server` package (`cvmfs_server`, `cvmfs_swissknife`) on the publisher.
+- Spool disk: job state plus the unpacked content of the packages in progress.
+  Size it for the largest package times the concurrent jobs, plus
+  `spool_min_free_gib` (default 20 GiB), below which uploads are refused.
 
-**Required for Option B (MQTT path) only:**
+### 1.3 Ports
 
-- Each Stratum 1 node must run the receiver agent (see §6)
-- A shared MQTT broker (e.g. Eclipse Mosquitto or EMQ X) reachable from both the pre-publisher and all Stratum 1 receivers — typically hosted on Stratum 0 infrastructure
-- mTLS certificates for the broker, publisher, and each receiver node (one client certificate per node)
-- Each Stratum 1 node connects **outbound** to the broker (TCP 8883) for the MQTT control exchange — no inbound port is needed for signalling
-- Each Stratum 1 node still requires **TCP 9100 inbound** from the Stratum 0 publisher for the CAS object data push (identical to the HTTP path; MQTT only replaces the announce/ready control channel)
-
-**Not required:**
-
-- `cvmfs` client tools on the pre-publisher node
-- Squid or any proxy — access tracking is proxy-agnostic (see REFERENCE.md §8.1)
-
-### 1.1 Network Requirements
-
-The table below summarises inbound and outbound port requirements per site for
-each deployment option.
-
-| Site | Direction | Port / protocol | Required for | Notes |
+| Listener | Default | Flag / key | Who connects | Notes |
 |---|---|---|---|---|
-| **Build runners** | outbound | TCP 8080 (HTTPS) to S0 | All options | POST to cvmfs-prepub REST API |
-| **Stratum 0** | inbound | TCP 8080 | All options | cvmfs-prepub REST API; TLS strongly recommended |
-| **Stratum 0** | inbound | TCP 8883 | MQTT only | MQTT broker, if hosted on S0 infrastructure |
-| **Stratum 0** | outbound | TCP 9100 to each S1 | Option B (HTTP + MQTT) | Data push — publisher connects to each receiver |
-| **Stratum 0** | outbound | TCP 8883 to broker | MQTT only | Publisher connects to MQTT broker for announce |
-| **Stratum 1** | inbound | TCP 9100 | Option B (HTTP + MQTT) | Receiver data endpoint — both HTTP and MQTT paths |
-| **Stratum 1** | outbound | TCP 8883 to broker | MQTT only | Receiver connects to MQTT broker for control exchange |
-| **MQTT broker host** | inbound | TCP 8883 | MQTT only | mTLS; one connection per publisher job + one persistent per receiver |
+| REST API, web console, discovery, pull manifests and objects | `:8080` | `--listen` / `server.listen` | producers, Stratum 1 receivers, monitoring | plain HTTP ([section 5.4](#54-tls-in-front-of-the-api)) |
+| Embedded broker (MQTT over WebSocket) | off, e.g. `:1882` | `--embedded-broker-ws-addr` | Stratum 1 receivers | pre-warming only; `wss://` with a certificate |
+| Enroll / revoke (HTTPS) | off, e.g. `:8443` | `--enroll-tls-addr` | Stratum 1 receivers, `cvmfs-prepub revoke` | pre-warming only |
+| pprof debug listener | off, e.g. `127.0.0.1:6060` | `--debug-listen` / `server.debug_listen` | an operator on the host | keep on loopback |
+| Receiver `/metrics` | `:9100` | `--control-addr` / `control_addr` | Prometheus | plain HTTP, receiver mode |
 
-**Key point:** MQTT replaces the Stratum 1 control-plane exposure — receivers
-subscribe outbound so S0 does not need to reach S1 for the announce/ready
-handshake.  However, once a receiver has signalled readiness (via the broker),
-the publisher connects *directly* to the receiver's HTTP data endpoint to push
-CAS objects.  **TCP 9100 inbound on each Stratum 1 is therefore required in
-both Option B variants.**
+The publisher connects out to the gateway (usually `:4929`), the S3 endpoint,
+the Stratum 0 HTTP server (`stratum0_url`) and any webhook URL a producer gives.
+Stratum 1 receivers connect out to the publisher's API, broker and enroll ports;
+the publisher never connects to a Stratum 1.
 
 ---
 
-## 2. Building from Source
+## 2. Build and install
+
+### 2.1 Build
 
 ```sh
-git clone https://github.com/your-org/cvmfs-bits.git
+git clone https://github.com/bitsorg/cvmfs-bits.git
 cd cvmfs-bits
+make build            # -> bin/cvmfs-prepub
+```
 
-# Download Go module dependencies
-go mod download
+Other targets: `make test` (unit tests with the race detector), `make lint`
+(`go fmt`, `go vet`), `make run-sim` (in-process cluster simulation) and
+`make clean`. To build for another platform: `GOOS=linux GOARCH=amd64 make build`.
 
-# Build both binaries: cvmfs-prepub (service) and prepubctl (admin CLI)
+### 2.2 Run install.sh
+
+`install.sh` installs, updates or removes the service. It must run as root and
+takes the binary from `./bin` (or `--bin-dir`).
+
+```sh
+sudo ./install.sh --dry-run                        # preview, change nothing
+sudo ./install.sh --skip-service                   # publisher (default mode)
+sudo ./install.sh --mode receiver --skip-service   # on a Stratum 1
+```
+
+The action is `install` (default), `update` ([section 11](#11-upgrading)) or
+`uninstall` ([section 12](#12-uninstalling)). Use `--skip-service` on a first
+install: the generated configuration has no secrets yet, so a service started
+straight away exits on the missing `PREPUB_API_TOKEN` and the script's health
+check reports an error.
+
+| Option | Actions | Meaning |
+|---|---|---|
+| `--mode publisher\|receiver\|all` | all | role; `all` installs both on one host (testing) |
+| `--bin-dir DIR` | install, update | directory with the built binary (default `./bin`) |
+| `--skip-service` | install | install files but do not enable or start units |
+| `--user NAME` | install, update | run the services as NAME ([section 2.4](#24-service-account-and-spool-location)) |
+| `--spool-dir DIR` | install, update | spool root ([section 2.4](#24-service-account-and-spool-location)) |
+| `--purge-legacy` | install, uninstall | remove the legacy bits-console spool daemon without asking ([section 2.5](#25-legacy-bits-console-spool-daemon)) |
+| `--legacy-spool DIR` | install, uninstall | legacy spool location (default `/mnt/build/bits/spool`) |
+| `--keep-spool`, `--keep-cas`, `--keep-user` | uninstall | preserve the spool, the CAS directory, the account |
+| `--dry-run` | all | print the actions only |
+| `--yes`, `-y` | all | no confirmation prompts |
+| `--help` | all | full usage |
+
+### 2.3 What install.sh creates
+
+| Path | Owner | Mode | Installed for |
+|---|---|---|---|
+| `/usr/local/bin/cvmfs-prepub` | root | 0755 | both modes |
+| `/etc/cvmfs-prepub/` and `/etc/cvmfs-prepub/tls/` | `root:cvmfs-prepub` | 0750 | both modes |
+| `/etc/cvmfs-prepub/config.yaml` (template; never overwritten) | `root:cvmfs-prepub` | 0640 | publisher |
+| `/etc/cvmfs-prepub/receiver.yaml` (template; never overwritten) | `root:cvmfs-prepub` | 0640 | receiver |
+| `/etc/cvmfs-prepub/env` (secrets skeleton; never overwritten) | `root:cvmfs-prepub` | 0600 | both modes |
+| spool (default `/var/spool/cvmfs-prepub`) and its `tmp/` | service user | 0700 | publisher |
+| publisher CAS directory (`cas.root`, default `/srv/cvmfs/cas`) | service user | 0750 | publisher |
+| receiver CAS directory (`cas.root`, default `/srv/cvmfs/stratum1/cas`) | service user | 0750 | receiver |
+| `/etc/systemd/system/cvmfs-prepub.service` | root | 0644 | publisher |
+| `/etc/systemd/system/cvmfs-prepub-receiver.service` | root | 0644 | receiver |
+
+It also creates the `cvmfs-prepub` system account (no login shell, home = the
+spool) and group, and adds the service user to the `cvmfs` group when that group
+exists (local mode needs it). The publisher unit runs `cvmfs-prepub --config
+/etc/cvmfs-prepub/config.yaml` with `EnvironmentFile=/etc/cvmfs-prepub/env`,
+`TMPDIR=<spool>/tmp`, `MemoryHigh=2G`, `MemoryMax=3G` and systemd hardening; the
+receiver unit runs `--config /etc/cvmfs-prepub/receiver.yaml --mode receiver`
+with the same env file (`systemctl cat` shows them). To install by hand,
+reproduce this table and take the unit text from `write_units_to` in
+`install.sh`.
+
+Add flags and limits with a drop-in (`systemctl edit`), not by editing the unit
+file: `update` replaces a unit file whose content differs from the shipped one
+(keeping a backup) but leaves drop-ins alone. A drop-in that changes the command
+line must first clear it with an empty `ExecStart=` ([section 7.2](#72-publisher-flags)).
+
+### 2.4 Service account and spool location
+
+By default the services run as `cvmfs-prepub`. To use an existing account (for
+example the repository owner, which `cvmfs_server ingest` may need) or a spool on
+another volume:
+
+```sh
+sudo ./install.sh --user cvbits --spool-dir /mnt/cvmfs-prepub --skip-service
+```
+
+The account must exist; it joins the `cvmfs-prepub` group, which can read the
+config and credential files, and `uninstall` never removes it. Without `--user`,
+`install` and `update` keep the user the installed unit runs as (drop-ins
+included). Without `--spool-dir` the spool is `spool_root` from an existing
+`config.yaml`, else `/var/spool/cvmfs-prepub`; a `--spool-dir` that disagrees
+with `spool_root` is refused. A spool path through a symlink is resolved, since
+systemd may refuse a symlink under SELinux (`226/NAMESPACE`).
+
+### 2.5 Legacy bits-console spool daemon
+
+`install` looks for the earlier bits-console spool publisher
+(`cvmfs-local-publish.service`, its scripts, `/etc/cvmfs-local-publish.conf` and
+the legacy spool) and offers to remove it; `--purge-legacy` removes it without
+asking. Removal deletes the legacy spool, so do it once cvmfs-prepub is
+publishing, and never run both publishers against the same repository.
+
+---
+
+## 3. Deploy a publisher
+
+This is the full procedure for a production publisher in gateway mode with an S3
+CAS and coarse (whole-build) publishing, which is what bits-console uses by
+default. Variations (local CAS, local mode, ingest and staged paths) are in
+[section 4](#4-publish-backends-and-paths).
+
+### Step 1 — packages and install
+
+```sh
+sudo dnf install -y cvmfs-server     # for the finalize, local mode or the ingest path
 make build
-
-# Binaries are placed in bin/
-ls -l bin/
-# bin/cvmfs-prepub
-# bin/prepubctl
+sudo ./install.sh --dry-run
+sudo ./install.sh --skip-service
 ```
 
-To cross-compile for a Linux target from macOS:
-
-```sh
-GOOS=linux GOARCH=amd64 make build
-```
-
-To run the in-process cluster integration test (no external services required):
-
-```sh
-make run-sim
-```
-
-This exercises the full publish pipeline — unpack, compress, dedup, CAS upload, gateway
-commit, and Stratum 1 distribution — using in-process fakes with configurable chaos.
-
-Install binaries system-wide:
-
-```sh
-sudo install -m 755 bin/cvmfs-prepub  /usr/local/bin/
-sudo install -m 755 bin/prepubctl     /usr/local/bin/
-```
-
----
-
-## 3. Directory Layout and Permissions
-
-```sh
-# Spool directory — owned by the service account, mode 0700
-# SIZING: besides job state, the spool holds spilled tar content while a job
-# runs — entries larger than 64 KiB are written here instead of being held in
-# memory, so peak RAM no longer scales with package size. Allow room for the
-# largest package you publish (plus concurrent jobs); the directory is removed
-# when each job finishes.
-sudo mkdir -p /var/spool/cvmfs-prepub
-sudo chown cvmfs-prepub:cvmfs-prepub /var/spool/cvmfs-prepub
-sudo chmod 0700 /var/spool/cvmfs-prepub
-
-# Config directory
-sudo mkdir -p /etc/cvmfs-prepub/tls
-sudo chown root:cvmfs-prepub /etc/cvmfs-prepub
-sudo chmod 0750 /etc/cvmfs-prepub
-
-# Config file — readable by service account only
-sudo install -m 0640 -o root -g cvmfs-prepub config.yaml /etc/cvmfs-prepub/config.yaml
-
-# Local CAS root (Option A, local filesystem backend)
-sudo mkdir -p /srv/cvmfs/cas
-sudo chown cvmfs-prepub:cvmfs-prepub /srv/cvmfs/cas
-```
-
-Create a dedicated system account if one does not exist:
-
-```sh
-sudo useradd -r -s /sbin/nologin -d /var/spool/cvmfs-prepub cvmfs-prepub
-```
-
----
-
-## 4. Configuration
-
-The service reads a YAML config file. A minimal working config for Option A with a
-local CAS is shown below; for the full annotated reference see
-[REFERENCE.md §10](REFERENCE.md#10-configuration-reference).
-
-```yaml
-# /etc/cvmfs-prepub/config.yaml
-
-server:
-  listen: ":8080"
-  # TLS and auth are strongly recommended in production; omit for local testing only
-  # tls_cert: /etc/cvmfs-prepub/tls/server.crt
-  # tls_key:  /etc/cvmfs-prepub/tls/server.key
-
-spool_root: /var/spool/cvmfs-prepub
-
-gateway:
-  url: http://localhost:4929
-  key_id: prepub-key-001
-  key_secret_env: CVMFS_GATEWAY_SECRET   # export in the environment or set in the unit file
-  lease_ttl: 120s
-  heartbeat_interval: 40s
-
-# HTTP base URL of the Stratum 0 CAS — used by the catalog merge to fetch the
-# current .cvmfspublished manifest and download the root catalog before commit.
-# Typically the same host as the gateway but on port 80/443 (the CVMFS HTTP server).
-stratum0_url: http://localhost:8000   # e.g. http://stratum0.example.org
-
-cas:
-  type: localfs
-  root: /srv/cvmfs/cas
-
-pipeline:
-  workers: 2            # peak RSS scales with workers x largest file
-  compression: zlib
-  upload_concurrency: 4
-
-repositories:
-  - name: atlas.cern.ch
-    gc:
-      enabled: false
-```
-
-**Secrets** — never put the gateway secret directly in the config file. Set it as an
-environment variable in the systemd unit `EnvironmentFile` (see §7), or inject it
-from a secrets manager.
-
-For an S3-backed repository, replace the `cas:` block with:
-
-```yaml
-cas:
-  type: s3
-  # The repository's own server.conf. Its CVMFS_UPSTREAM_STORAGE
-  #   S3,<tmpdir>,<repo_alias>@<s3.conf>
-  # supplies the alias, and <s3.conf> supplies CVMFS_S3_HOST / _PORT / _BUCKET /
-  # _ACCESS_KEY / _SECRET_KEY / _REGION / _USE_HTTPS / _DNS_BUCKETS /
-  # _X_AMZ_ACL. Defaults to /etc/cvmfs/repositories.d/<repo_name>/server.conf.
-  server_conf: /etc/cvmfs/repositories.d/atlas.cern.ch/server.conf
-```
-
-**S3 settings are deliberately NOT configured separately here.** The
-pre-publisher writes objects into the same bucket the repository is served
-from, under the same `<alias>/data/<xx>/<rest>` keys the C++ uploader uses
-(`upload_s3.cc:478`). Re-declaring bucket, endpoint or credentials in this file
-would let them drift from the repository's real storage, and the failure mode is
-brutal: the publish succeeds, the catalogs are internally consistent, and every
-client read fails with `Input/output error` because the objects are not where
-the catalogs say they are. Reading the repository's own configuration makes that
-class of mistake impossible.
-
-Credentials therefore come from the repository's S3 config file, **not** from
-the AWS SDK chain — the service account must be able to read that file. Objects
-are uploaded with the canned ACL from `CVMFS_S3_X_AMZ_ACL`, defaulting to
-`public-read` exactly as CVMFS does; without a readable ACL the objects are
-served as 403 and clients report EIO.
-
----
-
-## 5. Option A — Single-Node Deployment
-
-Option A runs the pre-publisher on the same host as the Stratum 0, using a local
-CAS. No Stratum 1 receiver agent is needed.
-
-```
-[client]  ──POST /api/v1/jobs──►  [cvmfs-prepub :8080]
-                                         │
-                               unpack / compress / hash
-                                         │
-                                    local CAS write
-                                         │
-                              cvmfs_gateway lease + payload
-                                         │
-                                   manifest commit
-```
-
-1. Build and install binaries (§2).
-2. Create directories and accounts (§3).
-3. Write `/etc/cvmfs-prepub/config.yaml` with `cas.type: localfs` and no
-   `distribution:` block (§4).
-4. Register and start the systemd service (§7).
-5. Run the smoke test (§8).
-
-The existing `cvmfs_server publish` workflow continues to work in parallel; the
-gateway lease enforces mutual exclusion at the path level.
-
-### 5.1 Local Mode (no cvmfs_gateway)
-
-If your Stratum 0 does not run `cvmfs_gateway` — for example, a single-node
-test environment or a site that manages leases through `cvmfs_server` directly —
-you can use **local mode**. In this mode cvmfs-prepub calls `cvmfs_server
-transaction` and `cvmfs_server publish` as subprocesses instead of the gateway
-HTTP API. No gateway key or heartbeat is required.
-
-```
-[client]  ──POST /api/v1/jobs──►  [cvmfs-prepub :8080]
-                                         │
-                               unpack / compress / hash
-                                         │
-                                    local CAS write
-                                         │
-                              cvmfs_server transaction
-                                    (extract tar)
-                              cvmfs_server publish
-```
-
-**Requirements:**
-
-- The `cvmfs_server` binary must be on `PATH` for the service account (`cvmfs-prepub`).
-- The service user must be in the `cvmfs` group (or otherwise permitted to run
-  `cvmfs_server transaction`/`publish`).
-- At most one concurrent transaction is allowed per repository; a second request
-  for the same repo is rejected immediately (equivalent to a gateway 409 Conflict).
-
-**Service account setup:**
-
-```sh
-sudo usermod -aG cvmfs cvmfs-prepub
-```
-
-**Config changes** — set `publish_mode: local` in `/etc/cvmfs-prepub/config.yaml`
-and omit the `gateway:` block entirely:
-
-```yaml
-server:
-  listen: ":8080"
-
-spool_root: /var/spool/cvmfs-prepub
-
-publish_mode: local            # use cvmfs_server instead of cvmfs_gateway
-cvmfs_mount: /cvmfs            # filesystem root where repos are mounted
-
-cas:
-  type: localfs
-  root: /srv/cvmfs/cas
-
-pipeline:
-  workers: 2
-  compression: zlib
-  upload_concurrency: 4
-
-repositories:
-  - name: atlas.cern.ch
-```
-
-Or pass `--publish-mode local` and `--cvmfs-mount /cvmfs` on the command line:
-
-```sh
-cvmfs-prepub \
-    --config /etc/cvmfs-prepub/config.yaml \
-    --publish-mode local \
-    --cvmfs-mount /cvmfs
-```
-
-**Probe** — on startup (and via the health endpoint) the service verifies that
-`cvmfs_server` is reachable on `PATH`. The health check reports an error if the
-binary is missing before any job is submitted.
-
-### Offering the ingest publish path
-
-`publish_mode` selects the DEFAULT backend. A deployment can additionally offer
-the **ingest** path, which a job asks for per package with `publish_path=ingest`:
-the tar is handed to `cvmfs_server ingest` and the gateway does the chunking,
-dedup, storage and catalogs (ADR-0008 D7).
-
-```yaml
-ingest_publish: true             # offer the "ingest" publish path
-ingest_publish_owner: cvmfs      # optional: cvmfs_server ingest -u <owner>
-```
-
-or `--ingest-publish [--ingest-publish-owner cvmfs]`.
-
-Prerequisites on the prepub host, once per repository:
-
-```sh
-mkdir -p /etc/cvmfs/keys
-echo "plain_text <KEY_ID> <KEY_SECRET>" > /etc/cvmfs/keys/<repo>.gw
-cvmfs_server connect-gw -P -K \
-    -u http://<gateway>:4929/api/v1 \
-    -w <stratum0-url>/<repo> \
-    -o <owner> <repo>
-```
-
-`-P` is mountless publisher mode: no FUSE mount, no overlay, no privileged
-container. Where `/etc/cvmfs/<repo>.s3.conf` also exists, data chunks go straight
-to S3 and only catalogs pass through the gateway.
-
-What the ingest path gives up, and why the API refuses rather than ignores:
-
-- **No coarse publish.** Each package commits on arrival, so `build_id` is
-  rejected — a producer sealing such a build would wait for a finalize that can
-  never fire.
-- **No pre-warming.** The commit goes through the gateway, so there is no window
-  in which the objects exist and the catalog has not flipped; `prewarm=true` is
-  rejected.
-- **No local dedup**, and one gateway transaction per package rather than one
-  per build. This is not the faster path — it is the one that releases the build
-  node and keeps CVMFS format logic out of prepub.
-
-The startup log lists which paths the node serves; a job naming one it does not
-have is rejected at submission with 400.
-
-**Running both paths on one service** — `--publish-mode local --ingest-publish`
-is supported and is the straightforward way to exercise both against a single
-service:
-
-```sh
-cvmfs-prepub --config /etc/cvmfs-prepub/config.yaml \
-    --publish-mode local --ingest-publish
-```
-
-Each publish still uses exactly one path — the two never mix within a job. Two
-jobs on the SAME repository are kept apart by the orchestrator's per-repo commit
-lock, which is backend-agnostic; neither backend's own lock (LocalBackend's
-fail-fast semaphore, the ingest backend's slot queue) can see the other's, so
-that lock is what makes the combination safe. Jobs on different repositories
-still run in parallel.
-
-### Cache pre-warming
-
-`--prewarm` (off by default) is the NODE default. A job may override it per
-package with the `prewarm` form field: absent inherits the node default, `true`
-asks the Stratum 1 replicas to pull the build's objects before the catalog
-flips, `false` declines. Pre-warming also needs a configured control-plane
-broker (`--embedded-broker-ws-addr`); without one the announce is a no-op.
-
-**Lease window** — in local mode there is no server-side lease expiry. The
-service holds a per-repository in-process lock (fail-fast on conflict) for the
-duration of the `cvmfs_server publish` call only, keeping the exclusive window
-as short as possible.
-
----
-
-## 5.2 Setting up a new prepub node
-
-A complete runbook for standing up a publisher on its own host — the usual case
-being to take it off the gateway node and give the gateway its memory back.
-
-Two things about a non-colocated publisher are not obvious:
-
-- **The gateway hop stops being loopback.** Plaintext is accepted without
-  question only for loopback. Off-node, either use HTTPS or opt in with
-  `gateway.allow_plaintext` — defensible on a trusted internal network, because
-  gateway requests are HMAC-signed and the secret never transits (see step 4).
-- **The build accumulator is local state.** A sealed build's members live in the
-  spool of the host that received them. Moving hosts mid-build strands a build
-  that nothing will ever finalize, and since the producer has already exited,
-  nobody notices. Drain first (step 1).
-
-### Step 1 — drain the old node (skip for a first-ever install)
-
-```sh
-ls /var/spool/cvmfs-prepub/builds/      # expect empty: nothing accumulating
-```
-
-Leave the old service running until the new one is live; the CI keeps using it
-until you change `PREPUB_URL` in step 9.
-
-### Step 2 — packages
-
-```sh
-# Only if this node will offer the ingest publish path, or run the
-# coarse-publish finalize (which shells out to cvmfs_swissknife):
-sudo dnf install -y cvmfs-server
-```
-
-The finalize needs a `cvmfs_swissknife` built with the *spooler-follows-upstream*
-patch plus its shared libraries; note where they are for `--ingest-env`.
-
-### Step 3 — build and install
-
-```sh
-git clone <cvmfs-bits> && cd cvmfs-bits
-make build                  # -> bin/cvmfs-prepub, bin/prepubctl
-sudo ./install.sh --dry-run # preview
-sudo ./install.sh           # publisher mode
-```
-
-This creates the `cvmfs-prepub` system user, `/var/spool/cvmfs-prepub` (0700)
-with its `tmp/` subdirectory, `/etc/cvmfs-prepub/{config.yaml,env}`, and the
-systemd unit. It does not overwrite an existing config.
-
-To run the service as an existing account instead (e.g. the repository owner,
-which `cvmfs_server ingest` needs), or with the spool on another volume:
-
-```sh
-sudo ./install.sh --user cvbits --spool-dir /mnt/cvmfs-prepub
-```
-
-The account is added to the `cvmfs-prepub` group, which owns the config and
-credential files (`/etc/cvmfs-prepub`, `/etc/cvmfs/keys/<repo>.s3.conf`), and
-the spool and CAS directories are given to it. A spool path that is a symlink
-is resolved: systemd refuses (226/NAMESPACE) a symlink it may not follow under
-SELinux, so the unit names the real directory. Without these options a re-run,
-`update` and `uninstall` keep the user the unit runs as (drop-ins included) and
-the spool from `config.yaml`; `--spool-dir` must agree with an existing
-`spool_root`. `uninstall` never removes an account given with `--user`.
-
-### Step 4 — copy the repository's own credentials from the gateway node
-
-prepub reads these files directly, so they must exist on this host:
-
-| File | Why |
+The coarse-publish finalize runs `cvmfs_swissknife ingestsql`, and its
+`ingestsql` must write objects through the repository's own
+`CVMFS_UPSTREAM_STORAGE` (local, S3 or gateway) rather than a built-in S3-only
+definition. Released cvmfs packages do not do this; the change ("ingestsql:
+object spooler follows the repo upstream") is in the
+[bitsorg/cvmfs](https://github.com/bitsorg/cvmfs) fork, for example its
+`server/ingest-direct-s3` branch. Install that build alongside the packaged one
+and note the paths of its `cvmfs_swissknife` and libraries for
+`ingest_swissknife` and `ingest_env`.
+
+### Step 2 — repository credentials
+
+The S3 CAS reads the repository's own configuration, so these files must exist
+on the publisher (copy them from the gateway host):
+
+| File | Used for |
 |---|---|
-| `/etc/cvmfs/repositories.d/<repo>/server.conf` | `cas.server_conf` follows its `CVMFS_UPSTREAM_STORAGE` to find S3 |
-| the `s3.conf` that variable points at | endpoint, bucket, credentials, repository alias |
-| the ingestsql config prefix `<dir>/<repo>/{config,gatewaykey,pubkey}` | coarse-publish finalize |
+| `/etc/cvmfs/repositories.d/<repo>/server.conf` | `cas.server_conf`; its `CVMFS_UPSTREAM_STORAGE` names the S3 config |
+| the S3 config it names (usually `/etc/cvmfs/keys/<repo>.s3.conf`) | endpoint, bucket, credentials, repository alias |
+| `<ingest_config_prefix>/<repo>/{config,gatewaykey,pubkey}` | coarse-publish finalize: the `ingestsql` gateway client configuration (`config` sets `CVMFS_GATEWAY`, `CVMFS_STRATUM0`, `CVMFS_HTTP_PROXY`, `CVMFS_UPSTREAM_STORAGE`) |
 
 ```sh
 sudo chown root:cvmfs-prepub /etc/cvmfs/keys/<repo>.s3.conf
 sudo chmod 0640              /etc/cvmfs/keys/<repo>.s3.conf
 ```
 
-The service refuses world-readable or group-writable credential files.
+The service refuses an S3 config that is world-accessible or group-writable.
+S3 credentials come only from that file, never from `AWS_*` environment
+variables or an instance role. Protect the finalize prefix the same way:
+`gatewaykey` is a secret.
 
-### Step 5 — configure
+### Step 3 — configure
+
+Edit `/etc/cvmfs-prepub/config.yaml`:
 
 ```yaml
-# /etc/cvmfs-prepub/config.yaml
 server:
   listen: ":8080"
-  auth_mode: both              # see step 6
+  auth_mode: both                  # see section 5
 
 spool_root: /var/spool/cvmfs-prepub
 
 publish_mode: gateway
 gateway:
-  url: http://<gateway-host>:4929
-  allow_plaintext: true        # trusted network; gateway auth is HMAC-signed
-  key_id: <key-id>
-  key_secret_env: CVMFS_GATEWAY_SECRET
+  url: http://gateway.example.org:4929
+  allow_plaintext: true            # non-loopback http://, trusted network only
+  # direct_graft: false            # stock gateway without the graft endpoint
 
-stratum0_url: http://<stratum0-host>/cvmfs
+stratum0_url: http://stratum0.example.org/cvmfs   # includes /cvmfs; not the gateway port
+repo_name: software.example.org
 
 cas:
   type: s3
-  server_conf: /etc/cvmfs/repositories.d/<repo>/server.conf
+  server_conf: /etc/cvmfs/repositories.d/software.example.org/server.conf
 
-# Coarse-publish finalize (ADR-0007). REQUIRED whenever publishers use
-# build_id, which the bits-console pipeline does by default: a sealed build is
-# finalized here, so without this every package uploads, the pipeline reports
-# success, and nothing is ever committed. GET /api/v1/health reports
-# finalize_ready, and startup warns when it is unset.
-ingest_config_prefix: /etc/cvmfs-prepub/ingest   # <dir>/<repo>/{config,gatewaykey,pubkey}
-ingest_swissknife: /usr/bin/cvmfs_swissknife
+# Coarse-publish finalize (bits-console's default mode needs it).
+ingest_config_prefix: /etc/cvmfs-prepub/ingest
+ingest_swissknife: /opt/cvmfs/bin/cvmfs_swissknife   # the build from step 1
 ingest_env:
-  - LD_LIBRARY_PATH=/usr/lib/cvmfs
+  - LD_LIBRARY_PATH=/opt/cvmfs/lib
 
 pipeline:
-  workers: 2                   # peak RSS ~ workers x largest file
+  workers: 2                       # peak memory scales with workers x largest file
   upload_concurrency: 4
 
 allowed_publish_prefixes:
-  - /cvmfs/<repo>/<group>      # containment: publishes may not escape this
-
-max_tar_size_gib: 10           # largest package tar per submission (413 above)
-spool_min_free_gib: 20         # an upload must leave this free on the spool (507)
-retry_window: 24h              # how long an accepted job is retried
+  - /cvmfs/software.example.org/lcg
 ```
 
-An accepted job is published eventually unless its failure is permanent. A
-failed attempt for any reason other than a conflict with already published
-content, an unreadable payload or an operator abort puts the job back in
-`incoming/` and retries it after 1, 2, 4, 8, 16, then every 30 minutes, until
-`retry_window` (counted from submission) runs out. `GET /api/v1/jobs/{id}`
-shows `attempts`, `last_error` and `next_attempt_at`; a restart keeps the
-schedule. `--retry-window=0` turns retries off.
+Every key is optional: an absent key, an empty string or a zero keeps the flag
+default, and a command-line flag overrides the file (which is read because the
+unit passes `--config`). Unknown keys are ignored without a warning, so check
+spelling against [REFERENCE.md](REFERENCE.md#3-publisher-configuration), which
+lists every key with its flag, environment variable and default. For a local CAS
+use `cas: {type: localfs, root: /srv/cvmfs/cas}`, pointing at the store the
+repository is served from.
 
-A job's `payload.tar` is deleted once the job is final (published or failed);
-the cause of a failure stays in its manifest, the log and the measurements.
-Older prepub versions kept every payload; after upgrading, reclaim that space
-once with
-`find <spool_root>/{published,accumulated,failed,aborted} -mindepth 2 -maxdepth 2 -name payload.tar -delete`.
+A plaintext gateway URL is accepted without a flag only on loopback. Gateway
+requests are HMAC-signed and the secret never travels, but plaintext exposes
+what is published and lets an on-path attacker forge responses; prefer HTTPS
+off-host.
 
-Add `ingest_publish: true` to also offer the gateway ingest path (step 8).
+Without `ingest_config_prefix`, a build submitted with `build_id` uploads,
+accumulates and is never committed, and the producer, which has usually exited,
+is not told. Startup warns, and `finalize_ready` in the health response is
+`false`.
 
-Raise `pipeline.workers` and the unit's `MemoryHigh`/`MemoryMax` together on a
-dedicated node — the shipped values suit an 8 GB host shared with a gateway.
-
-### Step 6 — secrets
+### Step 4 — secrets
 
 ```sh
-sudo tee /etc/cvmfs-prepub/env >/dev/null <<'EOF'
-CVMFS_GATEWAY_SECRET=<gateway hmac secret>
-PREPUB_API_TOKEN=<shared secret for the publish API>
-EOF
-sudo chown root:cvmfs-prepub /etc/cvmfs-prepub/env && sudo chmod 0600 /etc/cvmfs-prepub/env
+sudo tee /etc/cvmfs-prepub/env >/dev/null <<'ENVEOF'
+CVMFS_GATEWAY_KEY_ID=<gateway key id>
+CVMFS_GATEWAY_SECRET=<gateway key secret>
+PREPUB_API_TOKEN=<output of: openssl rand -hex 32>
+ENVEOF
+sudo chown root:cvmfs-prepub /etc/cvmfs-prepub/env
+sudo chmod 0600 /etc/cvmfs-prepub/env
 ```
 
-**No inline comments in this file.** systemd's `EnvironmentFile` does not strip
-them, so `GOMEMLIMIT=3GiB  # note` makes the value `3GiB  # note` and the
-service fails to start.
+`CVMFS_GATEWAY_KEY_ID` defaults to `cvmfs-prepub` and must be a key the gateway
+associates with the repository (on the gateway, `/etc/cvmfs/keys/<repo>.gw`
+holds `plain_text <key_id> <secret>`). Do not put a comment on the same line as
+a value: systemd keeps it as part of the value. The other secrets are described
+in [section 5](#5-api-authentication-and-secrets).
 
-`auth_mode` decides how `PREPUB_API_TOKEN` is used: `bearer` sends it on every
-request, `hmac` uses it as an HMAC key so it never travels, `both` accepts
-either. Start at `both`, switch to `hmac` once the pipeline signs, then rotate
-the token — until that point it had been on the wire.
+### Step 5 — network and start
 
-### Step 7 — network
-
-| From | To | Why |
-|---|---|---|
-| prepub | gateway `:4929` | leases and commits |
-| prepub | S3 endpoint | object upload |
-| prepub | Stratum 0 HTTP | `.cvmfspublished` + catalog fetch |
-| GitLab runners | prepub `:8080` | job submission |
-
-Restrict `:8080` to the runner network. Signing authenticates a request; it does
-not encrypt it.
-
-### Step 8 — optional: the ingest publish path
-
-Per repository, once, on this host:
-
-```sh
-mkdir -p /etc/cvmfs/keys
-echo "plain_text <KEY_ID> <KEY_SECRET>" > /etc/cvmfs/keys/<repo>.gw
-cvmfs_server connect-gw -P -K \
-    -u http://<gateway>:4929/api/v1 \
-    -w <stratum0-url>/<repo> \
-    -o <owner> <repo>
-```
-
-`connect-gw` state is per publisher and does not travel with the config.
-
-A mountless host cannot create the parent directories of a publish target
-(e.g. `<group>/<arch>/Packages`), so the gateway must: set
-`CVMFS_GW_MKDIR_PARENTS=true` in the gateway's
-`/etc/cvmfs/repositories.d/<repo>/server.conf` (cvmfs fork). Without it, a first
-publish into a new area fails on the gateway with "failed to graft nested
-catalog".
-
-### Step 9 — start, verify, cut over
+Open the API port to the producers (and, with pre-warming, to the Stratum 1s)
+and allow the outbound connections in [section 1.3](#13-ports). Request signing
+authenticates producers but does not encrypt; restrict the port to the networks
+that need it.
 
 ```sh
 sudo systemctl enable --now cvmfs-prepub
 journalctl -u cvmfs-prepub -n 50 --no-pager
 ```
 
-The startup log states the publish paths on offer, the auth mode, and the temp
-root. Then:
+At startup the service checks that it can write to the CAS and reach the
+gateway (a signed `GET /api/v1/repos`), or in local mode that `cvmfs_server` is
+on `PATH`, and exits if not. The log then states the publish paths offered, the
+auth mode, the temp directory, the upload limits and whether the finalize is
+configured.
 
-```sh
-curl -s http://<new-host>:8080/api/v1/health | jq
-# {"status":"healthy","publish_paths":["prepub"],"auth_mode":"both",
-#  "finalize_ready":true, ...}      <- finalize_ready MUST be true for coarse publish
-```
+Then run [section 6](#6-verify-the-installation): health with
+`finalize_ready: true`, metrics, and a smoke-test publish into a scratch path.
 
-Publish one package end to end before switching anything. Then set `PREPUB_URL`
-in the bits-console CI/CD variables to the new host, run one real build, and
-only then:
+### Step 6 — cut over from an existing publisher
 
-```sh
-sudo ./install.sh uninstall --keep-spool     # on the old node
-```
+Skip this for a first installation. A coarse build in progress lives in the
+spool of the host that received it, so drain the old host first:
 
-`--keep-spool` preserves the job history and any surviving accumulator; delete
-it once you are satisfied nothing was in flight.
+1. On the old host, check that nothing is in flight or accumulating:
+   `<spool_root>/builds/` should be empty, and `GET /api/v1/jobs` should list no
+   job outside `published`, `failed` and `accumulated`.
+2. Point the producers at the new host (`PREPUB_URL` in bits-console,
+   [section 8](#8-bits-console-integration)) and publish one real build.
+3. Remove the old installation, keeping its history for as long as you need it:
+   `sudo ./install.sh uninstall --keep-spool`.
 
-### Step 10 — tighten
+### Step 7 — tighten authentication
 
-Once the pipeline signs (the publish log says so, and `auth_mode` is visible in
-`/api/v1/health`):
-
-```yaml
-server:
-  auth_mode: hmac
-```
-
-then rotate `PREPUB_API_TOKEN` on both sides.
-
-
-## 6. Option B — Distributed Deployment with Stratum 1 Pre-Warming
-
-Option B adds a lightweight receiver agent on each Stratum 1 node. The pre-publisher
-pushes new CAS objects to every configured Stratum 1 before committing the catalog,
-eliminating the thundering-herd cache-miss burst on the first replication.
-
-### 6.1 Stratum 1 receiver agent
-
-The receiver is embedded in the same binary. On each Stratum 1 node:
-
-```sh
-sudo install -m 755 bin/cvmfs-prepub /usr/local/bin/
-
-# Minimal config for receiver-only mode
-cat > /etc/cvmfs-prepub/receiver.yaml <<'EOF'
-server:
-  listen: ":9100"
-  tls_cert: /etc/cvmfs-prepub/tls/server.crt
-  tls_key:  /etc/cvmfs-prepub/tls/server.key
-
-cas:
-  type: localfs
-  root: /srv/cvmfs/stratum1/cas
-EOF
-```
-
-Start with the `--mode receiver` flag (or add `mode: receiver` to the config):
-
-```sh
-cvmfs-prepub --config /etc/cvmfs-prepub/receiver.yaml --mode receiver
-```
-
-### 6.2 Pre-publisher node config
-
-Add a `distribution:` block to the pre-publisher config on the Stratum 0 node:
-
-```yaml
-distribution:
-  stratum1_endpoints:
-    - https://stratum1-site-a.example.org:9100/cvmfs
-    - https://stratum1-site-b.example.org:9100/cvmfs
-  quorum: 0.75          # commit after 75 % of S1s acknowledge
-  timeout: 10m
-  commit_anyway: true   # proceed with gateway commit even if quorum not met
-  per_s1_concurrency: 8
-```
-
-For a full topology diagram see [REFERENCE.md §6](REFERENCE.md#6-option-b--distributed-pre-processor-with-stratum-1-pre-warming).
-
-### 6.3 MQTT Control Plane (optional)
-
-The default Option B announce uses HTTPS from the publisher to each receiver
-(inbound port 9100 on each Stratum 1).  If your Stratum 1 sites cannot accept
-inbound connections from the Stratum 0 publisher for signalling, you can use
-the **MQTT control plane** instead — the announce/ready exchange is routed
-through a shared broker so each receiver needs only outbound TCP 8883 for the
-control channel.  Note that the CAS object data push is unchanged: the
-publisher still connects directly to each receiver's HTTP endpoint (TCP 9100
-inbound on each S1) after receiving the ready signal via the broker.
-
-See [REFERENCE.md §20.11](REFERENCE.md#2011-mqtt-control-plane-optional) for
-the full topic schema, security model, and flow diagram.
-
-**Step 1 — Broker setup**
-
-Deploy an MQTT broker on Stratum 0 infrastructure (or a dedicated host) with:
-
-- TLS listener on port 8883 (Let's Encrypt or an internal CA)
-- mTLS client certificate verification enabled
-- Per-client topic ACLs: each node may only publish to its own presence/ready
-  topics and subscribe to announce topics for its configured repositories
-
-Example Mosquitto config:
-
-```ini
-# /etc/mosquitto/mosquitto.conf
-listener 8883
-certfile   /etc/mosquitto/certs/broker.crt
-keyfile    /etc/mosquitto/certs/broker.key
-cafile     /etc/mosquitto/certs/ca.crt
-require_certificate true
-use_identity_as_username true
-
-# ACL file referenced here; see Mosquitto acl_file documentation
-acl_file /etc/mosquitto/acl
-```
-
-**Step 2 — Issue per-node client certificates**
-
-Issue one client certificate per node (broker, publisher, and each receiver)
-from your internal CA:
-
-```sh
-# Example using openssl — adapt to your PKI tooling
-openssl req -new -newkey rsa:4096 -nodes \
-  -subj "/CN=stratum1-cern" \
-  -keyout stratum1-cern.key -out stratum1-cern.csr
-openssl x509 -req -in stratum1-cern.csr -CA ca.crt -CAkey ca.key \
-  -CAcreateserial -days 730 -out stratum1-cern.crt
-```
-
-**Step 3 — Receiver config**
-
-Add MQTT flags to the receiver on each Stratum 1 node:
-
-```sh
-cvmfs-prepub \
-  --config /etc/cvmfs-prepub/receiver.yaml \
-  --mode receiver \
-  --node-id stratum1-cern \
-  --broker-url tls://broker.cern.ch:8883 \
-  --broker-client-cert /etc/cvmfs-prepub/tls/stratum1-cern.crt \
-  --broker-client-key  /etc/cvmfs-prepub/tls/stratum1-cern.key \
-  --broker-ca-cert     /etc/cvmfs-prepub/tls/ca.crt
-```
-
-Or add to the receiver YAML config:
-
-```yaml
-broker_url:         tls://broker.cern.ch:8883
-broker_client_cert: /etc/cvmfs-prepub/tls/stratum1-cern.crt
-broker_client_key:  /etc/cvmfs-prepub/tls/stratum1-cern.key
-broker_ca_cert:     /etc/cvmfs-prepub/tls/ca.crt
-node_id:            stratum1-cern
-repos:
-  - atlas.cern.ch
-  - cms.cern.ch
-```
-
-**Step 4 — Publisher config**
-
-Add matching MQTT flags to the pre-publisher (Stratum 0):
-
-```yaml
-distribution:
-  broker_url:         tls://broker.cern.ch:8883
-  broker_client_cert: /etc/cvmfs-prepub/tls/publisher.crt
-  broker_client_key:  /etc/cvmfs-prepub/tls/publisher.key
-  broker_ca_cert:     /etc/cvmfs-prepub/tls/ca.crt
-  mqtt_quorum_timeout: 30s
-  quorum: 0.75
-```
-
-When `broker_url` is set in the publisher config the MQTT path takes precedence
-over the HTTP announce path.  The `stratum1_endpoints` list is still used for
-direct HTTP object PUTs (the data channel) — include the plain-HTTP data address
-for each receiver.
-
-**Verifying connectivity:**
-
-```sh
-# On each Stratum 1 node, check the receiver published its presence
-mosquitto_sub -h broker.cern.ch -p 8883 \
-  --cafile ca.crt --cert client.crt --key client.key \
-  -t 'cvmfs/receivers/+/presence' -C 1 | python3 -m json.tool
-# Should show {"node_id":"stratum1-cern","online":true,"bloom_ready":true,...}
-```
+When every producer signs its requests, set `server.auth_mode: hmac`, restart,
+and rotate `PREPUB_API_TOKEN` on both sides
+([section 5.2](#52-moving-to-signed-requests-and-rotating-the-token)).
 
 ---
 
-## 7. Systemd Setup
+## 4. Publish backends and paths
 
-### Service unit — pre-publisher
+`publish_mode` selects the backend for the default path. A job may name another
+path the node offers (`publish_path` form field); a path the node does not offer
+is rejected with 400. The startup log and `publish_paths` in the health response
+list what a node offers:
 
-```ini
-# /etc/systemd/system/cvmfs-prepub.service
+- `prepub` (default): always offered. In gateway mode cvmfs-prepub unpacks,
+  compresses and uploads, then takes a short gateway lease for the commit; in
+  local mode the tar is extracted inside `cvmfs_server transaction`.
+- `ingest`: offered with `ingest_publish: true` ([section 4.3](#43-the-ingest-path)).
+- `staged`: offered in gateway mode; works only with an S3 CAS
+  ([section 4.4](#44-the-staged-path)).
 
-[Unit]
-Description=CVMFS Pre-Publisher Service
-After=network.target
+Coarse builds and pre-warming exist only on the `prepub` path in gateway mode;
+a request for either on another path is rejected with 400. What each path does
+is described in [REFERENCE.md](REFERENCE.md#1-architecture).
 
-[Service]
-Type=simple
-User=cvmfs-prepub
-Group=cvmfs-prepub
-ExecStart=/usr/local/bin/cvmfs-prepub --config /etc/cvmfs-prepub/config.yaml
-Restart=on-failure
-RestartSec=5s
+### 4.1 Gateway mode (default)
 
-# Secrets — never put these in config.yaml
-EnvironmentFile=/etc/cvmfs-prepub/env
-# /etc/cvmfs-prepub/env should contain (mode 0600, owned by cvmfs-prepub):
-#   CVMFS_GATEWAY_SECRET=<your-gateway-key-secret>
-#   AWS_ACCESS_KEY_ID=<key>          # S3 only
-#   AWS_SECRET_ACCESS_KEY=<secret>   # S3 only
+The pipeline runs before any lease is taken; the gateway lease covers only the
+commit. It needs `gateway.url` (HTTPS, loopback, or `gateway.allow_plaintext`;
+`--dev` also permits plaintext but drops the secret requirements, so never use
+it in production), the gateway key in the env file, `stratum0_url`, and a CAS:
+`cas.type: localfs` with `cas.root`, or `cas.type: s3` with `cas.server_conf`
+(or `repo_name`, from which `/etc/cvmfs/repositories.d/<repo_name>/server.conf`
+is derived). On a gateway without the graft endpoint (cvmfs PR #4296) set
+`gateway.direct_graft: false`.
 
-# Hardening
-NoNewPrivileges=true
-ProtectSystem=full
-PrivateTmp=true
-ReadWritePaths=/var/spool/cvmfs-prepub /srv/cvmfs/cas
+When another publisher holds the lease, acquisition keeps retrying for up to
+`--lease-retry-max` (default 12 minutes; set it above the gateway's
+`max_lease_time`). `cvmfs_server publish` and other gateway clients keep working
+alongside: the gateway lease serialises them.
 
-[Install]
-WantedBy=multi-user.target
+### 4.2 Local mode
+
+For a Stratum 0 without a gateway, `publish_mode: local` runs
+`cvmfs_server transaction`, extracts the tar under `cvmfs_mount` (default
+`/cvmfs`) and runs `cvmfs_server publish`. The pipeline, the CAS settings and the
+gateway secrets are not used.
+
+The service user must be allowed to run `cvmfs_server` for the repository
+(`install.sh` adds it to the `cvmfs` group when the group exists). Jobs on one
+repository are serialised; different repositories publish in parallel. Coarse
+publishing and pre-warming need the pipeline and therefore gateway mode; have
+producers on a local-mode node submit without coarse accumulation
+(`coarse=false`, or `PREPUB_COARSE=false` in bits-console).
+
+### 4.3 The ingest path
+
+```yaml
+ingest_publish: true
+ingest_publish_owner: cvmfs        # optional: cvmfs_server ingest -u <owner>
 ```
+
+Once per repository on the publisher, register a mountless gateway publisher
+(`-P`: no FUSE mount, no overlay):
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now cvmfs-prepub
-sudo systemctl status cvmfs-prepub
+sudo mkdir -p /etc/cvmfs/keys
+echo "plain_text <key_id> <secret>" | sudo tee /etc/cvmfs/keys/<repo>.gw >/dev/null
+sudo cvmfs_server connect-gw -P -K \
+    -u http://<gateway>:4929/api/v1 \
+    -w <stratum0-url>/<repo> \
+    -o <owner> <repo>
 ```
 
-### Service unit — Stratum 1 receiver (Option B)
+`cvmfs_server` must be on `PATH` (the service exits at startup otherwise), and
+the service user must be allowed to run `cvmfs_server ingest` for the
+repository, which often means running as the repository owner (`--user`,
+[section 2.4](#24-service-account-and-spool-location)). `connect-gw` state
+belongs to this host and does not travel with the config. `publish_mode: local`
+with `ingest_publish: true` is supported; jobs on one repository are still
+serialised.
 
-```ini
-# /etc/systemd/system/cvmfs-prepub-receiver.service
+Direct S3 is chosen per job: a job submitted with `direct_s3=true` (in
+bits-console, the Build dialog's direct-S3 option) runs
+`cvmfs_server ingest --direct-s3`, which writes data objects straight to S3,
+reading `/etc/cvmfs/<repo>.s3.conf`, and sends only catalogs through the
+gateway. The file's presence alone does not enable it, and the installed
+`cvmfs_server` must support `--direct-s3`.
 
-[Unit]
-Description=CVMFS Pre-Publisher Stratum 1 Receiver
-After=network.target
+A mountless publisher cannot create the parent directories of a new target, so
+the gateway must: set `CVMFS_GW_MKDIR_PARENTS=true` in the gateway's
+`/etc/cvmfs/repositories.d/<repo>/server.conf`. Without it the first publish
+into a new area fails with "failed to graft nested catalog".
 
-[Service]
-Type=simple
-User=cvmfs-prepub
-ExecStart=/usr/local/bin/cvmfs-prepub \
-    --config /etc/cvmfs-prepub/receiver.yaml \
-    --mode receiver
-Restart=on-failure
-RestartSec=5s
-NoNewPrivileges=true
-ProtectSystem=full
-PrivateTmp=true
-ReadWritePaths=/srv/cvmfs/stratum1/cas
+### 4.4 The staged path
 
-[Install]
-WantedBy=multi-user.target
-```
+Offered automatically in gateway mode, but it works only with `cas.type: s3`
+(the objects are promoted by server-side copy inside the store). The producer
+prepares the package itself and submits `publish_path=staged` with
+`staging_prefix` and `catalog_hash` and no tar. Producer-side requirements for
+bits-console are listed in the CI template
+([section 8](#8-bits-console-integration)). `promote_workers` (default 16) sets
+the copy concurrency ([section 10.8](#108-tuning)).
+
+### 4.5 Coarse publish and the finalize
+
+Coarse publishing is the default on the `prepub` path: a job that carries
+`build_id` accumulates (state `accumulated`) instead of committing, unless it
+says `coarse=false`, and the whole build is committed once by a finalize that
+runs `cvmfs_swissknife ingestsql`. bits-console sends `build_id` on every job and
+seals the build, after which the publisher finalizes on its own.
+
+Prerequisites on the publisher: `ingest_config_prefix` (empty disables the
+finalize), `ingest_swissknife` and `ingest_env` pointing at the build from
+[section 3](#3-deploy-a-publisher) step 1, and a CAS that the repository's
+upstream storage reads (in a multi-host deployment, the shared S3 store).
+`GET /api/v1/health` reports `finalize_ready`, and `GET /api/v1/builds/{id}`
+shows a build's progress and result. How a build is sealed and finalized, and
+what happens when one of its jobs fails, is described in
+[REFERENCE.md](REFERENCE.md#2-job-lifecycle).
 
 ---
 
-## 8. Health Check and Smoke Test
+## 5. API authentication and secrets
 
-### Health check
+### 5.1 The API token and auth modes
+
+Every write endpoint and the job endpoints require `PREPUB_API_TOKEN`; the
+publisher refuses to start without it (only `--dev` allows that, for
+development). `server.auth_mode` selects `bearer` (the token travels on every
+request), `both` (default; bearer or signed) or `hmac` (signed requests only, the
+token never travels). Signed requests are valid only for a short time window, so
+keep producer and publisher clocks synchronised (NTP). Modes, signature format
+and the endpoints that need no token are described in
+[REFERENCE.md](REFERENCE.md#5-rest-api).
+
+### 5.2 Moving to signed requests and rotating the token
+
+1. Run with `auth_mode: both` while producers are updated. The bits-console
+   pipeline signs by default (`PREPUB_SIGN` unset or `true`).
+2. When every producer signs, set `server.auth_mode: hmac` and restart. Requests
+   with only a bearer token are now refused with 401.
+3. Rotate the token once, because until now it travelled on the wire: generate
+   a new value, put it in `/etc/cvmfs-prepub/env` and in every producer (the
+   bits-console CI variable), and restart the service. Requests signed with the
+   old value fail with 401 until the producers have the new one.
+
+Rotate the same way whenever the token may have leaked. Under `auth_mode: hmac`
+the web console can no longer list or show jobs, because it authenticates with a
+bearer token, and the curl examples in this guide need a signing client instead;
+health, metrics and measurements stay open.
+
+### 5.3 Other secrets
+
+All secrets go in `/etc/cvmfs-prepub/env` (mode 0600), never in a YAML file:
+`PREPUB_API_TOKEN`, `CVMFS_GATEWAY_KEY_ID` and `CVMFS_GATEWAY_SECRET` on every
+publisher, `PREPUB_HMAC_SECRET` on a pre-warming publisher, and `S1_NODE_KEY` on
+each Stratum 1 ([section 7](#7-stratum-1-pre-warming)). What each one protects
+is listed in [REFERENCE.md](REFERENCE.md#7-security-model).
+
+### 5.4 TLS in front of the API
+
+The API listener is plain HTTP. To encrypt it, terminate TLS in a reverse proxy
+(or use WireGuard) and give producers the proxy URL. Behind a path prefix (for
+example `https://host/prepub`) signing clients must sign the prefixed path;
+bits-console derives it from the URL it calls.
+
+---
+
+## 6. Verify the installation
+
+### 6.1 Health
 
 ```sh
-curl -sf http://localhost:8080/api/v1/health | jq .
-# {"status":"ok","version":"0.1.0"}
+curl -s http://localhost:8080/api/v1/health | jq
 ```
 
-### Prometheus metrics
-
-```sh
-curl -sf http://localhost:8080/api/v1/metrics | grep cvmfs_prepub
+```json
+{"status":"healthy","publish_paths":["prepub","staged"],"auth_mode":"both",
+ "finalize_ready":true,"max_tar_size":10737418240,
+ "replay_cache":{"entries":0,"rejected_full":0}}
 ```
 
-### Smoke test — submit a job and poll to completion
+Check `publish_paths`, `finalize_ready` (must be `true` for coarse builds) and
+`auth_mode`; a non-zero `replay_cache.rejected_full` means signed requests are
+being refused for capacity reasons, which producers see as 401s.
+
+### 6.2 Metrics
 
 ```sh
-# Create a small test tar
-mkdir -p /tmp/smoke/usr/share/test
-echo "hello cvmfs" > /tmp/smoke/usr/share/test/hello.txt
-tar -czf /tmp/smoke.tar.gz -C /tmp/smoke .
+curl -s http://localhost:8080/api/v1/metrics | grep '^cvmfs_prepub_'
+```
 
-# Submit the job (multipart/form-data).
-# tag_name and tag_description are optional; include them to create a named
-# snapshot browsable via `cvmfs_server tag`.
+Useful for alerting: `cvmfs_prepub_job_failures_by_class_total` (label `class`:
+`transient`, `permanent`, `internal`), `cvmfs_prepub_spool_jobs` (per state),
+`cvmfs_prepub_spool_jobs_waiting_retry` and `cvmfs_prepub_spool_fs_avail_bytes`;
+the full list is in [REFERENCE.md](REFERENCE.md#9-metrics-and-logs). Logs go to
+the journal as `key=value` text (`log_level: debug` for more).
+
+### 6.3 Smoke test
+
+Publish a small tar into a scratch path:
+
+```sh
+export PREPUB_API_TOKEN=<token>          # bearer: needs auth_mode bearer or both
+mkdir -p /tmp/smoke/hello && echo "hello cvmfs" > /tmp/smoke/hello/hello.txt
+tar -cf /tmp/smoke.tar -C /tmp/smoke .
+
 JOB=$(curl -sf -X POST http://localhost:8080/api/v1/jobs \
   -H "Authorization: Bearer $PREPUB_API_TOKEN" \
-  -F "repo=atlas.cern.ch" \
+  -F "repo=software.example.org" \
   -F "path=test/smoke" \
-  -F "tar=@/tmp/smoke.tar.gz;type=application/octet-stream" \
-  -F "tag_name=smoke-test-1.0" \
-  -F "tag_description=Smoke test publish" \
-  | jq -r .job_id)
-echo "job: $JOB"
+  -F "tar=@/tmp/smoke.tar;type=application/octet-stream" | jq -r .job_id)
 
-# Poll until terminal state
-for i in $(seq 1 30); do
-  STATE=$(curl -sf \
-    -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+for i in $(seq 1 60); do
+  STATE=$(curl -sf -H "Authorization: Bearer $PREPUB_API_TOKEN" \
     http://localhost:8080/api/v1/jobs/$JOB | jq -r .state)
-  echo "$i: $STATE"
-  [[ "$STATE" == "published" || "$STATE" == "failed" || "$STATE" == "aborted" ]] && break
-  sleep 2
+  echo "$STATE"
+  case "$STATE" in published|failed) break ;; esac
+  sleep 5
 done
 ```
 
-Tag names must match `^[A-Za-z0-9._-]+$` and be at most 255 characters long.
-Omit `tag_name` to publish without creating a named snapshot (the default
-`generic` tag applied by the gateway still marks the catalog revision).
-
-### Admin CLI
-
-```sh
-# Show all active jobs
-prepubctl status
-
-# Drain the queue — wait for in-flight jobs to finish, refuse new ones
-prepubctl drain --wait
-
-# Abort a stuck job
-prepubctl abort --job $JOB
-```
-
----
-
-## 9. Upgrading
-
-In-flight jobs survive a service restart: each state transition is an atomic
-filesystem rename preceded by a WAL journal fsync, so the service picks up where
-it left off.
-
-### `install.sh update` (recommended)
-
-```sh
-make build                      # produce the new binaries in ./bin/
-sudo ./install.sh update --dry-run   # preview: shows exactly what would change
-sudo ./install.sh update
-```
-
-`update` refuses to run unless the host is already installed, and it never
-writes configuration. Specifically:
-
-| Preserved | Replaced |
-|---|---|
-| `config.yaml`, `env` (secrets), `receiver.yaml`, TLS material | `cvmfs-prepub`, `prepubctl` |
-| spool, CAS, the service account | systemd units **only if their content changed** — the previous file is copied to `<unit>.bak-<timestamp>` first |
-| each unit's enabled/disabled and active/inactive state | |
-
-Services are stopped for the binary swap and restarted **only if they were
-running beforehand**, so an upgrade neither starts a service you deliberately
-stopped nor leaves a publisher down. If this release ships config keys your
-`config.yaml` does not set, `update` lists them (they are optional — flag
-defaults apply) rather than editing the file.
-
-For a drain-first upgrade on a busy publisher:
-
-```sh
-prepubctl drain --wait          # let in-flight jobs finish
-sudo ./install.sh update
-curl -sf http://localhost:8080/api/v1/health | jq .
-```
-
-### Manual equivalent
-
-```sh
-sudo install -m 755 bin/cvmfs-prepub /usr/local/bin/
-sudo systemctl restart cvmfs-prepub
-curl -sf http://localhost:8080/api/v1/health | jq .
-```
-
-If the new version changes the spool directory schema, a migration note will appear
-in the release changelog. Migrations are run automatically on startup; no manual
-action is required unless a breaking schema change is explicitly called out.
-
----
-
-## 10. Installing and Uninstalling
-
-The repository ships a single `install.sh` script that handles both
-installation and removal.  It is idempotent — running it again updates what
-has changed and skips everything already correct.  Always run with `--dry-run`
-first to preview every action before committing.
-
-### Install
-
-```sh
-# 1. Build binaries first (places them in ./bin/)
-make build
-
-# 2. Preview — nothing is changed
-sudo ./install.sh --dry-run
-
-# 3. Install the publisher service
-sudo ./install.sh
-
-# 4. Install and automatically remove legacy bits-console spool daemon
-sudo ./install.sh --purge-legacy
-
-# 5. Install receiver agent on a Stratum-1 node
-sudo ./install.sh --mode receiver
-
-# 6. Upgrade an existing host later — keeps all configuration (see §9)
-sudo ./install.sh update
-
-# 7. Run as an existing account, spool on another volume (see Step 3 above)
-sudo ./install.sh --user cvbits --spool-dir /mnt/cvmfs-prepub
-```
-
-After installation, edit the generated config templates before starting the
-service (or before the first real job):
-
-| File | Purpose |
-|---|---|
-| `/etc/cvmfs-prepub/config.yaml` | Publisher config — set `gateway.url`, `gateway.key_id`, `repositories`. |
-| `/etc/cvmfs-prepub/env` | Secrets — set `CVMFS_GATEWAY_SECRET`, `PREPUB_API_TOKEN` (mode 0600). |
-| `/etc/cvmfs-prepub/receiver.yaml` | Receiver config (Option B / `--mode receiver`). |
-
-Restart after editing:
-
-```sh
-sudo systemctl restart cvmfs-prepub
-curl http://localhost:8080/api/v1/health
-```
-
-### Uninstall
-
-```sh
-# 1. Preview every action — nothing is changed
-sudo ./install.sh uninstall --dry-run
-
-# 2. Remove the publisher (Stratum-0 node)
-sudo ./install.sh uninstall
-
-# 3. Remove the receiver agent (Stratum-1 node)
-sudo ./install.sh uninstall --mode receiver
-
-# 4. Remove both roles on a combined node
-sudo ./install.sh uninstall --mode all
-```
-
-### Uninstall options
-
-| Option | Effect |
-|---|---|
-| `--dry-run` | Print every action; make no changes. Always run this first. |
-| `--mode publisher` | Remove publisher binary, service, config, spool, CAS. (default) |
-| `--mode receiver` | Remove receiver binary, service, config, receiver CAS. |
-| `--mode all` | Remove all artifacts for both roles. |
-| `--keep-spool` | Preserve `/var/spool/cvmfs-prepub` (job history and WAL journal). |
-| `--keep-cas` | Preserve the local CAS data directory. |
-| `--keep-user` | Preserve the `cvmfs-prepub` system account. |
-| `--purge-legacy` | Also remove legacy bits-console spool daemon artifacts if found. |
-| `--yes` | Skip the interactive confirmation prompt (for automation). |
-
-### What gets removed
-
-**Publisher node** (`--mode publisher`, the default):
-
-| Artifact | Path | Notes |
-|---|---|---|
-| Binary | `/usr/local/bin/cvmfs-prepub` | |
-| Admin CLI | `/usr/local/bin/prepubctl` | |
-| Systemd unit | `/etc/systemd/system/cvmfs-prepub.service` | |
-| Configuration | `/etc/cvmfs-prepub/` | Includes TLS certs and env file |
-| Spool + WAL | `/var/spool/cvmfs-prepub/` | **All job history lost** — use `--keep-spool` |
-| Publisher CAS | `/srv/cvmfs/cas/` (or `cas.root` from config) | **All CAS objects lost** — use `--keep-cas` |
-| System account | `cvmfs-prepub` | `userdel` (no `-r`; home dir removed separately) |
-
-**Receiver node** (`--mode receiver`):
-
-| Artifact | Path | Notes |
-|---|---|---|
-| Binary | `/usr/local/bin/cvmfs-prepub` | |
-| Systemd unit | `/etc/systemd/system/cvmfs-prepub-receiver.service` | |
-| Configuration | `/etc/cvmfs-prepub/` | |
-| Receiver CAS | `/srv/cvmfs/stratum1/cas/` (or `cas.root` from receiver.yaml) | **All pre-warmed objects lost** — use `--keep-cas` |
-| System account | `cvmfs-prepub` | |
-
-The script reads `cas.root` from the config file if present, so custom CAS
-paths are handled automatically without editing the script.
-
-### Legacy bits-console spool daemon detection
-
-If the old `cvmfs-local-publish` daemon (bits-console spool service) is
-detected on the host, `install.sh` warns and optionally removes it.  These
-artifacts conflict with cvmfs-prepub because both attempt CVMFS transactions:
-
-| Legacy artifact | Default path |
-|---|---|
-| Systemd unit | `/etc/systemd/system/cvmfs-local-publish.service` |
-| Daemon binary | `/usr/local/sbin/cvmfs-local-publish.sh` |
-| Submit helper | `/usr/local/bin/cvmfs-spool-submit.sh` |
-| Configuration | `/etc/cvmfs-local-publish.conf` |
-| Spool directory | `/mnt/build/bits/spool` |
-
-Remove legacy artifacts during install:
-
-```sh
-sudo ./install.sh --purge-legacy
-```
-
-Or remove them separately after confirming cvmfs-prepub is working:
-
-```sh
-sudo ./install.sh uninstall --purge-legacy   # removes both sets of artifacts
-```
-
-### Preserving data for post-mortem inspection
-
-```sh
-# Stop the service but keep all data intact for forensics
-sudo ./install.sh uninstall --keep-spool --keep-cas --keep-user
-
-# Inspect the spool before final removal
-ls /var/spool/cvmfs-prepub/
-
-# Final cleanup when done
-sudo ./install.sh uninstall --yes
-```
-
-### Non-interactive removal (automation / Ansible)
-
-```sh
-sudo ./install.sh uninstall --yes --mode all
-```
-
-The exit code is 0 on success, 1 if any step failed (safe to use in `&&` chains).
-
-### Manual equivalent
-
-If you prefer not to run the script, the equivalent manual steps are:
-
-```sh
-# Publisher node — stop and remove
-sudo systemctl stop cvmfs-prepub
-sudo systemctl disable cvmfs-prepub
-sudo rm -f /etc/systemd/system/cvmfs-prepub.service
-sudo systemctl daemon-reload
-sudo rm -f /usr/local/bin/cvmfs-prepub /usr/local/bin/prepubctl
-sudo rm -rf /etc/cvmfs-prepub
-sudo rm -rf /var/spool/cvmfs-prepub          # CAUTION: deletes all job history
-sudo rm -rf /srv/cvmfs/cas                   # CAUTION: deletes all CAS objects
-sudo userdel cvmfs-prepub
-
-# Receiver node (Option B) — additional steps on each Stratum-1 host
-sudo systemctl stop cvmfs-prepub-receiver
-sudo systemctl disable cvmfs-prepub-receiver
-sudo rm -f /etc/systemd/system/cvmfs-prepub-receiver.service
-sudo systemctl daemon-reload
-sudo rm -f /usr/local/bin/cvmfs-prepub
-sudo rm -rf /etc/cvmfs-prepub
-sudo rm -rf /srv/cvmfs/stratum1/cas          # CAUTION: deletes receiver cache
-sudo userdel cvmfs-prepub
-```
-
----
-
-## 11. bits-console Integration
-
-[bits-console](https://gitlab.cern.ch/hep-software/bits-console) is the
-GitLab-based CI/CD front-end used to compile and publish HEP software to CVMFS.
-It manages build runners, enforces access control, and drives publication through
-configurable pipeline files.  `cvmfs-prepub` replaces the two-step
-`bits-ingest` + `bits-cvmfs-publisher` runner flow with a single REST API call.
-
-### 11.1 Prerequisites
-
-Before wiring bits-console to cvmfs-prepub, confirm the following:
-
-- `cvmfs-prepub` is installed, has a valid gateway key, and is reachable from
-  the bits-console build runners over HTTPS (§2–§6).
-- The bits-console GitLab project exists and at least one build runner tagged
-  `self-hosted` + `bits-build-<arch>-<os>` is registered (see the bits-console
-  INSTALL.txt runner registration guide for `bits-build` runner setup).
-- No `bits-ingest` or `bits-publisher` runners are required for the
-  cvmfs-prepub path — those are only needed for the legacy three-stage pipeline.
-
-### 11.2 Step 1 — Add CI/CD Variables to bits-console
-
-In the bits-console GitLab project go to **Settings → CI/CD → Variables** and
-add two protected, masked variables:
-
-| Variable | Example value | Notes |
-|---|---|---|
-| `PREPUB_URL` | `https://prepub.example.org:8080` | Base URL of the cvmfs-prepub API; no trailing slash |
-| `PREPUB_API_TOKEN` | `<random 32-byte base64 string>` | Same token configured in the cvmfs-prepub `EnvironmentFile` |
-
-Generate the token with:
-
-```sh
-openssl rand -base64 32
-```
-
-Set the matching value in the cvmfs-prepub server's environment file and reload:
-
-```sh
-# /etc/cvmfs-prepub/env (on the prepub host)
-PREPUB_API_TOKEN=<same token as above>
-```
-
-```sh
-sudo systemctl reload cvmfs-prepub
-```
-
-### 11.3 Step 2 — Add the Pipeline File
-
-Create `.gitlab/cvmfs-prepub-publish.yml` in the bits-console repository.
-This file is selected per-community via `publish_pipeline` in
-`ui-config.yaml` (see §11.4).
-
-```yaml
-# .gitlab/cvmfs-prepub-publish.yml
-#
-# Replaces the bits-ingest + bits-cvmfs-publisher two-stage flow.
-# The build runner compiles with bits, packages a tar, POSTs to cvmfs-prepub,
-# then polls until the job reaches "published".
-
-stages:
-  - compile-and-publish
-
-compile_and_publish:
-  stage: compile-and-publish
-  tags:
-    - self-hosted
-    - bits-build-${ARCHITECTURE}-${PLATFORM}
-  variables:
-    GIT_STRATEGY: fetch
-  script:
-    # 1. Fetch community config to determine the publish path
-    - >
-      ui_cfg=$(curl -fsSL --header "JOB-TOKEN: $CI_JOB_TOKEN"
-      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/files/communities%2F${COMMUNITY}%2Fui-config.yaml/raw?ref=${CI_COMMIT_REF_NAME}"
-      | python3 -c "import sys,yaml; c=yaml.safe_load(sys.stdin); print(c.get('cvmfs_prefix',''))")
-    # 2. Determine per-user or admin path
-    - |
-      ADMINS_FILE=$(curl -fsSL --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/files/communities%2F${COMMUNITY}%2Fui-config.yaml/raw?ref=${CI_COMMIT_REF_NAME}" \
-        | python3 -c "import sys,yaml; c=yaml.safe_load(sys.stdin); print(' '.join(c.get('admins',[])))")
-      if echo "$ADMINS_FILE" | grep -qw "$GITLAB_USER_LOGIN"; then
-        PUBLISH_PATH="${ui_cfg}"
-      else
-        USER_PREFIX=$(cat communities/${COMMUNITY}/ui-config.yaml \
-          | python3 -c "import sys,yaml; c=yaml.safe_load(sys.stdin); print(c.get('cvmfs_user_prefix',''))")
-        PUBLISH_PATH="${USER_PREFIX}/${GITLAB_USER_LOGIN}"
-      fi
-    # 3. Build with bits
-    - bits build --architecture $ARCHITECTURE --platform $PLATFORM
-    # 4. Package the build output as a tar
-    - tar -czf /tmp/build-output.tar.gz -C /tmp/bits-output .
-    # 5. Submit to cvmfs-prepub (multipart/form-data: repo, path, tar as separate fields)
-    - |
-      PREPUB_REPO=$(echo "$PUBLISH_PATH" | cut -d/ -f3)
-      PREPUB_SUBPATH=$(echo "$PUBLISH_PATH" | cut -d/ -f4-)
-      JOB_ID=$(curl -fsSL -X POST \
-        -H "Authorization: Bearer $PREPUB_API_TOKEN" \
-        -F "repo=${PREPUB_REPO}" \
-        -F "path=${PREPUB_SUBPATH}" \
-        -F "tar=@/tmp/build-output.tar.gz;type=application/octet-stream" \
-        "${PREPUB_URL}/api/v1/jobs" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
-      echo "Submitted cvmfs-prepub job: $JOB_ID"
-    # 6. Poll until published (timeout 30 min)
-    - |
-      for i in $(seq 1 180); do
-        STATE=$(curl -fsSL \
-          -H "Authorization: Bearer $PREPUB_API_TOKEN" \
-          "${PREPUB_URL}/api/v1/jobs/${JOB_ID}" | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
-        echo "[${i}] Job ${JOB_ID} state: ${STATE}"
-        [ "$STATE" = "published" ] && exit 0
-        [ "$STATE" = "failed" ] && { echo "Job failed"; exit 1; }
-        sleep 10
-      done
-      echo "Timeout waiting for job $JOB_ID"
-      exit 1
-  artifacts:
-    when: always
-    paths:
-      - /tmp/bits-output/
-    expire_in: 1 week
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_SOURCE == "api"'
-```
-
-Commit this file to the bits-console repository and push.
-
-### 11.4 Step 3 — Set `publish_pipeline` in `ui-config.yaml`
-
-For each community that should publish via cvmfs-prepub, open
-`communities/<community>/ui-config.yaml` and change (or add) the
-`publish_pipeline` key:
-
-```yaml
-# communities/LCG/ui-config.yaml  (example)
-cvmfs_prefix: /cvmfs/software.cern.ch/lcg
-cvmfs_user_prefix: /cvmfs/software.cern.ch/user
-
-# Change from:
-#   publish_pipeline: .gitlab/cvmfs-local-publish.yml
-# To:
-publish_pipeline: .gitlab/cvmfs-prepub-publish.yml
-
-admins:
-  - alice
-  - bob
-```
-
-Commit and push.  From this point any build triggered for that community will
-use the new pipeline.
-
-### 11.5 Step 4 — Runner Requirements
-
-The cvmfs-prepub pipeline needs only the `bits-build` runner — it handles
-compilation, packaging, API submission, and polling in a single job.  No
-dedicated `bits-ingest` or `bits-publisher` runner is required.
-
-Each `bits-build` runner must carry two tags so GitLab can schedule the job on
-the right architecture and OS:
-
-```
-self-hosted
-bits-build-x86_64-el9       ← replace with actual arch-os pair
-```
-
-Register runners following the bits-console INSTALL.txt runner registration
-guide (section "Build runner").  The runner user needs no special CVMFS
-privileges — all CVMFS writes happen server-side inside cvmfs-prepub.
-
-### 11.6 Step 5 — Verify the Integration
-
-Trigger a test build from the bits-console web UI:
-
-1. Open the bits-console GitLab project → **CI/CD → Pipelines → Run pipeline**.
-2. Set the `COMMUNITY` variable to the community configured in §11.4.
-3. Set `ARCHITECTURE` and `PLATFORM` to match a registered runner.
-4. Click **Run pipeline** and watch the `compile_and_publish` job log.
-
-The job log should show:
-
-```
-Submitted cvmfs-prepub job: <uuid>
-[1] Job <uuid> state: uploading
-[2] Job <uuid> state: distributing
-...
-[N] Job <uuid> state: published
-```
-
-Confirm the files are visible on CVMFS:
-
-```sh
-ls /cvmfs/software.cern.ch/lcg/
-```
-
-If the job reaches `failed`, retrieve the server-side error from the prepub API:
+Without `build_id` the job commits on its own. A `failed` job shows its error in
+`GET /api/v1/jobs/$JOB` and its log in `GET /api/v1/jobs/$JOB/log`. Check the
+result on a client: `ls /cvmfs/software.example.org/test/smoke/hello`. The path
+must lie inside `allowed_publish_prefixes` if that is set; otherwise the
+submission is refused with 403.
+
+### 6.4 Web console and job list
+
+The read-only web console is at `http://<host>:8080/` (`/jobs`, `/jobs/{id}`).
+The page itself is public; to show jobs it asks for the API token, keeps it in
+the browser, and sends it as a bearer token, so it needs `auth_mode` `bearer` or
+`both`. The job list is also available as JSON, newest first:
 
 ```sh
 curl -s -H "Authorization: Bearer $PREPUB_API_TOKEN" \
-    https://prepub.example.org:8080/api/v1/jobs/<uuid> | python3 -m json.tool
+  http://localhost:8080/api/v1/jobs | jq -r '.[] | "\(.state)\t\(.repo)/\(.path)\t\(.job_id)"'
 ```
 
 ---
 
-## 12. Multi-Community Deployment
+## 7. Stratum 1 pre-warming
 
-A single `cvmfs-prepub` instance can serve all bits-console communities
-simultaneously.  Access control between communities is enforced by two
-independent mechanisms: the CVMFS gateway (via namespace-scoped leases) and the
-bits-console pipeline itself (via `GITLAB_USER_LOGIN` checked against the
-community's `admins` list in `ui-config.yaml`).
+Pre-warming lets Stratum 1s pull a build's new objects from the publisher before
+its catalog is committed, so their next replication downloads little more than
+catalogs. The commit never waits for receivers; they also catch up after each
+commit. Protocol and trust model:
+[REFERENCE.md](REFERENCE.md#6-pull-distribution-protocol),
+[REFERENCE.md](REFERENCE.md#7-security-model).
 
-### 12.1 Namespace Isolation via the Gateway
+Pre-warming needs gateway mode and the default `prepub` path. Replace
+`s0.example.org` below with the publisher's public name.
 
-Each community publishes to a distinct sub-path of the CVMFS repository.  The
-gateway key used by cvmfs-prepub must be scoped to cover all community prefixes:
+### 7.1 Keys and certificates on the publisher
+
+`/etc/cvmfs-prepub/tls` is not readable by ordinary users, so run every command
+with `sudo` and absolute paths:
 
 ```sh
-# Allow cvmfs-prepub to acquire leases anywhere under /cvmfs/software.cern.ch:
-cvmfs_gateway key add prepub-service /cvmfs/software.cern.ch
+T=/etc/cvmfs-prepub/tls
+# A CA for the broker and enroll certificate (or use your site CA).
+sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -subj "/CN=cvmfs-prepub CA" -keyout $T/ca.key -out $T/ca.crt
+# Server certificate for the broker and enroll listeners: the public name that
+# receivers use, plus localhost for the publisher's own broker clients.
+sudo openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj "/CN=s0.example.org" -keyout $T/broker.key -out $T/broker.csr
+printf 'subjectAltName=DNS:s0.example.org,DNS:localhost\n' | sudo tee $T/broker.ext >/dev/null
+sudo openssl x509 -req -in $T/broker.csr -CA $T/ca.crt -CAkey $T/ca.key -CAcreateserial \
+  -days 825 -extfile $T/broker.ext -out $T/broker.crt
+# Ed25519 key pair that signs the discovery document.
+sudo openssl genpkey -algorithm ed25519 -out $T/discovery.key
+sudo openssl pkey -in $T/discovery.key -pubout -out $T/discovery.pub
+sudo chown root:cvmfs-prepub $T/broker.key $T/discovery.key
+sudo chmod 0640 $T/broker.key $T/discovery.key
+# Master secret (publisher only).
+echo "PREPUB_HMAC_SECRET=$(openssl rand -hex 32)" | sudo tee -a /etc/cvmfs-prepub/env >/dev/null
 ```
 
-A single broad key is appropriate when cvmfs-prepub is the only publisher and
-enforces per-community path boundaries itself.  If other publishers also use the
-gateway, use narrower keys (one per community sub-path) and run a separate
-cvmfs-prepub instance per community.
+The publisher's own announce and notification clients connect to its broker as
+`wss://localhost:<port>` and verify the certificate against `--broker-ca-cert`,
+which is why the certificate names `localhost` as well. Keep `ca.key` off the
+publisher once the certificate is issued. Receivers get only `ca.crt` and
+`discovery.pub`.
 
-### 12.2 Community `ui-config.yaml` Settings
+### 7.2 Publisher flags
 
-Each community declares its own paths and admin list.  The bits-console pipeline
-reads these at CI job runtime via the GitLab API (using `CI_JOB_TOKEN`) and
-applies them server-side before calling cvmfs-prepub:
+The control-plane settings are command-line flags with no YAML keys; add them in
+a drop-in (`sudo systemctl edit cvmfs-prepub`):
 
-| `ui-config.yaml` field | Purpose |
-|---|---|
-| `cvmfs_prefix` | Publish path for admin users |
-| `cvmfs_user_prefix` | Prefix for per-user sandbox paths |
-| `publish_pipeline` | Pipeline file selected for this community |
-| `admins` | GitLab login names with admin-path write access |
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/cvmfs-prepub --config /etc/cvmfs-prepub/config.yaml \
+  --prewarm \
+  --embedded-broker-ws-addr :1882 \
+  --control-plane-url wss://s0.example.org:1882 \
+  --embedded-broker-tls-cert /etc/cvmfs-prepub/tls/broker.crt \
+  --embedded-broker-tls-key /etc/cvmfs-prepub/tls/broker.key \
+  --embedded-broker-auth \
+  --broker-ca-cert /etc/cvmfs-prepub/tls/ca.crt \
+  --enroll-tls-addr :8443 --enroll-url https://s0.example.org:8443 \
+  --discovery-signing-key /etc/cvmfs-prepub/tls/discovery.key \
+  --pull-object-base-url http://s0.example.org:8080
+```
 
-A community with:
+`--prewarm` makes pre-warming the node default, which a job can override with
+its `prewarm` field (`PREPUB_PREWARM` in bits-console); without it no pre-commit
+announce is sent, but receivers still converge after each commit.
+`--embedded-broker-auth` (needs `PREPUB_HMAC_SECRET`) admits only enrolled nodes,
+and `--enroll-tls-addr` serves enrollment and revocation over HTTPS with the
+broker certificate, so the enrollment token never travels in plaintext.
+`--broker-ca-cert` lets the publisher's own clients verify the broker.
+Receivers are told `--control-plane-url` and `--enroll-url`, and fetch objects
+from `--pull-object-base-url` (the API base URL). Open ports 1882, 8443 and the
+API port to the Stratum 1s.
+
+Restart and check the log for `embedded broker: token authentication enabled`,
+`control-plane: TLS enroll/revoke listener started` and
+`control-plane: discovery advertising broker`.
+
+### 7.3 Provision a receiver key
+
+Each receiver authenticates with its own key, derived from the master secret and
+its node id (the receiver's `node_id`, by default its hostname; `publisher` is
+reserved). Print it on the publisher and hand it to the Stratum 1 operator over
+a secure channel:
+
+```sh
+sudo sh -c 'set -a; . /etc/cvmfs-prepub/env; /usr/local/bin/cvmfs-prepub node-key stratum1-a'
+```
+
+### 7.4 Install and configure the receiver
+
+On the Stratum 1:
+
+```sh
+sudo ./install.sh --mode receiver --skip-service
+sudo cp ca.crt discovery.pub /etc/cvmfs-prepub/tls/      # from the publisher
+echo "S1_NODE_KEY=<hex from node-key>" | sudo tee /etc/cvmfs-prepub/env >/dev/null
+```
+
+`/etc/cvmfs-prepub/receiver.yaml`:
 
 ```yaml
-cvmfs_prefix: /cvmfs/software.cern.ch/lcg
-cvmfs_user_prefix: /cvmfs/software.cern.ch/user
-admins: [alice, bob]
+control_addr: ":9100"                  # plain-HTTP /metrics
+node_id: stratum1-a                    # must match the node-key argument
+repos:
+  - software.example.org
+receiver_stratum0_url: http://s0.example.org:8080   # the publisher's API base URL
+broker_ca_cert: /etc/cvmfs-prepub/tls/ca.crt
+cas:
+  root: /srv/cvmfs/stratum1/cas
 ```
 
-will publish alice's builds to `/cvmfs/software.cern.ch/lcg/` and all other
-users' builds to `/cvmfs/software.cern.ch/user/<login>/`.
+Discovery and authentication flags have no YAML keys; add them in a drop-in
+(`sudo systemctl edit cvmfs-prepub-receiver`):
 
-### 12.3 Single cvmfs-prepub Instance for All Communities
-
-No per-community cvmfs-prepub instances are needed.  The publish path is passed
-by the bits-console pipeline in the `X-Cvmfs-Path` HTTP header; cvmfs-prepub
-treats each path independently within the same spool and CAS:
-
-```
-Community A build  ──┐
-Community B build  ──┼──▶  cvmfs-prepub :8080  ──▶  cvmfs_gateway  ──▶  Stratum 1
-Community C build  ──┘         (shared)
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/cvmfs-prepub --config /etc/cvmfs-prepub/receiver.yaml --mode receiver \
+  --discovery-url http://s0.example.org:8080 \
+  --discovery-verify-key /etc/cvmfs-prepub/tls/discovery.pub \
+  --broker-auth
 ```
 
-The systemd unit from §3 requires no changes.  The gateway key must be broad
-enough to cover all community prefixes (see §12.1).
+Then `sudo systemctl enable --now cvmfs-prepub-receiver`.
 
-### 12.4 Runner Tagging for Multiple Communities
+`repos` must not be empty: the receiver fetches discovery for the first
+repository listed and acts only on announcements for the listed repositories.
+Always use `--broker-auth` with `--discovery-verify-key`; the discovery
+signature is checked only under `--broker-auth`. Pulled objects are stored under
+`cas.root` in the CVMFS data layout. The receiver's only secret is
+`S1_NODE_KEY`. Transfer tuning (`--pull-concurrency`, `--pull-files-per-request`,
+`--pull-auto`) and all receiver keys are in
+[REFERENCE.md](REFERENCE.md#4-receiver-configuration).
 
-If different communities target different architectures or OS platforms,
-register multiple `bits-build` runners, each tagged accordingly:
+### 7.5 Verify
 
+- Receiver log: `control-plane: broker URL learned from discovery`, then
+  `receiver ready`.
+- Publish a package with pre-warming on. The job passes through `distributing`,
+  and the publisher logs `pull: transaction manifest stored`.
+- Receiver metrics: `curl -s http://<stratum1>:9100/metrics | grep cvmfs_receiver_pull`
+  shows `cvmfs_receiver_pull_transactions_total{result="warmed"}` increasing.
+
+### 7.6 Revoke a receiver
+
+```sh
+sudo sh -c 'set -a; . /etc/cvmfs-prepub/env; /usr/local/bin/cvmfs-prepub revoke stratum1-a \
+  --enroll-url https://s0.example.org:8443 --ca-cert /etc/cvmfs-prepub/tls/ca.crt'
 ```
-self-hosted + bits-build-x86_64-el9    ← EL9 x86_64 (LCG, ATLAS, CMS …)
-self-hosted + bits-build-aarch64-el9   ← EL9 ARM64
-self-hosted + bits-build-x86_64-el8    ← EL8 (legacy communities)
+
+This needs the enroll listener (`--enroll-tls-addr`). The node is put on a
+denylist and its live broker sessions are closed. The denylist is held in
+memory, so it lasts until the publisher restarts; to exclude a node
+permanently, also rotate `PREPUB_HMAC_SECRET`, issue new keys to the remaining
+receivers and restart.
+
+---
+
+## 8. bits-console integration
+
+bits-console publishes through its CI template
+[`.gitlab/cvmfs-prepub-publish.yml`](https://gitlab.cern.ch/buncic/bits-console/-/blob/main/.gitlab/cvmfs-prepub-publish.yml).
+Its header documents every pipeline variable; this section covers what the
+publisher operator has to set and check.
+
+### 8.1 Configure bits-console
+
+1. In the bits-console project, **Settings → CI/CD → Variables**, add
+   `PREPUB_URL` (the publisher's API base URL, for example
+   `http://prepub.example.org:8080`, or the TLS proxy URL) and
+   `PREPUB_API_TOKEN` (the same value as on the publisher), both protected and
+   masked. They may instead come from the runner's `config.toml` environment.
+2. Each community selects the pipeline in `communities/<community>/ui-config.yaml`
+   with `publish_pipeline: .gitlab/cvmfs-prepub-publish.yml`. An optional
+   `prepub_url:` there overrides `PREPUB_URL` for that community.
+3. Build runners need the tags `self-hosted` and `bits-build-<arch>` (for example
+   `bits-build-x86_64`; bits-console may pin a build with `bits-host-<name>`).
+   Runners need no CVMFS privileges, except for the staged path, whose runner
+   requirements are listed under `PREPUB_PUBLISH_PATH` in the template.
+
+### 8.2 Defaults that affect the publisher
+
+| Variable | Default | Effect on the publisher |
+|---|---|---|
+| `PREPUB_COARSE` | `true` | every job carries `build_id` (the CI pipeline id) and accumulates; one finalize commits the build. Needs `finalize_ready: true` ([section 4.5](#45-coarse-publish-and-the-finalize)) |
+| `PREPUB_WAIT` | `false` | the CI job uploads, seals the build and exits; the publisher finalizes on its own, so a green pipeline does not yet mean "published" |
+| `PREPUB_SIGN` | `true` | requests are signed (`X-Bits-Auth`); works with `auth_mode` `both` or `hmac` |
+| `PREPUB_PUBLISH_PATH` | `prepub` | `ingest` and `staged` require the node to offer that path ([section 4](#4-publish-backends-and-paths)) |
+| `PREPUB_PREWARM` | off | `true` sends `prewarm=true` (prepub path only) |
+
+### 8.3 Verify
+
+Run one pipeline for a test package. The `bits-prepub-build` job log shows
+`[publish] auth: PREPUB_API_TOKEN present`, the publish path or coarse mode in
+use, and, with the defaults, that the build was sealed. Then follow it on the
+publisher:
+
+```sh
+curl -s -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+  http://localhost:8080/api/v1/builds/<CI pipeline id> | jq
 ```
 
-GitLab's runner matching (`tags:` in the pipeline YAML) routes each
-`compile_and_publish` job to the correct host automatically.  No changes to
-the cvmfs-prepub server are required when adding new runners.
+The build should reach a result with no failed members and the files should
+appear on a CVMFS client. For 401s or a build that never finalizes, see
+[section 10.9](#109-common-problems).
 
-### 12.5 Monitoring Across Communities
+---
 
-The single cvmfs-prepub instance exposes per-job metrics with the path label
-set to the `X-Cvmfs-Path` value, allowing Grafana dashboards to show
-per-community throughput, failure rates, and publish latencies without running
-separate instances.
+## 9. Several communities on one instance
 
-Key metrics:
+One publisher can serve every community and repository it has credentials for;
+the target of each job is its `repo` and `path` fields. Spool, CAS and limits
+are shared.
 
-| Metric | What to watch |
-|---|---|
-| `cvmfs_prepub_jobs_submitted_total` | Build cadence (label: `path`) |
-| `cvmfs_prepub_pipeline_dedup_hits_total` | Cross-community dedup effectiveness |
-| `cvmfs_prepub_cas_upload_duration_seconds` | CAS upload performance |
-| `cvmfs_prepub_distribution_duration_seconds` | Stratum 1 push latency (Option B) |
-| `cvmfs_prepub_jobs_recovered_total` | Crash recovery events |
-| `cvmfs_prepub_job_failures_by_class_total` | Failure classification |
+- **Gateway key scope.** The gateway key in `CVMFS_GATEWAY_KEY_ID` must be
+  allowed, in the gateway's repository access configuration, on every path the
+  communities publish to. The gateway refuses a lease outside that scope.
+- **Containment.** `allowed_publish_prefixes` (flag `--allowed-publish-prefix`,
+  comma-separated) lists the group roots this instance may publish into, for
+  example `/cvmfs/software.example.org/lcg`. A submission or reservation outside
+  every root is refused with 403. List a group's root, not its `releases/`
+  directory, when its user area is a sibling.
+- **One API token.** All producers share `PREPUB_API_TOKEN`; deciding who may
+  publish where is bits-console's job, and containment bounds the damage.
+- **Monitoring.** Metrics have no per-community labels. Filter the per-publish
+  measurement records by `repo` and `path` instead; they are grouped per build
+  (`GET /api/v1/measurements` lists builds, `latest` is only the newest), e.g.
+  `curl -s http://localhost:8080/api/v1/measurements/<build> | jq '[.[] | select(.path | startswith("lcg/"))]'`.
 
-Set an alert on `job_failures_by_class_total{class="permanent"}` to detect
-misconfiguration (wrong gateway URL, revoked token, malformed tar) before it
-affects users.
+---
+
+## 10. Operations and troubleshooting
+
+### 10.1 Job lifecycle at a glance
+
+A job moves `incoming → staging → uploading → [distributing] → leased →
+committing → published`; a coarse-build member ends in `accumulated`, and a
+failed or aborted job in `failed`. Each job is a directory under
+`<spool_root>/<state>/` ([REFERENCE.md](REFERENCE.md#2-job-lifecycle)).
+
+### 10.2 Retries
+
+A failed attempt is retried with backoff until `retry_window` (default 24 h from
+submission) runs out, unless the failure is permanent (for example a conflict
+with already published content) or the job was aborted. Coarse-build members
+and finalize jobs are not retried. `GET /api/v1/jobs/{id}` shows `attempts`,
+`last_error` and `next_attempt_at`, and `cvmfs_prepub_spool_jobs_waiting_retry`
+counts waiting jobs. Turn retries off with the flag `--retry-window=0` (a zero in
+YAML means "default"). The schedule is in
+[REFERENCE.md](REFERENCE.md#2-job-lifecycle).
+
+### 10.3 Restarts and recovery
+
+A restart is safe: at startup every job in a non-terminal state is resumed, a
+clean stop does not count against the job, and a job that repeatedly crashes the
+service is eventually failed instead of crash-looping it
+([REFERENCE.md](REFERENCE.md#2-job-lifecycle)). On stop the service waits up to
+30 s for requests to drain. The unit has no reload action; configuration
+changes need a restart.
+
+### 10.4 Aborting a job
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+  http://localhost:8080/api/v1/jobs/<id>/abort
+```
+
+Abort applies to a queued or running job (202), including one waiting for a
+concurrency slot; the job ends in `failed` and is not retried. A job that is
+already terminal answers 409.
+
+### 10.5 Spool space and payload cleanup
+
+A job's `payload.tar` is deleted when the job reaches a final state; the failure
+cause stays in its manifest, its log and the measurements. Job directories are
+kept. Uploads that would leave less than `spool_min_free_gib` free are refused
+with 507, and tars above `max_tar_size_gib` with 413. Watch
+`cvmfs_prepub_spool_fs_avail_bytes`, and prune old `published/` and `failed/`
+job directories when you no longer need their history. Measurement records live
+in `<spool>/measurements` unless `measurements_dir` says otherwise (`off`
+disables them).
+
+### 10.6 Timeouts
+
+`job_timeout` bounds a whole job from the moment it gets a concurrency slot. It
+is off by default (startup warns): a wall clock cannot tell a slow job from a
+stuck one, so size it against the largest package on your storage, or leave it
+off. Lease acquisition on a busy path gives up after `--lease-retry-max` (12
+min); S3 requests time out after 2 min without a response header and 15 min per
+operation.
+
+### 10.7 Diagnosing a stalled publisher
+
+A pipeline stage that stops returning parks the others at zero CPU with no log
+output. Enable the debug listener (`server.debug_listen: 127.0.0.1:6060`,
+restart) and take a goroutine dump:
+
+```sh
+curl -s 'http://127.0.0.1:6060/debug/pprof/goroutine?debug=2' > goroutines.txt
+```
+
+Use this instead of `SIGQUIT`, which kills the process and pushes thousands of
+lines through the rate-limited journal. Keep the listener on loopback: profiles
+contain heap contents, including credentials. Then check the storage:
+`vmstat 1` (high `b` and `wa`) and `iostat -x 1` (`%util`, `r_await`). If the
+spool device is saturated, no concurrency setting helps.
+
+### 10.8 Tuning
+
+| Setting (YAML) | Default | When to change |
+|---|---|---|
+| `pipeline.workers` | 4 (template: 2) | memory lever; see below |
+| `pipeline.upload_concurrency` | 4 | dedup is one `HEAD` per object on S3; raise when re-publishing mostly existing content is slow |
+| `pipeline.prefetch` | on | turn off on I/O-bound storage, where the look-ahead doubles disk I/O |
+| `promote_workers` | 16 | staged path only; mind the 256-connection pool per S3 host shared with uploads |
+
+Peak memory scales with `pipeline.workers` times the largest file being
+compressed. The unit's `MemoryHigh=2G` and `MemoryMax=3G` suit `workers: 2` on
+an 8 GB host shared with a gateway; at 4 workers a large package can exceed
+`MemoryMax` and systemd kills the service. On a dedicated host raise the workers
+and both limits together, in a drop-in (`[Service]`, `MemoryHigh=6G`,
+`MemoryMax=8G`). Leave `chunking` at its fixed 6 MiB: coarse publish requires
+it. Job-slot limits, prefetch budget and the environment-variable equivalents are
+in [REFERENCE.md](REFERENCE.md#3-publisher-configuration); the startup line
+`publisher tuning` shows the values in effect.
+
+### 10.9 Common problems
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Service exits at start: `PREPUB_API_TOKEN environment variable must be set` | env file missing or not readable | [section 3](#3-deploy-a-publisher) step 4 |
+| `gateway URL must use HTTPS` | non-loopback `http://` gateway | HTTPS or `gateway.allow_plaintext: true` |
+| `startup probe failed` or `failed to load S3 settings` | CAS not writable or S3 config missing or too permissive; gateway unreachable or key rejected; `cvmfs_server` missing | read the error; [section 3](#3-deploy-a-publisher) steps 2 and 4 |
+| CI green but nothing published | finalize not configured | set `ingest_config_prefix`; check `finalize_ready` |
+| Every submission 400 naming a publish path | node does not offer that path | `ingest_publish: true`; `staged` is offered in gateway mode but fails at run time without `cas.type: s3` |
+| 401 on signed requests | token mismatch, clock skew, or a proxy path prefix | compare tokens, check NTP, sign the prefixed path |
+| 403 on submit | target outside `allowed_publish_prefixes` | extend the list or fix the path |
+| Commit fails with a graft error | gateway without the graft endpoint | `gateway.direct_graft: false` |
+| Service killed during large publishes | `MemoryMax` below what `pipeline.workers` needs | lower workers or raise the limits |
+
+---
+
+## 11. Upgrading
+
+```sh
+git pull && make build
+sudo ./install.sh update --dry-run     # shows exactly what would change
+sudo ./install.sh update
+curl -s http://localhost:8080/api/v1/health | jq
+```
+
+`update` refuses to run on a host that is not installed and never writes
+configuration. It preserves `config.yaml`, `env`, `receiver.yaml`, TLS material,
+spool, CAS, the service account and each unit's enabled and running state. It
+replaces the binary, and a unit file only if its content differs from the
+shipped template, after copying the old one to `<unit>.bak-<timestamp>`.
+Running services are stopped for the swap and restarted; stopped ones stay
+stopped. If the shipped config template has top-level keys your `config.yaml`
+lacks, `update` lists them; they are optional.
+
+In-flight jobs survive the restart ([section 10.3](#103-restarts-and-recovery)).
+There is no drain command; on a busy publisher, wait until `GET /api/v1/jobs`
+shows nothing in `incoming` to `committing` before updating. Without
+`install.sh`: install the new binary and `systemctl restart` the units.
+
+### Rolling back
+
+`update` does not keep the previous binary. To go back, build the previous
+version and update to it:
+
+```sh
+git checkout <previous release tag or commit>
+make build
+sudo ./install.sh update
+```
+
+Unit files that `update` replaced are kept next to them as
+`/etc/systemd/system/<unit>.service.bak-<YYYYmmddHHMMSS>`; rolling back writes
+the older template and backs up the current file the same way. Remove drop-in
+flags the older version does not define first, or it exits with
+`flag provided but not defined`.
+
+### Notes for this release
+
+- Receiver flags `--tls-cert`, `--tls-key`, `--data-addr`, `--data-host`,
+  `--session-ttl` and `--disk-headroom` are accepted but ignored, with the
+  warning `ignoring deprecated flags; remove them from the unit`. Remove them
+  now; a later release will reject them.
+- Flags of removed features (push distribution, an external MQTT broker with
+  client certificates, TLS on the API listener, `--api-token`) are no longer
+  defined, and the service exits with `flag provided but not defined`. Remove
+  them from units and drop-ins before updating.
+- Configuration keys of removed features are ignored silently. Delete
+  `gateway.key_id`, `gateway.key_secret_env`, `gateway.lease_ttl`,
+  `gateway.heartbeat_interval`, `pipeline.compression`, `repositories`, the
+  server TLS keys and any `distribution:` block. The gateway key id now comes
+  from `CVMFS_GATEWAY_KEY_ID`.
+- The admin CLI `prepubctl` is no longer built or installed. Delete a leftover
+  `/usr/local/bin/prepubctl`; use the job API and the web console
+  ([section 10.4](#104-aborting-a-job)).
+- Older versions kept every job's payload. Reclaim the space once with
+  `sudo find <spool_root>/{published,accumulated,failed,aborted} -mindepth 2 -maxdepth 2 -name payload.tar -delete`.
+
+---
+
+## 12. Uninstalling
+
+```sh
+sudo ./install.sh uninstall --dry-run                  # preview
+sudo ./install.sh uninstall --keep-spool --keep-cas    # publisher, keep data
+sudo ./install.sh uninstall --mode receiver            # on a Stratum 1
+sudo ./install.sh uninstall --mode all --yes           # everything, no prompts
+```
+
+| Removed | publisher | receiver |
+|---|---|---|
+| unit (stopped and disabled first) | `cvmfs-prepub.service` | `cvmfs-prepub-receiver.service` |
+| `/usr/local/bin/cvmfs-prepub` | yes | yes |
+| `/etc/cvmfs-prepub/` (config, env, TLS material) | yes | yes |
+| spool (all job history) | unless `--keep-spool` | no |
+| CAS directory from `cas.root` | unless `--keep-cas` | unless `--keep-cas` |
+| `cvmfs-prepub` account | unless `--keep-user`; never an account given with `--user` | same |
+
+Without `--yes` the script lists what it will remove and asks for `yes`.
+`--keep-cas` matters most on a Stratum 1 or wherever
+`cas.root` is the repository's live store: removing it deletes published
+objects. `--mode receiver` removes the shared binary and `/etc/cvmfs-prepub` even
+if a publisher is installed on the same host; use `--mode all` there. Legacy
+bits-console spool artifacts found during uninstall are removed with
+`--purge-legacy` or `--yes`.
+
+Files outside the installation (`/etc/cvmfs/keys/*`, `connect-gw` state, the
+ingest config prefix) are not touched.

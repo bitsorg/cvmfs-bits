@@ -8,9 +8,11 @@ DirectGraft fast-path commit.
 
 ## What it brings up
 
-The stack combines two fixtures from the cvmfs source tree:
+The stack uses fixtures from the cvmfs source tree:
 
-- the S3 backend (Garage) from `test/common/container/s3-integration`
+- the S3 backend: Garage (`dxflrs/garage` image), configured with
+  `config/garage.toml` and `scripts/setup_garage.sh` from
+  `test/common/container/publish-mountless`
 - a **mountless** gateway (`cvmfs_server mkfs -P -D` — no FUSE, no systemd, no
   privileged) from `test/common/container/publish-mountless`, built from
   `cvmfs@devel`
@@ -47,6 +49,9 @@ Requires Docker (with Compose v2), Go, and a cvmfs checkout on `devel`:
 CVMFS_SRC=/path/to/cvmfs ./run.sh
 ```
 
+`run.sh` starts `prepub` with `--gateway-direct-graft=true`, so the checkout
+must include the gateway's graft endpoint (`POST /api/v1/leases/<token>/graft`).
+
 The first run builds the gateway image from cvmfs source, which is slow. Set
 `KEEP_UP=1` to leave the stack and `prepub` running afterwards for debugging:
 
@@ -61,7 +66,8 @@ CVMFS_SRC=/path/to/cvmfs docker compose -f docker-compose.yml down -v
 `.github/workflows/gateway-publish.yml` checks out both repos, then runs
 `run.sh`. It triggers on `workflow_dispatch` (with an optional `cvmfs_ref`
 input) and on pull requests that touch the gateway client (`internal/lease`,
-`internal/api`, `cmd/prepub`) or these fixtures. It does **not** run on every
+`internal/api`, `cmd/prepub`) or these fixtures, and on pushes to the
+`gateway-dedicated-graft-endpoint-test` branch. It does **not** run on every
 push — building cvmfs from source is expensive.
 
 ## Credentials

@@ -291,7 +291,7 @@ func main() {
 	// --stratum0-url (publisher-mode, a /cvmfs URL) to avoid a flag collision.
 	recvStratum0URL := flag.String("receiver-stratum0-url", "", "cvmfs-prepub publisher base URL, e.g. http://stratum0:8080; the receiver fetches {url}/s1/... (manifests, bundles) and {url}/cvmfs/{repo}/data/... (post-commit objects) [receiver]")
 	discoveryURL := flag.String("discovery-url", "", "Fixed S0 endpoint serving the discovery doc GET {url}/cvmfs/{repo}/.cvmfsbits; the receiver learns its control-plane broker URL from it [receiver]")
-	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs PREPUB_HMAC_SECRET and --discovery-url [receiver]")
+	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs S1_NODE_KEY and --discovery-url [receiver]")
 
 	// Removed receiver flags, still accepted (and ignored) for one release so
 	// existing units do not fail with "flag provided but not defined".
