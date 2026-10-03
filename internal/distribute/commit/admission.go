@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
-// Package commit implements the Stratum-0 coordination mechanisms of ADR-0001
-// phase P3: server-side admission control (leases), the warm-gate that decides
+// Package commit implements the Stratum-0 coordination mechanisms of pull
+// distribution: server-side admission control (leases), the warm-gate that decides
 // when an authoritative quorum of replicas is warm enough to commit, and the
 // durable transaction journal used to reconcile a crashed publisher on restart.
 //
 // These are transport-agnostic building blocks: they hold no broker or HTTP
 // dependency, so they can be driven by the MQTT control plane, an SSE control
-// plane (ADR P-B), or directly in tests.
+// plane, or directly in tests.
 package commit
 
 import (
@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// Budget is the transfer allowance granted with a lease (ADR D6).
+// Budget is the transfer allowance granted with a lease.
 type Budget struct {
 	MaxBytesPerSec int64 // 0 = unlimited
 	Slots          int   // concurrent object fetches the receiver may run
@@ -41,7 +41,7 @@ type Options struct {
 	Budget        Budget        // budget handed out with each lease
 }
 
-// Admission is the server-side admission controller (ADR D6). It bounds how many
+// Admission is the server-side admission controller. It bounds how many
 // receivers may pull concurrently — globally and per node — and issues TTL'd
 // leases so an unused or stalled lease frees its slot on the next sweep.
 type Admission struct {

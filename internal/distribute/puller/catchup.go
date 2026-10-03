@@ -15,8 +15,8 @@ import (
 	"cvmfs.io/prepub/internal/distribute/manifest"
 )
 
-// PullStream brings the local CAS up to a streamed NDJSON manifest (ADR-0001 D4 /
-// P4 catch-up). Unlike Pull it never materialises the object set: it decodes the
+// PullStream brings the local CAS up to a streamed NDJSON manifest (catch-up).
+// Unlike Pull it never materialises the object set: it decodes the
 // header, then for every object record checks the local store and dispatches the
 // missing ones to a bounded worker pool as they arrive — so memory stays flat no
 // matter how large the catch-up diff is.
@@ -106,8 +106,8 @@ func (p *Puller) PullStream(ctx context.Context, r io.Reader) (Result, *manifest
 }
 
 // Catchup fetches the cumulative catch-up manifest for repo (from the receiver's
-// persisted last-synced root up to targetRoot) and pulls every missing object
-// (ADR-0001 D4). It advances the synced root ONLY when the diff stream both
+// persisted last-synced root up to targetRoot) and pulls every missing object.
+// It advances the synced root ONLY when the diff stream both
 // completed (X-Catchup-Complete trailer) and every object was installed — so an
 // interrupted catch-up is safely retried from the same baseline next time.
 func (c *Coordinator) Catchup(ctx context.Context, repo, targetRoot string) (Result, error) {

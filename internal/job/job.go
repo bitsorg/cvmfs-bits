@@ -126,8 +126,8 @@ const (
 	StateLeased State = "leased"
 	// StateCommitting is the final gateway publish stage.
 	StateCommitting State = "committing"
-	// StateAccumulated is a terminal state for a coarse-publish package job
-	// (ADR-0007): its objects are uploaded and its catalog entries recorded into
+	// StateAccumulated is a terminal state for a coarse-publish package job:
+	// its objects are uploaded and its catalog entries recorded into
 	// the build accumulator, awaiting the single end-of-build finalize commit.
 	// The job itself does not commit to the gateway.
 	StateAccumulated State = "accumulated"
@@ -188,7 +188,7 @@ type Job struct {
 	// accumulate into one commit is Coarse, below.
 	// Empty preserves the legacy per-package commit behaviour.
 	BuildID string `json:"build_id,omitempty"`
-	// Coarse says this job takes part in its build's ONE commit (ADR-0007
+	// Coarse says this job takes part in its build's ONE commit (coarse
 	// accumulate + finalize) rather than committing on arrival.
 	//
 	// Separate from BuildID on purpose. BuildID is the CI pipeline that
@@ -330,7 +330,7 @@ type Job struct {
 	//	"" / "prepub" — compress + dedup + CAS, then a gateway commit. Supports
 	//	                pre-warming and coarse (whole-build) publish.
 	//	"ingest"      — hand the tar to `cvmfs_server ingest` and let the gateway
-	//	                do the chunking, dedup and catalogs (ADR-0008 D7).
+	//	                do the chunking, dedup and catalogs.
 	//
 	// The name must resolve to a backend the deployment actually has; a job
 	// naming an unserviceable path is rejected at submission.
@@ -408,7 +408,7 @@ func NewJob(id, repo, packageName, tarPath string) *Job {
 const DefaultPublishPathName = "prepub"
 
 // IsCoarse reports whether this job accumulates into its build's single
-// commit (ADR-0007) rather than committing on arrival.
+// commit rather than committing on arrival.
 //
 // A nil Coarse means the producer did not say -- either an older producer, or
 // a manifest written before the field existed. Fall back to what prepub used

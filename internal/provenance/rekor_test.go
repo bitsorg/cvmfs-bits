@@ -13,7 +13,7 @@ import (
 )
 
 // TestParseRekorConflict_UUIDFromLocation verifies that the Location header
-// is used to extract the real entry UUID on a 409 response (Fix #6).
+// is used to extract the real entry UUID on a 409 response.
 func TestParseRekorConflict_UUIDFromLocation(t *testing.T) {
 	body, _ := json.Marshal(rekorResponseEntry{
 		LogIndex:       42,
@@ -80,11 +80,11 @@ func TestParseRekorConflict_BadBodyNoLocation(t *testing.T) {
 	}
 }
 
-// ── Fix #11: URL construction uses url.Values encoding ────────────────────────
+// ── URL construction uses url.Values encoding ─────────────────────────────────
 
 // TestSearchRekor_URLEncoding verifies that the sha256 hash is transmitted as
 // a properly parsed query parameter rather than raw string concatenation,
-// and that the server receives the correct "hash" value (Fix #11).
+// and that the server receives the correct "hash" value.
 func TestSearchRekor_URLEncoding(t *testing.T) {
 	var gotHash string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

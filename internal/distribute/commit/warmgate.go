@@ -10,8 +10,8 @@ import (
 )
 
 // WarmGate tracks per-transaction warming acks and decides when an authoritative
-// quorum of Stratum 1 replicas is warm, so the catalog commit may proceed
-// (ADR-0001 D6). "Committed" is decoupled from "globally warm": only the
+// quorum of Stratum 1 replicas is warm, so the catalog commit may proceed.
+// "Committed" is decoupled from "globally warm": only the
 // configured authoritative replicas count toward quorum; non-authoritative or
 // late replicas converge afterwards via catch-up.
 type WarmGate struct {
@@ -93,7 +93,7 @@ func (g *WarmGate) Reached(txn string) bool {
 
 // WaitQuorum blocks until an authoritative quorum has acked txn, ctx is done, or
 // timeout elapses. It returns true only if quorum was reached — on timeout the
-// caller commits anyway (ADR D6) and lets laggards catch up post-commit.
+// caller commits anyway and lets laggards catch up post-commit.
 //
 // Lifecycle contract: calling WaitQuorum (or Ack) lazily creates per-txn state
 // in an internal map. The caller MUST call Forget(txn) once the transaction is

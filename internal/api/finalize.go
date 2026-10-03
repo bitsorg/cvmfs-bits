@@ -111,7 +111,7 @@ type FinalizeResult struct {
 // this only has to stop a hung one from pinning the claim forever.
 const defaultAutoFinalizeTimeout = 2 * time.Hour
 
-// FinalizeBuild publishes a whole build's accumulated packages (ADR-0007 coarse
+// FinalizeBuild publishes a whole build's accumulated packages (coarse
 // publish) in one ingestsql commit, using the orchestrator's configured ingest
 // settings. It is invoked by the finalize job (Orchestrator.Run), by the
 // /builds/{id}/finalize endpoint, and by auto-finalize. On success the build

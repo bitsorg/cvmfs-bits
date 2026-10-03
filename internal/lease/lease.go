@@ -110,7 +110,7 @@ func NewClient(baseURL, keyID, secret string, obs *observe.Provider) *Client {
 		KeyID:   keyID,
 		Secret:  secret,
 		obs:     obs,
-		// Fix #25: Enforce a minimum TLS version.  TLS 1.0 and 1.1 have known
+		// Enforce a minimum TLS version.  TLS 1.0 and 1.1 have known
 		// weaknesses (BEAST, POODLE); require at least 1.2.  Production
 		// deployments should prefer TLS 1.3 where the gateway supports it — Go
 		// will automatically negotiate 1.3 when both sides support it.

@@ -74,10 +74,10 @@ func withMuxVars(r *http.Request, vars map[string]string) *http.Request {
 	return setMuxVars(r, vars) // implemented in server_muxvars_test.go
 }
 
-// ── Fix #2: job goroutine WaitGroup ──────────────────────────────────────────
+// ── job goroutine WaitGroup ──────────────────────────────────────────────────
 
 // TestShutdown_WaitsForInFlightJob verifies that Shutdown blocks until all
-// background job goroutines finish (Fix #2).
+// background job goroutines finish.
 func TestShutdown_WaitsForInFlightJob(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -106,7 +106,7 @@ func TestShutdown_WaitsForInFlightJob(t *testing.T) {
 }
 
 // TestShutdown_RespectsContextDeadline verifies that Shutdown returns when its
-// context expires even if jobs are still running (Fix #2).
+// context expires even if jobs are still running.
 func TestShutdown_RespectsContextDeadline(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -124,7 +124,7 @@ func TestShutdown_RespectsContextDeadline(t *testing.T) {
 	}
 }
 
-// ── Fix #3: CancelJob and real abort handler ──────────────────────────────────
+// ── CancelJob and real abort handler ──────────────────────────────────────────
 
 func TestCancelJob_RegisterUnregister(t *testing.T) {
 	orch := &Orchestrator{}

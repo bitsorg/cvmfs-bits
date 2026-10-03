@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Package buildset implements the coarse, publish-at-end-of-build model of
-// ADR-0007: per-package publish jobs record their catalog entries (already
+// Package buildset implements the coarse, publish-at-end-of-build model:
+// per-package publish jobs record their catalog entries (already
 // content-hashed and uploaded to the store) into a build-scoped accumulator
 // instead of committing individually. One end-of-build finalize step assembles
 // all members into a single ingestsql descriptor and publishes them in one
@@ -363,7 +363,7 @@ type Conflict struct {
 }
 
 // Assemble merges members into a single, repo-relative []Entry ready for the
-// ingestsql descriptor, applying the ADR-0007 dedup/conflict rule keyed on the
+// ingestsql descriptor, applying the coarse-publish dedup/conflict rule keyed on the
 // bits fingerprint:
 //
 //   - Two members at the SAME path with the SAME fingerprint  -> idempotent,

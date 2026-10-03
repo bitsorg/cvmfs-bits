@@ -19,7 +19,7 @@ import (
 	"cvmfs.io/prepub/pkg/observe"
 )
 
-// TestRunContextCancelledNoPanic is a regression test for Fix #P1.
+// TestRunContextCancelledNoPanic is a regression test for a failed sem.Acquire.
 //
 // Before the fix, cancelling the outer context while compress.Run was
 // dispatching work caused sem.Acquire to fail and Run to return *early*,
@@ -372,8 +372,7 @@ func TestRunWithConfig(t *testing.T) {
 }
 
 // TestCompressEntryChunkedGuardNonPositiveChunkSize verifies that
-// compressEntryChunked returns an error for zero and negative chunkSize values
-// (Fix C4).
+// compressEntryChunked returns an error for zero and negative chunkSize values.
 func TestCompressEntryChunkedGuardNonPositiveChunkSize(t *testing.T) {
 	entry := unpack.FileEntry{
 		Path:    "/file.bin",
@@ -393,7 +392,7 @@ func TestCompressEntryChunkedGuardNonPositiveChunkSize(t *testing.T) {
 
 // TestCompressZeroChunkSizeFallsBackToWhole verifies that compressEntry does NOT
 // call compressEntryChunked when chunkSize is 0 — the file should be processed
-// as a single whole object regardless of its size (Fix C4 companion).
+// as a single whole object regardless of its size.
 func TestCompressZeroChunkSizeFallsBackToWhole(t *testing.T) {
 	// Large file: if chunkSize were applied it would be split.
 	data := make([]byte, 16*1024)
@@ -421,7 +420,7 @@ func TestCompressZeroChunkSizeFallsBackToWhole(t *testing.T) {
 }
 
 // TestChunkCompressedSizeMatchesLen verifies that Chunk.CompressedSize equals
-// len(Chunk.Compressed) for every chunk (Fix L1 — was int64(len(compBuf.Bytes()))
+// len(Chunk.Compressed) for every chunk (it was int64(len(compBuf.Bytes()))
 // called twice; now uses compBuf.Len() and an explicit copy).
 func TestChunkCompressedSizeMatchesLen(t *testing.T) {
 	// Make a file large enough to produce multiple chunks.
@@ -505,7 +504,7 @@ func TestChunkedBulkHashIsRawFileHash(t *testing.T) {
 
 // TestChunkBufferReuse verifies that chunks produced on separate iterations are
 // independent — modifying one chunk's Compressed slice does not affect another
-// (Fix L2 — buffer is reset and content is copied, not shared).
+// (the buffer is reset and content is copied, not shared).
 //
 // The approach: save a deep copy of chunk[1].Compressed before mutating
 // chunk[0], then verify chunk[1] is byte-for-byte identical to the saved copy.

@@ -5,7 +5,7 @@ package manifest
 
 import "time"
 
-// Phase is a three-phase-commit phase for a distribution transaction (ADR D2):
+// Phase is a three-phase-commit phase for a distribution transaction:
 // objects are prepared on Stratum 0, replicas are warmed, then the catalog is
 // committed. Abort unwinds a prepared-but-not-committed transaction.
 type Phase string
@@ -17,14 +17,13 @@ const (
 	PhaseAbort   Phase = "abort"
 )
 
-// TxnRecord is the durable journal record for a distribution transaction
-// (ADR R1). It is defined here in P0; persistence via internal/spool and the
-// crash-recovery reconcile are wired in P3.
+// TxnRecord is the durable journal record for a distribution transaction,
+// persisted by commit.Journal and replayed on restart by commit.Reconcile.
 type TxnRecord struct {
 	TxnID          string    `json:"txn_id"`
 	Repo           string    `json:"repo"`
 	Phase          Phase     `json:"phase"`
 	TargetRootHash string    `json:"target_root_hash"`
-	GCPin          string    `json:"gc_pin,omitempty"` // pin/lease protecting objects in the prepare→commit window (ADR R2)
+	GCPin          string    `json:"gc_pin,omitempty"` // pin/lease protecting objects in the prepare→commit window
 	At             time.Time `json:"at"`
 }

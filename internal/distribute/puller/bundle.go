@@ -19,8 +19,8 @@ import (
 )
 
 // PullBundle brings the local CAS up to a manifest by asking the publisher for
-// the entire locally-missing set in a single POST /s1/bundle request (ADR-0001
-// P-A): one round-trip instead of one per object. Each object is still
+// the entire locally-missing set in a single POST /s1/bundle request:
+// one round-trip instead of one per object. Each object is still
 // hash-verified. For latency-tuned transfers use PullChunked.
 func (p *Puller) PullBundle(ctx context.Context, bundleURL string, m *manifest.Manifest) (Result, error) {
 	if p.Store == nil {

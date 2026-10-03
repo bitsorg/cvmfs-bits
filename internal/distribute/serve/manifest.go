@@ -16,7 +16,7 @@ type ManifestSource interface {
 	Manifest(ctx context.Context, txn string) (*manifest.Manifest, bool, error)
 }
 
-// ManifestHandler serves GET /s1/{txn}/manifest (ADR D3/D4). It returns a single
+// ManifestHandler serves GET /s1/{txn}/manifest. It returns a single
 // JSON document by default, or streamed NDJSON (for large cold-start deltas)
 // when the client sends Accept: application/x-ndjson or ?stream=1.
 type ManifestHandler struct {

@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// ── Fix #7: per-object retry ──────────────────────────────────────────────────
+// ── per-object retry ──────────────────────────────────────────────────────────
 
 // flakyBackend succeeds after failCount failures.
 type flakyBackend struct {
@@ -41,7 +41,7 @@ func (f *flakyBackend) Delete(ctx context.Context, hash string) error        { r
 func (f *flakyBackend) List(ctx context.Context) ([]string, error)           { return nil, nil }
 
 // TestUploadWithRetry_SucceedsAfterTransientFailure verifies that a transient
-// CAS error is retried and the upload eventually succeeds (Fix #7).
+// CAS error is retried and the upload eventually succeeds.
 func TestUploadWithRetry_SucceedsAfterTransientFailure(t *testing.T) {
 	// Fail 2 times, succeed on attempt 3 — within maxUploadAttempts.
 	backend := &flakyBackend{failCount: 2}

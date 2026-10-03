@@ -23,7 +23,7 @@ import (
 // IngestBackend implements Backend by handing the spooled tar straight to
 // `cvmfs_server ingest`, letting the CVMFS gateway do the chunking, dedup,
 // storage and catalog work that the prepub pipeline would otherwise do itself
-// (ADR-0008 D7, "relay mode").
+// ("relay mode").
 //
 // It relies on MOUNTLESS ingest: the host registers once with
 //

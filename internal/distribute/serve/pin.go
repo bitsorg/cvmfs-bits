@@ -11,9 +11,9 @@ import (
 )
 
 // Pinner protects a transaction's objects from garbage collection during the
-// prepare→commit window (ADR R2). P1 provides an in-memory registry with TTL;
-// integration with cvmfs_server gc (a temporary named tag, or holding the
-// gateway lease for the window) is wired alongside the commit in P3. The TTL +
+// prepare→commit window. MemPinner is an in-memory registry with TTL; integration with
+// cvmfs_server gc (a temporary named tag, or holding the gateway lease for
+// the window) would be another Pinner. The TTL +
 // Sweep guard against pins leaked by a crash.
 type Pinner interface {
 	// Pin protects hashes for txn for at least ttl. Re-pinning a txn replaces it.

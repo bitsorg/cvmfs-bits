@@ -30,7 +30,7 @@ type BuildParams struct {
 
 // BuildManifest assembles a manifest from the transaction metadata and the set
 // of new-object hashes — the authoritative set the publish pipeline already
-// computed during dedup (ADR D3). Object sizes are filled from sizer when
+// computed during dedup. Object sizes are filled from sizer when
 // provided; a per-object Size error is tolerated (left zero) so a transient
 // store hiccup does not fail manifest generation.
 func BuildManifest(ctx context.Context, p BuildParams, hashes []string, sizer ObjectSizer) (*manifest.Manifest, error) {

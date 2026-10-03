@@ -5,7 +5,7 @@ package provenance
 
 import "testing"
 
-// Security review H3: with OIDC issuers configured, an audience is mandatory —
+// With OIDC issuers configured, an audience is mandatory —
 // CI OIDC issuers are global, so an unset audience lets any workflow obtain
 // Verified=true. The provider must fail closed (refuse to start).
 func TestCheckOIDCAudience(t *testing.T) {

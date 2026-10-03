@@ -296,8 +296,8 @@ func ExtractWithOptions(ctx context.Context, r io.Reader, out chan<- FileEntry, 
 			entry.Mode = fs.FileMode(header.Mode) | fs.ModeDir
 
 		case tar.TypeSymlink:
-			// Bug fix #1: reject empty symlink targets (previously accepted).
-			// Bug fix #2: validate the target in context of the symlink's own
+			// Reject empty symlink targets (previously accepted).
+			// Validate the target in context of the symlink's own
 			// directory so that valid relative references like ../sibling are
 			// accepted while true escapes like ../../etc/passwd are rejected.
 			if err := validateSymlinkTarget(cleanPath, header.Linkname); err != nil {

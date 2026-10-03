@@ -14,12 +14,12 @@ import (
 )
 
 // Fetcher transfers a single CAS object from a base URL into w and returns the
-// number of bytes written. It is the pluggable data-plane transport of ADR-0001
-// (D5): per-object HTTP GET is the default implementation (added in P2), with
-// bundled/archived transports as optional, benchmark-gated alternatives (P-A).
+// number of bytes written. It is the pluggable data-plane transport:
+// per-object HTTP GET is the default implementation, with bundled/archived
+// transports as optional, benchmark-gated alternatives.
 //
 // A Fetcher must not assume the bytes it transfers are trustworthy: the caller
-// verifies the content hash before the object is installed (ADR R3), so the
+// verifies the content hash before the object is installed, so the
 // data channel can safely traverse untrusted proxies.
 type Fetcher interface {
 	// Name is the stable registry key for this transport (e.g. "object-http").

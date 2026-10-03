@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// State persists the last-synced root hash per repository (ADR R4) so that, after
+// State persists the last-synced root hash per repository so that, after
 // any absence, catch-up can compute the old→current diff. Writes are atomic
 // (temp + rename); a missing file reads as the empty root.
 type State struct {

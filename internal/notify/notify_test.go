@@ -17,7 +17,7 @@ import (
 )
 
 // TestWebhookClient_TLSMinVersion verifies that the package-level webhookClient
-// refuses connections that negotiate TLS 1.0 or 1.1 (Fix #3).
+// refuses connections that negotiate TLS 1.0 or 1.1.
 //
 // We spin up a test TLS server that accepts any TLS version.  When we configure
 // it to advertise only TLS 1.0/1.1, the client must refuse to connect.

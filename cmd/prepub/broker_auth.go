@@ -24,7 +24,7 @@ import (
 // bearer token (obtained via the challenge/response enrollment) as the MQTT
 // CONNECT password; the hook verifies the HMAC signature + expiry, records the
 // node identity, and enforces per-role topic ACLs. A revocation denylist plus
-// active disconnect (in-process broker) gives immediate cut-off (H3).
+// active disconnect (in-process broker) gives immediate cut-off.
 type brokerAuthHook struct {
 	mqttbroker.HookBase
 	verifier      *credential.Verifier

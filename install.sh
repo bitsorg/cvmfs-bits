@@ -627,7 +627,7 @@ EOF
 # CVMFS_GATEWAY_SECRET=
 
 # Shared secret for the publish API. Used as a bearer token, or as the HMAC
-# key for signed requests, depending on server.auth_mode (see ADR-0008 D3):
+# key for signed requests, depending on server.auth_mode:
 #   bearer — the token travels on every request
 #   both   — either is accepted (default; use while publishers migrate)
 #   hmac   — signed requests only, so the token stops travelling

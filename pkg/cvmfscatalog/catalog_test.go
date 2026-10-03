@@ -576,7 +576,7 @@ func TestUpsertReplaceUpdatesDelta(t *testing.T) {
 }
 
 // TestCatalogClose verifies that Close() is idempotent and that Finalize sets
-// db to nil so subsequent Close calls are no-ops (Fix H1).
+// db to nil so subsequent Close calls are no-ops.
 func TestCatalogClose(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -601,7 +601,7 @@ func TestCatalogClose(t *testing.T) {
 }
 
 // TestFinalizeNilsDB verifies that Finalize sets c.db = nil so a subsequent
-// Close() is safe (Fix H1).
+// Close() is safe.
 func TestFinalizeNilsDB(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -628,7 +628,7 @@ func TestFinalizeNilsDB(t *testing.T) {
 }
 
 // TestRemoveDeltaNetZero verifies that adding then removing an entry leaves the
-// in-memory delta at zero for all counters (Fix C1 — delta only updated post-commit).
+// in-memory delta at zero for all counters (delta only updated post-commit).
 func TestRemoveDeltaNetZero(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -683,7 +683,7 @@ func TestRemoveDeltaNetZero(t *testing.T) {
 
 // TestUpsertAtomicReplace verifies that replacing an entry with Upsert correctly
 // removes the old row and inserts the new one, with exactly one catalog row
-// and updated delta (Fix C3 — single transaction for replace).
+// and updated delta (single transaction for replace).
 func TestUpsertAtomicReplace(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -753,7 +753,7 @@ func TestUpsertAtomicReplace(t *testing.T) {
 
 // TestCatalogUniqueConstraint verifies that the UNIQUE (md5path_1, md5path_2)
 // constraint on the catalog table prevents a concurrent or buggy caller from
-// inserting a second row for the same path (Fix L3).
+// inserting a second row for the same path.
 //
 // The constraint is enforced at the DB level, so even a raw INSERT (bypassing
 // the transactional upsertEntry logic) must fail.
@@ -792,7 +792,7 @@ func TestCatalogUniqueConstraint(t *testing.T) {
 }
 
 // TestChunksUniqueConstraint verifies that the UNIQUE (md5path_1, md5path_2, offset)
-// constraint on the chunks table prevents duplicate chunk rows (Fix L3).
+// constraint on the chunks table prevents duplicate chunk rows.
 func TestChunksUniqueConstraint(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -825,7 +825,7 @@ func TestChunksUniqueConstraint(t *testing.T) {
 // ── N3: UNIQUE indexes survive Open() ────────────────────────────────────────
 
 // TestOpenAppliesUniqueIndexes verifies that Open() enforces UNIQUE constraints
-// even on a catalog whose schema predates the explicit index creation (Fix N3).
+// even on a catalog whose schema predates the explicit index creation.
 // We simulate a "legacy" catalog by stripping the unique index from a freshly
 // created one, re-opening it, and confirming the constraint is reinstated.
 func TestOpenAppliesUniqueIndexes(t *testing.T) {
@@ -922,7 +922,7 @@ func TestRemoveAfterUpsertNoError(t *testing.T) {
 // ── N5: Close() concurrent safety ────────────────────────────────────────────
 
 // TestCloseConcurrentSafe verifies that calling Close() from many goroutines
-// simultaneously does not panic or return a double-close error (Fix N5).
+// simultaneously does not panic or return a double-close error.
 func TestCloseConcurrentSafe(t *testing.T) {
 	tmpdir := t.TempDir()
 	cat, err := Create(filepath.Join(tmpdir, "cat.db"), "")
@@ -957,7 +957,7 @@ func TestCloseConcurrentSafe(t *testing.T) {
 // ── N6: nested_catalogs UNIQUE constraint ────────────────────────────────────
 
 // TestNestedCatalogsUniqueConstraint verifies that inserting a second
-// nested_catalogs row for the same path is rejected at the DB level (Fix N6).
+// nested_catalogs row for the same path is rejected at the DB level.
 func TestNestedCatalogsUniqueConstraint(t *testing.T) {
 	tmpdir := t.TempDir()
 	cat, err := Create(filepath.Join(tmpdir, "cat.db"), "")

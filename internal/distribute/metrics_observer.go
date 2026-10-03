@@ -9,7 +9,7 @@ import (
 )
 
 // metricsObserver adapts *observe.Metrics to commit.Observer so the three-phase
-// commit orchestrator (ADR-0001 P3) feeds the publisher-side pull-distribution
+// commit orchestrator feeds the publisher-side pull-distribution
 // metrics surfaced at /api/v1/metrics. It is the wiring glue kept out of the
 // dependency-free commit package.
 type metricsObserver struct {

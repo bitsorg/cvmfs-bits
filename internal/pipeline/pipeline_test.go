@@ -50,7 +50,7 @@ func buildTar(entries []struct{ name, content string }) []byte {
 }
 
 // TestPipelineDuplicatePathFails verifies that a tar containing two entries
-// with the same path is rejected with an error (Fix L5 — previously the second
+// with the same path is rejected with an error (previously the second
 // entry silently overwrote the first in resultsByPath, producing a catalog with
 // two rows for the same path but only one hash retained).
 func TestPipelineDuplicatePathFails(t *testing.T) {
@@ -113,7 +113,7 @@ func TestPipelineUniquePaths(t *testing.T) {
 // ── N7: chunk-meta allocation outside resultMu ────────────────────────────────
 
 // TestPipelineChunkedFileMetaIsCorrect verifies that the chunk metadata stored
-// in resultsByPath (now assembled outside the mutex, Fix N7) is faithfully
+// in resultsByPath (now assembled outside the mutex) is faithfully
 // propagated to the returned CatalogEntries.  We run a chunked pipeline and
 // confirm that the catalog entry for the large file carries the right number of
 // chunk records and non-empty hashes.

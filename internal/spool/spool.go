@@ -36,7 +36,7 @@ type Spool struct {
 // from reading sensitive job metadata (lease tokens, manifests). Returns an error
 // if the root directory cannot be created.
 func New(root string, obs *observe.Provider) (*Spool, error) {
-	// Fix #12: Spool directories are 0700 — job metadata (including lease tokens)
+	// Spool directories are 0700 — job metadata (including lease tokens)
 	// must not be readable by other local users.
 	// Directories are listed in FSM order: lease is now acquired after distribution.
 	for _, dir := range []string{".", "incoming", "staging", "uploading", "distributing", "leased", "committing", "accumulated", "published", "failed", "aborted"} {
@@ -233,8 +233,8 @@ func (s *Spool) Scan(ctx context.Context) ([]*job.Job, error) {
 // WriteManifest durably persists job metadata to manifest.json in the job directory.
 //
 // Durability: Uses write-to-temp-then-atomic-rename with fsync of the parent directory
-// (Fix #6) to ensure a crash mid-write never leaves a partial or zero-byte manifest.
-// The manifest is written with mode 0600 (Fix #12) so other local users cannot
+// to ensure a crash mid-write never leaves a partial or zero-byte manifest.
+// The manifest is written with mode 0600 so other local users cannot
 // read sensitive data like lease tokens.
 func (s *Spool) WriteManifest(j *job.Job) error {
 	jobDir := s.JobDir(j)
@@ -278,7 +278,7 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 		return fmt.Errorf("renaming manifest: %w", err)
 	}
 
-	// Fix #6: fsync the parent directory so the directory entry for the
+	// Fsync the parent directory so the directory entry for the
 	// renamed file is durable.  Without this a crash between the rename and
 	// the next sync could leave the directory pointing at the old inode.
 	// Best-effort: data was already written; a sync failure here does not

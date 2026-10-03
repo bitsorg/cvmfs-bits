@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package distribute holds the publisher-side distribution configuration for
-// ADR-0001 pull distribution. The legacy HTTP push data plane and the
+// pull distribution. The legacy HTTP push data plane and the
 // per-endpoint worker pool have been removed: the pre-commit announce is now
 // published directly on the embedded control-plane broker by the API
 // orchestrator (see internal/api.Orchestrator.publishAnnounce), and Stratum 1

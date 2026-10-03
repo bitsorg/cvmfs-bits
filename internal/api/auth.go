@@ -6,7 +6,7 @@ package api
 // Request authentication for the publisher API.
 //
 // Two credentials are understood, and which are accepted is deployment policy
-// (ADR-0008 D3):
+// (--auth-mode):
 //
 //   - a bearer token, which must travel on every request, so observing one
 //     request yields publish rights until the token is rotated;

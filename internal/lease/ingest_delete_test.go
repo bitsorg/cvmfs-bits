@@ -12,7 +12,7 @@ import (
 )
 
 // The stub outputs below are DERIVED FROM THE REAL cvmfs_server, observed on
-// the testbed on 2026-08-15 (MEASUREMENTS.md §25): the success tail
+// the testbed on 2026-08-15: the success tail
 // "Changes submitted to repository gateway", and the exit-0 refusal
 // "[WARNING] '<path>' cannot be deleted. Unrecognized file type." that an
 // unfixed server (or a non-nested-catalog target) produces while committing an

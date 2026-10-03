@@ -11,7 +11,7 @@
 //   - receiver: runs the two-channel Stratum 1 pre-warming server.  An HTTPS
 //     control channel handles announce requests (HMAC-authenticated); a plain-
 //     HTTP data channel accepts object PUTs (per-session bearer token + SHA-256
-//     hash verification).  See REFERENCE.md §20 for the full protocol spec.
+//     hash verification).  See REFERENCE.md (Pull Distribution Protocol) for the full spec.
 //
 // Select the mode with --mode publisher|receiver.  All flags except --mode,
 // --log-level, and --dev are mode-specific; unrecognised flags for the active
@@ -113,7 +113,7 @@ func nodeKeyHex(secret []byte, node string) (string, error) {
 
 // runNodeKey implements `prepub node-key <node>`: print the receiver's per-node
 // enrollment key so an operator on the publisher can provision it as the
-// receiver's S1_NODE_KEY (H2 — the receiver never holds the master secret).
+// receiver's S1_NODE_KEY (the receiver never holds the master secret).
 func runNodeKey(args []string) {
 	node := ""
 	for _, a := range args {
@@ -140,16 +140,14 @@ func main() {
 	}
 	// Subcommand: prepub node-key <node> -- print a receiver's per-node broker
 	// enrollment key (hex), derived from PREPUB_HMAC_SECRET on the publisher, so it
-	// can be provisioned to that receiver as S1_NODE_KEY (H2: receivers never
+	// can be provisioned to that receiver as S1_NODE_KEY (receivers never
 	// hold the master secret).
 	if len(os.Args) > 1 && os.Args[1] == "node-key" {
 		runNodeKey(os.Args[2:])
 		return
 	}
 	mode := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
-	// ADR-0001 (reserved; not yet active in P0). Data-plane direction and
-	// control-plane transport selectors; parsed now so config/tooling can set
-	// them, wired into behaviour in later phases.
+	// Pull distribution: embedded broker, control plane, enrollment, object URLs.
 	embeddedBrokerWSAddr := flag.String("embedded-broker-ws-addr", "", "If set, run an in-process MQTT broker with a WebSocket listener at this address (e.g. :1882); the control plane then runs on S0 with no separate broker [publisher]")
 	controlPlaneURL := flag.String("control-plane-url", "", "Control-plane (broker) URL advertised to receivers via discovery, e.g. ws://cvmfs-prepub:1882 or wss://... [publisher]")
 	pullObjectBaseURL := flag.String("pull-object-base-url", "", "Externally reachable base URL for content-addressed object GETs, embedded in pull manifests as {url}/cvmfs/{repo}/data (e.g. http://cvmfs-prepub:8080) [publisher]")
@@ -177,14 +175,14 @@ func main() {
 	gatewayAllowPlaintext := flag.Bool("gateway-allow-plaintext", false, "Permit a plaintext http:// gateway URL on a trusted network. Gateway requests are HMAC-SHA256 signed and the secret never transits, so the credential is safe without TLS; what plaintext gives up is confidentiality of the publish and authenticity of gateway responses. Loopback needs no flag. Prefer this over --dev, which also disables the gateway-secret and API-token requirements [publisher]")
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
-	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels). See ADR-0008 D3 [publisher]")
+	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels) [publisher]")
 	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
-	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs (ADR-0008 D7). Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
+	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs. Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
 	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
 	replaceOnConflict := flag.Bool("replace-on-conflict", false, "REPLACE an already published path when a commit fails on it: confirm the conflict against the published catalogs, delete the existing subtree in its own transaction, and retry the commit once. Destroys the published subtree at the conflicting path (prior revisions keep their objects until GC); off, a conflict stays a terminal error [publisher]")
-	promoteWorkers := flag.Int("promote-workers", envInt("PREPUB_PROMOTE_WORKERS", cas.DefaultPromoteWorkers), "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (MEASUREMENTS.md §26: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half. Env: PREPUB_PROMOTE_WORKERS [publisher]")
+	promoteWorkers := flag.Int("promote-workers", envInt("PREPUB_PROMOTE_WORKERS", cas.DefaultPromoteWorkers), "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (measured: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half. Env: PREPUB_PROMOTE_WORKERS [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
-	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize (ADR-0007) [publisher]")
+	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize [publisher]")
 	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
 	ingestEnv := flag.String("ingest-env", "", "Comma-separated extra env for the ingestsql finalize, e.g. 'LD_LIBRARY_PATH=/opt/cvmfs/lib' [publisher]")
 	stratum0URL := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
@@ -242,7 +240,7 @@ func main() {
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
 	// Default to FIXED cvmfsdescriptor.ChunkGrid chunking (min==avg==max): the
 	// xor32 chunker then cuts at fixed grid boundaries, which coarse publish
-	// (ADR-0007, the default mode) requires — ingestsql derives chunk offsets as
+	// (the default mode) requires — ingestsql derives chunk offsets as
 	// i*kChunkSize and the descriptor emitter enforces chunk-count ==
 	// ceil(size/ChunkGrid).
 	//
@@ -377,7 +375,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer stopDebug()
-	obs.Logger.Debug("distribution config (ADR-0001 pull, MQTT-over-wss control plane)")
+	obs.Logger.Debug("distribution config (pull, MQTT-over-wss control plane)")
 
 	switch *mode {
 	case "publisher":
@@ -447,7 +445,7 @@ func runPublisher(
 	// brokerURL is derived from the embedded broker (loopback); the publisher's
 	// own announce/published clients connect there. There is no external broker
 	// and no client-cert mTLS — the embedded broker is reached over ws/wss with a
-	// token. warmQuorum is reserved for the warm-gate commit gating (ADR-0001 D6).
+	// token. warmQuorum is reserved for the warm-gate commit gating.
 	brokerURL := ""
 	_ = warmQuorum
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
@@ -604,10 +602,10 @@ func runPublisher(
 	// --publish-mode selects the DEFAULT backend; a deployment can additionally
 	// offer alternative paths that a job may name. Today there is one: "ingest",
 	// which hands the tar to `cvmfs_server ingest` so the gateway does the
-	// chunking, dedup and catalogs (ADR-0008 D7).
+	// chunking, dedup and catalogs.
 	//
 	// The registry is keyed by path name now and becomes (repo, path) when one
-	// instance serves several repositories (ADR-0008 D1).
+	// instance serves several repositories.
 	publishPaths := map[string]lease.Backend{}
 	// Declared out here so the staged path can borrow its DeleteSubtree for
 	// replace_on_conflict: deleting a published subtree is repository-level
@@ -779,7 +777,7 @@ func runPublisher(
 	// Embedded control-plane broker (alternative to an external mosquitto): run
 	// an in-process MQTT broker with a WebSocket listener on S0. The publisher's
 	// own broker clients connect on localhost; receivers connect via the URL
-	// advertised in discovery (ADR-0001 D7/D10).
+	// advertised in discovery.
 	var brokerClose func()
 	var enrollSrv *credential.EnrollServer
 	var pubCreds func() (string, string)
@@ -789,7 +787,7 @@ func runPublisher(
 	var ctrlTLSClose func()
 	var enrollOverTLS bool
 	if embeddedBrokerWSAddr != "" {
-		// Build the broker's server TLS config (H1: real wss://). When no cert is
+		// Build the broker's server TLS config (real wss://). When no cert is
 		// configured the listener stays plaintext ws:// (dev), but advertising a
 		// wss:// control-plane URL without a cert is a hard misconfiguration.
 		var brokerTLS *tls.Config
@@ -874,7 +872,7 @@ func runPublisher(
 	}
 
 	// Attach the publisher's token credentials to the announce broker config so
-	// the one-shot announce client authenticates to the embedded broker (H3).
+	// the one-shot announce client authenticates to the embedded broker.
 	if pubCreds != nil && distCfg != nil && distCfg.BrokerConfig != nil {
 		distCfg.BrokerConfig.CredentialsProvider = pubCreds
 	}
@@ -957,7 +955,7 @@ func runPublisher(
 	}
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
-	// Which credentials the API accepts (ADR-0008 D3). Parsed here rather than
+	// Which credentials the API accepts. Parsed here rather than
 	// inside the server so a typo fails at startup instead of silently falling
 	// back to the most permissive setting.
 	am, amErr := api.ParseAuthMode(authMode)
@@ -1014,12 +1012,12 @@ func runPublisher(
 		obs.Logger.Info("control-plane: discovery advertising broker", "url", controlPlaneURL)
 	}
 
-	// ADR-0001: serve objects + manifests (incl. the gateway POST ingest) so
+	// Pull distribution: serve objects + manifests (incl. the gateway POST ingest) so
 	// Stratum 1 can pull on a prepare announce. Pull is the only distribution mode.
 	{
-		// Admission control (ADR D6): cap concurrent receiver pulls and issue one
+		// Admission control: cap concurrent receiver pulls and issue one
 		// lease per node at a time. Limits are conservative defaults for the small
-		// Stratum 1 fleet; make them configurable when the benchmark (P5) lands.
+		// Stratum 1 fleet; make them configurable when a fleet benchmark exists.
 		admission := commit.NewAdmission(commit.Options{MaxConcurrent: 16, MaxPerNode: 1})
 		plaintextEnroll := enrollSrv
 		if enrollOverTLS {
@@ -1032,7 +1030,7 @@ func runPublisher(
 			Enroll:    plaintextEnroll,
 			RateLimit: ctrlRateLimit.Middleware,
 		})
-		obs.Logger.Info("ADR-0001: pull-mode distribute serving enabled")
+		obs.Logger.Info("pull-mode distribute serving enabled")
 	}
 
 	// Crash-recovery: re-run jobs that were interrupted by a previous crash.
@@ -1159,7 +1157,7 @@ func runReceiver(
 	brokerURL := ""
 	brokerClientCert := ""
 	brokerClientKey := ""
-	// H2: a receiver does NOT hold the master secret. Announce authenticity comes
+	// A receiver does NOT hold the master secret. Announce authenticity comes
 	// from the authenticated control-plane broker (token + ACL) and TLS, not a
 	// shared HMAC — so PREPUB_HMAC_SECRET is neither read nor required here. The
 	// receiver's only key is its own per-node S1_NODE_KEY (see --broker-auth).
@@ -1237,7 +1235,7 @@ func runReceiver(
 	var brokerCreds func() (string, string)
 	if brokerAuth {
 		// Per-node enrollment key: the receiver is provisioned with its own
-		// S1_NODE_KEY (hex) and NEVER holds the master secret (H2). There is no
+		// S1_NODE_KEY (hex) and NEVER holds the master secret. There is no
 		// fallback to deriving it from PREPUB_HMAC_SECRET — a compromised receiver
 		// could otherwise derive any node's key and mint publisher tokens. Generate
 		// the key on the publisher with `prepub node-key <node>`.

@@ -52,7 +52,7 @@ func newTestClient(t *testing.T, srv *httptest.Server) *Client {
 
 // TestHeartbeat_RenewsWithCorrectToken verifies that the heartbeat goroutine
 // always renews using the exact token string passed to Heartbeat().
-// Previously this was a snapshot test (Fix #3) to guard against *Lease
+// Previously this was a snapshot test to guard against *Lease
 // mutation; now that Heartbeat accepts a plain string (value type) the test
 // verifies the simpler invariant: the token used for renewal equals the one
 // passed in.

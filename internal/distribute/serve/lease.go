@@ -10,7 +10,7 @@ import (
 	"cvmfs.io/prepub/internal/distribute/commit"
 )
 
-// LeaseGranter issues pull leases; implemented by *commit.Admission (ADR D6).
+// LeaseGranter issues pull leases; implemented by *commit.Admission.
 type LeaseGranter interface {
 	Grant(node, txn string) (commit.Lease, bool)
 }

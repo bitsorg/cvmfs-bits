@@ -162,7 +162,7 @@ func TestSummarise_MatchesTheNumbersAMeasurementSectionQuotes(t *testing.T) {
 	base := time.Date(2026, 8, 15, 12, 15, 40, 0, time.UTC)
 	var recs []Record
 	// 169 fast publishes and one 65.9 s outlier -- the shape of the real
-	// GEANT4 run in §24, where the tail is the story.
+	// GEANT4 run, where the tail is the story.
 	for i := 0; i < 169; i++ {
 		recs = append(recs, Record{
 			BuildID: "b", Repo: "test.cvmfs.io", PublishPath: "ingest",
@@ -189,7 +189,7 @@ func TestSummarise_MatchesTheNumbersAMeasurementSectionQuotes(t *testing.T) {
 	if s.PublishPaths["ingest"] != 170 {
 		t.Errorf("publish path breakdown = %v", s.PublishPaths)
 	}
-	// Serialised sum vs window is the ratio §24 reports.
+	// Serialised sum vs window is the reported ratio.
 	if s.Backend.Sum != round3(169*0.5+65.925) {
 		t.Errorf("sum = %v", s.Backend.Sum)
 	}

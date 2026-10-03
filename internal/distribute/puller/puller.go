@@ -19,7 +19,7 @@ import (
 // match the cvmfs_server snapshot norm rather than a timid handful.
 const defaultSlots = 16
 
-// Puller fetches a transaction's objects into the local CAS (ADR-0001 D1/D3/R3).
+// Puller fetches a transaction's objects into the local CAS.
 // It computes the missing set locally (manifest − localstore), so no per-receiver
 // hash list is sent upstream; each object is verified against its hash before
 // being installed.
@@ -37,7 +37,7 @@ type Puller struct {
 	FilesPerRequest int
 	// Client is used for chunked-bundle requests (nil -> http.DefaultClient).
 	Client *http.Client
-	// State, when set, records the last-synced root on a fully successful pull (R4).
+	// State, when set, records the last-synced root on a fully successful pull.
 	State *State
 }
 

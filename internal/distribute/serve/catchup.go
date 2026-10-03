@@ -12,7 +12,7 @@ import (
 )
 
 // DiffSource computes the cumulative set of CAS objects added to a repository
-// between two root-catalog states (ADR-0001 D4). It streams each object to emit
+// between two root-catalog states. It streams each object to emit
 // so an arbitrarily large catch-up never materialises the whole set on Stratum 0.
 // In production it is backed by `cvmfs_server diff` (or a catalog walk) over the
 // two roots; it is an interface so the HTTP layer is testable without cvmfs.
@@ -23,7 +23,7 @@ type DiffSource interface {
 	Diff(ctx context.Context, repo, fromRoot, toRoot string, emit func(manifest.ObjRef) error) error
 }
 
-// CatchupHandler serves the cumulative catch-up manifest (ADR-0001 D4 / P4):
+// CatchupHandler serves the cumulative catch-up manifest:
 //
 //	GET /s1/catchup?repo={repo}&to={root}[&from={root}]
 //

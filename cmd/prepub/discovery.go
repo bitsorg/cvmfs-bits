@@ -21,7 +21,7 @@ import (
 )
 
 // staticDiscovery is a minimal serve.DiscoverySource advertising a fixed
-// control-plane reference for the repos this publisher serves (ADR-0001 D10).
+// control-plane reference for the repos this publisher serves.
 // Unsigned in dev (nil Signer).
 type staticDiscovery struct {
 	repos     []string

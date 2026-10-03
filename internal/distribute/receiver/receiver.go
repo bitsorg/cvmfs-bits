@@ -25,7 +25,7 @@
 // without any inbound firewall rules (outbound
 // TCP 8883 only).  The data channel (plain HTTP PUT) is unchanged.
 //
-// See REFERENCE.md §20 for the HTTP protocol and §21 for the MQTT control plane.
+// See REFERENCE.md (Pull Distribution Protocol) for HTTP and the MQTT control plane.
 package receiver
 
 import (
@@ -132,7 +132,7 @@ type Config struct {
 	// Defaults to 1 GiB (1 << 30).  Set to 0 to use the default.
 	MaxObjectSize int64
 
-	// PullMode enables ADR-0001 pull-based distribution: on a prepare announce
+	// PullMode enables pull-based distribution: on a prepare announce
 	// the receiver fetches the transaction manifest and pulls the objects it is
 	// missing, instead of waiting to be pushed to. Default false (legacy push).
 	PullMode bool
@@ -154,7 +154,7 @@ type Config struct {
 	PullAuto bool
 
 	// OnWarmed, when set, is invoked exactly once after each pull-mode warming
-	// attempt completes (ADR-0001 D6). warmed is true only when every missing
+	// attempt completes. warmed is true only when every missing
 	// object was fetched and verified, i.e. the receiver is warm for txn; the
 	// publisher routes a true result into its WarmGate quorum. It MUST NOT block
 	// (it runs on the pull goroutine); the broker publish it typically performs
@@ -227,7 +227,7 @@ type Receiver struct {
 	// Key: repo name string.  Value: *sync.Mutex.
 	s0PullMu sync.Map
 
-	// pullCoordinator drives ADR-0001 pull-based warming; non-nil only when
+	// pullCoordinator drives pull-based warming; non-nil only when
 	// cfg.PullMode is set.
 	pullCoordinator *puller.Coordinator
 	// pullSem bounds concurrent pull goroutines; pullInflight coalesces
@@ -282,7 +282,7 @@ func New(cfg Config) (*Receiver, error) {
 		},
 	}
 
-	// Pull mode (ADR-0001): build the coordinator that fetches manifests and
+	// Pull mode: build the coordinator that fetches manifests and
 	// pulls missing objects into the local CAS on announce.
 	if cfg.PullMode {
 		store := casStore

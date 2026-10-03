@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Command prepub-finalize publishes a build's accumulated packages in one
-// ingestsql commit (ADR-0007 coarse publish). It runs on the release-manager
+// ingestsql commit (coarse publish). It runs on the release-manager
 // host, where cvmfs_swissknife and the repository store are available — the
 // containerized cvmfs-prepub is not, since it commits via the gateway API and
 // does not carry swissknife or a store mount. The bits build invokes this once,

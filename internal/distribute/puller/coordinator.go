@@ -20,7 +20,7 @@ const defaultMaxManifestBytes = 256 << 20 // 256 MiB
 // Coordinator turns a transaction notification into a pull: it fetches the
 // transaction manifest from Stratum 0 (the cvmfs-prepub endpoint) and runs the
 // Puller. It is the receiver-side glue invoked by the control plane
-// (announce/published) when the receiver runs in pull mode (ADR-0001 D1/D3).
+// (announce/published) when the receiver runs in pull mode.
 type Coordinator struct {
 	// ManifestBase is the base URL where manifests are served (the cvmfs-prepub
 	// endpoint). The manifest for a transaction is at

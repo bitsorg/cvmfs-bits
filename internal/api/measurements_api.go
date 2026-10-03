@@ -25,7 +25,7 @@ import (
 // The full records are returned by default because the point of this endpoint
 // is to let the caller do the arithmetic it wants with jq, rather than to
 // guess in advance which reduction is useful. ?summary=1 exists because one
-// reduction — the table MEASUREMENTS.md keeps repeating — is worth not
+// reduction — the per-run comparison table — is worth not
 // rewriting each time.
 func (s *Server) measurementsHandler(w http.ResponseWriter, r *http.Request) {
 	if s.orch == nil || s.orch.Measurements == nil {

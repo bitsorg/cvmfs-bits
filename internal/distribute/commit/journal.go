@@ -14,7 +14,7 @@ import (
 )
 
 // Journal is an append-only, fsync'd record of distribution-transaction phase
-// transitions (ADR-0001 R1). On restart the publisher reads it and reconciles
+// transitions. On restart the publisher reads it and reconciles
 // any transaction left in a non-terminal phase (resume / commit / abort), so a
 // crash during the three-phase commit cannot lose objects or strand a GC pin.
 type Journal struct {
@@ -88,7 +88,7 @@ func (j *Journal) Records() ([]manifest.TxnRecord, error) {
 
 // Reconcile returns the latest record of every transaction left in a
 // non-terminal phase (Prepare or Warm) — those that crashed mid-flight and must
-// be resumed or aborted on restart (ADR R1). Transactions whose last record is
+// be resumed or aborted on restart. Transactions whose last record is
 // Commit or Abort are terminal and omitted.
 func Reconcile(records []manifest.TxnRecord) []manifest.TxnRecord {
 	latest := make(map[string]manifest.TxnRecord, len(records))

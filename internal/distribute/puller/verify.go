@@ -15,8 +15,8 @@ import (
 // verifyReader streams src while computing its SHA-1, and at EOF returns an
 // error instead of io.EOF if the digest does not match expected (the hex part of
 // the object hash). Feeding this to cas.Backend.Put makes the store abort before
-// renaming, so a corrupted or substituted object is never installed (ADR R3,
-// matching pkg/cvmfshash: CAS key = SHA-1 of the compressed object bytes).
+// renaming, so a corrupted or substituted object is never installed
+// (matching pkg/cvmfshash: CAS key = SHA-1 of the compressed object bytes).
 type verifyReader struct {
 	src      io.Reader
 	h        hash.Hash

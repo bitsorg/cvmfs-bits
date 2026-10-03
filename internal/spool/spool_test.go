@@ -90,7 +90,7 @@ func TestWriteManifest_Atomic(t *testing.T) {
 }
 
 // TestWriteManifest_FileMode verifies that the manifest is written with mode
-// 0600 — readable only by the owner (Fix #12).
+// 0600 — readable only by the owner.
 func TestWriteManifest_FileMode(t *testing.T) {
 	s := newTestSpool(t)
 	j := &job.Job{ID: "perm-job", State: job.StateIncoming}
@@ -111,7 +111,7 @@ func TestWriteManifest_FileMode(t *testing.T) {
 
 // TestWriteManifest_DirFsync verifies that WriteManifest succeeds and that the
 // parent directory entry points to the final manifest — not the tmp file.
-// This exercises the Fix #6 code path (fsync parent dir after rename).
+// This exercises the fsync-parent-dir-after-rename code path.
 //
 // We cannot easily intercept the fsync syscall in a unit test, but we can at
 // least verify that:
@@ -125,7 +125,7 @@ func TestWriteManifest_DirFsync(t *testing.T) {
 		t.Fatalf("WriteManifest: %v", err)
 	}
 
-	// Parent directory must be openable (Fix #6 opens it for Sync).
+	// Parent directory must be openable (it is opened for Sync).
 	jobDir := s.JobDir(j)
 	f, err := os.Open(jobDir)
 	if err != nil {
@@ -227,7 +227,7 @@ func isNotExist(err error) bool {
 
 // TestIncomingBySize_SortsLargestFirst verifies that IncomingBySize returns
 // incoming jobs in descending TarSize order so the orchestrator dispatches
-// large jobs first (Fix #priority).
+// large jobs first.
 func TestIncomingBySize_SortsLargestFirst(t *testing.T) {
 	s := newTestSpool(t)
 	ctx := context.Background()

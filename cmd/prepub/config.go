@@ -78,7 +78,7 @@ type fileConfig struct {
 	// IngestPublish offers the "ingest" publish path in addition to the default
 	// selected by publish_mode: a job may ask for its tar to be handed to
 	// `cvmfs_server ingest` so the gateway does the chunking, dedup and
-	// catalogs (ADR-0008 D7).  IngestPublishOwner maps to `ingest -u`.
+	// catalogs.  IngestPublishOwner maps to `ingest -u`.
 	IngestPublish      bool   `yaml:"ingest_publish"`
 	IngestPublishOwner string `yaml:"ingest_publish_owner"`
 
@@ -95,7 +95,7 @@ type fileConfig struct {
 	// (--measurements-dir). Empty uses <spool>/measurements; "off" disables.
 	MeasurementsDir string `yaml:"measurements_dir"`
 
-	// Coarse-publish finalize (ADR-0007): one cvmfs_swissknife ingestsql
+	// Coarse-publish finalize: one cvmfs_swissknife ingestsql
 	// invocation commits a whole build. Without IngestConfigPrefix the finalize
 	// is DISABLED, and since a sealed build finalizes server-side, that failure
 	// is silent from the producer's side — packages upload, the pipeline goes
@@ -125,7 +125,7 @@ type fileConfig struct {
 		// DebugListen is the pprof listener address (e.g. 127.0.0.1:6060).
 		// Empty disables it. Loopback only — profiles expose heap contents.
 		DebugListen string `yaml:"debug_listen"`
-		// AuthMode: bearer | both | hmac. See ADR-0008 D3. Empty = both.
+		// AuthMode: bearer | both | hmac (see --auth-mode). Empty = both.
 		AuthMode string `yaml:"auth_mode"`
 		// SignatureSkew is how far a signed request's timestamp may lag before
 		// it is refused; the replay cache retains nonces for twice this. Empty
@@ -166,7 +166,7 @@ type fileConfig struct {
 
 	Distribution struct {
 		// WarmQuorum is the fraction of authoritative Stratum 1 replicas that must
-		// report warm before the catalog commit proceeds (ADR-0001 D6).
+		// report warm before the catalog commit proceeds.
 		WarmQuorum float64 `yaml:"warm_quorum"`
 	} `yaml:"distribution"`
 
@@ -388,7 +388,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("tls-key", tlsKey, fc.Server.TLSKey)
 
 	// Warm-quorum: fraction of authoritative Stratum 1 replicas that must report
-	// warm before the catalog commit proceeds (ADR-0001 D6).
+	// warm before the catalog commit proceeds.
 	flt("warm-quorum", warmQuorum, fc.Distribution.WarmQuorum)
 
 	// MQTT broker CA (the only broker flag; the broker URL is derived from the

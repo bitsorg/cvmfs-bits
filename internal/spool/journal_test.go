@@ -11,7 +11,7 @@ import (
 )
 
 // TestJournal_JobIDPresent verifies that Append writes the job_id field and
-// Read recovers it correctly (Fix #4).
+// Read recovers it correctly.
 func TestJournal_JobIDPresent(t *testing.T) {
 	dir := t.TempDir()
 	j := OpenJournal(dir)

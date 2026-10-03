@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package httpsig implements the body-bound request signing used between build
-// runners and the cvmfs-prepub API (ADR-0008 D3, option T1).
+// runners and the cvmfs-prepub API.
 //
 // # Why not just send the token
 //
@@ -19,7 +19,7 @@
 // Confidentiality (the payload is still readable) and server authenticity (an
 // on-path attacker can still forge a RESPONSE, e.g. a fake job_id). Those need
 // transport encryption; this composes with TLS or WireGuard rather than
-// replacing them. See ADR-0008 D3.
+// replacing them.
 //
 // # The scheme
 //

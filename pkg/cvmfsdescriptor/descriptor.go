@@ -4,7 +4,7 @@
 // Package cvmfsdescriptor writes the cvmfs `ingestsql` SQLite descriptor
 // (schema_revision 4) from prepub catalog entries.
 //
-// It is the producer side of ADR-0007 Variant A: instead of the prepub authoring
+// It is the producer side of coarse publish: instead of the prepub authoring
 // a CVMFS catalog itself (pkg/cvmfscatalog), it emits a flat description of the
 // files/dirs/symlinks to register — content referenced by hash, objects already
 // in the store — and the canonical `cvmfs_swissknife ingestsql` builds and
@@ -28,7 +28,7 @@ import (
 // ExternalChunkSize / InternalChunkSize mirror cvmfs swissknife_ingestsql.cc:
 // ingestsql derives chunk offsets as i*chunkSize and requires exactly
 // ceil(size/chunkSize) hashes for a file. The prepub's ingestsql path must
-// therefore chunk large files at this fixed size (ADR-0007 decision: align the
+// therefore chunk large files at this fixed size (by design: align the
 // prepub rather than extend ingestsql). Files <= the grid size are a single
 // blob (one hash) and are unaffected.
 //
@@ -92,7 +92,7 @@ var schema = []string{
 // classified by mode into the dirs / files / links tables. Regular files
 // reference content by hash (Entry.Hash, or the ordered Entry.Chunks hashes).
 //
-// Assumptions, guaranteed by the prepub pipeline (ADR-0007):
+// Assumptions, guaranteed by the prepub pipeline:
 //   - No file xattrs and no hardlinks (hardlinks are converted to symlinks
 //     upstream); only dir POSIX ACLs would be representable, and bits has none,
 //     so acl is always empty.

@@ -14,7 +14,7 @@ import (
 )
 
 // startEmbeddedBroker starts an in-process Mochi MQTT broker exposing a single
-// WebSocket listener, so the ADR-0001 control plane runs ON Stratum 0 with no
+// WebSocket listener, so the pull control plane runs ON Stratum 0 with no
 // separate broker (mosquitto) container. Receivers connect over ws:// (dev) or
 // wss:// (prod) and the publisher connects to the same listener on localhost.
 //

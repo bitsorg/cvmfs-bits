@@ -14,7 +14,7 @@
 // MaxSlots defaults to runtime.NumCPU().  As load drops, the highest-priority
 // waiters are woken first.
 //
-// Priority scheduling (Fix #priority): when multiple jobs are queued waiting
+// Priority scheduling: when multiple jobs are queued waiting
 // for a slot, the job with the largest TarSize is dispatched first.  This
 // ensures long-running jobs overlap with shorter ones rather than being pushed
 // to the tail, reducing overall makespan.

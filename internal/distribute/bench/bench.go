@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
-// Package bench is the measurement harness behind ADR-0001's open question P-A:
+// Package bench is the measurement harness for the object-bundling question:
 // is it worth bundling many small CAS objects into one request, or is per-object
 // HTTP good enough? It builds a synthetic object set with a realistic small-file
 // size distribution, serves it over a loopback HTTP server with a configurable

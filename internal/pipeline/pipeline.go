@@ -548,7 +548,7 @@ func runFromSortedEntries(
 
 	// Stage 1: Fan-out — feed sorted entries to both compress and catalog.
 	//
-	// Fix #14: if the compress send succeeds but the catalog send is blocked
+	// If the compress send succeeds but the catalog send is blocked
 	// at context cancellation, we return an error so the two stages cannot
 	// silently diverge.
 	eg.Go(func() error {
@@ -630,7 +630,7 @@ func runFromSortedEntries(
 	uploadLogPath := filepath.Join(cfg.SpoolDir, "upload.log")
 	uploadLog := upload.OpenUploadLog(uploadLogPath)
 
-	// Fix H2: store only the hash strings we need for catalog patching, not the
+	// Store only the hash strings we need for catalog patching, not the
 	// full compress.Result (which holds the compressed byte slices that are
 	// already in CAS and should be GC'd after upload).
 	type chunkMeta struct {
@@ -714,7 +714,7 @@ func runFromSortedEntries(
 		// derived from egCtx so any pipeline stage failure cancels all workers.
 		inner, innerCtx := errgroup.WithContext(egCtx)
 
-		// Fix #P1 (upload stage): capture sem.Acquire failure without returning early.
+		// Upload stage: capture sem.Acquire failure without returning early.
 		// If we returned on Acquire error, in-flight inner.Go workers would still be
 		// running when we return, and they access shared state (result, resultMu,
 		// uploadLog) after the outer eg proceeds past eg.Wait() — a data race.
@@ -867,7 +867,7 @@ func runFromSortedEntries(
 	result.DirtabContent = capturedDirtab
 
 	// Patch catalog entries with hashes and chunks from compress results.
-	// Fix C2: hex decode errors are now propagated rather than silently ignored.
+	// Hex decode errors are propagated rather than silently ignored.
 	rawEntries := builder.Entries()
 	result.CatalogEntries = make([]cvmfscatalog.Entry, len(rawEntries))
 	for i, e := range rawEntries {
@@ -896,7 +896,7 @@ func runFromSortedEntries(
 		if len(fm.chunks) > 0 {
 			chunks := make([]cvmfscatalog.ChunkRecord, len(fm.chunks))
 			for j, ch := range fm.chunks {
-				// Fix C2: propagate decode error instead of silently using nil bytes.
+				// Propagate decode error instead of silently using nil bytes.
 				chBytes, decErr := hex.DecodeString(ch.hash)
 				if decErr != nil {
 					return nil, fmt.Errorf("decoding chunk hash for %s at offset %d: %w",

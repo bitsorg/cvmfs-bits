@@ -3,7 +3,7 @@
 
 // Package manifest defines the transaction manifest exchanged between a
 // cvmfs-prepub publisher (Stratum 0) and receivers (Stratum 1) under the
-// pull-based distribution model (ADR-0001).
+// pull-based distribution model.
 //
 // A manifest is the authoritative, deduplicated set of CAS objects a
 // transaction adds, plus the metadata a receiver needs to fetch and verify
@@ -26,14 +26,14 @@ type Generator string
 
 const (
 	// GeneratorPipeline: the set came from the publish pipeline's dedup step
-	// (the incremental, authoritative new-object set — ADR D3).
+	// (the incremental, authoritative new-object set).
 	GeneratorPipeline Generator = "pipeline"
 	// GeneratorDiff: the set was computed from a catalog diff
-	// (cvmfs_server diff / catalog walk) for cold-start or catch-up (ADR D4).
+	// (cvmfs_server diff / catalog walk) for cold-start or catch-up.
 	GeneratorDiff Generator = "diff"
 )
 
-// Auth is the object-channel authorization policy for a transaction (ADR D8).
+// Auth is the object-channel authorization policy for a transaction.
 type Auth string
 
 const (
@@ -119,7 +119,7 @@ func isObjectName(s string) bool {
 }
 
 // Missing returns the subset of Objects for which has(hash) reports false — the
-// receiver-local delta (ADR D3). The receiver supplies a predicate backed by its
+// receiver-local delta. The receiver supplies a predicate backed by its
 // own CAS, so no per-receiver hash list is round-tripped to S0.
 func (m *Manifest) Missing(has func(hash string) bool) []ObjRef {
 	out := make([]ObjRef, 0, len(m.Objects))
@@ -162,8 +162,8 @@ func (m *Manifest) EncodeNDJSON(w io.Writer) error {
 
 // EncodeNDJSONHeader writes just the NDJSON header line (manifest metadata with
 // Objects omitted). Pair it with EncodeNDJSONObject to stream an object set that
-// is too large to materialise — e.g. a catch-up diff generated on the fly (ADR
-// D4 / P4), where the producer never holds the whole set in memory.
+// is too large to materialise — e.g. a catch-up diff generated on the fly,
+// where the producer never holds the whole set in memory.
 func EncodeNDJSONHeader(w io.Writer, m *Manifest) error {
 	header := *m
 	header.Objects = nil
@@ -188,8 +188,8 @@ func DecodeNDJSON(r io.Reader, onObj func(ObjRef) error) (*Manifest, error) {
 	return DecodeNDJSONStream(r, nil, onObj)
 }
 
-// DecodeNDJSONStream is the streaming decoder used by catch-up pulls (ADR D4 /
-// P4). It parses the header line, invokes onHeader once (if non-nil) BEFORE any
+// DecodeNDJSONStream is the streaming decoder used by catch-up pulls.
+// It parses the header line, invokes onHeader once (if non-nil) BEFORE any
 // object — so the consumer has the header's BaseURLs/roots before it starts
 // fetching — then invokes onObj for each object record. Neither the header nor
 // the object set is buffered. A non-nil error from onHeader or onObj aborts the

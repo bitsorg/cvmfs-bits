@@ -11,8 +11,8 @@ import (
 )
 
 // Summary is one run reduced to the numbers a comparison table needs. The
-// field set is taken from the tables already in MEASUREMENTS.md (§24, §25),
-// so a section can be written from this without further arithmetic.
+// field set matches the comparison tables written so far, so a table can be
+// filled from this without further arithmetic.
 type Summary struct {
 	BuildID string `json:"build_id,omitempty"`
 	Repo    string `json:"repo,omitempty"`
@@ -37,7 +37,7 @@ type Summary struct {
 	// clock. Not the sum of the per-job times -- jobs overlap.
 	WindowS float64 `json:"window_s"`
 
-	// Backend is the per-publish tool duration, the distribution §24 quotes.
+	// Backend is the per-publish tool duration distribution.
 	// Serialised sum vs WindowS is what shows whether the path is serialised.
 	Backend Stats `json:"backend_s"`
 	// Total is submission-to-terminal per job.
@@ -110,7 +110,7 @@ func Summarise(recs []Record) Summary {
 	// necessarily the job that finished first: records are written at terminal
 	// time. Deriving the start per record (terminal - total) and taking the
 	// minimum needs no heuristic and is right when a long job starts first --
-	// the GEANT4 shape §24 is about.
+	// the GEANT4 shape.
 	var earliestStart time.Time
 
 	for _, r := range recs {

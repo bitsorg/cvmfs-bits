@@ -42,7 +42,7 @@ type Metrics struct {
 	//   total_s0         — wall time from job submission to StatePublished
 	JobPhaseDuration *prometheus.HistogramVec
 
-	// ── ADR-0001 pull-based distribution ────────────────────────────────────
+	// ── pull-based distribution ─────────────────────────────────────────────
 	// Publisher (Stratum 0) side.
 	DistWarmQuorum      *prometheus.CounterVec // result=reached|timeout
 	DistTxn             *prometheus.CounterVec // result=committed|aborted
@@ -154,7 +154,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15), // 0.1s … 1638s
 		}, []string{"phase"}),
 
-		// ── pull distribution (ADR-0001) ──
+		// ── pull distribution ──
 		DistWarmQuorum: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cvmfs_prepub_dist_warm_quorum_total",
 			Help: "Warm-gate outcomes per transaction (result=reached|timeout).",

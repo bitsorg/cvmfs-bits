@@ -21,8 +21,8 @@ import (
 // observed on the testbed on 2026-08-15 — prepub log, jobs e0adbb19 and the
 // 170-job re-runs of 12:52Z and 16:2xZ. The remediation keys on the UNIQUE
 // constraint marker inside it, so the test must use the real shape, not a
-// convenient sentinel (see MEASUREMENTS.md §25 on fakes that diverge from the
-// system they fake).
+// convenient sentinel: a fake that diverges from the system it fakes hides
+// exactly this kind of bug.
 var realConflictErr = errors.New(`cvmfs_server ingest into "el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3": exit status 1 (output: terminate called after throwing an instance of 'ECvmfsException'
   what():  PANIC: cvmfs/catalog_rw.cc : 168
 failed to add '/el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3/lib64/libgomp.so' (parent '/el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3') to catalog '/el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3': UNIQUE constraint failed: catalog.md5path_1, catalog.md5path_2
@@ -122,7 +122,7 @@ func TestReplaceOnConflict_ReplacesAndRetriesOnce(t *testing.T) {
 }
 
 // A real conflict arrives with the job's lease still OPEN: the staged graft
-// path returns merge_error without releasing it (MEASUREMENTS §29). The
+// path returns merge_error without releasing it (seen on the testbed). The
 // remediation must release that lease BEFORE DeleteSubtree, because the delete
 // (cvmfs_server ingest -f) acquires a gateway lease on the same path and would
 // otherwise fail path_busy.

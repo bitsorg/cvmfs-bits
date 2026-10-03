@@ -14,18 +14,18 @@ import (
 	"cvmfs.io/prepub/internal/distribute/serve"
 )
 
-// DistributeServing holds the dependencies for the pull-based serving routes
-// (ADR-0001 P1/P2). It is mounted only when the publisher runs with
+// DistributeServing holds the dependencies for the pull-based serving routes.
+// It is mounted only when the publisher runs with
 // --distribute-mode pull, so the default (push) server is byte-for-byte
 // unchanged.
 type DistributeServing struct {
 	CAS       cas.Backend
 	Manifests serve.ManifestStore
 	// Admission, when set, mounts POST /s1/{txn}/lease for receiver admission
-	// control (ADR D6). Satisfied by *commit.Admission.
+	// control. Satisfied by *commit.Admission.
 	Admission serve.LeaseGranter
 	// Diff, when set, mounts GET /s1/catchup for cumulative catch-up of a
-	// receiver that fell behind (ADR D4 / P4). ObjectBaseURLs is the S0 object
+	// receiver that fell behind. ObjectBaseURLs is the S0 object
 	// base URL(s) advertised to receivers in the catch-up manifest header.
 	Diff           serve.DiffSource
 	ObjectBaseURLs []string
@@ -51,14 +51,14 @@ func (s *Server) MountDistributeServing(d DistributeServing) {
 
 // mountDistributeServing is the testable core (no *Server required). The
 // receiver-facing object and manifest GETs are unauthenticated (content-
-// addressed, public default — ADR D8); the producer-facing manifest POST
+// addressed, public by default); the producer-facing manifest POST
 // (gateway or pipeline) requires the bearer token.
 func mountDistributeServing(router *mux.Router, requireAuth mux.MiddlewareFunc, log *slog.Logger, d DistributeServing) {
 	if d.CAS != nil {
 		router.PathPrefix("/cvmfs/").
 			Handler(&serve.ObjectHandler{Store: d.CAS}).
 			Methods(http.MethodGet, http.MethodHead)
-		// Chunked-bundle endpoint: many objects in one streamed response (P-A).
+		// Chunked-bundle endpoint: many objects in one streamed response.
 		router.Handle("/s1/bundle", &serve.BundleHandler{Store: d.CAS}).
 			Methods(http.MethodPost)
 	}

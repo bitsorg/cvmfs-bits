@@ -77,7 +77,7 @@ func TestNDJSONRoundTrip(t *testing.T) {
 func TestNDJSONStreamHeaderCallbackOrdering(t *testing.T) {
 	m := sample()
 	var buf bytes.Buffer
-	// Encode header + objects piecemeal via the streaming primitives (P4).
+	// Encode header + objects piecemeal via the streaming primitives.
 	if err := EncodeNDJSONHeader(&buf, m); err != nil {
 		t.Fatalf("encode header: %v", err)
 	}

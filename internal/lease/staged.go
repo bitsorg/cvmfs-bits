@@ -87,7 +87,7 @@ func NewStagedBackend(c *Client, remover subtreeRemover) *StagedBackend {
 // occupied path (swissknife -D with -f), but the receiver's graft is add-only
 // by construction, so the commit is refused until the existing subtree is
 // gone. Without this the staged path silently had weaker semantics than
-// ingest, which is what MEASUREMENTS.md §25 claimed it did not.
+// ingest, although it was believed to match it.
 func (b *StagedBackend) DeleteSubtree(ctx context.Context, repo, relPath string) error {
 	if b.remover == nil {
 		return ErrSubtreeDeleteUnsupported

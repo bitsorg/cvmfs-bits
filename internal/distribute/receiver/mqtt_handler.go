@@ -101,11 +101,11 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 		return
 	}
 
-	// Pull mode (ADR-0001 P2): treat the announce as a "prepare" — fetch the
+	// Pull mode: treat the announce as a "prepare" — fetch the
 	// transaction manifest and pull the missing objects, instead of replying with
 	// a push session. A pull-mode publisher does not push, so we return here.
 	// startPull is bounded and deduplicated (see pull.go).
-	// Pull mode (ADR-0001): the announce is a "prepare" trigger. Fetch the
+	// Pull mode: the announce is a "prepare" trigger. Fetch the
 	// transaction manifest and pull the missing objects (bounded + deduplicated;
 	// see pull.go). Pull is the only distribution mode.
 	if r.pullCoordinator != nil {

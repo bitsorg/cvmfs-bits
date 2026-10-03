@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
-// Package credential implements the data-plane authentication of ADR-0001: a
+// Package credential implements pull-distribution data-plane authentication: a
 // Stratum 1 enrols with the publisher over the (mutually authenticated) control
 // plane using an out-of-band per-node key, and in return receives a short-lived,
 // scoped bearer token that it presents on critical data-plane endpoints such as

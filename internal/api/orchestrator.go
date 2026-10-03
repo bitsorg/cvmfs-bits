@@ -95,12 +95,12 @@ type Orchestrator struct {
 	//	"prepub" — the default: compress/dedup/CAS pipeline, then a gateway
 	//	           commit; supports pre-warming and coarse (whole-build) publish.
 	//	"ingest" — relay: hand the tar to `cvmfs_server ingest` and let the
-	//	           gateway do the work (ADR-0008 D7).
+	//	           gateway do the work.
 	//
 	// The map is populated at startup from the deployment's configuration, so
 	// a path a node cannot serve simply is not there and jobs asking for it are
 	// rejected rather than silently published a different way.  This is also
-	// the registry that ADR-0008 D1 needs for per-repository backends: the key
+	// the registry that per-repository backends need: the key
 	// becomes (repo, path) when one instance serves several repositories.
 	PublishPaths map[string]lease.Backend
 	// JobTimeout is the maximum wall-clock duration a single job may run
@@ -117,7 +117,7 @@ type Orchestrator struct {
 	// (e.g. "/cvmfs").  Only used in local publish mode; ignored by the
 	// gateway backend.
 	CVMFSMount string
-	// Ingest* configure the ADR-0007 coarse-publish finalize: one
+	// Ingest* configure the coarse-publish finalize: one
 	// cvmfs_swissknife ingestsql invocation that publishes a whole build's
 	// accumulated packages in a single commit. Set at startup; used by
 	// FinalizeBuild (the finalize job and the /builds finalize endpoint).
@@ -172,7 +172,7 @@ type Orchestrator struct {
 	// --gateway-direct-graft for A/B comparison and integrity verification.
 	DirectGraft bool
 	// Distribute carries the control-plane broker configuration used to emit the
-	// pre-commit pull announce (ADR-0001). nil disables the announce (typical for
+	// pre-commit pull announce. nil disables the announce (typical for
 	// local mode); receivers then converge on the post-commit published broadcast.
 	Distribute *distribute.Config
 	// PreWarm gates the pre-commit pull announce (Stratum 1 cache pre-warming).
@@ -194,7 +194,7 @@ type Orchestrator struct {
 	// deployments both configs reference the same broker.
 	BrokerConfig *broker.Config
 	// Manifests, when non-nil, is the per-transaction manifest store used in pull
-	// mode (ADR-0001). The orchestrator records a manifest for each distributed
+	// mode. The orchestrator records a manifest for each distributed
 	// transaction so a receiver can fetch GET /s1/{txn}/manifest and pull the
 	// objects it is missing. Shares the instance passed to MountDistributeServing.
 	Manifests serve.ManifestStore
@@ -1047,7 +1047,7 @@ func (o *Orchestrator) preWarmFor(j *job.Job) bool {
 
 // publishAnnounce broadcasts the pre-commit AnnounceMessage directly on the
 // control-plane broker so Stratum 1 receivers begin pulling the transaction's
-// objects before the catalog flips (ADR-0001 pull mode). It mirrors
+// objects before the catalog flips (pull mode). It mirrors
 // publishMQTTNotification: a single-use broker.Client connects with the
 // distribution BrokerConfig (which carries the token CredentialsProvider so it
 // authenticates to the embedded broker), publishes one message to the repo
@@ -1160,7 +1160,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			j.PublishPath, strings.Join(o.PublishPathNames(), ", ")))
 	}
 
-	// ── Coarse-publish finalize job (ADR-0007) ───────────────────────────────
+	// ── Coarse-publish finalize job ──────────────────────────────────────────
 	// A finalize job carries no payload: it publishes all of BuildID's
 	// accumulated packages in one ingestsql commit. Release the concurrency slot
 	// immediately (no pipeline work) and commit.
@@ -1309,7 +1309,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 					"job_id", j.ID, "error", err)
 			}
 
-			// Pull mode (ADR-0001): record the transaction manifest so a receiver
+			// Pull mode: record the transaction manifest so a receiver
 			// triggered by the announce can GET /s1/{txn}/manifest and pull the
 			// objects it is missing. Keyed by j.ID — the same payloadID the announce
 			// carries. Objects are content-addressed (self-verifying), so the fetch
@@ -1341,7 +1341,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 					logger.Info("pull: transaction manifest stored", "txn", j.ID, "objects", len(objs))
 				}
 			}
-			// Pull mode (ADR-0001): publish the pre-commit announce directly on the
+			// Pull mode: publish the pre-commit announce directly on the
 			// embedded broker so receivers begin pulling the new objects before the
 			// catalog flips. This mirrors publishMQTTNotification (the post-commit
 			// "published" broadcast): a single-use broker.Client connects, publishes
@@ -1368,7 +1368,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		}
 	}
 
-	// ── Coarse publish (ADR-0007): accumulate entries, defer the commit ──────
+	// ── Coarse publish: accumulate entries, defer the commit ─────────────────
 	// When the job belongs to a build (BuildID set), its objects are already in
 	// CAS and pre-warmed to the Stratum 1s above.  Record its catalog entries in
 	// the build-scoped accumulator and finish in StateAccumulated; a single
@@ -1764,10 +1764,10 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 				// afterwards, which is the whole point of a tunable.
 				"workers", o.PromoteWorkers)
 
-			// Record what moved (ADR-0011 D6). Without this a staged publish
+			// Record what moved. Without this a staged publish
 			// reports objects=0 bytes=0 on completion and in every accounting
 			// built on the job record -- which is what the first end-to-end run
-			// showed (MEASUREMENTS §22), a publish of 6 objects and 102 kB
+			// showed: a publish of 6 objects and 102 kB
 			// looking empty.
 			//
 			// NObjects counts everything this publish needs in the store,
@@ -1899,7 +1899,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		leaseCtx, leaseCancel = context.WithCancel(ctx)
 		cancelHeartbeat = o.leaseFor(j).Heartbeat(ctx, token, 10*time.Second, leaseCancel)
 	} else {
-		logger.Info("using pre-acquired gateway lease (Phase 2.7)",
+		logger.Info("using pre-acquired gateway lease",
 			"repo", j.Repo, "path", j.Path)
 	}
 
@@ -2480,7 +2480,7 @@ var pathExistsFn = cvmfscatalog.PathExists
 //     path's heartbeat is already cancelled before the commit.
 //  3. Commit does not depend on OldRootHash: the delete advances the
 //     repository root, so any root read before it is stale — and the graft
-//     does NOT enforce old_root_hash (proven, MEASUREMENTS §29), so the stale
+//     does NOT enforce old_root_hash (proven on the testbed), so the stale
 //     value the retry still carries is harmless.
 type subtreeDeleter interface {
 	DeleteSubtree(ctx context.Context, repo, relPath string) error
@@ -2544,7 +2544,7 @@ func (o *Orchestrator) replaceOnConflict(ctx context.Context, j *job.Job,
 	// merge_error WITHOUT releasing its gateway lease (StagedBackend.Commit ->
 	// CommitFinalizeOnly), and DeleteSubtree acquires a gateway lease on the
 	// same path, so a still-open lease makes the delete fail path_busy
-	// (MEASUREMENTS §29). On the ingest path Commit already freed the slot and
+	// (seen on the testbed). On the ingest path Commit already freed the slot and
 	// IngestBackend.Abort is an idempotent no-op, so this is safe there too.
 	if j.LeaseToken != "" {
 		if relErr := backend.Abort(ctx, j.LeaseToken); relErr != nil {

@@ -48,7 +48,7 @@ func (s *MapEnrollStore) Key(node string) ([]byte, bool) {
 }
 
 // EnrollServer runs the two-step challenge–response enrollment and mints scoped
-// tokens (ADR-0001 data-plane auth):
+// tokens (data-plane auth):
 //
 //	GET  /control/challenge?node={id}   → {"nonce": "..."}
 //	POST /control/enroll  {node,nonce,mac=hex(HMAC-SHA256(enrollKey, node|nonce))}

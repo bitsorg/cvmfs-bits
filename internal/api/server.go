@@ -78,7 +78,7 @@ type Server struct {
 	//	AuthBoth   — either; the migration setting, and the default.
 	//	AuthHMAC   — signed requests only; the token stops travelling.
 	//
-	// See ADR-0008 D3. The point of AuthHMAC is that observing a request no
+	// The point of AuthHMAC is that observing a request no
 	// longer yields a reusable credential.
 	authMode AuthMode
 	// nonces prevents a captured signature from being replayed.
@@ -193,7 +193,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	auth.HandleFunc("/{id}/log", s.jobLogHandler).Methods("GET")
 
 	// Measurements (internal/measure): the per-publish records behind the
-	// numbers in MEASUREMENTS.md. PUBLIC by design — read-only performance
+	// performance comparisons. PUBLIC by design — read-only performance
 	// stats a CI run or a person fetches without a token, so they can be
 	// captured per build without log scraping. They expose repository paths,
 	// object/byte counts and failure causes, judged non-sensitive; nothing
@@ -213,7 +213,7 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	published.Use(s.requireAuth)
 	published.HandleFunc("", s.publishedHandler).Methods("POST")
 
-	// Coarse publish finalize (ADR-0007): publish a whole build's accumulated
+	// Coarse publish finalize: publish a whole build's accumulated
 	// packages in one commit. Authenticated.
 	builds := s.router.PathPrefix("/api/v1/builds").Subrouter()
 	builds.Use(s.requireAuth)
@@ -493,7 +493,7 @@ func (s *Server) reserveHandler(w http.ResponseWriter, r *http.Request) {
 
 // MountDiscovery mounts the signed discovery document (GET /cvmfs/{repo}/.cvmfsbits)
 // on the API router so Stratum 1 receivers can learn the control-plane broker URL
-// from a fixed S0 endpoint (ADR-0001 D10).
+// from a fixed S0 endpoint.
 func (s *Server) MountDiscovery(h http.Handler) {
 	if h != nil {
 		s.router.Handle("/cvmfs/{repo}/.cvmfsbits", h).Methods("GET")
@@ -726,7 +726,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preloadExe                string   // optional: repo-relative exe path for preload
 		preloadPaths              []string // optional: repo-relative paths opened at startup
 		buildID                   string   // optional: the CI pipeline identity of this run
-		coarseField               string   // optional: "true"/"false"; empty means "infer" (ADR-0007)
+		coarseField               string   // optional: "true"/"false"; empty means "infer"
 		buildExpect               int      // optional: package count → auto-finalize when reached
 		finalize                  bool     // coarse-publish finalize job (no tar payload)
 		directS3                  bool     // pass --direct-s3 to cvmfs_server ingest (this job only)

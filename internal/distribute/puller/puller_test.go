@@ -31,7 +31,7 @@ func mustPut(t *testing.T, c cas.Backend, hash string, b []byte) {
 func TestPullVerifiesSkipsAndRejectsCorrupt(t *testing.T) {
 	ctx := context.Background()
 
-	// Source CAS on "S0", served via the P1 object handler.
+	// Source CAS on "S0", served via serve.ObjectHandler.
 	src, err := cas.NewLocalFS(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

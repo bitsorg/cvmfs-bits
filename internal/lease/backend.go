@@ -134,8 +134,7 @@ type CommitRequest struct {
 // OPTIONAL and zero means "not measured", which is why the counts are
 // pointers: recording 0 objects for a path that never counted them is the
 // kind of confident-but-wrong number these records exist to replace (the
-// ingest path logged objects=0 for real publishes for weeks -- MEASUREMENTS
-// §22, §24).
+// ingest path logged objects=0 for real publishes for weeks).
 type PublishStats struct {
 	// Backend is the tool-level duration: for the ingest path, exactly the
 	// wall clock of `cvmfs_server ingest`, excluding lease and ancestors.

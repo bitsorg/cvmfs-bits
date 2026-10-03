@@ -146,7 +146,7 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 	ctx, span := obs.Tracer.Start(ctx, "pipeline.compress")
 	defer span.End()
 
-	// Fix #16: Clamp workers to a safe range so a bad config value cannot
+	// Clamp workers to a safe range so a bad config value cannot
 	// create an unbounded goroutine explosion.
 	workers := cfg.Workers
 	maxSane := 4 * runtime.NumCPU()
@@ -173,7 +173,7 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 	eg, egCtx := errgroup.WithContext(ctx)
 	sem := semaphore.NewWeighted(int64(workers))
 
-	// Fix #P1: capture sem.Acquire failure without returning early.
+	// Capture sem.Acquire failure without returning early.
 	// If we returned here, already-launched eg.Go workers would still be
 	// running when our caller closes out (via defer close(compressOut)),
 	// causing a "send on closed channel" panic.  Breaking out of the loop
@@ -210,7 +210,7 @@ func Run(ctx context.Context, in <-chan unpack.FileEntry, out chan<- Result, cfg
 				return fmt.Errorf("compressing %s: %w", entry.Path, err)
 			}
 
-			// Fix #24: guard against nil Metrics (e.g. a manually constructed
+			// Guard against nil Metrics (e.g. a manually constructed
 			// Provider in tests that omit metric initialisation).
 			if obs != nil && obs.Metrics != nil {
 				obs.Metrics.PipelineFilesProcessed.Inc()
@@ -415,7 +415,7 @@ func compressEntry(entry unpack.FileEntry, chunkSize int64, level int) (Result, 
 }
 
 func compressEntryChunked(entry unpack.FileEntry, chunkSize int64, level int) (Result, error) {
-	// Fix C4: guard against a non-positive chunkSize reaching this function.
+	// Guard against a non-positive chunkSize reaching this function.
 	// compressEntry already checks this via the caller, but a defensive check
 	// here prevents subtle bugs if compressEntryChunked is ever called directly.
 	if chunkSize <= 0 {

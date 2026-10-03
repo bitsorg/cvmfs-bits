@@ -12,7 +12,7 @@
 // are the measurement.
 //
 // Why not the service log: the numbers are there, but only as prose. Every
-// figure in MEASUREMENTS.md so far was recovered by grepping multi-thousand
+// figure reported so far was recovered by grepping multi-thousand
 // line logs with ad-hoc regexes, which is slow, easy to get subtly wrong, and
 // impossible once the containers are recreated. One JSON object per publish
 // makes the same extraction a jq one-liner.
@@ -73,7 +73,7 @@ type Record struct {
 	BytesRaw        *int64 `json:"bytes_raw,omitempty"`
 	BytesCompressed *int64 `json:"bytes_compressed,omitempty"`
 
-	// ── conflict remediation (ADR-0011 D17 / replace_on_conflict) ──
+	// ── conflict remediation (replace_on_conflict) ──
 	Conflicted bool `json:"conflicted,omitempty"`
 	Replaced   bool `json:"replaced,omitempty"`
 

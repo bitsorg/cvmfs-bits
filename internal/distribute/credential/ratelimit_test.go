@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Security review M3: eviction must be least-recently-USED, not FIFO. A client
+// Eviction must be least-recently-USED, not FIFO. A client
 // that keeps making requests must NOT be evicted by a flood of one-shot IPs.
 // Under the old FIFO behaviour the oldest-INSERTED entry (the active client A)
 // would be wrongly dropped; LRU keeps it and evicts the idle one (B).

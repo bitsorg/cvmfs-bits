@@ -10,13 +10,13 @@ import (
 	"cvmfs.io/prepub/internal/distribute/manifest"
 )
 
-// Orchestrator drives the Stratum-0 three-phase distribution commit of ADR-0001
-// (D2): Prepare (pin objects, journal, announce so receivers pull) → Warm (wait
+// Orchestrator drives the Stratum-0 three-phase distribution commit:
+// Prepare (pin objects, journal, announce so receivers pull) → Warm (wait
 // for an authoritative quorum of replicas to report warm) → Commit (flip the
 // catalog, journal the terminal record, release the pin, tell receivers). It is
 // transport-agnostic: the catalog flip, the control-plane broadcasts, and the
 // GC pin are injected as interfaces, so the same logic is exercised by the MQTT
-// control plane, an SSE one (P-B), or fakes in tests.
+// control plane, an SSE one, or fakes in tests.
 //
 // Ordering is chosen for crash safety. The journal is the source of truth: a
 // Prepare/Warm record is written and fsync'd before the action it guards, and
@@ -33,7 +33,7 @@ type Orchestrator struct {
 	Notifier  Notifier
 
 	// WarmTimeout bounds how long Run waits for the warm quorum before
-	// degrading to a timeout-commit (ADR D6/R5). 0 → 30s.
+	// degrading to a timeout-commit. 0 → 30s.
 	WarmTimeout time.Duration
 	// PinTTL is the GC-pin lifetime; it must outlast a normal prepare→commit
 	// window so a slow warm does not expose objects to GC. 0 → 15m.
@@ -45,7 +45,7 @@ type Orchestrator struct {
 }
 
 // Pinner protects a transaction's objects from garbage collection during the
-// prepare→commit window (ADR R2). Satisfied structurally by *serve.MemPinner;
+// prepare→commit window. Satisfied structurally by *serve.MemPinner;
 // in production it is backed by an external, crash-surviving pin (a cvmfs_server
 // named tag or a held gateway lease) so that recovery after a publisher crash
 // still finds the objects intact.
@@ -65,7 +65,7 @@ type Committer interface {
 // Notifier broadcasts control-plane events to receivers. Announce triggers the
 // pull (prepare); Committed signals that the catalog flipped. Both are
 // best-effort: a failed broadcast never blocks or fails the commit, because
-// receivers have a backstop poll of .cvmfspublished (ADR R5) to converge.
+// receivers have a backstop poll of .cvmfspublished to converge.
 type Notifier interface {
 	Announce(repo, txn, rootHash string, hashes []string) error
 	Committed(repo, txn, rootHash string) error
@@ -198,7 +198,7 @@ func (o *Orchestrator) Run(ctx context.Context, t Txn) (Outcome, error) {
 }
 
 // Recover replays the journal on publisher startup and resolves every
-// transaction left non-terminal by a crash (ADR R1). A transaction that had
+// transaction left non-terminal by a crash. A transaction that had
 // reached Warm is finished by re-running the (idempotent) catalog commit; one
 // still at Prepare is aborted. Each resolution writes a terminal journal record
 // and releases the pin, so Recover is itself idempotent across repeated restarts.
