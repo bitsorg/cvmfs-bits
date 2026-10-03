@@ -77,11 +77,17 @@ func TestBrokerAuthHook(t *testing.T) {
 	if aclAllowed("stratum1-a", "publisher", "cvmfs/repos/r/published", true) {
 		t.Error("receiver must NOT be allowed to publish published")
 	}
-	if !aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-a/ready", true) {
-		t.Error("receiver must be allowed to publish its ready")
+	if aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-a/ready", true) {
+		t.Error("receiver must NOT be allowed to publish ready")
 	}
 	if !aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-a/presence", true) {
 		t.Error("receiver must be allowed to publish its presence")
+	}
+	if aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-b/presence", true) {
+		t.Error("receiver must NOT be allowed to publish another node's presence")
+	}
+	if aclAllowed("stratum1-a", "publisher", "cvmfs/repos/r/presence", true) {
+		t.Error("receiver must NOT publish a non-presence topic containing /presence")
 	}
 	if !aclAllowed("stratum1-a", "publisher", "cvmfs/repos/r/announce", false) {
 		t.Error("receiver must be allowed to subscribe announce")
@@ -114,12 +120,12 @@ func TestBrokerAuthHookConnectionIdentity(t *testing.T) {
 		t.Fatalf("verified node must overwrite forged username: got %q", got)
 	}
 	// Despite the forged "publisher" username, the receiver must NOT be able to
-	// publish announce, and CAN publish its own ready.
+	// publish announce, and CAN publish its own presence.
 	if h.OnACLCheck(recvCl, "cvmfs/repos/r/announce", true) {
 		t.Error("receiver (forged username) must NOT be authorized to publish announce")
 	}
-	if !h.OnACLCheck(recvCl, "cvmfs/receivers/stratum1-a/ready", true) {
-		t.Error("receiver must be authorized to publish its ready")
+	if !h.OnACLCheck(recvCl, "cvmfs/receivers/stratum1-a/presence", true) {
+		t.Error("receiver must be authorized to publish its presence")
 	}
 
 	// The real publisher authenticates and CAN publish announce — and this still

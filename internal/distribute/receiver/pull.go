@@ -69,21 +69,10 @@ func (r *Receiver) startPull(payloadID, repo string) {
 		if err != nil {
 			r.cfg.Obs.Logger.Warn("pull: transaction failed",
 				"payload_id", payloadID, "repo", repo, "error", err)
-			// Report the failed warm so the publisher does not count this node
-			// toward quorum (it still degrades to a timeout-commit if needed).
-			if r.cfg.OnWarmed != nil {
-				r.cfg.OnWarmed(payloadID, repo, false)
-			}
 			return
 		}
 		r.cfg.Obs.Logger.Info("pull: transaction warmed",
 			"payload_id", payloadID, "repo", repo,
 			"fetched", res.Fetched, "skipped", res.Skipped, "failed", res.Failed)
-		// Ack the warm to the publisher's WarmGate. A non-nil
-		// Failed count means some objects could not be fetched/verified, so the
-		// node is not warm.
-		if r.cfg.OnWarmed != nil {
-			r.cfg.OnWarmed(payloadID, repo, res.Failed == 0)
-		}
 	}()
 }

@@ -9,12 +9,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
 	"sync"
 
 	mqttbroker "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
 
+	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/distribute/credential"
 	"cvmfs.io/prepub/pkg/observe"
 )
@@ -68,8 +68,7 @@ func (h *brokerAuthHook) authNode(token string) (string, bool) {
 
 // aclAllowed is the pure, testable authorization rule. The publisher may do
 // anything; receivers may SUBSCRIBE freely but may only PUBLISH to their own
-// ready/presence topics — they cannot publish announce/published (which would
-// let a forged warm/ready ack push the publisher toward a premature commit).
+// presence topic — not announce/published, nor another node's presence.
 func aclAllowed(node, publisherNode, topic string, write bool) bool {
 	if node != "" && node == publisherNode {
 		return true
@@ -77,7 +76,10 @@ func aclAllowed(node, publisherNode, topic string, write bool) bool {
 	if !write {
 		return true
 	}
-	return strings.Contains(topic, "/ready") || strings.Contains(topic, "/presence")
+	if node == "" || broker.ValidateNodeID(node) != nil {
+		return false
+	}
+	return topic == broker.PresenceTopic(node)
 }
 
 func (h *brokerAuthHook) OnConnectAuthenticate(cl *mqttbroker.Client, pk packets.Packet) bool {

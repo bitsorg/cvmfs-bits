@@ -2123,7 +2123,6 @@ function renderDetail(data){
       +(state==='leased'?'Possible cause: waiting for per-repo serialisation lock (another job is committing).'
        :state==='committing'?'Possible cause: cvmfs_receiver is processing the catalog graft (30–150 s normal).'
        :state==='staging'?'Possible cause: large tar or slow CAS — pipeline is compressing/uploading.'
-       :state==='distributing'?'Possible cause: waiting for Stratum 1 quorum confirmation.'
        :'Check service logs for details.')
       +'</div>';
   }

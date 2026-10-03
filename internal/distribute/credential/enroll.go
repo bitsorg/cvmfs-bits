@@ -56,12 +56,12 @@ func (s *MapEnrollStore) Key(node string) ([]byte, bool) {
 //
 // The MAC proves the node holds the enrollment key without ever transmitting it,
 // and the server-issued one-time nonce makes a captured MAC unreplayable. On
-// success the node receives a short-lived bearer token (default scope "catchup")
-// to present on the data plane.
+// success the node receives a short-lived bearer token (default scope "control")
+// to present to the control-plane broker.
 type EnrollServer struct {
 	Keys     EnrollKeyStore
 	Minter   *Minter
-	Scope    string        // token scope to grant (default "catchup")
+	Scope    string        // token scope to grant (default "control")
 	TokenTTL time.Duration // token lifetime (default 10m)
 	NonceTTL time.Duration // challenge lifetime (default 2m)
 
@@ -84,7 +84,7 @@ func NewEnrollServer(keys EnrollKeyStore, minter *Minter, log func(string, ...an
 	return &EnrollServer{
 		Keys:     keys,
 		Minter:   minter,
-		Scope:    "catchup",
+		Scope:    "control",
 		TokenTTL: 10 * time.Minute,
 		NonceTTL: 2 * time.Minute,
 		log:      log,
@@ -97,7 +97,7 @@ func (s *EnrollServer) scope() string {
 	if s.Scope != "" {
 		return s.Scope
 	}
-	return "catchup"
+	return "control"
 }
 
 func (s *EnrollServer) tokenTTL() time.Duration {

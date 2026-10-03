@@ -5,13 +5,13 @@
 //
 //   - publisher (default): accepts publish jobs via an HTTP API, coordinates
 //     the pre-publish pipeline (dedup → compress → CAS → gateway commit), and
-//     distributes pre-warmed objects to Stratum 1 receivers before the catalog
-//     flip.
+//     serves objects and manifests that Stratum 1 receivers pull, announced
+//     over the embedded MQTT broker.
 //
-//   - receiver: runs the two-channel Stratum 1 pre-warming server.  An HTTPS
-//     control channel handles announce requests (HMAC-authenticated); a plain-
-//     HTTP data channel accepts object PUTs (per-session bearer token + SHA-256
-//     hash verification).  See REFERENCE.md (Pull Distribution Protocol) for the full spec.
+//   - receiver: the Stratum 1 pull agent.  It connects outbound to the
+//     publisher's broker and pulls new objects into its local CAS; its only
+//     listener is a plain-HTTP /metrics endpoint.  See REFERENCE.md (Pull
+//     Distribution Protocol).
 //
 // Select the mode with --mode publisher|receiver.  All flags except --mode,
 // --log-level, and --dev are mode-specific; unrecognised flags for the active
@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,7 +44,6 @@ import (
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
-	"cvmfs.io/prepub/internal/distribute/commit"
 	"cvmfs.io/prepub/internal/distribute/credential"
 	"cvmfs.io/prepub/internal/distribute/receiver"
 	"cvmfs.io/prepub/internal/distribute/serve"
@@ -163,7 +163,7 @@ func main() {
 	pullAuto := flag.Bool("pull-auto", false, "Measure RTT to Stratum 0 and auto-pick --pull-concurrency/--pull-files-per-request from a latency class when they are unset [receiver]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
-	config := flag.String("config", "", "Config file path (reserved for future use)")
+	config := flag.String("config", "", "YAML config file; its values apply to flags not set on the command line")
 
 	// ── Publisher-mode flags ───────────────────────────────────────────────────
 	spoolRoot := flag.String("spool-root", "/var/spool/cvmfs-prepub", "Spool root directory [publisher]")
@@ -266,7 +266,6 @@ func main() {
 	repoName := flag.String("repo-name", "", "CVMFS repository name (e.g. atlas.cern.ch) [publisher]")
 
 	// ── Stratum 1 distribution flags (publisher) ─────────────────────────────
-	warmQuorum := flag.Float64("warm-quorum", 1.0, "Fraction of authoritative Stratum 1 replicas that must report warm before the catalog commit proceeds (0.5 = majority, 1.0 = all) [publisher]")
 	preWarm := flag.Bool("prewarm", false, "Enable Stratum 1 cache pre-warming: emit the pre-commit pull announce so receivers start pulling before the commit. OFF by default (no S1 receivers => nothing to warm); enable once authoritative receivers exist. Post-commit pull is unaffected [publisher]")
 	// Queue-driven distribution worker flags.
 
@@ -285,31 +284,23 @@ func main() {
 	// The CAS root for the receiver is shared with --cas-root above so that a
 	// node running both modes (unusual but possible in a test setup) uses the
 	// same directory by default.  Override with --cas-root as needed.
-	controlAddr := flag.String("control-addr", ":9100", "HTTPS listen address for announce requests [receiver]")
-	dataAddr := flag.String("data-addr", ":9101", "Plain-HTTP listen address for object PUTs [receiver]")
-	dataHost := flag.String("data-host", "", "Publicly reachable hostname or IP returned to senders as the data endpoint [receiver]")
-	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate for the control channel [receiver]")
-	tlsKey := flag.String("tls-key", "", "Path to TLS private key for the control channel [receiver]")
-	sessionTTL := flag.Duration("session-ttl", time.Hour, "How long announce sessions remain valid [receiver]")
-	diskHeadroom := flag.Float64("disk-headroom", 1.2, "Multiplier applied to announced payload size when checking available disk space [receiver]")
-
-	// HepCDN coordination service — off by default.
-	nodeID := flag.String("node-id", "", "Stable identifier for this receiver node; defaults to hostname [receiver]")
+	controlAddr := flag.String("control-addr", ":9100", "Plain-HTTP listen address of the receiver's Prometheus /metrics endpoint [receiver]")
+	nodeID := flag.String("node-id", "", "Stable identifier for this receiver node (MQTT client id and presence topic); empty = os.Hostname() [receiver]")
 	repos := flag.String("repos", "", "Comma-separated list of CVMFS repositories served by this receiver (e.g. atlas.cern.ch,cms.cern.ch) [receiver]")
-	// recvStratum0URL is the Stratum 0 base URL the receiver uses to pull CAS
-	// objects on published-notification.  Distinct from --stratum0-url (which
-	// is publisher-mode only) to avoid flag-name collisions in the shared flag
-	// set.  Using --receiver-stratum0-url makes the purpose explicit.
-	recvStratum0URL := flag.String("receiver-stratum0-url", "", "Stratum 0 HTTP base URL used by the receiver to pull objects on commit notification (e.g. http://stratum0/cvmfs) [receiver]")
+	// recvStratum0URL is the publisher (cvmfs-prepub) base URL. Distinct from
+	// --stratum0-url (publisher-mode, a /cvmfs URL) to avoid a flag collision.
+	recvStratum0URL := flag.String("receiver-stratum0-url", "", "cvmfs-prepub publisher base URL, e.g. http://stratum0:8080; the receiver fetches {url}/s1/... (manifests, bundles) and {url}/cvmfs/{repo}/data/... (post-commit objects) [receiver]")
 	discoveryURL := flag.String("discovery-url", "", "Fixed S0 endpoint serving the discovery doc GET {url}/cvmfs/{repo}/.cvmfsbits; the receiver learns its control-plane broker URL from it [receiver]")
 	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs PREPUB_HMAC_SECRET and --discovery-url [receiver]")
 
-	// MQTT broker — shared by publisher and receiver modes.
-	// When set, receivers connect outbound to the broker and publish retained
-	// presence messages; publishers use pub/sub announce instead of HTTP.
-	// The broker URL uses Paho format: "tls://broker.cern.ch:8883" (production)
-	// or "tcp://localhost:1883" (development).  mTLS cert/key are required in
-	// production; --broker-ca-cert overrides the system CA pool.
+	// Removed receiver flags, still accepted (and ignored) for one release so
+	// existing units do not fail with "flag provided but not defined".
+	deprecatedFlags := []string{"tls-cert", "tls-key", "data-addr", "data-host", "session-ttl", "disk-headroom"}
+	for _, name := range deprecatedFlags {
+		flag.String(name, "", "deprecated, ignored [receiver]")
+	}
+
+	// Broker CA, shared by publisher and receiver modes.
 	brokerCACert := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker; empty uses system pool [publisher+receiver]")
 
 	flag.Parse()
@@ -334,10 +325,8 @@ func main() {
 			casServerConf,
 			stratum0URL, repoName,
 			jobTimeout, minConcurrentJobs, maxConcurrentJobs,
-			warmQuorum,
 			brokerCACert,
-			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
-			sessionTTL, diskHeadroom,
+			controlAddr,
 			nodeID, repos, recvStratum0URL,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
 			allowedPublishPrefixes,
@@ -368,6 +357,15 @@ func main() {
 	}))
 
 	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode)
+	var ignored []string
+	flag.Visit(func(f *flag.Flag) {
+		if slices.Contains(deprecatedFlags, f.Name) {
+			ignored = append(ignored, "--"+f.Name)
+		}
+	})
+	if len(ignored) > 0 {
+		obs.Logger.Warn("ignoring deprecated flags; remove them from the unit", "flags", strings.Join(ignored, " "))
+	}
 
 	stopDebug, derr := startDebugListener(*debugListen, obs)
 	if derr != nil {
@@ -388,11 +386,11 @@ func main() {
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
 			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *promoteWorkers, *prefetch,
 			*chunkMin, *chunkAvg, *chunkMax,
-			*warmQuorum, *preWarm,
+			*preWarm,
 			*brokerCACert,
 			*embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
 	case "receiver":
-		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
+		runReceiver(obs, *controlAddr, *casRoot,
 			*nodeID, *repos,
 			*brokerCACert,
 			*recvStratum0URL, *discoveryURL, *brokerAuth, *discoveryVerifyKey,
@@ -433,7 +431,6 @@ func runPublisher(
 	promoteWorkers int,
 	prefetch bool,
 	chunkMin, chunkAvg, chunkMax int64,
-	warmQuorum float64,
 	preWarm bool,
 	brokerCACert string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
@@ -445,9 +442,8 @@ func runPublisher(
 	// brokerURL is derived from the embedded broker (loopback); the publisher's
 	// own announce/published clients connect there. There is no external broker
 	// and no client-cert mTLS — the embedded broker is reached over ws/wss with a
-	// token. warmQuorum is reserved for the warm-gate commit gating.
+	// token.
 	brokerURL := ""
-	_ = warmQuorum
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
 		if devMode {
@@ -1015,10 +1011,6 @@ func runPublisher(
 	// Pull distribution: serve objects + manifests (incl. the gateway POST ingest) so
 	// Stratum 1 can pull on a prepare announce. Pull is the only distribution mode.
 	{
-		// Admission control: cap concurrent receiver pulls and issue one
-		// lease per node at a time. Limits are conservative defaults for the small
-		// Stratum 1 fleet; make them configurable when a fleet benchmark exists.
-		admission := commit.NewAdmission(commit.Options{MaxConcurrent: 16, MaxPerNode: 1})
 		plaintextEnroll := enrollSrv
 		if enrollOverTLS {
 			plaintextEnroll = nil // enrollment is served over TLS only
@@ -1026,7 +1018,6 @@ func runPublisher(
 		apiServer.MountDistributeServing(api.DistributeServing{
 			CAS:       casBackend,
 			Manifests: pullManifestStore,
-			Admission: admission,
 			Enroll:    plaintextEnroll,
 			RateLimit: ctrlRateLimit.Middleware,
 		})
@@ -1125,22 +1116,13 @@ func runPublisher(
 	obs.Logger.Info("shutdown complete")
 }
 
-// runReceiver starts the two-channel Stratum 1 pre-warming server.  It never
-// returns normally; it blocks until a SIGINT or SIGTERM is received and then
-// performs a graceful shutdown.
-//
-// The HMAC shared secret is read from the PREPUB_HMAC_SECRET environment
-// variable.  It must be identical on the publisher and all receivers.  When
-// --dev is set the HMAC check is skipped and the control channel uses plain
-// HTTP instead of TLS (never use in production).
+// runReceiver starts the Stratum 1 pull receiver.  It never returns normally;
+// it blocks until a SIGINT or SIGTERM is received and then performs a graceful
+// shutdown.
 func runReceiver(
 	obs *observe.Provider,
-	devMode bool,
-	controlAddr, dataAddr, dataHost string,
-	tlsCert, tlsKey string,
+	controlAddr string,
 	casRoot string,
-	sessionTTL time.Duration,
-	diskHeadroom float64,
 	nodeID, reposFlag string,
 	brokerCACert string,
 	stratum0URL string,
@@ -1155,28 +1137,13 @@ func runReceiver(
 	// There is no external --broker-url and no client-cert mTLS. Pull is the only
 	// distribution mode.
 	brokerURL := ""
-	brokerClientCert := ""
-	brokerClientKey := ""
 	// A receiver does NOT hold the master secret. Announce authenticity comes
 	// from the authenticated control-plane broker (token + ACL) and TLS, not a
 	// shared HMAC — so PREPUB_HMAC_SECRET is neither read nor required here. The
 	// receiver's only key is its own per-node S1_NODE_KEY (see --broker-auth).
 
-	// Validate TLS configuration early so the error is reported before any
-	// listeners are bound.  In DevMode TLS is not used.
-	if !devMode {
-		if tlsCert == "" || tlsKey == "" {
-			obs.Logger.Error("--tls-cert and --tls-key are required for the control channel (or use --dev for testing)")
-			os.Exit(1)
-		}
-		if _, err := os.Stat(tlsCert); err != nil {
-			obs.Logger.Error("TLS certificate file not found", "path", tlsCert, "error", err)
-			os.Exit(1)
-		}
-		if _, err := os.Stat(tlsKey); err != nil {
-			obs.Logger.Error("TLS key file not found", "path", tlsKey, "error", err)
-			os.Exit(1)
-		}
+	if nodeID == "" {
+		nodeID, _ = os.Hostname()
 	}
 
 	// Parse --repos flag into a slice of repository names.
@@ -1280,25 +1247,14 @@ func runReceiver(
 	}
 	cfg := receiver.Config{
 		ControlAddr:               controlAddr,
-		DataAddr:                  dataAddr,
-		DataHost:                  dataHost,
-		TLSCert:                   tlsCert,
-		TLSKey:                    tlsKey,
 		CASRoot:                   casRoot,
-		SessionTTL:                sessionTTL,
-		DiskHeadroom:              diskHeadroom,
-		DevMode:                   devMode,
 		NodeID:                    nodeID,
 		Repos:                     repoList,
 		Stratum0URL:               stratum0URL,
-		PullMode:                  true,
-		PullManifestBase:          stratum0URL, // points at the cvmfs-prepub endpoint
 		PullConcurrency:           pullConcurrency,
 		PullFilesPerRequest:       pullFilesPerRequest,
 		PullAuto:                  pullAuto,
 		BrokerURL:                 brokerURL,
-		BrokerClientCert:          brokerClientCert,
-		BrokerClientKey:           brokerClientKey,
 		BrokerCACert:              brokerCACert,
 		Obs:                       obs,
 		BrokerCredentialsProvider: brokerCreds,
@@ -1317,9 +1273,8 @@ func runReceiver(
 
 	obs.Logger.Info("receiver ready",
 		"control_addr", controlAddr,
-		"data_addr", dataAddr,
+		"node_id", nodeID,
 		"cas_root", casRoot,
-		"dev_mode", devMode,
 	)
 
 	// Block until a signal is received, then shut down gracefully.

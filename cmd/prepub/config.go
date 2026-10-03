@@ -33,12 +33,10 @@ import (
 //	  type: localfs
 //	  root: /mnt/build/bits/cas
 //
-// Example full config (Option B with MQTT):
+// Example gateway-mode publisher:
 //
 //	server:
 //	  listen: ":8080"
-//	  tls_cert: /etc/cvmfs-prepub/tls/server.crt
-//	  tls_key:  /etc/cvmfs-prepub/tls/server.key
 //	spool_root: /var/spool/cvmfs-prepub
 //	publish_mode: gateway
 //	gateway:
@@ -46,20 +44,20 @@ import (
 //	cas:
 //	  type: localfs
 //	  root: /srv/cvmfs/cas
-//	distribution:
-//	  stratum1_endpoints:
-//	    - https://s1a.example.org:9100
-//	    - https://s1b.example.org:9100
-//	  quorum: 0.75
-//	  timeout: 10m
-//	broker_url: tls://broker.example.org:8883
-//	broker_client_cert: /etc/cvmfs-prepub/tls/publisher.crt
-//	broker_client_key:  /etc/cvmfs-prepub/tls/publisher.key
-//	broker_ca_cert:     /etc/cvmfs-prepub/tls/ca.crt
+//
+// Example receiver:
+//
+//	mode: receiver
+//	control_addr: ":9100"
+//	repos: [atlas.cern.ch]
+//	receiver_stratum0_url: http://stratum0.example.org:8080
+//	broker_ca_cert: /etc/cvmfs-prepub/tls/ca.crt
+//
+// Bool keys are pointers so an explicit `false` overrides a default-true flag.
 type fileConfig struct {
 	Mode        string `yaml:"mode"`
 	LogLevel    string `yaml:"log_level"`
-	Dev         bool   `yaml:"dev"`
+	Dev         *bool  `yaml:"dev"`
 	SpoolRoot   string `yaml:"spool_root"`
 	StagingRoot string `yaml:"staging_root"`
 	PublishMode string `yaml:"publish_mode"`
@@ -79,13 +77,13 @@ type fileConfig struct {
 	// selected by publish_mode: a job may ask for its tar to be handed to
 	// `cvmfs_server ingest` so the gateway does the chunking, dedup and
 	// catalogs.  IngestPublishOwner maps to `ingest -u`.
-	IngestPublish      bool   `yaml:"ingest_publish"`
+	IngestPublish      *bool  `yaml:"ingest_publish"`
 	IngestPublishOwner string `yaml:"ingest_publish_owner"`
 
 	// ReplaceOnConflict lets a commit that fails on an already published path
 	// delete the existing subtree and retry once (--replace-on-conflict).
 	// Destructive by design, so it is opt-in and defaults to off.
-	ReplaceOnConflict bool `yaml:"replace_on_conflict"`
+	ReplaceOnConflict *bool `yaml:"replace_on_conflict"`
 
 	// PromoteWorkers is the concurrency of the staged path's server-side copy
 	// into the CAS (--promote-workers). Zero/omitted keeps the CLI default.
@@ -119,9 +117,7 @@ type fileConfig struct {
 	RepoName string `yaml:"repo_name"`
 
 	Server struct {
-		Listen  string `yaml:"listen"`
-		TLSCert string `yaml:"tls_cert"`
-		TLSKey  string `yaml:"tls_key"`
+		Listen string `yaml:"listen"`
 		// DebugListen is the pprof listener address (e.g. 127.0.0.1:6060).
 		// Empty disables it. Loopback only — profiles expose heap contents.
 		DebugListen string `yaml:"debug_listen"`
@@ -141,15 +137,14 @@ type fileConfig struct {
 		// receiver.  Defaults to true (enabled).  Set to false only when publishes
 		// via this node may update pre-existing content at the lease path, in which
 		// case the standard DiffRec path is required for correctness.
-		// Can be overridden at runtime with --gateway-direct-graft=false.
-		DirectGraft bool `yaml:"direct_graft"`
+		DirectGraft *bool `yaml:"direct_graft"`
 		// AllowPlaintext permits a plaintext http:// gateway URL. Gateway
 		// requests are HMAC-SHA256 signed and the secret never transits, so
 		// plaintext does not expose the credential; it exposes what is being
 		// published and lets an on-path attacker forge gateway responses.
 		// Reasonable on a trusted internal network, and deliberately separate
 		// from `dev`, which also disables authentication requirements.
-		AllowPlaintext bool `yaml:"allow_plaintext"`
+		AllowPlaintext *bool `yaml:"allow_plaintext"`
 	} `yaml:"gateway"`
 
 	CAS struct {
@@ -164,35 +159,24 @@ type fileConfig struct {
 		ServerConf string `yaml:"server_conf"`
 	} `yaml:"cas"`
 
-	Distribution struct {
-		// WarmQuorum is the fraction of authoritative Stratum 1 replicas that must
-		// report warm before the catalog commit proceeds.
-		WarmQuorum float64 `yaml:"warm_quorum"`
-	} `yaml:"distribution"`
-
 	// MQTT broker CA — verifies the control-plane broker's server certificate.
 	// The broker URL is derived from the embedded broker / learned from discovery;
 	// there is no external broker URL or client-cert mTLS.
 	BrokerCACert string `yaml:"broker_ca_cert"`
 
 	// Receiver-mode settings.
-	ControlAddr  string       `yaml:"control_addr"`
-	DataAddr     string       `yaml:"data_addr"`
-	DataHost     string       `yaml:"data_host"`
-	SessionTTL   yamlDuration `yaml:"session_ttl"`
-	DiskHeadroom float64      `yaml:"disk_headroom"`
-	NodeID       string       `yaml:"node_id"`
+	ControlAddr string `yaml:"control_addr"`
+	NodeID      string `yaml:"node_id"`
 	// Repos is a list of CVMFS repositories served by this receiver.
 	// Equivalent to --repos (comma-separated on the CLI).
 	Repos []string `yaml:"repos"`
-	// ReceiverStratum0URL is the Stratum 0 HTTP base URL used by the receiver
-	// to pull CAS objects when a PublishedMessage is received over MQTT.
-	// Example: "http://stratum0.example.org/cvmfs"
+	// ReceiverStratum0URL is the cvmfs-prepub publisher base URL the receiver
+	// pulls from (e.g. "http://stratum0.example.org:8080").
 	// Equivalent to --receiver-stratum0-url.
 	ReceiverStratum0URL string `yaml:"receiver_stratum0_url"`
 
 	// Provenance / Rekor transparency log.
-	Provenance      bool     `yaml:"provenance"`
+	Provenance      *bool    `yaml:"provenance"`
 	RekorServer     string   `yaml:"rekor_server"`
 	RekorSigningKey string   `yaml:"rekor_signing_key"`
 	OIDCIssuers     []string `yaml:"oidc_issuers"`
@@ -281,10 +265,9 @@ func loadFileConfig(path string) (*fileConfig, error) {
 // applyFileConfig copies values from fc into the flag variables, skipping
 // any flag whose name appears in explicit (i.e. was set on the command line).
 //
-// String/numeric zero values in the config struct are treated as "not set"
-// and leave the flag at its default.  Bool flags are only set when true in
-// the config (there is no way to force a flag to false via the config file;
-// use the command line for that).
+// String/numeric zero values and absent bool keys are treated as "not set"
+// and leave the flag at its default; a bool key present as true or false is
+// applied.
 func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	mode, logLevel *string,
 	devMode *bool,
@@ -293,11 +276,8 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	stratum0URL, repoName *string,
 	jobTimeout *time.Duration,
 	minConcurrentJobs, maxConcurrentJobs *int,
-	warmQuorum *float64,
 	brokerCACert *string,
-	controlAddr, dataAddr, dataHost, tlsCert, tlsKey *string,
-	sessionTTL *time.Duration,
-	diskHeadroom *float64,
+	controlAddr *string,
 	nodeID, repos, recvStratum0URL *string,
 	provenanceEnabled *bool,
 	rekorServer, rekorSigningKey, oidcIssuers *string,
@@ -329,9 +309,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 			*dst = val.Duration
 		}
 	}
-	flt := func(flag string, dst *float64, val float64) {
-		if !has(flag) && val != 0 {
-			*dst = val
+	bl := func(flag string, dst *bool, val *bool) {
+		if !has(flag) && val != nil {
+			*dst = *val
 		}
 	}
 	i := func(flag string, dst *int, val int) {
@@ -347,9 +327,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 
 	str("mode", mode, fc.Mode)
 	str("log-level", logLevel, fc.LogLevel)
-	if !has("dev") && fc.Dev {
-		*devMode = true
-	}
+	bl("dev", devMode, fc.Dev)
 
 	str("spool-root", spoolRoot, fc.SpoolRoot)
 	str("staging-root", stagingRoot, fc.StagingRoot)
@@ -372,9 +350,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	i("max-tar-size-gib", maxTarSizeGiB, fc.MaxTarSizeGiB)
 	i("spool-min-free-gib", spoolMinFreeGiB, fc.SpoolMinFreeGiB)
 	dur("retry-window", retryWindow, fc.RetryWindow)
-	if !has("prefetch") && fc.Pipeline.Prefetch != nil {
-		*prefetch = *fc.Pipeline.Prefetch
-	}
+	bl("prefetch", prefetch, fc.Pipeline.Prefetch)
 	dur("job-timeout", jobTimeout, fc.JobTimeout)
 	if !has("min-concurrent-jobs") && fc.MinConcurrentJobs != 0 {
 		*minConcurrentJobs = fc.MinConcurrentJobs
@@ -383,24 +359,12 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		*maxConcurrentJobs = fc.MaxConcurrentJobs
 	}
 
-	// server.tls_cert / tls_key apply to both publisher and receiver.
-	str("tls-cert", tlsCert, fc.Server.TLSCert)
-	str("tls-key", tlsKey, fc.Server.TLSKey)
-
-	// Warm-quorum: fraction of authoritative Stratum 1 replicas that must report
-	// warm before the catalog commit proceeds.
-	flt("warm-quorum", warmQuorum, fc.Distribution.WarmQuorum)
-
 	// MQTT broker CA (the only broker flag; the broker URL is derived from the
 	// embedded broker / learned from discovery, and there is no client-cert mTLS).
 	str("broker-ca-cert", brokerCACert, fc.BrokerCACert)
 
 	// Receiver.
 	str("control-addr", controlAddr, fc.ControlAddr)
-	str("data-addr", dataAddr, fc.DataAddr)
-	str("data-host", dataHost, fc.DataHost)
-	dur("session-ttl", sessionTTL, fc.SessionTTL)
-	flt("disk-headroom", diskHeadroom, fc.DiskHeadroom)
 	str("node-id", nodeID, fc.NodeID)
 	if !has("repos") && len(fc.Repos) > 0 {
 		*repos = strings.Join(fc.Repos, ",")
@@ -408,9 +372,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("receiver-stratum0-url", recvStratum0URL, fc.ReceiverStratum0URL)
 
 	// Provenance.
-	if !has("provenance") && fc.Provenance {
-		*provenanceEnabled = true
-	}
+	bl("provenance", provenanceEnabled, fc.Provenance)
 	str("rekor-server", rekorServer, fc.RekorServer)
 	str("rekor-signing-key", rekorSigningKey, fc.RekorSigningKey)
 	if !has("oidc-issuers") && len(fc.OIDCIssuers) > 0 {
@@ -420,33 +382,11 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 		*allowedPublishPrefixes = strings.Join(fc.AllowedPublishPrefixes, ",")
 	}
 
-	// Gateway commit mode.  The flag defaults to true; config can only reaffirm
-	// true (bool fields have no zero-vs-explicit-false distinction in YAML).
-	// To disable direct-graft use --gateway-direct-graft=false on the CLI.
-	if !has("gateway-direct-graft") && fc.Gateway.DirectGraft {
-		*gatewayDirectGraft = true
-	}
-
-	// Same bool caveat as direct-graft: YAML cannot express "explicitly false",
-	// so config can only turn plaintext ON; use --gateway-allow-plaintext=false
-	// on the CLI to override a config that enables it.
-	if !has("gateway-allow-plaintext") && fc.Gateway.AllowPlaintext {
-		*gatewayAllowPlaintext = true
-	}
-
-	// Optional publish paths.  Same bool caveat as direct-graft: YAML cannot
-	// express "explicitly false", so config can only turn the path ON; use
-	// --ingest-publish=false on the CLI to override a config that enables it.
-	if !has("ingest-publish") && fc.IngestPublish {
-		*ingestPublish = true
-	}
+	bl("gateway-direct-graft", gatewayDirectGraft, fc.Gateway.DirectGraft)
+	bl("gateway-allow-plaintext", gatewayAllowPlaintext, fc.Gateway.AllowPlaintext)
+	bl("ingest-publish", ingestPublish, fc.IngestPublish)
 	str("ingest-publish-owner", ingestPublishOwner, fc.IngestPublishOwner)
-	// Same bool caveat again: config can only turn replacement ON; use
-	// --replace-on-conflict=false on the CLI to override a config that
-	// enables it.
-	if !has("replace-on-conflict") && fc.ReplaceOnConflict {
-		*replaceOnConflict = true
-	}
+	bl("replace-on-conflict", replaceOnConflict, fc.ReplaceOnConflict)
 	str("measurements-dir", measurementsDir, fc.MeasurementsDir)
 	str("ingest-swissknife", ingestSwissknife, fc.IngestSwissknife)
 	str("ingest-config-prefix", ingestConfigPrefix, fc.IngestConfigPrefix)

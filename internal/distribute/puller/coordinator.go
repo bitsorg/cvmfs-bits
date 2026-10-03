@@ -34,14 +34,6 @@ type Coordinator struct {
 	Puller     *Puller
 	// MaxManifestBytes caps the manifest body read (0 = 256 MiB default).
 	MaxManifestBytes int64
-	// CatchupBase is the base URL for the cumulative catch-up endpoint
-	// (GET /s1/catchup). Empty falls back to ManifestBase (they are the same S0
-	// endpoint in the default deployment).
-	CatchupBase string
-	// TokenSource, when set, supplies a bearer token attached to catch-up
-	// requests (data-plane auth). Satisfied by *credential.Client.Token. A nil
-	// source sends no Authorization header (open deployments).
-	TokenSource func(ctx context.Context) (string, error)
 }
 
 // OnTransaction fetches the manifest for txnID and pulls the objects the local

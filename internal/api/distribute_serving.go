@@ -14,29 +14,14 @@ import (
 	"cvmfs.io/prepub/internal/distribute/serve"
 )
 
-// DistributeServing holds the dependencies for the pull-based serving routes.
-// It is mounted only when the publisher runs with
-// --distribute-mode pull, so the default (push) server is byte-for-byte
-// unchanged.
+// DistributeServing holds the dependencies for the pull-distribution serving
+// routes (objects, manifests, bundles, enrollment).
 type DistributeServing struct {
 	CAS       cas.Backend
 	Manifests serve.ManifestStore
-	// Admission, when set, mounts POST /s1/{txn}/lease for receiver admission
-	// control. Satisfied by *commit.Admission.
-	Admission serve.LeaseGranter
-	// Diff, when set, mounts GET /s1/catchup for cumulative catch-up of a
-	// receiver that fell behind. ObjectBaseURLs is the S0 object
-	// base URL(s) advertised to receivers in the catch-up manifest header.
-	Diff           serve.DiffSource
-	ObjectBaseURLs []string
-	// CatchupAuth, when set, requires a valid scoped bearer token (scope
-	// "catchup") on GET /s1/catchup — the token a receiver obtains by enrolling
-	// with its out-of-band node key (data-plane auth). Nil leaves catch-up open
-	// (object/manifest GETs remain public regardless).
-	CatchupAuth *credential.Verifier
 	// Enroll, when set, mounts the challenge/enroll endpoints
 	// (GET /control/challenge, POST /control/enroll) so receivers can exchange
-	// their out-of-band node key for a short-lived data-plane token.
+	// their out-of-band node key for a short-lived control-plane token.
 	Enroll *credential.EnrollServer
 	// RateLimit, when set, wraps the control endpoints (enroll) to bound request
 	// floods (R-DoS). Typically credential.IPRateLimiter.Middleware.
@@ -73,20 +58,6 @@ func mountDistributeServing(router *mux.Router, requireAuth mux.MiddlewareFunc, 
 		ingest.Handle("", &serve.ManifestIngestHandler{Store: d.Manifests}).
 			Methods(http.MethodPost, http.MethodPut)
 	}
-	if d.Admission != nil {
-		router.Handle("/s1/{txn}/lease", &serve.LeaseHandler{Admission: d.Admission}).
-			Methods(http.MethodPost)
-	}
-	if d.Diff != nil && len(d.ObjectBaseURLs) > 0 {
-		var catchup http.Handler = &serve.CatchupHandler{
-			Source:   d.Diff,
-			BaseURLs: d.ObjectBaseURLs,
-		}
-		// Gate catch-up behind a scoped bearer token when configured (data-plane
-		// auth): the receiver enrols with its out-of-band key to obtain it.
-		catchup = credential.RequireToken(d.CatchupAuth, "catchup")(catchup)
-		router.Handle("/s1/catchup", catchup).Methods(http.MethodGet)
-	}
 	if d.Enroll != nil {
 		var eh http.Handler = d.Enroll.Handler()
 		if d.RateLimit != nil {
@@ -97,7 +68,6 @@ func mountDistributeServing(router *mux.Router, requireAuth mux.MiddlewareFunc, 
 	}
 	if log != nil {
 		log.Info("distribute serving mounted (pull mode)",
-			"objects", d.CAS != nil, "manifests", d.Manifests != nil,
-			"catchup", d.Diff != nil)
+			"objects", d.CAS != nil, "manifests", d.Manifests != nil)
 	}
 }

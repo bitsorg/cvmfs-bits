@@ -1,10 +1,9 @@
 .PHONY: build test lint clean run-sim
 
 build:
-	@echo "Building cvmfs-prepub and prepubctl..."
+	@echo "Building cvmfs-prepub..."
 	@mkdir -p bin
 	go build -v -o bin/cvmfs-prepub  ./cmd/prepub
-	go build -v -o bin/prepubctl     ./cmd/prepubctl
 
 test:
 	@echo "Running tests..."

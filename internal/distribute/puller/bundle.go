@@ -29,7 +29,7 @@ func (p *Puller) PullBundle(ctx context.Context, bundleURL string, m *manifest.M
 	missing := p.missing(ctx, m)
 	res := Result{Total: len(m.Objects), Skipped: len(m.Objects) - len(missing)}
 	if len(missing) == 0 {
-		return p.bundleDone(res, m)
+		return res, nil
 	}
 	f, fa, errs := p.fetchBundle(ctx, bundleURL, m.Repo, missing)
 	res.Fetched += f
@@ -38,7 +38,7 @@ func (p *Puller) PullBundle(ctx context.Context, bundleURL string, m *manifest.M
 	if res.Failed > 0 {
 		return res, fmt.Errorf("puller: %d of %d bundled objects failed for txn %s", res.Failed, len(missing), m.TransactionID)
 	}
-	return p.bundleDone(res, m)
+	return res, nil
 }
 
 // PullChunked brings the local CAS up to a manifest using latency-tuned chunked
@@ -54,7 +54,7 @@ func (p *Puller) PullChunked(ctx context.Context, bundleURL string, m *manifest.
 	missing := p.missing(ctx, m)
 	res := Result{Total: len(m.Objects), Skipped: len(m.Objects) - len(missing)}
 	if len(missing) == 0 {
-		return p.bundleDone(res, m)
+		return res, nil
 	}
 
 	k := p.FilesPerRequest
@@ -99,7 +99,7 @@ func (p *Puller) PullChunked(ctx context.Context, bundleURL string, m *manifest.
 	if res.Failed > 0 {
 		return res, fmt.Errorf("puller: %d of %d chunked-bundle objects failed for txn %s", res.Failed, len(missing), m.TransactionID)
 	}
-	return p.bundleDone(res, m)
+	return res, nil
 }
 
 // missing returns the manifest objects not already present in the local CAS.
@@ -108,16 +108,6 @@ func (p *Puller) missing(ctx context.Context, m *manifest.Manifest) []manifest.O
 		ok, err := p.Store.Exists(ctx, h)
 		return err == nil && ok
 	})
-}
-
-// bundleDone records the synced root on a fully successful, non-provisional pull.
-func (p *Puller) bundleDone(res Result, m *manifest.Manifest) (Result, error) {
-	if p.State != nil && !m.Provisional && m.TargetRootHash != "" {
-		if err := p.State.Set(m.Repo, m.TargetRootHash); err != nil {
-			return res, fmt.Errorf("puller: recording synced root: %w", err)
-		}
-	}
-	return res, nil
 }
 
 // fetchBundle pulls a specific set of objects in one POST /s1/bundle request,

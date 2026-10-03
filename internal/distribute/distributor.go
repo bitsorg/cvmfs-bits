@@ -17,8 +17,8 @@ import (
 // Config carries the control-plane broker configuration the publisher uses to
 // emit the pre-commit announce. It is attached to the API Orchestrator as
 // Distribute; a nil Config (or empty BrokerConfig.BrokerURL) disables the
-// announce, in which case receivers converge on the post-commit published
-// broadcast and the .cvmfspublished backstop poll.
+// announce, in which case receivers converge on the retained post-commit
+// published message.
 type Config struct {
 	// Obs provides logging and metrics.
 	Obs *observe.Provider

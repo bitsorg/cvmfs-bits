@@ -43,18 +43,10 @@ type Metrics struct {
 	JobPhaseDuration *prometheus.HistogramVec
 
 	// ── pull-based distribution ─────────────────────────────────────────────
-	// Publisher (Stratum 0) side.
-	DistWarmQuorum      *prometheus.CounterVec // result=reached|timeout
-	DistTxn             *prometheus.CounterVec // result=committed|aborted
-	DistCommitDuration  prometheus.Histogram   // three-phase Run wall time
-	DistAdmissionActive prometheus.Gauge       // active pull leases
-	DistAdmissionDenied prometheus.Counter     // lease grants refused (429)
-	DistReconcile       *prometheus.CounterVec // crash recovery, action=commit|abort
 	// Receiver (Stratum 1) side.
 	PullTransactions *prometheus.CounterVec // result=warmed|failed
 	PullObjects      *prometheus.CounterVec // result=fetched|skipped|failed
 	PullDuration     prometheus.Histogram   // per-transaction warming wall time
-	PullCatchup      *prometheus.CounterVec // result=ok|incomplete|error
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -155,31 +147,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"phase"}),
 
 		// ── pull distribution ──
-		DistWarmQuorum: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_warm_quorum_total",
-			Help: "Warm-gate outcomes per transaction (result=reached|timeout).",
-		}, []string{"result"}),
-		DistTxn: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_txn_total",
-			Help: "Three-phase distribution transactions by outcome (result=committed|aborted).",
-		}, []string{"result"}),
-		DistCommitDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "cvmfs_prepub_dist_commit_duration_seconds",
-			Help:    "Wall time of the prepare→warm→commit orchestration.",
-			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
-		}),
-		DistAdmissionActive: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "cvmfs_prepub_dist_admission_active",
-			Help: "Currently active receiver pull leases.",
-		}),
-		DistAdmissionDenied: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_admission_denied_total",
-			Help: "Pull lease grants refused because a concurrency cap was reached.",
-		}),
-		DistReconcile: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_reconcile_total",
-			Help: "Crash-recovery resolutions on restart (action=commit|abort).",
-		}, []string{"action"}),
 		PullTransactions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cvmfs_receiver_pull_transactions_total",
 			Help: "Pull-warming attempts by outcome (result=warmed|failed).",
@@ -193,10 +160,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Wall time to warm one transaction by pulling its missing objects.",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
 		}),
-		PullCatchup: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_receiver_pull_catchup_total",
-			Help: "Cumulative catch-up runs by outcome (result=ok|incomplete|error).",
-		}, []string{"result"}),
 	}
 }
 
@@ -225,15 +188,8 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 		m.ReceiverBloomSize,
 		m.ReceiverHeartbeatErrors,
 		m.JobPhaseDuration,
-		m.DistWarmQuorum,
-		m.DistTxn,
-		m.DistCommitDuration,
-		m.DistAdmissionActive,
-		m.DistAdmissionDenied,
-		m.DistReconcile,
 		m.PullTransactions,
 		m.PullObjects,
 		m.PullDuration,
-		m.PullCatchup,
 	)
 }

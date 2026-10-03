@@ -69,7 +69,7 @@ func (s *MemManifestStore) Put(_ context.Context, m *manifest.Manifest) error {
 	return nil
 }
 
-// Delete drops a manifest (e.g. once its warm quorum is reached). O(1); fully
+// Delete drops a manifest. O(1); fully
 // removes the entry from both the index and the eviction list.
 func (s *MemManifestStore) Delete(txn string) {
 	s.mu.Lock()

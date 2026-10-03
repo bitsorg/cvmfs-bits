@@ -3,8 +3,8 @@
 
 // Package serve implements the Stratum-0 HTTP serving side of pull-based
 // distribution: the content-addressed object endpoint, the
-// transaction-manifest endpoint, the signed .cvmfsbits discovery document, and
-// the GC pin registry. Handlers are framework-agnostic http.Handlers so they can
+// transaction-manifest endpoint and the signed .cvmfsbits discovery document.
+// Handlers are framework-agnostic http.Handlers so they can
 // be mounted on the existing gorilla/mux router when the pull path is activated.
 package serve
 

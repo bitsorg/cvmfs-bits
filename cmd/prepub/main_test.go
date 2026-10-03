@@ -129,20 +129,6 @@ func TestLoadFileConfig_EmptyFile(t *testing.T) {
 	}
 }
 
-func TestLoadFileConfig_WarmQuorum(t *testing.T) {
-	path := writeYAML(t, `
-distribution:
-  warm_quorum: 0.75
-`)
-	fc, err := loadFileConfig(path)
-	if err != nil {
-		t.Fatalf("loadFileConfig: %v", err)
-	}
-	if fc.Distribution.WarmQuorum != 0.75 {
-		t.Errorf("WarmQuorum = %v; want 0.75", fc.Distribution.WarmQuorum)
-	}
-}
-
 // ── applyFileConfig ───────────────────────────────────────────────────────────
 
 // applyTestVars holds default-valued flag variables for an applyFileConfig call.
@@ -154,11 +140,8 @@ type applyTestVars struct {
 	stratum0URL, repoName                                   string
 	jobTimeout                                              time.Duration
 	minConcurrentJobs, maxConcurrentJobs                    int
-	warmQuorum                                              float64
 	brokerCACert                                            string
-	controlAddr, dataAddr, dataHost, tlsCert, tlsKey        string
-	sessionTTL                                              time.Duration
-	diskHeadroom                                            float64
+	controlAddr                                             string
 	nodeID, repos, recvStratum0URL                          string
 	provenanceEnabled                                       bool
 	rekorServer, rekorSigningKey, oidcIssuers               string
@@ -187,9 +170,8 @@ func defaultApplyVars() *applyTestVars {
 		spoolRoot: "/default/spool", listen: ":8080", publishMode: "gateway",
 		gatewayURL: "https://localhost:4929", cvmfsMount: "/cvmfs",
 		casType: "localfs", casRoot: "/var/lib/cas",
-		jobTimeout: 0, warmQuorum: 1.0,
-		controlAddr: ":9100", dataAddr: ":9101",
-		sessionTTL: time.Hour, diskHeadroom: 1.2,
+		jobTimeout:  0,
+		controlAddr: ":9100",
 	}
 }
 
@@ -200,10 +182,8 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.casServerConf,
 		&v.stratum0URL, &v.repoName,
 		&v.jobTimeout, &v.minConcurrentJobs, &v.maxConcurrentJobs,
-		&v.warmQuorum,
 		&v.brokerCACert,
-		&v.controlAddr, &v.dataAddr, &v.dataHost, &v.tlsCert, &v.tlsKey,
-		&v.sessionTTL, &v.diskHeadroom,
+		&v.controlAddr,
 		&v.nodeID, &v.repos, &v.recvStratum0URL,
 		&v.provenanceEnabled, &v.rekorServer, &v.rekorSigningKey, &v.oidcIssuers,
 		&v.allowedPublishPrefixes,
@@ -248,17 +228,6 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	}
 }
 
-func TestApplyFileConfig_WarmQuorum(t *testing.T) {
-	fc := &fileConfig{}
-	fc.Distribution.WarmQuorum = 0.5
-	v := defaultApplyVars()
-	v.apply(fc, map[string]bool{})
-
-	if v.warmQuorum != 0.5 {
-		t.Errorf("warmQuorum = %v; want 0.5 (copied from config)", v.warmQuorum)
-	}
-}
-
 // TestApplyFileConfig_PipelineWorkers guards the memory lever: peak RSS scales
 // with the compress worker count (each worker holds a whole file plus its
 // compressed chunks), so a constrained host must be able to lower it from the
@@ -288,7 +257,8 @@ func TestApplyFileConfig_PipelineWorkers(t *testing.T) {
 }
 
 func TestApplyFileConfig_ReplaceOnConflict(t *testing.T) {
-	fc := &fileConfig{ReplaceOnConflict: true}
+	on := true
+	fc := &fileConfig{ReplaceOnConflict: &on}
 	v := defaultApplyVars()
 	v.apply(fc, map[string]bool{})
 	if !v.replaceOnConflict {
@@ -299,6 +269,32 @@ func TestApplyFileConfig_ReplaceOnConflict(t *testing.T) {
 	v2.apply(fc, map[string]bool{"replace-on-conflict": true})
 	if v2.replaceOnConflict {
 		t.Error("explicit --replace-on-conflict=false was overridden by config")
+	}
+}
+
+// An explicit `false` in YAML must turn off a default-true flag; an absent key
+// must leave the default alone.
+func TestApplyFileConfig_ExplicitFalseBool(t *testing.T) {
+	fc, err := loadFileConfig(writeYAML(t, "gateway:\n  direct_graft: false\n"))
+	if err != nil {
+		t.Fatalf("loadFileConfig: %v", err)
+	}
+	v := defaultApplyVars()
+	v.gatewayDirectGraft = true
+	v.apply(fc, map[string]bool{})
+	if v.gatewayDirectGraft {
+		t.Error("direct_graft: false in config was not applied")
+	}
+
+	empty, err := loadFileConfig(writeYAML(t, "spool_root: /x\n"))
+	if err != nil {
+		t.Fatalf("loadFileConfig: %v", err)
+	}
+	v2 := defaultApplyVars()
+	v2.gatewayDirectGraft = true
+	v2.apply(empty, map[string]bool{})
+	if !v2.gatewayDirectGraft {
+		t.Error("absent direct_graft key must keep the default (true)")
 	}
 }
 

@@ -55,10 +55,9 @@ func TestCoordinatorOnTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := NewState(t.TempDir())
 	coord := &Coordinator{
 		ManifestBase: srv.URL,
-		Puller:       &Puller{Store: dst, Fetcher: &HTTPFetcher{}, State: st},
+		Puller:       &Puller{Store: dst, Fetcher: &HTTPFetcher{}},
 	}
 
 	res, err := coord.OnTransaction(ctx, "txn-9")
@@ -69,9 +68,6 @@ func TestCoordinatorOnTransaction(t *testing.T) {
 		if ok, _ := dst.Exists(ctx, h); !ok {
 			t.Fatalf("object %s not pulled", h)
 		}
-	}
-	if root, _ := st.Get("cms.cern.ch"); root != "ROOT9" {
-		t.Fatalf("state root = %q, want ROOT9", root)
 	}
 
 	// Unknown transaction → manifest 404 → error.

@@ -188,9 +188,9 @@ type Orchestrator struct {
 	// non-nil, a short-lived client is created per commit to publish the message
 	// and then disconnected.  nil disables MQTT publish notifications.
 	//
-	// This is separate from Distribute.BrokerConfig: distribution uses the
-	// broker for the announce/ready exchange BEFORE the commit, while this
-	// config is for the post-commit "published" notification.  In typical
+	// This is separate from Distribute.BrokerConfig, which is used for the
+	// pre-commit announce; this config is for the post-commit "published"
+	// notification.  In typical
 	// deployments both configs reference the same broker.
 	BrokerConfig *broker.Config
 	// Manifests, when non-nil, is the per-transaction manifest store used in pull
@@ -1010,9 +1010,6 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 	}
 	defer client.Disconnect(500)
 
-	// Hashes are intentionally omitted: for bits path S1 receivers already
-	// hold all pre-warmed objects; for native ingest the receiver pulls the
-	// root catalog using NewRootHash.  Omitting hashes keeps the message small.
 	msg := broker.PublishedMessage{
 		Repo:        repo,
 		NewRootHash: newRootHash,
@@ -1054,10 +1051,9 @@ func (o *Orchestrator) preWarmFor(j *job.Job) bool {
 // announce topic, and disconnects.
 //
 // The announce is best-effort: a failed broadcast is logged but never blocks or
-// fails the publish. Receivers also converge on the post-commit published
-// broadcast and the .cvmfspublished backstop poll, so a missed announce only
-// delays warming, it does not lose data.
-func (o *Orchestrator) publishAnnounce(j *job.Job, repo, payloadID string, hashes []string, totalBytes int64) {
+// fails the publish. Receivers also converge on the retained post-commit
+// published message, so a missed announce only delays warming.
+func (o *Orchestrator) publishAnnounce(j *job.Job, repo, payloadID string, totalBytes int64) {
 	if !o.preWarmFor(j) {
 		return // S1 cache pre-warming is opt-in; off by default.
 	}
@@ -1093,7 +1089,6 @@ func (o *Orchestrator) publishAnnounce(j *job.Job, repo, payloadID string, hashe
 		PayloadID:   payloadID,
 		PublisherID: "pub-" + payloadID,
 		Repo:        repo,
-		Hashes:      hashes,
 		TotalBytes:  totalBytes,
 	}
 	if err := client.Publish(broker.AnnounceTopic(repo), 1, false, msg); err != nil {
@@ -1103,8 +1098,7 @@ func (o *Orchestrator) publishAnnounce(j *job.Job, repo, payloadID string, hashe
 	}
 	o.Obs.Logger.Info("mqtt: announce published",
 		"payload_id", payloadID,
-		"repo", repo,
-		"hashes", len(hashes))
+		"repo", repo)
 }
 
 // Run executes the job through all pipeline stages.
@@ -1333,7 +1327,6 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 					CreatedAt:      time.Now(),
 					TotalSize:      pipelineResult.NBytesComp,
 					Objects:        objs,
-					Provisional:    true,
 				}
 				if perr := o.Manifests.Put(ctx, mf); perr != nil {
 					logger.Warn("pull: failed to store transaction manifest", "txn", j.ID, "error", perr)
@@ -1346,14 +1339,12 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// catalog flips. This mirrors publishMQTTNotification (the post-commit
 			// "published" broadcast): a single-use broker.Client connects, publishes
 			// one AnnounceMessage, and disconnects. Its CredentialsProvider (carried
-			// on BrokerConfig) authenticates to the token-gated broker. The warm
-			// quorum is gated by the receivers' pull acks; a failed announce only
-			// means receivers converge on the post-commit published broadcast.
+			// on BrokerConfig) authenticates to the token-gated broker. A failed
+			// announce only means receivers converge on the post-commit published
+			// broadcast.
 			if o.Distribute != nil && o.Distribute.BrokerConfig != nil &&
 				o.Distribute.BrokerConfig.BrokerURL != "" {
-				o.publishAnnounce(j, j.Repo, j.ID,
-					append([]string(nil), pipelineResult.NewObjectHashes...),
-					pipelineResult.NBytesComp)
+				o.publishAnnounce(j, j.Repo, j.ID, pipelineResult.NBytesComp)
 			}
 			// Job continues immediately to the serialised commit section below.
 		}
@@ -2206,16 +2197,8 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// pull any new objects from S0 that were not pre-warmed via the bits
 	// pipeline (e.g. native ingest path publishing to the same repo).
 	//
-	// This is fire-and-forget: a failed publish does not fail the job.  The
-	// bits pipeline already pre-warmed all objects before the commit, so the
-	// notification is supplemental for S1 receivers on the native ingest path.
-	//
-	// Hashes are intentionally omitted from the notification: for the bits path
-	// S1 receivers already hold all pre-warmed objects, so there is nothing to
-	// fetch.  For the native ingest path S1 receivers use the NewRootHash to
-	// fetch just the root catalog from S0.  Including the full hash list would
-	// make the MQTT message proportionally large (63 bytes × N hashes) and
-	// could exceed the broker's message_size_limit for large payloads.
+	// This is fire-and-forget: a failed publish does not fail the job. S1
+	// receivers use NewRootHash to fetch the new root catalog from S0.
 	if o.BrokerConfig != nil && j.NewRootHash != "" {
 		go o.publishMQTTNotification(j.Repo, j.NewRootHash)
 	}

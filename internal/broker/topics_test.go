@@ -35,52 +35,6 @@ func TestPresenceTopic(t *testing.T) {
 	}
 }
 
-// TestPresenceTopicFilter verifies the wildcard presence filter.
-func TestPresenceTopicFilter(t *testing.T) {
-	got := PresenceTopicFilter()
-	want := "cvmfs/receivers/+/presence"
-	if got != want {
-		t.Errorf("PresenceTopicFilter = %q, want %q", got, want)
-	}
-}
-
-// TestReadyTopic verifies the per-node reply topic.
-func TestReadyTopic(t *testing.T) {
-	got := ReadyTopic("pub-abc123", "payload-xyz", "node-1")
-	want := "cvmfs/publishers/pub-abc123/ready/payload-xyz/node-1"
-	if got != want {
-		t.Errorf("ReadyTopic = %q, want %q", got, want)
-	}
-}
-
-// TestReadyTopicFilter verifies the wildcard ready filter (matches all nodes for
-// a specific publisher/payload pair).
-func TestReadyTopicFilter(t *testing.T) {
-	got := ReadyTopicFilter("pub-abc123", "payload-xyz")
-	want := "cvmfs/publishers/pub-abc123/ready/payload-xyz/+"
-	if got != want {
-		t.Errorf("ReadyTopicFilter = %q, want %q", got, want)
-	}
-}
-
-// TestReadyTopicFilter_NotMatchOtherPayload verifies that the wildcard filter
-// for one payloadID would not lexically match a different payloadID.
-// (Structural sanity: the payloadID must appear before the node-level wildcard.)
-func TestReadyTopicFilter_NotMatchOtherPayload(t *testing.T) {
-	filter := ReadyTopicFilter("pub-abc", "payload-A")
-	// A topic for a different payload must not satisfy the filter structurally.
-	otherTopic := ReadyTopic("pub-abc", "payload-B", "node-1")
-	// The filter and other topic differ in the payload segment — confirm they differ.
-	if filter == otherTopic {
-		t.Error("ReadyTopicFilter for payload-A should not equal ReadyTopic for payload-B")
-	}
-	// The wildcard (+) must be the last segment.
-	segs := strings.Split(filter, "/")
-	if last := segs[len(segs)-1]; last != "+" {
-		t.Errorf("ReadyTopicFilter last segment should be \"+\", got %q", last)
-	}
-}
-
 // ── validTopicSegment ─────────────────────────────────────────────────────────
 
 // TestValidTopicSegment_AcceptsValidSegments verifies that normal strings
@@ -103,11 +57,11 @@ func TestValidTopicSegment_AcceptsValidSegments(t *testing.T) {
 // characters are rejected.
 func TestValidTopicSegment_RejectsSpecialChars(t *testing.T) {
 	bad := []string{
-		"a/b",       // level separator
-		"a+b",       // single-level wildcard
-		"a#b",       // multi-level wildcard
-		"a\x00b",    // NUL byte
-		"",          // empty
+		"a/b",    // level separator
+		"a+b",    // single-level wildcard
+		"a#b",    // multi-level wildcard
+		"a\x00b", // NUL byte
+		"",       // empty
 	}
 	for _, v := range bad {
 		if err := validTopicSegment("field", v); err == nil {
@@ -126,16 +80,6 @@ func TestAnnounceTopic_PanicsOnSpecialChars(t *testing.T) {
 		}
 	}()
 	AnnounceTopic("repo/injected")
-}
-
-// TestReadyTopic_PanicsOnSlashInNodeID verifies the same for ReadyTopic.
-func TestReadyTopic_PanicsOnSlashInNodeID(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("ReadyTopic with slash in nodeID should panic")
-		}
-	}()
-	ReadyTopic("pub-abc", "payload-xyz", "node/injected")
 }
 
 // ── exported API validators ───────────────────────────────────────────────────
@@ -184,9 +128,6 @@ func TestTopics_NoSlashPrefix(t *testing.T) {
 		AnnounceTopic("repo.example.com"),
 		AnnounceTopicFilter(),
 		PresenceTopic("node-1"),
-		PresenceTopicFilter(),
-		ReadyTopic("pub", "pay", "node"),
-		ReadyTopicFilter("pub", "pay"),
 	}
 	for _, topic := range topics {
 		if strings.HasPrefix(topic, "/") {

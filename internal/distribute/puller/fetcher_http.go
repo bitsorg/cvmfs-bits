@@ -26,8 +26,6 @@ type HTTPFetcher struct {
 	Client *http.Client
 }
 
-func (f *HTTPFetcher) Name() string { return "object-http" }
-
 // Fetch GETs obj from base, where base is an object root ending in ".../data"
 // (a Manifest.BaseURLs entry). The returned body must be closed by the caller.
 func (f *HTTPFetcher) Fetch(ctx context.Context, base string, obj manifest.ObjRef) (io.ReadCloser, error) {

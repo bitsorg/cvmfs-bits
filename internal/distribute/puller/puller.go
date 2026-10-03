@@ -37,8 +37,6 @@ type Puller struct {
 	FilesPerRequest int
 	// Client is used for chunked-bundle requests (nil -> http.DefaultClient).
 	Client *http.Client
-	// State, when set, records the last-synced root on a fully successful pull.
-	State *State
 }
 
 // Result summarises one Pull.
@@ -104,11 +102,6 @@ func (p *Puller) Pull(ctx context.Context, m *manifest.Manifest) (Result, error)
 	}
 	if res.Failed > 0 {
 		return res, fmt.Errorf("puller: %d of %d objects failed for txn %s", res.Failed, len(missing), m.TransactionID)
-	}
-	if p.State != nil && !m.Provisional {
-		if err := p.State.Set(m.Repo, m.TargetRootHash); err != nil {
-			return res, fmt.Errorf("puller: recording synced root: %w", err)
-		}
 	}
 	return res, nil
 }

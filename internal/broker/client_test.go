@@ -129,9 +129,6 @@ func TestMessage_Decode_HappyPath(t *testing.T) {
 	if ann.TotalBytes != 1024 {
 		t.Errorf("TotalBytes = %d, want 1024", ann.TotalBytes)
 	}
-	if len(ann.Hashes) != 2 {
-		t.Errorf("Hashes len = %d, want 2", len(ann.Hashes))
-	}
 }
 
 // TestMessage_Decode_InvalidJSON verifies that malformed JSON returns an error.

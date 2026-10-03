@@ -6,24 +6,15 @@
 //
 // # Control-plane overview
 //
-// When a broker URL is configured the entire coordination flow moves from HTTP
-// polling to MQTT pub/sub:
-//
-//   - The broker runs on Stratum 0 infrastructure (e.g. CERN).  Stratum 1 sites
-//     only need outbound TCP 8883; no inbound firewall rules are required.
-//   - Receivers publish a retained "presence" message on connect and configure a
-//     Last-Will-and-Testament so the broker marks them offline on unexpected
-//     disconnect — replacing the HTTP heartbeat loop in coord_client.go.
-//   - Publishers broadcast an AnnounceMessage to all receivers subscribed to a
-//     repository topic.  Each receiver checks the hash list against its own
-//     local CAS and replies with a ReadyMessage carrying its session token and
-//     the subset of hashes it actually needs.
-//   - Publishers collect ReadyMessages until quorum is reached (or a timeout
-//     fires), then push objects to each receiver's plain-HTTP data channel using
-//     the per-session bearer token — identical to the HTTP announce path.
-//
-// When BrokerURL is empty the system falls back to the legacy HTTP announce
-// protocol with no change in behaviour.
+//   - The broker is embedded in the publisher.  Stratum 1 receivers connect
+//     outbound only; no inbound firewall rules are required.
+//   - Receivers publish a retained "presence" message on connect and configure
+//     a Last-Will-and-Testament so the broker marks them offline on unexpected
+//     disconnect.
+//   - Before a commit the publisher broadcasts an AnnounceMessage; receivers
+//     fetch the transaction manifest over HTTP and pull the objects they lack.
+//   - After a commit the publisher broadcasts a PublishedMessage; receivers
+//     pull the listed objects (or the new root catalog) from Stratum 0.
 //
 // # Topic schema
 //
@@ -33,24 +24,17 @@
 //
 //	cvmfs/repos/{repo}/published
 //	    Publisher → all receivers.  Payload: PublishedMessage (JSON).
-//	    QoS 1, retained=false.  Sent after every successful catalog commit
-//	    (bits pipeline and native ingest path alike).  Receivers use it as a
-//	    trigger to pull any new objects from Stratum 0.
+//	    QoS 1.  Sent after every successful catalog commit (bits pipeline and
+//	    native ingest path alike).
 //
 //	cvmfs/receivers/{node_id}/presence
 //	    Receiver → all observers.  Payload: PresenceMessage (JSON).
 //	    QoS 1, retained=true.  LWT publishes the same topic with Online=false.
 //
-//	cvmfs/publishers/{publisher_id}/ready/{payload_id}/{node_id}
-//	    Receiver → specific publisher.  Payload: ReadyMessage (JSON).
-//	    QoS 1, retained=false.
-//
 // # Security
 //
-// All connections use mTLS (broker-issued per-node client certificates).  The
-// broker enforces topic ACLs so that a receiver can only publish to its own
-// presence and ready topics, and can only subscribe to announce topics for
-// repositories it serves.
+// Clients authenticate to the broker with a bearer token; topic ACLs let a
+// receiver publish only to presence topics.
 package broker
 
 import (
@@ -60,14 +44,12 @@ import (
 
 // Topic path segments.
 const (
-	topicBase       = "cvmfs"
-	topicRepos      = "repos"
-	topicReceivers  = "receivers"
-	topicPublishers = "publishers"
-	topicAnnounce   = "announce"
-	topicPublished  = "published"
-	topicPresence   = "presence"
-	topicReady      = "ready"
+	topicBase      = "cvmfs"
+	topicRepos     = "repos"
+	topicReceivers = "receivers"
+	topicAnnounce  = "announce"
+	topicPublished = "published"
+	topicPresence  = "presence"
 )
 
 // validTopicSegment returns an error if s contains characters that have
@@ -155,50 +137,4 @@ func PresenceTopic(nodeID string) string {
 		panic(err)
 	}
 	return fmt.Sprintf("%s/%s/%s/%s", topicBase, topicReceivers, nodeID, topicPresence)
-}
-
-// PresenceTopicFilter returns an MQTT subscription filter that matches presence
-// messages for all receivers.
-//
-//	cvmfs/receivers/+/presence
-func PresenceTopicFilter() string {
-	return fmt.Sprintf("%s/%s/+/%s", topicBase, topicReceivers, topicPresence)
-}
-
-// ReadyTopic returns the topic on which a receiver publishes its ReadyMessage
-// in response to an AnnounceMessage from a specific publisher/payload pair.
-//
-//	cvmfs/publishers/{publisher_id}/ready/{payload_id}/{node_id}
-//
-// Panics if any argument contains MQTT-reserved characters or is empty.
-func ReadyTopic(publisherID, payloadID, nodeID string) string {
-	if err := validTopicSegment("publisher_id", publisherID); err != nil {
-		panic(err)
-	}
-	if err := validTopicSegment("payload_id", payloadID); err != nil {
-		panic(err)
-	}
-	if err := validTopicSegment("node_id", nodeID); err != nil {
-		panic(err)
-	}
-	return fmt.Sprintf("%s/%s/%s/%s/%s/%s",
-		topicBase, topicPublishers, publisherID, topicReady, payloadID, nodeID)
-}
-
-// ReadyTopicFilter returns an MQTT subscription filter that matches all
-// ReadyMessages for a specific publisher/payload pair, regardless of which
-// receiver node sent them.
-//
-//	cvmfs/publishers/{publisher_id}/ready/{payload_id}/+
-//
-// Panics if either argument contains MQTT-reserved characters or is empty.
-func ReadyTopicFilter(publisherID, payloadID string) string {
-	if err := validTopicSegment("publisher_id", publisherID); err != nil {
-		panic(err)
-	}
-	if err := validTopicSegment("payload_id", payloadID); err != nil {
-		panic(err)
-	}
-	return fmt.Sprintf("%s/%s/%s/%s/%s/+",
-		topicBase, topicPublishers, publisherID, topicReady, payloadID)
 }

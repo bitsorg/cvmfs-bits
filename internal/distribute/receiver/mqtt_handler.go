@@ -5,35 +5,13 @@ package receiver
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
 	"cvmfs.io/prepub/internal/broker"
+	"cvmfs.io/prepub/internal/distribute/manifest"
 )
-
-// maxHashesPerAnnounce is the maximum number of CAS hashes accepted in a
-// single AnnounceMessage.  An announce that exceeds this limit is rejected with
-// an error ReadyMessage so the publisher can make an informed quorum decision
-// rather than timing out.
-//
-// A typical large CVMFS transaction touches tens of thousands of objects.
-// 1 000 000 is a generous upper bound that still prevents a rogue broker client
-// from forcing GB-scale allocations in computeAbsentHashes (each hash is
-// ~64 bytes, so 1M hashes ≈ 64 MB — well within a receiver's budget).
-const maxHashesPerAnnounce = 1_000_000
-
-// maxHashLen is the maximum byte length of a single CAS hash string accepted
-// inside an AnnounceMessage.  SHA-256 hex is 64 chars; SHA-512 hex is 128.
-// 256 is a generous bound that covers any realistic algorithm while preventing
-// pathological hash computations caused by arbitrarily long strings.
-const maxHashLen = 256
 
 // mqttPublish publishes v to topic under the mqttMu read-lock so that
 // concurrent Shutdown()/stopMQTT() calls cannot nil-race the client pointer.
@@ -53,21 +31,9 @@ func (r *Receiver) mqttPublish(topic string, v any) bool {
 }
 
 // mqttAnnounceHandler is called by the broker client each time an
-// AnnounceMessage arrives on one of the subscribed announce topics.
-//
-// Flow:
-//  1. Decode the JSON payload into an AnnounceMessage.
-//  2. Validate that the announced repo is one this receiver serves.
-//  3. Check available disk space against the announced total bytes.
-//  4. Return the existing session if PayloadID was already announced (idempotent).
-//  5. Create a new session (session cap applies; reply with error on rejection).
-//  6. Compute AbsentHashes by checking each announced hash directly against
-//     the receiver's local CAS (CAS.Exists per hash).
-//  7. Publish a ReadyMessage to the publisher's reply topic.
-//
-// All errors are published back to the publisher as ReadyMessage.Error so
-// the publisher can make an informed quorum decision rather than just timing
-// out waiting for a reply that will never arrive.
+// AnnounceMessage arrives on one of the subscribed announce topics. A complete
+// announce for a served repo starts a bounded, deduplicated pull of the transaction's manifest
+// objects (see pull.go); a malformed one is logged and dropped.
 func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 	var ann broker.AnnounceMessage
 	if err := msg.Decode(&ann); err != nil {
@@ -75,39 +41,14 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 			"topic", msg.Topic, "error", err)
 		return
 	}
-
-	// Validate required fields before constructing any reply topic.
 	if ann.PayloadID == "" || ann.PublisherID == "" || ann.Repo == "" {
 		r.cfg.Obs.Logger.Warn("mqtt: AnnounceMessage missing required fields",
 			"topic", msg.Topic, "payload_id", ann.PayloadID)
-		// Publish a best-effort error reply using whatever fields we have.
-		pubID := ann.PublisherID
-		if pubID == "" {
-			pubID = "unknown"
-		}
-		payID := ann.PayloadID
-		if payID == "" {
-			payID = "unknown"
-		}
-		nodeID := r.cfg.NodeID
-		if nodeID == "" {
-			nodeID = "unknown"
-		}
-		replyTopic := broker.ReadyTopic(pubID, payID, nodeID)
-		r.mqttPublish(replyTopic, broker.ReadyMessage{
-			NodeID: nodeID,
-			Error:  "malformed announce: missing required fields (payload_id, publisher_id, repo)",
-		})
 		return
 	}
-
-	// Pull mode: treat the announce as a "prepare" — fetch the
-	// transaction manifest and pull the missing objects, instead of replying with
-	// a push session. A pull-mode publisher does not push, so we return here.
-	// startPull is bounded and deduplicated (see pull.go).
-	// Pull mode: the announce is a "prepare" trigger. Fetch the
-	// transaction manifest and pull the missing objects (bounded + deduplicated;
-	// see pull.go). Pull is the only distribution mode.
+	if !r.servesRepo(ann.Repo) {
+		return
+	}
 	if r.pullCoordinator != nil {
 		r.startPull(ann.PayloadID, ann.Repo)
 	}
@@ -119,11 +60,11 @@ func (r *Receiver) mqttAnnounceHandler(msg *broker.Message) {
 // Flow:
 //  1. Decode the JSON payload.
 //  2. Validate the repo is one this receiver serves.
-//  3. If Stratum0URL is not configured, log and return (graceful degradation).
+//  3. If Stratum0URL is not configured, log and return.
 //  4. If a pull goroutine is already running for this repo, drop the
 //     notification (the in-progress pull will fetch the latest state anyway).
-//  5. Launch a background goroutine (governed by bgCtx) that fetches missing
-//     objects from Stratum 0.
+//  5. Launch a background goroutine (governed by bgCtx) that pulls the new
+//     root catalog.
 //
 // The handler is non-blocking: all I/O runs in a separate goroutine so that
 // the broker's callback goroutine is never blocked.
@@ -149,11 +90,10 @@ func (r *Receiver) mqttPublishedHandler(msg *broker.Message) {
 	r.cfg.Obs.Logger.Info("mqtt: published notification received",
 		"repo", pm.Repo,
 		"new_root_hash", pm.NewRootHash,
-		"hashes", len(pm.Hashes),
 		"published_at", pm.PublishedAt)
 
-	if r.cfg.Stratum0URL == "" {
-		r.cfg.Obs.Logger.Info("mqtt: no stratum0_url configured — skipping S0 pull",
+	if r.pullCoordinator == nil {
+		r.cfg.Obs.Logger.Info("mqtt: no receiver_stratum0_url configured — skipping pull",
 			"repo", pm.Repo)
 		return
 	}
@@ -177,182 +117,40 @@ func (r *Receiver) mqttPublishedHandler(msg *broker.Message) {
 	}()
 }
 
-// pullFromS0 fetches objects that this receiver does not yet hold from the
-// Stratum 0 CAS, using the hash list from pm.Hashes when available or the
-// root catalog hash when Hashes is empty (native ingest path).
-//
-// It is designed to be idempotent: if an object is already in the local CAS
-// (filesystem stat), it is skipped.
-//
-// All network I/O is governed by ctx so that Shutdown() can cancel in-flight
-// pulls promptly.
+// pullFromS0 fetches the new root catalog named by pm from the publisher
+// ({Stratum0URL}/cvmfs/{repo}/data/...) into the local CAS, hash-verified, via
+// the same Puller the announce path uses. An object already present is skipped,
+// so a repeated (retained) notification is cheap. ctx bounds all network I/O.
 func (r *Receiver) pullFromS0(ctx context.Context, pm broker.PublishedMessage) {
-	logger := r.cfg.Obs.Logger.With(
-		"repo", pm.Repo,
-		"new_root_hash", pm.NewRootHash,
-		"phase", "s0_pull",
-	)
-
-	s0Base := strings.TrimRight(r.cfg.Stratum0URL, "/")
-
-	// Build the list of hashes to check/fetch.
-	//
-	// Bits path: pm.Hashes contains all object hashes the publisher produced.
-	// Native ingest path: pm.Hashes is empty; we pull only the root catalog.
-	hashesToFetch := pm.Hashes
-	if len(hashesToFetch) == 0 {
-		// Native ingest: the root catalog is identified by pm.NewRootHash.
-		// We add it with the 'C' (compressed/catalog) suffix that CVMFS uses
-		// to distinguish catalog objects from regular data objects on disk.
-		hashesToFetch = []string{pm.NewRootHash}
-		logger.Info("mqtt: native ingest path — fetching root catalog only",
-			"root_hash", pm.NewRootHash)
-	}
-
-	// Compute the minimal fetch set by checking the local CAS directly: an
-	// object already on disk is skipped.  The fetch loop below re-checks each
-	// path with os.Stat just before downloading, so a stale result here only
-	// costs an extra stat, never a redundant download.
-	var absent []string
-	for _, h := range hashesToFetch {
-		plain := strings.TrimSuffix(h, "C")
-		if len(plain) < 2 {
-			absent = append(absent, h)
-			continue
-		}
-		if _, err := os.Stat(casPath(r.cfg.CASRoot, plain)); err != nil {
-			absent = append(absent, h)
-		}
-	}
-
-	if len(absent) == 0 {
-		logger.Info("mqtt: all objects already present — no S0 pull needed")
+	logger := r.cfg.Obs.Logger.With("repo", pm.Repo, "new_root_hash", pm.NewRootHash)
+	if r.pullCoordinator == nil {
 		return
 	}
-
-	logger.Info("mqtt: pulling absent objects from S0",
-		"absent", len(absent), "total", len(hashesToFetch))
-
-	fetched := 0
-	for _, hash := range absent {
-		if ctx.Err() != nil {
-			logger.Info("mqtt: S0 pull cancelled", "fetched", fetched)
-			return
-		}
-
-		// Strip 'C' suffix for URL construction; the S0 data URL uses the plain
-		// hash (without suffix) as the path component.
-		// S0 serves objects at: /cvmfs/{repo}/data/{hash[0:2]}/{hash}C
-		plain := strings.TrimSuffix(hash, "C")
-		if len(plain) < 2 {
-			logger.Warn("mqtt: skipping hash with length < 2", "hash", hash)
-			continue
-		}
-
-		// Check the filesystem directly: if the object is already on disk, skip it.
-		localPath := casPath(r.cfg.CASRoot, plain)
-		if _, err := os.Stat(localPath); err == nil {
-			continue
-		}
-
-		// Stratum0URL convention (same as publisher): includes the /cvmfs path
-		// prefix (e.g. "http://stratum0/cvmfs").  CAS objects are served at
-		// {Stratum0URL}/{repo}/data/{hash[0:2]}/{hash}C, matching the CVMFS
-		// Apache DocumentRoot/cvmfs/{repo}/data/ layout.
-		objectURL := fmt.Sprintf("%s/%s/data/%s/%sC",
-			s0Base, pm.Repo, plain[:2], plain)
-
-		if err := r.fetchObjectFromS0(ctx, objectURL, plain); err != nil {
-			logger.Error("mqtt: failed to fetch object from S0",
-				"hash", plain, "url", objectURL, "error", err)
-			// Continue with remaining hashes — partial success is better than
-			// giving up.  The next PublishedMessage will retry missing objects.
-			continue
-		}
-		fetched++
+	m := &manifest.Manifest{
+		TransactionID:  "published-" + pm.NewRootHash,
+		Repo:           pm.Repo,
+		TargetRootHash: pm.NewRootHash,
+		BaseURLs:       []string{strings.TrimRight(r.cfg.Stratum0URL, "/") + "/cvmfs/" + pm.Repo + "/data"},
+		Generator:      manifest.GeneratorPipeline,
+		Objects:        []manifest.ObjRef{{Hash: pm.NewRootHash + "C"}},
 	}
-
-	logger.Info("mqtt: S0 pull complete", "fetched", fetched, "absent", len(absent))
-}
-
-// fetchObjectFromS0 downloads a single CAS object from objectURL and stores it
-// in the local CAS at the path derived from plain (the hash without 'C' suffix).
-//
-// The download is streamed through a SHA-256 hasher into a sibling temp file
-// and atomically renamed to the final CAS path on success.  SHA-256 of the
-// received bytes is verified against the computed value (the 'C' object is
-// already compressed; we don't re-hash the uncompressed form here, but we do
-// ensure transfer integrity against bit-rot or truncation).
-func (r *Receiver) fetchObjectFromS0(ctx context.Context, objectURL, plain string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
+	// Validate rejects a malformed hash (e.g. "../../x") before it can reach
+	// the URL or the local CAS path.
+	if err := m.Validate(); err != nil {
+		logger.Warn("mqtt: ignoring PublishedMessage with invalid root hash", "error", err)
+		return
+	}
+	res, err := r.pullCoordinator.Puller.Pull(ctx, m)
 	if err != nil {
-		return fmt.Errorf("building request: %w", err)
+		logger.Warn("mqtt: root catalog pull failed — will retry on next notification", "error", err)
+		return
 	}
-
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("GET %s: %w", objectURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		// S0 doesn't have this object yet (e.g. race with commit propagation).
-		// Not an error — the object will arrive on the next pull cycle.
-		r.cfg.Obs.Logger.Info("mqtt: object not yet available on S0 (404) — will retry on next notification",
-			"url", objectURL)
-		return nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s returned %d", objectURL, resp.StatusCode)
-	}
-
-	// Ensure the CAS sub-directory exists.
-	finalPath := casPath(r.cfg.CASRoot, plain)
-	if err := os.MkdirAll(filepath.Dir(finalPath), 0700); err != nil {
-		return fmt.Errorf("creating CAS subdirectory: %w", err)
-	}
-
-	// Write to a temp file with a random suffix to avoid races with concurrent
-	// PUTs or other fetch goroutines for the same hash.
-	tmpPath := finalPath + "." + randomToken()[:8] + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-
-	hasher := sha256.New()
-	_, copyErr := io.Copy(f, io.TeeReader(resp.Body, hasher))
-	syncErr := f.Sync()
-	f.Close()
-
-	if copyErr != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("streaming body: %w", copyErr)
-	}
-	if syncErr != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("fsync temp file: %w", syncErr)
-	}
-
-	// Atomic rename.
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		os.Remove(tmpPath)
-		// If the file already exists (concurrent fetch or PUT), treat as success.
-		if _, statErr := os.Stat(finalPath); statErr == nil {
-			return nil
-		}
-		return fmt.Errorf("rename to final path: %w", err)
-	}
-
-	r.cfg.Obs.Logger.Debug("mqtt: fetched object from S0",
-		"hash", plain, "sha256", hex.EncodeToString(hasher.Sum(nil)))
-	return nil
+	logger.Info("mqtt: root catalog pull complete", "fetched", res.Fetched, "skipped", res.Skipped)
 }
 
 // servesRepo returns true if repo is listed in r.cfg.Repos.
 // An empty Repos slice means the receiver has not been configured with a
-// repository list; in that case all repos are accepted (permissive default
-// matching the HTTP announce behaviour, which has no repo filter).
+// repository list; in that case all repos are accepted.
 // Comparison is case-insensitive because CVMFS repository names are DNS
 // hostnames (RFC 4343: DNS is case-insensitive).
 func (r *Receiver) servesRepo(repo string) bool {
@@ -380,26 +178,22 @@ func (r *Receiver) startMQTT() error {
 	}
 	nodeID := r.cfg.NodeID
 	if nodeID == "" {
-		// An empty NodeID would cause all receivers to publish to the same
-		// presence and ready topics, making them indistinguishable to publishers.
+		// An empty NodeID would make all receivers share one presence topic and
+		// MQTT client id.
 		return fmt.Errorf("receiver: NodeID must not be empty when BrokerURL is configured")
 	}
 
 	presenceTopic := broker.PresenceTopic(nodeID)
 	offlineMsg := broker.PresenceMessage{
-		NodeID:     nodeID,
-		Repos:      r.cfg.Repos,
-		DataURL:    r.cfg.dataEndpoint(),
-		ControlURL: r.cfg.controlEndpoint(),
-		Online:     false,
-		Ready:      false,
+		NodeID: nodeID,
+		Repos:  r.cfg.Repos,
+		Online: false,
+		Ready:  false,
 	}
 
 	brokerCfg := broker.Config{
 		BrokerURL:           r.cfg.BrokerURL,
 		CredentialsProvider: r.cfg.BrokerCredentialsProvider,
-		ClientCert:          r.cfg.BrokerClientCert,
-		ClientKey:           r.cfg.BrokerClientKey,
 		CACert:              r.cfg.BrokerCACert,
 		ClientID:            nodeID + "-receiver",
 	}
@@ -413,12 +207,10 @@ func (r *Receiver) startMQTT() error {
 
 	// Publish our online presence (retained) immediately after connecting.
 	onlineMsg := broker.PresenceMessage{
-		NodeID:     nodeID,
-		Repos:      r.cfg.Repos,
-		DataURL:    r.cfg.dataEndpoint(),
-		ControlURL: r.cfg.controlEndpoint(),
-		Online:     true,
-		Ready:      true,
+		NodeID: nodeID,
+		Repos:  r.cfg.Repos,
+		Online: true,
+		Ready:  true,
 	}
 	if err := client.Publish(presenceTopic, 1, true, onlineMsg); err != nil {
 		// Non-fatal: we're connected, presence just didn't publish.
@@ -448,8 +240,7 @@ func (r *Receiver) startMQTT() error {
 	// notifications are not lost on a transient connection drop.
 	publishedFilter := broker.PublishedTopicFilter()
 	if err := client.Subscribe(publishedFilter, 1, r.mqttPublishedHandler); err != nil {
-		// Non-fatal: the announce path still works, and the bits pre-push already
-		// delivered objects before the commit.  Log the error and continue.
+		// Non-fatal: the announce path still works. Log the error and continue.
 		r.cfg.Obs.Logger.Warn("receiver: subscribing to published topic failed — S0 pull disabled",
 			"filter", publishedFilter, "error", err)
 	}
@@ -467,12 +258,10 @@ func (r *Receiver) startMQTT() error {
 		r.cfg.Obs.Logger.Info("mqtt: reconnected — republishing online presence",
 			"node_id", nodeID)
 		r.mqttPublish(presenceTopic, broker.PresenceMessage{
-			NodeID:     nodeID,
-			Repos:      r.cfg.Repos,
-			DataURL:    r.cfg.dataEndpoint(),
-			ControlURL: r.cfg.controlEndpoint(),
-			Online:     true,
-			Ready:      true, // receiver answers presence via direct CAS.Exists
+			NodeID: nodeID,
+			Repos:  r.cfg.Repos,
+			Online: true,
+			Ready:  true, // receiver answers presence via direct CAS.Exists
 		})
 	})
 
@@ -510,12 +299,10 @@ func (r *Receiver) stopMQTT() {
 	// delay (which may be up to the keep-alive interval).
 	presenceTopic := broker.PresenceTopic(nodeID)
 	offlineMsg := broker.PresenceMessage{
-		NodeID:     nodeID,
-		Repos:      r.cfg.Repos,
-		DataURL:    r.cfg.dataEndpoint(),
-		ControlURL: r.cfg.controlEndpoint(),
-		Online:     false,
-		Ready:      false,
+		NodeID: nodeID,
+		Repos:  r.cfg.Repos,
+		Online: false,
+		Ready:  false,
 	}
 	if err := client.Publish(presenceTopic, 1, true, offlineMsg); err != nil {
 		r.cfg.Obs.Logger.Warn("mqtt: failed to publish offline presence on shutdown",
