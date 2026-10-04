@@ -10,6 +10,7 @@ import (
 type Metrics struct {
 	JobsSubmitted           prometheus.Counter
 	JobsCompleted           prometheus.Counter
+	PublishedBytes          prometheus.Counter
 	JobsFailed              prometheus.Counter
 	JobsRecovered           prometheus.Counter
 	JobFailuresByClass      *prometheus.CounterVec
@@ -48,6 +49,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		JobsCompleted: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "cvmfs_prepub_jobs_completed_total",
 			Help: "Total number of jobs completed successfully.",
+		}),
+		PublishedBytes: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "cvmfs_prepub_published_bytes_total",
+			Help: "Payload bytes of published jobs (the submitted tar; uncompressed content when there is none).",
 		}),
 		JobsFailed: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "cvmfs_prepub_jobs_failed_total",
@@ -125,6 +130,7 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 	reg.MustRegister(
 		m.JobsSubmitted,
 		m.JobsCompleted,
+		m.PublishedBytes,
 		m.JobsFailed,
 		m.JobsRecovered,
 		m.JobFailuresByClass,

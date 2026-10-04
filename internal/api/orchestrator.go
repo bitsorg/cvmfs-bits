@@ -182,10 +182,10 @@ type Orchestrator struct {
 	// pre-commit pull announce. nil disables the announce (typical for
 	// local mode); receivers then converge on the post-commit published broadcast.
 	Distribute *distribute.Config
-	// PreWarm gates the pre-commit pull announce (Stratum 1 cache pre-warming).
-	// OFF by default: with no S1 receivers there is nothing to warm and a warm
-	// gate must never block a commit. Enable it (--prewarm) once authoritative S1
-	// receivers exist; the testbed enables it for testing. Post-commit pull
+	// PreWarm makes Stratum 1 cache pre-warming available on this node; a job
+	// still has to ask for it (preWarmFor). OFF by default: with no S1
+	// receivers there is nothing to warm. Enable it (--prewarm) once
+	// authoritative S1 receivers exist; the testbed enables it for testing. Post-commit pull
 	// (manifests + the published broadcast) is independent of this and stays on
 	// whenever the broker is configured, so S1 receivers still converge.
 	PreWarm bool
@@ -1055,16 +1055,12 @@ func (o *Orchestrator) publishMQTTNotification(repo, newRootHash string) {
 
 // preWarmFor reports whether this job should pre-warm Stratum 1 caches.
 //
-// The job's own request wins when it made one; otherwise the node default
-// (--prewarm, off) applies. Pre-warming is expensive for the receivers and
-// pointless for a package nobody will read soon, so it is opt-in at both
-// levels — but a producer that knows a release is about to be used everywhere
-// can ask for it per build without the node having to enable it globally.
+// Opt-in at both levels: the node must be started with --prewarm (prewarm:
+// true in config.yaml), which only makes pre-warming available, and the job
+// must ask for it. Pre-warming is expensive for the receivers and pointless for
+// a package nobody will read soon, so neither alone turns it on.
 func (o *Orchestrator) preWarmFor(j *job.Job) bool {
-	if j != nil && j.PreWarm != nil {
-		return *j.PreWarm
-	}
-	return o.PreWarm
+	return o.PreWarm && j != nil && j.PreWarm != nil && *j.PreWarm
 }
 
 // publishAnnounce broadcasts the pre-commit AnnounceMessage directly on the
@@ -1126,6 +1122,53 @@ func (o *Orchestrator) publishAnnounce(j *job.Job, repo, payloadID string, total
 		"repo", repo)
 }
 
+// publishedBytes is a job's payload size for the throughput counter: the
+// submitted tar, else the pipeline's uncompressed content (a staged job has
+// neither and counts zero).
+func publishedBytes(j *job.Job) int64 {
+	if j.TarSize > 0 {
+		return j.TarSize
+	}
+	return j.NBytesRaw
+}
+
+// storePullManifest records the transaction manifest a receiver fetches after
+// an announce (GET /s1/{txn}/manifest), keyed by j.ID -- the payload id the
+// announce carries. Objects are content-addressed and hash-verified by the
+// receiver, so the fetch does not depend on the catalog root. Reports whether a
+// manifest was stored: without one an announce would only produce 404s. No-op
+// unless pull serving is configured.
+func (o *Orchestrator) storePullManifest(ctx context.Context, j *job.Job, hashes []string, totalBytes int64, logger *slog.Logger) bool {
+	if o.Manifests == nil || o.PullObjectBaseURL == "" {
+		return false
+	}
+	objs := make([]manifest.ObjRef, 0, len(hashes))
+	for _, h := range hashes {
+		objs = append(objs, manifest.ObjRef{Hash: h})
+	}
+	rootHash := j.NewRootHash
+	if rootHash == "" {
+		rootHash = j.ID // placeholder: not needed for an object pull
+	}
+	mf := &manifest.Manifest{
+		TransactionID:  j.ID,
+		Repo:           j.Repo,
+		TargetRootHash: rootHash,
+		BaseURLs:       []string{strings.TrimRight(o.PullObjectBaseURL, "/") + "/cvmfs/" + j.Repo + "/data"},
+		Generator:      manifest.GeneratorPipeline,
+		Auth:           manifest.AuthPublic,
+		CreatedAt:      time.Now(),
+		TotalSize:      totalBytes,
+		Objects:        objs,
+	}
+	if err := o.Manifests.Put(ctx, mf); err != nil {
+		logger.Warn("pull: failed to store transaction manifest", "txn", j.ID, "error", err)
+		return false
+	}
+	logger.Info("pull: transaction manifest stored", "txn", j.ID, "objects", len(objs))
+	return true
+}
+
 // Run executes the job through all pipeline stages.
 //
 // ── Gateway mode (Lease.NeedsPipeline() == true) ─────────────────────────────
@@ -1160,6 +1203,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	// on arrival is measured too: a run's failures are as interesting as its
 	// successes, and the failures are what needed measuring most.
 	o.measBegin(j)
+	if j.PreWarm != nil && *j.PreWarm && !o.PreWarm {
+		logger.Info("prewarm requested but pre-warming is not enabled on this node (--prewarm / prewarm: true); not pre-warming")
+	}
 	// Backstop: whatever exit Run takes, the accumulator is released and a
 	// record is written. The explicit measFinish calls on the success and
 	// abort paths claim the interesting outcomes first; this catches the
@@ -1333,32 +1379,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// objects it is missing. Keyed by j.ID — the same payloadID the announce
 			// carries. Objects are content-addressed (self-verifying), so the fetch
 			// is independent of the catalog root, which is not known until commit.
-			if o.Manifests != nil && o.PullObjectBaseURL != "" {
-				objs := make([]manifest.ObjRef, 0, len(pipelineResult.NewObjectHashes))
-				for _, h := range pipelineResult.ObjectHashes {
-					objs = append(objs, manifest.ObjRef{Hash: h})
-				}
-				rootHash := j.NewRootHash
-				if rootHash == "" {
-					rootHash = j.ID // placeholder: real root is set at commit; not needed for object pull
-				}
-				mf := &manifest.Manifest{
-					TransactionID:  j.ID,
-					Repo:           j.Repo,
-					TargetRootHash: rootHash,
-					BaseURLs:       []string{strings.TrimRight(o.PullObjectBaseURL, "/") + "/cvmfs/" + j.Repo + "/data"},
-					Generator:      manifest.GeneratorPipeline,
-					Auth:           manifest.AuthPublic,
-					CreatedAt:      time.Now(),
-					TotalSize:      pipelineResult.NBytesComp,
-					Objects:        objs,
-				}
-				if perr := o.Manifests.Put(ctx, mf); perr != nil {
-					logger.Warn("pull: failed to store transaction manifest", "txn", j.ID, "error", perr)
-				} else {
-					logger.Info("pull: transaction manifest stored", "txn", j.ID, "objects", len(objs))
-				}
-			}
+			stored := o.storePullManifest(ctx, j, pipelineResult.ObjectHashes, pipelineResult.NBytesComp, logger)
 			// Pull mode: publish the pre-commit announce directly on the
 			// embedded broker so receivers begin pulling the new objects before the
 			// catalog flips. This mirrors publishMQTTNotification (the post-commit
@@ -1367,7 +1388,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// on BrokerConfig) authenticates to the token-gated broker. A failed
 			// announce only means receivers converge on the post-commit published
 			// broadcast.
-			if o.Distribute != nil && o.Distribute.BrokerConfig != nil &&
+			if stored && o.Distribute != nil && o.Distribute.BrokerConfig != nil &&
 				o.Distribute.BrokerConfig.BrokerURL != "" {
 				o.publishAnnounce(j, j.Repo, j.ID, pipelineResult.NBytesComp)
 			}
@@ -2025,6 +2046,12 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		// nil when nothing is recording.
 		Stats: o.measStats(j),
 	}
+	// Ingest with an object list can pre-warm: the publisher reports the data
+	// objects it stored, and they are announced once the commit has succeeded.
+	var confirmed []string
+	if j.ObjectList && j.DirectS3 && o.preWarmFor(j) {
+		req.ConfirmedObjects = &confirmed
+	}
 	if j.StagingPrefix != "" {
 		// The producer named the catalog; the receiver downloads it by this hash.
 		// Suffixed, which ingress has already checked -- the receiver refuses a
@@ -2176,6 +2203,18 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		o.GatewayQueue.NotifyRelease(j.Repo)
 	}
 
+	// Post-commit pre-warm for ingest: receivers pull the confirmed objects now,
+	// ahead of their next snapshot, which then finds them in place. Off the
+	// job's path (the broker round-trip can take seconds), like the published
+	// broadcast. Size is the tar's, i.e. uncompressed: informational only.
+	if len(confirmed) > 0 {
+		go func(names []string, mctx context.Context) {
+			if o.storePullManifest(mctx, j, names, j.TarSize, logger) {
+				o.publishAnnounce(j, j.Repo, j.ID, j.TarSize)
+			}
+		}(confirmed, context.WithoutCancel(ctx))
+	}
+
 	// ── Serialize-until-published barrier ────────────────────────────────────
 	// Hold the per-repo commit lock until stratum0 reflects this commit, so the
 	// next package's graft sees a base that already contains the parent dirs this
@@ -2276,6 +2315,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	o.webhookPublished(j)
 
 	o.Obs.Metrics.JobsCompleted.Inc()
+	o.Obs.Metrics.PublishedBytes.Add(float64(publishedBytes(j)))
 	o.measFinish(j, "published", nil)
 	logger.Info("job completed successfully",
 		"objects", j.NObjects,

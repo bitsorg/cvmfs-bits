@@ -117,6 +117,7 @@ down; check `journalctl`).
 | `--skip-service` | install | install files but do not enable or start units |
 | `--user NAME` | install, update | run the services as NAME ([section 2.4](#24-service-account-and-spool-location)) |
 | `--spool-dir DIR` | install, update | spool root ([section 2.4](#24-service-account-and-spool-location)) |
+| `--prewarm`, `--no-prewarm` | install, update | publisher: set `prewarm: true` or `false` in `config.yaml` ([section 7](#7-stratum-1-pre-warming)); without either it is left as it is |
 | `--purge-legacy` | install, uninstall | remove the legacy bits-console spool daemon without asking ([section 2.5](#25-legacy-bits-console-spool-daemon)) |
 | `--legacy-spool DIR` | install, uninstall | legacy spool location (default `/mnt/build/bits/spool`) |
 | `--keep-spool`, `--keep-user` | uninstall | preserve the spool, the account |
@@ -361,8 +362,9 @@ list what a node offers:
 - `staged`: offered in gateway mode with an S3 CAS
   ([section 4.4](#44-the-staged-path)).
 
-Coarse builds and pre-warming exist only on the `prepub` path in gateway mode;
-a request for either on another path is rejected with 400. What each path does
+Coarse builds exist only on the `prepub` path in gateway mode. Pre-warming
+also works on `ingest` with `direct_s3` and `object_list`, right after the
+commit. A request for either on another path is rejected with 400. What each path does
 is described in [REFERENCE.md](REFERENCE.md#1-architecture).
 
 ### 4.1 Gateway mode (default)
@@ -593,7 +595,10 @@ commit. Protocol and trust model:
 [REFERENCE.md](REFERENCE.md#6-pull-distribution-protocol),
 [REFERENCE.md](REFERENCE.md#7-security-model).
 
-Pre-warming needs gateway mode and the default `prepub` path. Replace
+Pre-warming needs gateway mode and either the default `prepub` path or
+`ingest` with `direct_s3` and `object_list`. On ingest the receivers fetch the
+reported objects from the publisher's CAS, so it must be the repository's S3
+storage (`--cas-type s3`). Replace
 `s0.example.org` below with the publisher's public name.
 
 ### 7.1 Keys and certificates on the publisher
@@ -637,7 +642,6 @@ a drop-in (`sudo systemctl edit cvmfs-prepub`):
 [Service]
 ExecStart=
 ExecStart=/usr/local/bin/cvmfs-prepub --config /etc/cvmfs-prepub/config.yaml \
-  --prewarm \
   --embedded-broker-ws-addr :1882 \
   --control-plane-url wss://s0.example.org:1882 \
   --embedded-broker-tls-cert /etc/cvmfs-prepub/tls/broker.crt \
@@ -649,9 +653,13 @@ ExecStart=/usr/local/bin/cvmfs-prepub --config /etc/cvmfs-prepub/config.yaml \
   --pull-object-base-url http://s0.example.org:8080
 ```
 
-`--prewarm` makes pre-warming the node default, which a job can override with
-its `prewarm` field (`PREPUB_PREWARM` in bits-console); without it no pre-commit
-announce is sent, but receivers still converge after each commit.
+Pre-warming itself is switched on with `sudo ./install.sh update --prewarm` on
+an installed publisher (or `--prewarm` on a fresh install), which sets `prewarm: true` in
+`config.yaml`; `--no-prewarm` switches it off again. It only makes pre-warming
+available: a build still asks for it with its `prewarm` field (the Build
+panel's pre-warm checkbox, `PREPUB_PREWARM` in bits-console). Without it no
+announce is sent and a build's request is ignored with a log line; receivers
+still converge after each commit.
 `--embedded-broker-auth` (needs `PREPUB_HMAC_SECRET`) admits only enrolled nodes,
 and `--enroll-tls-addr` serves enrollment and revocation over HTTPS with the
 broker certificate, so the enrollment token never travels in plaintext.
@@ -790,7 +798,7 @@ publisher operator has to set and check.
 | `PREPUB_WAIT` | `false` | the CI job uploads, seals the build and exits; the publisher finalizes on its own, so a green pipeline does not yet mean "published" |
 | `PREPUB_SIGN` | `true` | requests are signed (`X-Bits-Auth`); works with `auth_mode` `both` or `hmac` |
 | `PREPUB_PUBLISH_PATH` | `prepub` | `ingest` and `staged` require the node to offer that path ([section 4](#4-publish-backends-and-paths)) |
-| `PREPUB_PREWARM` | off | `true` sends `prewarm=true` (prepub path only) |
+| `PREPUB_PREWARM` | off | `true` sends `prewarm=true`; needs `PREPUB_OBJECT_LIST=true` (ingest with direct-S3) and a publisher with pre-warming enabled ([section 7](#7-stratum-1-pre-warming)) |
 
 ### 8.3 Verify
 

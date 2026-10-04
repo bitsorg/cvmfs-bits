@@ -89,6 +89,13 @@ type CommitRequest struct {
 	// without it. Ignored by backends that do not shell out to cvmfs_server.
 	ObjectList bool
 
+	// ConfirmedObjects, when non-nil, receives the names of the data objects
+	// the publisher confirmed in S3 (the "ok" lines of the object list, as
+	// CVMFS object names such as "abcdef…P"). It is written only for a
+	// successful publish whose list was read to the end, so a consumer never
+	// sees a partial set, and always before Commit returns.
+	ConfirmedObjects *[]string
+
 	// ── Tagging (gateway mode) ───────────────────────────────────────────────
 
 	// TagName is the optional CVMFS snapshot tag to create on commit.

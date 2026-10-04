@@ -84,6 +84,8 @@ type fileConfig struct {
 	// delete the existing subtree and retry once (--replace-on-conflict).
 	// Destructive by design, so it is opt-in and defaults to off.
 	ReplaceOnConflict *bool `yaml:"replace_on_conflict"`
+	// PreWarm makes Stratum 1 pre-warming available (--prewarm); jobs opt in.
+	PreWarm *bool `yaml:"prewarm"`
 
 	// PromoteWorkers is the concurrency of the staged path's server-side copy
 	// into the CAS (--promote-workers). Zero/omitted keeps the CLI default.
@@ -298,6 +300,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	prefetch *bool,
 	maxTarSizeGiB, spoolMinFreeGiB *int,
 	retryWindow *time.Duration,
+	preWarm *bool,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -399,6 +402,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	bl("ingest-publish", ingestPublish, fc.IngestPublish)
 	str("ingest-publish-owner", ingestPublishOwner, fc.IngestPublishOwner)
 	bl("replace-on-conflict", replaceOnConflict, fc.ReplaceOnConflict)
+	bl("prewarm", preWarm, fc.PreWarm)
 	str("measurements-dir", measurementsDir, fc.MeasurementsDir)
 	str("ingest-swissknife", ingestSwissknife, fc.IngestSwissknife)
 	str("ingest-config-prefix", ingestConfigPrefix, fc.IngestConfigPrefix)

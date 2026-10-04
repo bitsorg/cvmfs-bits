@@ -162,6 +162,7 @@ type applyTestVars struct {
 	prefetch                                                bool
 	maxTarSizeGiB, spoolMinFreeGiB                          int
 	retryWindow                                             time.Duration
+	preWarm                                                 bool
 }
 
 func defaultApplyVars() *applyTestVars {
@@ -198,6 +199,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.pipelineWorkers, &v.pipelineUploadConc, &v.prefetchLimit, &v.promoteWorkers, &v.prefetch,
 		&v.maxTarSizeGiB, &v.spoolMinFreeGiB,
 		&v.retryWindow,
+		&v.preWarm,
 	)
 }
 
@@ -333,5 +335,21 @@ func TestEnvInt(t *testing.T) {
 		if got := envInt(k, 7); got != 7 {
 			t.Fatalf("bad %q: want builtin 7, got %d", bad, got)
 		}
+	}
+}
+
+// prewarm: true in config.yaml makes pre-warming available, like --prewarm;
+// an explicit --prewarm=false on the command line wins.
+func TestApplyFileConfig_PreWarm(t *testing.T) {
+	yes := true
+	v := defaultApplyVars()
+	v.apply(&fileConfig{PreWarm: &yes}, map[string]bool{})
+	if !v.preWarm {
+		t.Error("prewarm: true in the config did not enable pre-warming")
+	}
+	v = defaultApplyVars()
+	v.apply(&fileConfig{PreWarm: &yes}, map[string]bool{"prewarm": true})
+	if v.preWarm {
+		t.Error("an explicit --prewarm=false must win over the config")
 	}
 }

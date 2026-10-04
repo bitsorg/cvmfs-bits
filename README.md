@@ -38,8 +38,9 @@ Contents: [Why](#why) · [What it does](#what-it-does) ·
 - **Survives crashes.** Every job lives in an on-disk spool with a journal.
   After a restart, jobs resume. Retryable failures are retried with backoff
   for up to `retry_window` (24 hours by default).
-- **Can pre-warm Stratum 1.** With `--prewarm`, receivers are told about a
-  transaction before its commit and start pulling objects. This is best
+- **Can pre-warm Stratum 1.** With `--prewarm`, receivers are told about the
+  transactions of jobs that ask for it (`prewarm=true`) and start pulling
+  objects: before the commit, or right after it on ingest with an object list. This is best
   effort: the commit never waits for receivers.
 - **Authenticates the API.** Clients send a bearer token or HMAC-signed
   requests. Signed requests mean the shared secret never travels.

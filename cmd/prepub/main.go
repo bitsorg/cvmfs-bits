@@ -267,7 +267,7 @@ func main() {
 	repoName := flag.String("repo-name", "", "CVMFS repository name (e.g. atlas.cern.ch) [publisher]")
 
 	// ── Stratum 1 distribution flags (publisher) ─────────────────────────────
-	preWarm := flag.Bool("prewarm", false, "Enable Stratum 1 cache pre-warming: emit the pre-commit pull announce so receivers start pulling before the commit. OFF by default (no S1 receivers => nothing to warm); enable once authoritative receivers exist. Post-commit pull is unaffected [publisher]")
+	preWarm := flag.Bool("prewarm", false, "Make Stratum 1 cache pre-warming available: jobs that ask for it (prewarm=true) get the pull announce, before the commit on the prepub path and right after it on ingest with an object list. OFF by default (no S1 receivers => nothing to warm); enable once authoritative receivers exist. Post-commit pull is unaffected [publisher]")
 	// Queue-driven distribution worker flags.
 
 	// Provenance & Rekor transparency log — off by default.
@@ -346,6 +346,7 @@ func main() {
 			pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers, prefetch,
 			maxTarSizeGiB, spoolMinFreeGiB,
 			retryWindow,
+			preWarm,
 		)
 	}
 

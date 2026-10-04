@@ -764,7 +764,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		stagingPrefix             string   // S3 prefix a producer already filled with prepared objects
 		catalogHash               string   // suffixed subtree catalog hash to graft
 		publishPath               string   // optional: "prepub" (default) or "ingest"
-		preWarm                   *bool    // optional: nil = node default
+		preWarm                   *bool    // optional: nil = not requested
 		identityPath              string   // optional: see job.IdentityPath
 		identityHash              string   // optional: see job.IdentityHash
 	)
@@ -1141,8 +1141,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		publishPath = field("publish_path")
 		identityPath = strings.TrimSpace(field("identity_path")) // optional
 		identityHash = strings.TrimSpace(field("identity_hash")) // optional
-		// prewarm is tri-state: absent means "use the node default", so an
-		// unset field must NOT be read as false.
+		// prewarm: absent means not requested; only true asks (and only a node
+		// with pre-warming enabled honours it).
 		if raw := field("prewarm"); raw != "" {
 			v, convErr := strconv.ParseBool(strings.TrimSpace(raw))
 			if convErr != nil {
@@ -1361,13 +1361,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if publishPath != "" && publishPath != DefaultPublishPath {
-		// Pre-warming is a property of the prepub pipeline: the ingest path
-		// commits through the gateway, so there is no window in which the
-		// objects exist and the catalog has not yet flipped. Accepting the
-		// request and ignoring it would be worse than saying so.
-		if preWarm != nil && *preWarm {
+		// Off the prepub pipeline, pre-warming needs the list of objects the
+		// publisher stored: only ingest with direct_s3 and object_list has it,
+		// and it warms right after the commit. Accepting the request and
+		// ignoring it would be worse than saying so.
+		if preWarm != nil && *preWarm && !(publishPath == "ingest" && directS3 && objectList) {
 			os.RemoveAll(jobDir)
-			http.Error(w, fmt.Sprintf(`{"error":"publish path %q cannot pre-warm Stratum 1 caches; drop prewarm or use the %q path"}`,
+			http.Error(w, fmt.Sprintf(`{"error":"publish path %q cannot pre-warm Stratum 1 caches; use ingest with direct_s3 and object_list, or the %q path"}`,
 				jsonEscape(publishPath), DefaultPublishPath), http.StatusBadRequest)
 			return
 		}

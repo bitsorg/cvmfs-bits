@@ -281,9 +281,17 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 		listed    int
 		readToEOF bool
 	)
+	var confirmed []string
 	if useObjectList {
 		out, readToEOF, err = b.cvmfsServerOutputWithObjectList(ctx,
-			func(string) { listed++ }, args...)
+			func(line string) {
+				listed++
+				if req.ConfirmedObjects != nil {
+					if name, ok := ConfirmedObjectName(line); ok {
+						confirmed = append(confirmed, name)
+					}
+				}
+			}, args...)
 	} else {
 		out, err = b.cvmfsServerOutput(ctx, args...)
 	}
@@ -332,6 +340,8 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 			b.obs.Logger.Warn("ingest backend: publish succeeded but the object "+
 				"list was truncated; do not pre-warm from it",
 				"repo", repo, "base", base, "object_list_lines", listed)
+		} else if req.ConfirmedObjects != nil {
+			*req.ConfirmedObjects = confirmed
 		}
 	}
 	b.obs.Logger.Info("ingest backend: published", fields...)

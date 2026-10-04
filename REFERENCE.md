@@ -61,9 +61,9 @@ offers are listed in the startup log and in `publish_paths` of
 
 | Path name | Offered when | What happens | Notes |
 |---|---|---|---|
-| `prepub` (default; also the empty name) with `publish_mode: gateway` | always in gateway mode | Pipeline before the lease: chunk, compress, dedup (`CAS.Exists` per object), write objects to the CAS, build the subtree catalog(s); then lease, upload catalog(s), commit | The only path that can pre-warm Stratum 1s and the only path that accumulates coarse builds |
+| `prepub` (default; also the empty name) with `publish_mode: gateway` | always in gateway mode | Pipeline before the lease: chunk, compress, dedup (`CAS.Exists` per object), write objects to the CAS, build the subtree catalog(s); then lease, upload catalog(s), commit | The only path that can pre-warm Stratum 1s before the commit and the only path that accumulates coarse builds |
 | `prepub` with `publish_mode: local` | always in local mode | `cvmfs_server transaction <repo>`, extract the tar under `<cvmfs_mount>/<repo>/<path>`, `cvmfs_server publish <repo>` | No gateway, no CAS, no pipeline; runs on the Stratum 0 with the repository mounted |
-| `ingest` | `--ingest-publish` | `cvmfs_server ingest -t <tar> -b <path> [-c] [-u <owner>] [--direct-s3 [--object-list]] <repo>`; the gateway does chunking, dedup and catalogs | Needs `cvmfs_server` on `PATH` and a mountless gateway registration (`cvmfs_server connect-gw -P`) per repository; one gateway transaction per package; no pre-warming |
+| `ingest` | `--ingest-publish` | `cvmfs_server ingest -t <tar> -b <path> [-c] [-u <owner>] [--direct-s3 [--object-list]] <repo>`; the gateway does chunking, dedup and catalogs | Needs `cvmfs_server` on `PATH` and a mountless gateway registration (`cvmfs_server connect-gw -P`) per repository; one gateway transaction per package; with `direct_s3`, `object_list` and `prewarm`, pre-warms right after the commit |
 | `staged` | gateway mode with `cas.type: s3` | A producer has already written the objects under an S3 `staging_prefix` and built the catalog (`catalog_hash`); cvmfs-prepub promotes the objects into the store with server-side copies and grafts the catalog | No tar payload; needs a gateway with the graft endpoint; always grafts |
 
 The commit granularity follows from the path: `ingest`, `staged` and the
@@ -127,7 +127,7 @@ the catalog format is CVMFS's own ([CATALOG.md](CATALOG.md)).
 | Input | File tree in the transaction overlay | Local tar file | Tar over HTTP (multipart), or a tar already in `--staging-root` |
 | Lock held during processing | Yes | Yes (its own transaction or lease) | No: the lease is taken after compress/hash/upload |
 | Who needs shell access to the publisher | Release manager | Release manager | Nobody: an API secret is enough |
-| Stratum 1 pre-warming | No | No | Optional (`--prewarm` or per job) |
+| Stratum 1 pre-warming | No | No | Optional, opt-in (`--prewarm` on the node, `prewarm` per job) |
 | Crash-safe job queue with retries | No | No | Yes: spool journal; interrupted jobs are re-run, failed attempts retried |
 | Status | Exit code, log | Exit code, log | REST API, SSE, webhooks, Prometheus metrics |
 | Build identity | Unix user | Unix user | Optional OIDC-verified CI identity and Rekor record |
@@ -380,6 +380,7 @@ A complete example configuration is in
 | `repo_name` | `--repo-name` | | empty | Repository name. Used to find `server.conf` for `cas.type: s3` and as the repository listed in the discovery document. An invalid name ([Conventions](#conventions)) stops startup |
 | `cvmfs_mount` | `--cvmfs-mount` | | `/cvmfs` | Repository mount root for the `local` backend and the base for `ingest -b` |
 | `replace_on_conflict` | `--replace-on-conflict` | | `false` | When a commit fails on an already published path: confirm the conflict in the published catalogs, delete the subtree in its own transaction and retry once. Destructive; works for the `ingest` and `staged` paths (needs `--ingest-publish` for `cvmfs_server`) |
+| `prewarm` | `--prewarm` | | `false` | Make Stratum 1 pre-warming available; jobs opt in with `prewarm`. Set by `install.sh --prewarm` / `--no-prewarm` |
 
 Gateway credentials are environment variables only:
 `CVMFS_GATEWAY_KEY_ID` (default `cvmfs-prepub`) and `CVMFS_GATEWAY_SECRET`
@@ -432,7 +433,7 @@ publish coarse builds ([Chunking and compression](#chunking-and-compression)).
 
 ### Stratum 1 distribution
 
-All CLI only. Their use is described in
+All CLI only, except `--prewarm` (config key `prewarm`). Their use is described in
 [INSTALL.md](INSTALL.md#7-stratum-1-pre-warming); the protocol is in
 [section 6](#6-pull-distribution-protocol).
 
@@ -446,7 +447,7 @@ All CLI only. Their use is described in
 | `--control-plane-url` | empty | Broker URL advertised to receivers, e.g. `wss://s0.example.org:1882`. Setting it mounts the discovery document and requires `--discovery-signing-key`; a `wss://` URL requires the broker cert |
 | `--discovery-signing-key` | empty | PEM PKCS#8 Ed25519 private key that signs the discovery document |
 | `--pull-object-base-url` | empty | Externally reachable base for object GETs, written into pull manifests as `{url}/cvmfs/{repo}/data`. Without it no pull manifest is stored and announces cannot be acted on |
-| `--prewarm` | `false` | Send the pre-commit announce for every default-path job (a job can override with `prewarm`) |
+| `--prewarm` | `false` | Make pre-warming available (config key `prewarm`, set by `install.sh --prewarm`); only jobs that send `prewarm=true` are pre-warmed |
 
 ### Provenance
 
@@ -750,7 +751,7 @@ parts in total).
 | `coarse` | bool | Override the coarse decision; `true` requires `build_id` and the default path. In local mode `coarse=true` is treated as `false`, but without `build_id` it is still refused with `400` |
 | `build_expect` | integer >= 0 | Number of jobs in this build; cvmfs-prepub finalizes when that many are terminal |
 | `finalize` | `true` | Finalize job for `build_id`: carries no payload (a sent tar is dropped) |
-| `prewarm` | bool | Pre-warm Stratum 1s for this job (default: node's `--prewarm`); `true` only on the default path |
+| `prewarm` | bool | Ask to pre-warm Stratum 1s for this job (default off); effective only on a node started with `--prewarm`, otherwise ignored with a log line. `true` only on the default path, or on `ingest` with `direct_s3` and `object_list` |
 | `identity_path` | string | Repository-relative path, at or under `path`, whose presence means this content is already published. Checked just before the commit: if present the job ends `published` without committing |
 | `identity_hash` | string | Expected `package.hash` in `<identity_path>/.meta.json`; a different hash fails the job instead of skipping |
 | `tag_name` | string | Named snapshot tag for the commit; up to 255 characters of `A-Z a-z 0-9 . _ -` |
@@ -1078,9 +1079,14 @@ A receiver does not fetch nested catalogs, does not write a
 `cvmfs_server snapshot` still runs; the pre-pulled objects are then already
 in the Stratum 1's store.
 
-Announces are sent only for jobs on the gateway-mode `prepub` path, only when
-pre-warming applies (`--prewarm`, or the job's `prewarm` field), and only if
-`--pull-object-base-url` is set (otherwise there is no manifest to fetch).
+Announces are sent only when pre-warming applies (`--prewarm` on the node and
+the job's `prewarm` field) and the transaction manifest was stored, which needs
+`--pull-object-base-url` (otherwise there is nothing to fetch), for two kinds
+of job: on the gateway-mode `prepub` path
+before the commit, and on `ingest` with `direct_s3` and `object_list` right
+after the commit, listing the data objects the publisher reported as stored.
+Receivers fetch the objects from the publisher's CAS, so on the ingest path
+the CAS must be the repository's S3 storage (`--cas-type s3`).
 The `published` message is sent after every commit that reports a new root
 hash, on any path, whenever the embedded broker runs; coarse-build finalizes
 do not send it.
@@ -1493,6 +1499,7 @@ Publisher metrics that are updated:
 |---|---|---|---|
 | `cvmfs_prepub_jobs_submitted_total` | counter | | Accepted submissions |
 | `cvmfs_prepub_jobs_completed_total` | counter | | Jobs published individually (including already-published skips; not finalizes) |
+| `cvmfs_prepub_published_bytes_total` | counter | | Payload bytes of published jobs: the submitted tar, else the pipeline's uncompressed content (staged jobs count 0; skips and finalizes are not counted) |
 | `cvmfs_prepub_jobs_failed_total` | counter | | Jobs that ended in `failed` |
 | `cvmfs_prepub_job_failures_by_class_total` | counter | `class` = `transient`, `permanent`, `internal` | Failures by class |
 | `cvmfs_prepub_jobs_recovered_total` | counter | | Jobs reset to `incoming` by recovery at startup |

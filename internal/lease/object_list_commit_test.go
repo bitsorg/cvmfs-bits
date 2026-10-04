@@ -447,3 +447,48 @@ func TestCommitObjectList_VerdictIsLogged(t *testing.T) {
 		})
 	}
 }
+
+// Commit hands back the confirmed object names, "ok" lines only, and only for
+// a publish that succeeded; a failed publish leaves the set untouched.
+func TestCommit_ConfirmedObjects(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit string
+		want []string
+	}{
+		{"success", "0", []string{"abcdef", "123456P"}},
+		{"failed publish", "4", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubCvmfsServer(t, `
+case "$*" in
+  *--object-list*)
+    p=$(printf '%s\n' "$*" | tr ' ' '\n' | grep -A1 -- '--object-list' | tail -1)
+    exec 9>"$p"
+    echo "test.cvmfs.io/data/ab/cdef ok created" >&9
+    echo "test.cvmfs.io/data/12/3456P ok present" >&9
+    echo "test.cvmfs.io/data/78/9abc failed -" >&9
+    exit `+tc.exit+`
+    ;;
+esac
+exit 0`)
+			repo := "test.cvmfs.io"
+			b, mount := newAncestorBackend(t, repo)
+			base := filepath.Join(mount, repo, "pkg")
+			if err := os.MkdirAll(filepath.Dir(base), 0o755); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			var got []string
+			err := b.Commit(context.Background(), CommitRequest{
+				Token: repo, TarPath: oneEntryTar(t, t.TempDir()), CVMFSDir: base,
+				DirectS3: true, ObjectList: true, ConfirmedObjects: &got,
+			})
+			if (err != nil) != (tc.exit != "0") {
+				t.Fatalf("commit error = %v, exit %s", err, tc.exit)
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("confirmed = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

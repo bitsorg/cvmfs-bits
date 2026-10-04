@@ -15,8 +15,9 @@
 #                them, then start them.
 #   update       Upgrade an EXISTING installation in place: replaces the
 #                binaries (and any systemd unit whose content changed, backing
-#                up the previous one first) while PRESERVING config.yaml, env
-#                secrets, receiver.yaml, TLS material, spool and CAS.  Services
+#                up the previous one first) while PRESERVING config.yaml (only
+#                prewarm changes, with --prewarm/--no-prewarm), env secrets,
+#                receiver.yaml, TLS material, spool and CAS.  Services
 #                are stopped for the swap and restarted only if they were
 #                running.  Fails if the host is not already installed.  Removes
 #                a leftover prepubctl from older installs.  Without --mode it
@@ -51,6 +52,12 @@
 #   --spool-dir DIR     Spool root. Default: spool_root from an existing
 #                       config.yaml, else /var/spool/cvmfs-prepub. A symlink is
 #                       resolved: the units name the real directory.
+#   --prewarm           Publisher: make Stratum 1 pre-warming available
+#                       (prewarm: true in config.yaml). Builds still opt in per
+#                       job. Off unless given; also needs the broker flags of
+#                       INSTALL.md section 7 on ExecStart.
+#   --no-prewarm        Publisher: turn it off again (prewarm: false).
+#                       Without either option the setting is left as it is.
 #
 # ── UNINSTALL OPTIONS ──────────────────────────────────────────────────────────
 #   --mode MODE         What to uninstall:
@@ -154,6 +161,7 @@ STARTED=()   # units started (and seen active) by this install
 SERVICE_USER=""
 SERVICE_GROUP=""
 SPOOL_DIR=""
+PREWARM=""   # "", true or false: --prewarm / --no-prewarm
 
 # uninstall-specific
 KEEP_SPOOL=false
@@ -379,6 +387,8 @@ while [[ $# -gt 0 ]]; do
         --legacy-spool)    shift; LEGACY_SPOOL_DIR="${1:-}" ;;
         --user)            shift; SERVICE_USER="${1:-}" ;;
         --spool-dir)       shift; SPOOL_DIR="${1:-}" ;;
+        --prewarm)         PREWARM=true ;;
+        --no-prewarm)      PREWARM=false ;;
         # uninstall options
         --keep-spool)      KEEP_SPOOL=true ;;
         --purge-cas)       PURGE_CAS=true ;;
@@ -628,6 +638,12 @@ pipeline:
   # workers x largest-file.
   workers: 2            # unset/0 keeps the built-in default (4)
   upload_concurrency: 4
+
+# ── Stratum 1 pre-warming ─────────────────────────────────────────────────────
+# Off by default. true makes it available; each build still asks for it.
+# Set with install.sh --prewarm / --no-prewarm. Also needs the broker flags of
+# INSTALL.md section 7 on ExecStart.
+# prewarm: false
 CFGEOF
     sed -i "s|^spool_root: .*|spool_root: ${SPOOL_DIR}|" "$1"
 }
@@ -701,6 +717,37 @@ install_config_template() {
         chown "root:${ACCESS_GROUP}" "$env_file"
         chmod 0600 "$env_file"
         ok "Secrets env skeleton written: ${env_file}"
+    fi
+}
+
+# set_prewarm -- write prewarm: true|false into the publisher's config.yaml when
+# --prewarm or --no-prewarm was given. Pre-warming is opt-in: without either the
+# key is left untouched (absent means off).
+set_prewarm() {
+    [ -n "$PREWARM" ] || return 0
+    if [[ "$MODE" != "publisher" && "$MODE" != "all" ]]; then
+        warn "--prewarm/--no-prewarm only apply to the publisher — ignored"
+        return 0
+    fi
+    local cfg="${CONFIG_DIR}/config.yaml"
+    if $DRY_RUN; then
+        dry "Set prewarm: ${PREWARM} in ${cfg}"
+        return 0
+    fi
+    [ -f "$cfg" ] || { err "${cfg} not found — prewarm not set"; return 0; }
+    # One top-level key only (yaml.v3 refuses a duplicate): replace the live
+    # line, else the template's commented one, else append.
+    if grep -qE '^prewarm:' "$cfg"; then
+        sed -i -E "s|^prewarm:.*|prewarm: ${PREWARM}|" "$cfg"
+    elif grep -qE '^# *prewarm:' "$cfg"; then
+        sed -i -E "0,/^# *prewarm:.*/s//prewarm: ${PREWARM}/" "$cfg"
+    else
+        printf '\nprewarm: %s\n' "$PREWARM" >> "$cfg"
+    fi
+    ok "prewarm: ${PREWARM} in ${cfg}"
+    # install only starts a stopped unit; update restarts a running one itself.
+    if [ "$ACTION" = "install" ] && svc_active "$SVC_PUB"; then
+        warn "${SVC_PUB} is running: restart it to apply (systemctl restart ${SVC_PUB})"
     fi
 }
 
@@ -1061,7 +1108,11 @@ update_config_report() {
 
     local f
     for f in "${CONFIG_DIR}/config.yaml" "${CONFIG_DIR}/env" "${CONFIG_DIR}/receiver.yaml"; do
-        [ -f "$f" ] && ok "$(basename "$f") — preserved, not modified"
+        if [ "$f" = "${CONFIG_DIR}/config.yaml" ] && [ -n "$PREWARM" ]; then
+            [ -f "$f" ] && ok "config.yaml — preserved; only prewarm is set below"
+        else
+            [ -f "$f" ] && ok "$(basename "$f") — preserved, not modified"
+        fi
     done
     if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
         report_new_keys "${CONFIG_DIR}/config.yaml" write_config_template_to
@@ -1098,7 +1149,7 @@ report_new_keys() {
 do_update() {
     if $DRY_RUN; then
         printf "\n${BOLD}cvmfs-prepub update  [DRY RUN]  mode=%s${RESET}\n" "$MODE"
-        printf "${DIM}No changes will be made.  Configuration is never modified.${RESET}\n"
+        printf "${DIM}No changes will be made.  Configuration is not modified (only the prewarm key, with --prewarm/--no-prewarm).${RESET}\n"
     else
         printf "\n${BOLD}cvmfs-prepub update  mode=%s${RESET}\n" "$MODE"
         info "Configuration, secrets, spool and CAS are preserved."
@@ -1142,6 +1193,7 @@ do_update() {
     remove_old_prepubctl
     update_units
     update_config_report
+    set_prewarm
     maybe_daemon_reload
 
     if [ ${#was_active[@]} -gt 0 ]; then
@@ -1174,7 +1226,11 @@ do_update() {
             info "Verify metrics:  curl $(rcv_metrics_url)"
             info "Check the log:   journalctl -u ${SVC_RCV} -n 30 --no-pager"
         fi
-        info "Configuration was not modified; no secrets were touched."
+        if [ -n "$PREWARM" ]; then
+            info "Configuration: only prewarm was set (${PREWARM}); no secrets were touched."
+        else
+            info "Configuration was not modified; no secrets were touched."
+        fi
     fi
 }
 
@@ -1227,6 +1283,7 @@ do_install() {
     install_dirs
     install_binaries
     install_config_template
+    set_prewarm
     install_units
     enable_start_services
     install_health_check

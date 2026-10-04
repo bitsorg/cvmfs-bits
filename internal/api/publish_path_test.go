@@ -174,6 +174,40 @@ func TestSubmitJob_RejectsPreWarmOnAlternativePath(t *testing.T) {
 	}
 }
 
+// Ingest pre-warms only with the stored-object list: prewarm is accepted with
+// direct_s3 and object_list, and refused without either.
+func TestSubmitJob_PreWarmOnIngestNeedsObjectList(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fields   map[string]string
+		wantCode int
+	}{
+		"with direct_s3 and object_list": {map[string]string{
+			"direct_s3": "true", "object_list": "true", "prewarm": "true"}, http.StatusAccepted},
+		"with direct_s3 only": {map[string]string{
+			"direct_s3": "true", "prewarm": "true"}, http.StatusBadRequest},
+		"prewarm=false is always fine": {map[string]string{
+			"prewarm": "false"}, http.StatusAccepted},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, _, orch := newTestServer(t)
+			orch.Lease = &noopBackend{}
+			orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}}
+			fields := map[string]string{
+				"repo": "software.cern.ch", "path": "x86_64-el9/pkg/1.0",
+				"publish_path": "ingest",
+			}
+			for k, v := range tc.fields {
+				fields[k] = v
+			}
+			rec := httptest.NewRecorder()
+			srv.submitJob(rec, newMultipartRequest(t, fields, []byte("dummy")))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("want %d, got %d: %s", tc.wantCode, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 // An alternative path commits each package on arrival, so it cannot take part
 // in a coarse build -- but it MUST still accept the build id, which is the CI
 // pipeline identity every job of a run carries (the same one the views and the
@@ -239,9 +273,8 @@ func TestSubmitJob_RejectsMalformedPreWarm(t *testing.T) {
 	}
 }
 
-// TestPreWarmFor covers the tri-state: a job that says nothing inherits the
-// node default, and a job that does say something overrides it in both
-// directions.
+// TestPreWarmFor: opt-in at both levels -- the node makes pre-warming
+// available, and only a job that asks for it gets it.
 func TestPreWarmFor(t *testing.T) {
 	_, _, orch := newTestServer(t)
 	yes, no := true, false
@@ -253,9 +286,10 @@ func TestPreWarmFor(t *testing.T) {
 		want        bool
 	}{
 		{"unset job, node off", false, nil, false},
-		{"unset job, node on", true, nil, true},
-		{"job opts in over an off node", false, &yes, true},
-		{"job opts out of an on node", true, &no, false},
+		{"unset job, node on", true, nil, false},
+		{"job asks, node off", false, &yes, false},
+		{"job asks, node on", true, &yes, true},
+		{"job declines, node on", true, &no, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			orch.PreWarm = tc.nodeDefault
@@ -266,8 +300,8 @@ func TestPreWarmFor(t *testing.T) {
 	}
 
 	orch.PreWarm = true
-	if !orch.preWarmFor(nil) {
-		t.Error("a nil job must fall back to the node default")
+	if orch.preWarmFor(nil) {
+		t.Error("a nil job must not pre-warm")
 	}
 }
 
