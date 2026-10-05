@@ -336,3 +336,33 @@ func TestOrchestrator_NoAccumulatorSurvivesRun(t *testing.T) {
 		})
 	}
 }
+
+// Time spent queued for the repository's commit lock is recorded as such, so
+// a run serialised behind other jobs shows where its time went.
+//
+// NEGATIVE CONTROL: drop the measLockWait call in acquireCommitLock and this
+// fails with lock_wait_s absent.
+func TestOrchestrator_RecordsTheCommitLockWait(t *testing.T) {
+	backend := &mockBackend{}
+	o, sp := minimalOrch(t, backend)
+	o.PublishPaths = map[string]lease.Backend{"ingest": backend}
+	w := withMeasurements(t, o)
+
+	j := newIncomingJob(t, sp)
+	j.PublishPath = "ingest"
+	j.BuildID = "b-lock"
+	mu := o.repoMutex(j.Repo)
+	mu.Lock() // another job of this repository is committing
+	time.AfterFunc(100*time.Millisecond, mu.Unlock)
+	if err := o.Run(context.Background(), j, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	recs, err := w.Read("b-lock")
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("Read: %v, %d records", err, len(recs))
+	}
+	if got := recs[0].LockWaitS; got == nil || *got < 0.09 {
+		t.Errorf("lock_wait_s = %v, want >= 0.09", got)
+	}
+}

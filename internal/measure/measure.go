@@ -57,8 +57,11 @@ type Record struct {
 	// Total is submission to terminal state: the number a run's wall clock is
 	// made of. The phases are the parts of it prepub can attribute; they do
 	// not necessarily sum to Total (queueing and spool moves sit between).
-	TotalS    float64  `json:"total_s"`
-	QueuedS   *float64 `json:"queued_s,omitempty"`   // accepted -> work started
+	TotalS  float64  `json:"total_s"`
+	QueuedS *float64 `json:"queued_s,omitempty"` // accepted -> work started
+	// LockWaitS is the time spent waiting for the repository's commit lock,
+	// which serialises every publish of one repository; not part of QueuedS.
+	LockWaitS *float64 `json:"lock_wait_s,omitempty"`
 	CommitS   *float64 `json:"commit_s,omitempty"`   // orchestrator commit phase
 	BackendS  *float64 `json:"backend_s,omitempty"`  // the publish tool itself
 	PipelineS *float64 `json:"pipeline_s,omitempty"` // chunk/compress/upload

@@ -366,6 +366,8 @@ A complete example configuration is in
 | `max_tar_size_gib` | `--max-tar-size-gib` | | `10` | Largest tar one submission may carry; larger uploads get `413`. Also the largest single file inside a tar on the default fixed chunk grid ([Tar archive rules](#tar-archive-rules)) |
 | `spool_min_free_gib` | `--spool-min-free-gib` | | `20` | Free space an upload must leave on the spool filesystem, else `507`. `0` disables the check |
 | `measurements_dir` | `--measurements-dir` | | `<spool_root>/measurements` | Measurement records ([Measurements](#get-apiv1measurements)); `off` disables them |
+| `catalog_cache_dir` | `--catalog-cache-dir` | | `$CACHE_DIRECTORY/catalogs` under systemd (the installed unit sets `CacheDirectory=cvmfs-prepub`), else `<spool_root>/catalog-cache` | Published catalogs downloaded for existence and hash checks, kept by hash (a catalog never changes under its hash); only the manifest is read fresh. Prefer local disk. `off` disables |
+| `catalog_cache_mib` | `--catalog-cache-mib` | | `1024` | Size limit of the catalog cache; least recently used catalogs are removed beyond it |
 
 ### Publish backend and gateway
 
@@ -1000,15 +1002,16 @@ array (`latest` selects the most recently written build). Query parameters:
 Record fields: `ts`, `build_id`, `job_id`, `repo`, `path`, `publish_path`,
 `outcome` (`published`, `already_published`, `failed`, `retry`, or
 `incomplete:<state>` for a job that ended elsewhere, e.g. an accumulated
-member), `total_s`, `queued_s`, `commit_s`, `backend_s`, `pipeline_s`,
+member), `total_s`, `queued_s`, `lock_wait_s` (waiting for the repository's
+commit lock, which serialises its publishes), `commit_s`, `backend_s`, `pipeline_s`,
 `tar_bytes`, `objects`, `objects_exact`, `bytes_raw`, `bytes_compressed`,
 `conflicted`, `replaced`, `error` (the real cause, truncated). Times are
 seconds; absent values are omitted.
 
 Summary fields: `build_id`, `repo`, `publish_paths` (count per path), `jobs`,
 `published`, `failed`, `incomplete`, `conflicted`, `replaced`, `first`,
-`last`, `window_s`, `backend_s` and `total_s` (each `{n, sum, mean, median,
-p90, p99, max}`), `tar_bytes`, `objects`, `objects_partial`.
+`last`, `window_s`, `backend_s`, `total_s` and `lock_wait_s` (each `{n, sum,
+mean, median, p90, p99, max}`), `tar_bytes`, `objects`, `objects_partial`.
 
 `404` for an unknown build, when nothing has been recorded yet (`latest`), or
 when measurements are disabled; `500` when the directory cannot be read.

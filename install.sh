@@ -843,6 +843,10 @@ PrivateTmp=true
 # "-": the CAS directory is optional (a node serving only the ingest path has
 # none); a missing listed path would stop the unit at step NAMESPACE.
 ReadWritePaths=${SPOOL_DIR} -${CAS_PUB}
+# /var/cache/cvmfs-prepub, owned by the service user: the published-catalog
+# cache defaults to it (CACHE_DIRECTORY/catalogs), local disk rather than the
+# spool, which may be a network filesystem.
+CacheDirectory=cvmfs-prepub
 
 [Install]
 WantedBy=multi-user.target

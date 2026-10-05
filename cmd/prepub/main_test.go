@@ -163,6 +163,8 @@ type applyTestVars struct {
 	maxTarSizeGiB, spoolMinFreeGiB                          int
 	retryWindow                                             time.Duration
 	preWarm                                                 bool
+	catalogCacheDir                                         string
+	catalogCacheMiB                                         int
 }
 
 func defaultApplyVars() *applyTestVars {
@@ -200,6 +202,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.maxTarSizeGiB, &v.spoolMinFreeGiB,
 		&v.retryWindow,
 		&v.preWarm,
+		&v.catalogCacheDir, &v.catalogCacheMiB,
 	)
 }
 
@@ -351,5 +354,22 @@ func TestApplyFileConfig_PreWarm(t *testing.T) {
 	v.apply(&fileConfig{PreWarm: &yes}, map[string]bool{"prewarm": true})
 	if v.preWarm {
 		t.Error("an explicit --prewarm=false must win over the config")
+	}
+}
+
+// The catalog cache settings come from config.yaml unless given on the
+// command line.
+func TestApplyFileConfig_CatalogCache(t *testing.T) {
+	v := defaultApplyVars()
+	v.catalogCacheMiB = 1024
+	v.apply(&fileConfig{CatalogCacheDir: "/var/cache/x", CatalogCacheMiB: 64}, map[string]bool{})
+	if v.catalogCacheDir != "/var/cache/x" || v.catalogCacheMiB != 64 {
+		t.Errorf("dir=%q mib=%d, want the config's", v.catalogCacheDir, v.catalogCacheMiB)
+	}
+	v = defaultApplyVars()
+	v.catalogCacheDir = "off"
+	v.apply(&fileConfig{CatalogCacheDir: "/var/cache/x"}, map[string]bool{"catalog-cache-dir": true})
+	if v.catalogCacheDir != "off" {
+		t.Errorf("dir=%q, want the command line's", v.catalogCacheDir)
 	}
 }

@@ -252,11 +252,13 @@ func DownloadCatalog(ctx context.Context, client *http.Client, stratum0URL, repo
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
 	}
-	defer out.Close()
-
 	if _, err := io.Copy(out, zr); err != nil {
+		out.Close()
 		return fmt.Errorf("writing decompressed catalog: %w", err)
 	}
-
+	// A failed close can mean the data never reached the file.
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("writing decompressed catalog: %w", err)
+	}
 	return nil
 }

@@ -10,8 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -101,47 +99,36 @@ func PathExists(ctx context.Context, client *http.Client, stratum0URL, repo, lea
 	}
 	curHash := strings.TrimSuffix(rootSuffixed, "C")
 
-	tmpDir, err := os.MkdirTemp("", "cvmfs-exists-*")
-	if err != nil {
-		return false, fmt.Errorf("creating temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
 	// Bound the descent so a pathological/looping nested chain cannot spin
 	// forever; the depth of any real publish path is small.
 	for depth := 0; depth < 64; depth++ {
-		dbPath := filepath.Join(tmpDir, curHash+".db")
-		if dlErr := DownloadCatalog(ctx, client, stratum0URL, repo, curHash, dbPath); dlErr != nil {
-			if errors.Is(dlErr, ErrCatalogNotFound) {
+		cat, release, openErr := openPublishedCatalog(ctx, client, stratum0URL, repo, curHash)
+		if openErr != nil {
+			if errors.Is(openErr, ErrCatalogNotFound) {
 				return false, nil
 			}
-			return false, fmt.Errorf("downloading catalog %s: %w", curHash, dlErr)
-		}
-		cat, openErr := Open(dbPath)
-		if openErr != nil {
-			return false, fmt.Errorf("opening catalog %s: %w", curHash, openErr)
+			return false, openErr
 		}
 
 		mount, childHash, found, ancErr := cat.longestNestedAncestor(abs)
 		if ancErr != nil {
-			cat.Close()
+			release()
 			return false, ancErr
 		}
 		if found && mount == abs {
-			cat.Close()
+			release()
 			return true, nil // absPath is itself a nested-catalog mountpoint
 		}
 		if found {
 			// A proper ancestor of absPath is a nested mount — descend into it.
-			cat.Close()
-			_ = os.Remove(dbPath)
+			release()
 			curHash = childHash
 			continue
 		}
 		// No child nested mount on the path in this catalog: absPath, if it
 		// exists at all, is a plain entry owned here.
 		has, hasErr := cat.HasEntry(abs)
-		cat.Close()
+		release()
 		return has, hasErr
 	}
 	return false, fmt.Errorf("nested-catalog walk exceeded max depth for %q", abs)
@@ -165,41 +152,30 @@ func ReadPublishedFile(ctx context.Context, client *http.Client, stratum0URL, re
 	}
 	curHash := strings.TrimSuffix(rootSuffixed, "C")
 
-	tmpDir, err := os.MkdirTemp("", "cvmfs-read-*")
-	if err != nil {
-		return nil, false, fmt.Errorf("creating temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
 	for depth := 0; depth < 64; depth++ {
-		dbPath := filepath.Join(tmpDir, curHash+".db")
-		if dlErr := DownloadCatalog(ctx, client, stratum0URL, repo, curHash, dbPath); dlErr != nil {
-			if errors.Is(dlErr, ErrCatalogNotFound) {
+		cat, release, openErr := openPublishedCatalog(ctx, client, stratum0URL, repo, curHash)
+		if openErr != nil {
+			if errors.Is(openErr, ErrCatalogNotFound) {
 				return nil, false, nil
 			}
-			return nil, false, fmt.Errorf("downloading catalog %s: %w", curHash, dlErr)
-		}
-		cat, openErr := Open(dbPath)
-		if openErr != nil {
-			return nil, false, fmt.Errorf("opening catalog %s: %w", curHash, openErr)
+			return nil, false, openErr
 		}
 		mount, childHash, nested, ancErr := cat.longestNestedAncestor(abs)
 		if ancErr != nil {
-			cat.Close()
+			release()
 			return nil, false, ancErr
 		}
 		if nested && mount != abs {
-			cat.Close()
-			_ = os.Remove(dbPath)
+			release()
 			curHash = childHash
 			continue
 		}
 		if nested { // abs is a nested-catalog root: a directory, not a file
-			cat.Close()
+			release()
 			return nil, false, nil
 		}
 		hashHex, algo, chunks, ok, lkErr := cat.fileContent(abs)
-		cat.Close()
+		release()
 		if lkErr != nil || !ok {
 			return nil, false, lkErr
 		}

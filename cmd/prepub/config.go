@@ -95,6 +95,13 @@ type fileConfig struct {
 	// (--measurements-dir). Empty uses <spool>/measurements; "off" disables.
 	MeasurementsDir string `yaml:"measurements_dir"`
 
+	// CatalogCacheDir keeps the published catalogs that existence and hash
+	// checks download (--catalog-cache-dir). Empty uses systemd's cache
+	// directory ($CACHE_DIRECTORY/catalogs), else <spool>/catalog-cache; "off"
+	// disables. CatalogCacheMiB caps it (--catalog-cache-mib).
+	CatalogCacheDir string `yaml:"catalog_cache_dir"`
+	CatalogCacheMiB int    `yaml:"catalog_cache_mib"`
+
 	// Coarse-publish finalize: one cvmfs_swissknife ingestsql
 	// invocation commits a whole build. Without IngestConfigPrefix the finalize
 	// is DISABLED, and since a sealed build finalizes server-side, that failure
@@ -301,6 +308,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	maxTarSizeGiB, spoolMinFreeGiB *int,
 	retryWindow *time.Duration,
 	preWarm *bool,
+	catalogCacheDir *string, catalogCacheMiB *int,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -404,6 +412,8 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	bl("replace-on-conflict", replaceOnConflict, fc.ReplaceOnConflict)
 	bl("prewarm", preWarm, fc.PreWarm)
 	str("measurements-dir", measurementsDir, fc.MeasurementsDir)
+	str("catalog-cache-dir", catalogCacheDir, fc.CatalogCacheDir)
+	i("catalog-cache-mib", catalogCacheMiB, fc.CatalogCacheMiB)
 	str("ingest-swissknife", ingestSwissknife, fc.IngestSwissknife)
 	str("ingest-config-prefix", ingestConfigPrefix, fc.IngestConfigPrefix)
 	if !has("ingest-env") && len(fc.IngestEnv) > 0 {

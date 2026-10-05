@@ -207,6 +207,14 @@ func TestSummarise_CountsConflictsAndReplacements(t *testing.T) {
 	}
 }
 
+func TestSummarise_LockWait(t *testing.T) {
+	a, b := 2.0, 4.0
+	s := Summarise([]Record{{LockWaitS: &a}, {LockWaitS: &b}, {}})
+	if s.LockWait.N != 2 || s.LockWait.Sum != 6 || s.LockWait.Max != 4 {
+		t.Errorf("lock_wait_s = %+v, want n=2 sum=6 max=4", s.LockWait)
+	}
+}
+
 // A run where some records counted objects and others did not must not be
 // reported as if the partial total were the run's total.
 func TestSummarise_FlagsAPartialObjectCount(t *testing.T) {

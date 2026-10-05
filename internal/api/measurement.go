@@ -37,6 +37,8 @@ type measAccum struct {
 	conflicted  bool
 	replaced    bool
 	commitKnown bool
+	lockWait    time.Duration
+	lockWaited  bool
 }
 
 // measBegin starts recording for a job. Safe when measurements are disabled.
@@ -72,6 +74,16 @@ func (o *Orchestrator) measCommit(j *job.Job, d time.Duration) {
 	if a := o.measFor(j); a != nil {
 		a.mu.Lock()
 		a.commit, a.commitKnown = d, true
+		a.mu.Unlock()
+	}
+}
+
+// measLockWait adds time spent waiting for the repository's commit lock.
+func (o *Orchestrator) measLockWait(j *job.Job, d time.Duration) {
+	if a := o.measFor(j); a != nil {
+		a.mu.Lock()
+		a.lockWait += d
+		a.lockWaited = true
 		a.mu.Unlock()
 	}
 }
@@ -157,6 +169,9 @@ func (o *Orchestrator) measFinish(j *job.Job, outcome string, cause error) {
 	}
 	if a.commitKnown {
 		rec.CommitS = measure.Secs(a.commit)
+	}
+	if a.lockWaited {
+		rec.LockWaitS = measure.Secs(a.lockWait)
 	}
 	if a.stats.Backend > 0 {
 		rec.BackendS = measure.Secs(a.stats.Backend)

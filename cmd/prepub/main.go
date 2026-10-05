@@ -54,6 +54,7 @@ import (
 	"cvmfs.io/prepub/internal/pipeline"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
+	"cvmfs.io/prepub/pkg/cvmfscatalog"
 	"cvmfs.io/prepub/pkg/cvmfsdescriptor"
 	"cvmfs.io/prepub/pkg/observe"
 )
@@ -179,6 +180,8 @@ func main() {
 	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels) [publisher]")
 	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs. Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
+	catalogCacheDir := flag.String("catalog-cache-dir", "", "Directory keeping the published catalogs that existence and hash checks download, by hash (a catalog never changes under its hash). Default: systemd's cache directory ($CACHE_DIRECTORY/catalogs), else <spool>/catalog-cache; prefer local disk over a network spool. 'off' disables [publisher]")
+	catalogCacheMiB := flag.Int("catalog-cache-mib", 1024, "Size limit of --catalog-cache-dir in MiB; the least recently used catalogs are removed beyond it [publisher]")
 	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
 	replaceOnConflict := flag.Bool("replace-on-conflict", false, "Allow a job that asks for it (replace=true) to REPLACE what another build published at its own path: when the published .meta.json hash differs from the job's, delete the existing subtree in its own transaction, then commit. Destroys the published subtree at that path (prior revisions keep their objects until GC); jobs that do not ask are never replaced [publisher]")
 	promoteWorkers := flag.Int("promote-workers", envInt("PREPUB_PROMOTE_WORKERS", cas.DefaultPromoteWorkers), "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (measured: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half. Env: PREPUB_PROMOTE_WORKERS [publisher]")
@@ -347,6 +350,7 @@ func main() {
 			maxTarSizeGiB, spoolMinFreeGiB,
 			retryWindow,
 			preWarm,
+			catalogCacheDir, catalogCacheMiB,
 		)
 	}
 
@@ -383,6 +387,7 @@ func main() {
 
 	switch *mode {
 	case "publisher":
+		setupCatalogCache(obs, *spoolRoot, *catalogCacheDir, *catalogCacheMiB)
 		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *signatureSkew, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *replaceOnConflict, *measurementsDir, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
 			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
@@ -405,6 +410,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown mode %q — valid modes are: publisher, receiver\n", *mode)
 		os.Exit(1)
 	}
+}
+
+// setupCatalogCache keeps the published catalogs that existence and hash
+// checks download (cvmfscatalog.SetCatalogCache). Local disk serves it best,
+// hence systemd's cache directory before the spool. A failure costs only the
+// cache, never a publish.
+func setupCatalogCache(obs *observe.Provider, spoolRoot, dir string, mib int) {
+	switch {
+	case strings.EqualFold(strings.TrimSpace(dir), "off"):
+		obs.Logger.Info("catalog cache disabled")
+		return
+	case dir == "" && os.Getenv("CACHE_DIRECTORY") != "":
+		dir = filepath.Join(strings.Split(os.Getenv("CACHE_DIRECTORY"), ":")[0], "catalogs")
+	case dir == "":
+		dir = filepath.Join(spoolRoot, "catalog-cache")
+	}
+	if err := cvmfscatalog.SetCatalogCache(dir, int64(mib)<<20); err != nil {
+		obs.Logger.Warn("catalog cache disabled", "dir", dir, "error", err)
+		return
+	}
+	obs.Logger.Info("catalog cache", "dir", dir, "max_mib", mib)
 }
 
 // runPublisher starts the publisher-mode HTTP API server.  It never returns

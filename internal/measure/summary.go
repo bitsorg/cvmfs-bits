@@ -42,6 +42,9 @@ type Summary struct {
 	Backend Stats `json:"backend_s"`
 	// Total is submission-to-terminal per job.
 	Total Stats `json:"total_s"`
+	// LockWait is the time jobs waited for the repository's commit lock: a
+	// large share of Total means the run was serialised behind other jobs.
+	LockWait Stats `json:"lock_wait_s"`
 
 	TarBytes int64 `json:"tar_bytes,omitempty"`
 	Objects  int   `json:"objects,omitempty"`
@@ -104,7 +107,7 @@ func round3(f float64) float64 { return math.Round(f*1000) / 1000 }
 // be passed; the caller decides what belongs together.
 func Summarise(recs []Record) Summary {
 	s := Summary{PublishPaths: map[string]int{}}
-	var backend, total []float64
+	var backend, total, lockWait []float64
 	countedObjects, sawUncounted, sawInexact := 0, false, false
 	// The run began when its EARLIEST-SUBMITTED job began, which is not
 	// necessarily the job that finished first: records are written at terminal
@@ -146,6 +149,9 @@ func Summarise(recs []Record) Summary {
 			backend = append(backend, *r.BackendS)
 		}
 		total = append(total, r.TotalS)
+		if r.LockWaitS != nil {
+			lockWait = append(lockWait, *r.LockWaitS)
+		}
 		if r.TarBytes != nil {
 			s.TarBytes += *r.TarBytes
 		}
@@ -166,6 +172,7 @@ func Summarise(recs []Record) Summary {
 
 	s.Backend = statsOf(backend)
 	s.Total = statsOf(total)
+	s.LockWait = statsOf(lockWait)
 	s.Objects = countedObjects
 	// Partial when some record did not count at all, OR when a count that was
 	// included is not authoritative (a truncated object list). Either way the

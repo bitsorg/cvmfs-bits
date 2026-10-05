@@ -312,7 +312,7 @@ func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-// acquireCommitLock acquires the per-repo commit serialisation mutex, honouring
+// acquireCommitLock acquires j's per-repo commit serialisation mutex, honouring
 // context cancellation. It returns an unlock func (always non-nil, idempotent)
 // that the caller must defer to release the lock at Run() return, plus an error
 // if ctx fired before the lock was obtained.
@@ -326,7 +326,8 @@ func (o *Orchestrator) repoMutex(repo string) *sync.Mutex {
 // (Phase 2.65) for subtree jobs — and held through the content commit and its
 // serialize-until-published barrier (Phase 4), so a package's parent-dir creation
 // and content graft form one serialised, fully-propagated unit.
-func (o *Orchestrator) acquireCommitLock(ctx context.Context, repo string) (func(), error) {
+func (o *Orchestrator) acquireCommitLock(ctx context.Context, j *job.Job) (func(), error) {
+	repo := j.Repo
 	repoMu := o.repoMutex(repo)
 	lockCh := make(chan struct{})
 	go func() {
@@ -334,6 +335,9 @@ func (o *Orchestrator) acquireCommitLock(ctx context.Context, repo string) (func
 		close(lockCh)
 	}()
 	start := time.Now()
+	// The wait is recorded either way: a job cancelled while queued for the
+	// lock spent exactly that time on it.
+	defer func() { o.measLockWait(j, time.Since(start)) }()
 	select {
 	case <-lockCh:
 		if waited := time.Since(start); waited > 5*time.Second {
@@ -1627,7 +1631,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			// serialised, fully-propagated unit. Without this the cold-start burst
 			// races: many jobs commit content against a base whose parent dirs are
 			// not yet committed/propagated, all fail merge_error, and we do not retry.
-			unlockCommit, lockErr := o.acquireCommitLock(ctx, j.Repo)
+			unlockCommit, lockErr := o.acquireCommitLock(ctx, j)
 			if lockErr != nil {
 				span.RecordError(lockErr)
 				return o.abortJob(ctx, j, lockErr)
@@ -1756,7 +1760,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		// the per-repo commit lock here — still BEFORE Phase 3 lease acquisition,
 		// so FetchManifestRootHash sees the previous job's fully committed manifest.
 		if !commitLockHeld {
-			unlockCommit, lockErr := o.acquireCommitLock(ctx, j.Repo)
+			unlockCommit, lockErr := o.acquireCommitLock(ctx, j)
 			if lockErr != nil {
 				span.RecordError(lockErr)
 				return o.abortJob(ctx, j, lockErr)
@@ -1877,7 +1881,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		// one repository concurrently is the stale-root-hash race the lock
 		// exists to prevent.
 		if !commitLockHeld {
-			unlockCommit, lockErr := o.acquireCommitLock(ctx, j.Repo)
+			unlockCommit, lockErr := o.acquireCommitLock(ctx, j)
 			if lockErr != nil {
 				span.RecordError(lockErr)
 				return o.abortJob(ctx, j, lockErr)
