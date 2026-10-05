@@ -51,8 +51,10 @@ func TestPreCommitChecks(t *testing.T) {
 		published    string // hash in the published .meta.json ("" = none)
 		present      []string
 		ingest       bool
-		replace      bool
+		replace      bool // the node allows replacing
+		jobReplace   bool // the job asks for it
 		wantSkip     bool
+		wantReplace  bool
 		wantErr      bool
 		wantBaseUsed bool
 	}{
@@ -62,7 +64,20 @@ func TestPreCommitChecks(t *testing.T) {
 		{name: "no .meta.json to compare", path: pkg, id: pkg, idHash: "h1", present: []string{pkg}, wantErr: true},
 		{name: "identity not there yet", path: pkg, id: pkg},
 		{name: "no identity sent", path: pkg, present: []string{pkg}},
-		{name: "replace_on_conflict overwrites", path: pkg, id: pkg, present: []string{pkg}, replace: true},
+		{name: "another build's hash, replace asked and allowed", path: pkg, id: pkg, idHash: "h1", published: "h2",
+			present: []string{pkg}, replace: true, jobReplace: true, wantReplace: true},
+		{name: "no .meta.json is never replaced", path: pkg, id: pkg, idHash: "h1",
+			present: []string{pkg}, replace: true, jobReplace: true, wantErr: true},
+		{name: "same hash with replace still skips", path: pkg, id: pkg, idHash: "h1", published: "h1",
+			present: []string{pkg}, replace: true, jobReplace: true, wantSkip: true},
+		{name: "replace asked, node does not allow", path: pkg, id: pkg, idHash: "h1", published: "h2",
+			present: []string{pkg}, jobReplace: true, wantErr: true},
+		{name: "node allows, job did not ask", path: pkg, id: pkg, idHash: "h1", published: "h2",
+			present: []string{pkg}, replace: true, wantErr: true},
+		{name: "replace never for an identity below the path", path: mods, id: mods + "/6.36-1", idHash: "h1",
+			published: "h2", present: []string{mods + "/6.36-1"}, replace: true, jobReplace: true, wantErr: true},
+		{name: "node allows, no hash sent: presence still skips", path: pkg, id: pkg, present: []string{pkg},
+			replace: true, wantSkip: true},
 		{name: "new modulefile in an existing modules dir", path: mods, id: mods + "/6.36-1",
 			present: []string{mods, mods + "/.cvmfscatalog"}, ingest: true, wantBaseUsed: true},
 		{name: "existing plain directory keeps -c", path: mods, present: []string{mods}, ingest: true},
@@ -77,13 +92,15 @@ func TestPreCommitChecks(t *testing.T) {
 			o := replOrch(t, b, tc.replace)
 			stubExistsSet(t, tc.present...)
 			stubHash(t, tc.published, tc.published != "")
-			j := &job.Job{ID: "j", Repo: "r.example.org", Path: tc.path, IdentityPath: tc.id, IdentityHash: tc.idHash}
+			j := &job.Job{ID: "j", Repo: "r.example.org", Path: tc.path, IdentityPath: tc.id,
+				IdentityHash: tc.idHash, Replace: tc.jobReplace}
 			var req lease.CommitRequest
 
-			skip, err := o.preCommitChecks(context.Background(), j, &req, o.Obs.Logger)
-			if skip != tc.wantSkip || (err != nil) != tc.wantErr || req.BaseExists != tc.wantBaseUsed {
-				t.Errorf("skip=%v err=%v BaseExists=%v, want %v %v %v",
-					skip, err, req.BaseExists, tc.wantSkip, tc.wantErr, tc.wantBaseUsed)
+			skip, replace, err := o.preCommitChecks(context.Background(), j, &req, o.Obs.Logger)
+			if skip != tc.wantSkip || replace != tc.wantReplace || (err != nil) != tc.wantErr ||
+				req.BaseExists != tc.wantBaseUsed {
+				t.Errorf("skip=%v replace=%v err=%v BaseExists=%v, want %v %v %v %v",
+					skip, replace, err, req.BaseExists, tc.wantSkip, tc.wantReplace, tc.wantErr, tc.wantBaseUsed)
 			}
 		})
 	}
@@ -193,6 +210,118 @@ func TestSubmitJob_IdentityPath(t *testing.T) {
 			if err != nil || j.IdentityPath != tc.id {
 				t.Errorf("stored identity: %+v, %v", j, err)
 			}
+		}
+	}
+}
+
+// replace is accepted only for the job's own path, recognised by a hash, on a
+// node that allows it and a publish path that can delete a subtree.
+func TestSubmitJob_Replace(t *testing.T) {
+	const p = "x86_64-el9/pkg/1.0"
+	for _, tc := range []struct {
+		name     string
+		allowed  bool
+		canDel   bool
+		fields   map[string]string
+		want     int
+		stored   bool
+		wantText string
+	}{
+		{name: "own path with hash", allowed: true, canDel: true,
+			fields: map[string]string{"identity_path": p, "identity_hash": "h"}, want: http.StatusAccepted, stored: true},
+		{name: "node does not allow", canDel: true,
+			fields: map[string]string{"identity_path": p, "identity_hash": "h"}, want: http.StatusBadRequest,
+			wantText: "not enabled"},
+		{name: "no hash", allowed: true, canDel: true,
+			fields: map[string]string{"identity_path": p}, want: http.StatusBadRequest, wantText: "identity_hash"},
+		{name: "identity below the path", allowed: true, canDel: true,
+			fields: map[string]string{"identity_path": p + "/x", "identity_hash": "h"}, want: http.StatusBadRequest,
+			wantText: "identity_path equal to path"},
+		{name: "publish path cannot delete", allowed: true,
+			fields: map[string]string{"identity_path": p, "identity_hash": "h"}, want: http.StatusBadRequest,
+			wantText: "cannot replace"},
+		{name: "replace=false is ordinary", fields: map[string]string{"replace": "false"},
+			want: http.StatusAccepted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, sp, orch := newTestServer(t)
+			if tc.canDel {
+				orch.Lease = &replBackend{}
+			} else {
+				orch.Lease = &noopBackend{}
+			}
+			orch.ReplaceOnConflict = tc.allowed
+			orch.Stratum0URL = "http://stratum0.test"
+			stubExistsSet(t)
+			fields := map[string]string{"repo": "software.cern.ch", "path": p, "replace": "true"}
+			for k, v := range tc.fields {
+				fields[k] = v
+			}
+			rec := httptest.NewRecorder()
+			srv.submitJob(rec, newMultipartRequest(t, fields, []byte("payload")))
+			if rec.Code != tc.want || !strings.Contains(rec.Body.String(), tc.wantText) {
+				t.Fatalf("want %d with %q, got %d: %s", tc.want, tc.wantText, rec.Code, rec.Body.String())
+			}
+			if rec.Code != http.StatusAccepted {
+				return
+			}
+			var body struct {
+				JobID string `json:"job_id"`
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &body)
+			j := waitTerminal(t, sp, body.JobID)
+			if j.Replace != tc.stored {
+				t.Errorf("stored Replace = %v, want %v", j.Replace, tc.stored)
+			}
+		})
+	}
+}
+
+func TestHealth_AdvertisesReplaceAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		flag      bool
+		stratum0  string
+		wantAllow bool
+	}{
+		{true, "http://stratum0.test", true},
+		{true, "", false}, // nothing to read the published hash from
+		{false, "http://stratum0.test", false},
+	} {
+		srv, _, orch := newTestServer(t)
+		orch.ReplaceOnConflict, orch.Stratum0URL = tc.flag, tc.stratum0
+		rec := httptest.NewRecorder()
+		srv.health(rec, httptest.NewRequest("GET", "/api/v1/health", nil))
+		var body struct {
+			ReplaceAllowed bool `json:"replace_allowed"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.ReplaceAllowed != tc.wantAllow {
+			t.Errorf("flag=%v stratum0=%q: replace_allowed = %v, want %v",
+				tc.flag, tc.stratum0, body.ReplaceAllowed, tc.wantAllow)
+		}
+	}
+}
+
+// noDeleteHere has DeleteSubtree but says it cannot use it, like the staged
+// path on a node without the ingest path.
+type noDeleteHere struct{ replBackend }
+
+func (*noDeleteHere) CanDeleteSubtree() bool { return false }
+
+func TestCanReplaceOn(t *testing.T) {
+	for name, tc := range map[string]struct {
+		b    lease.Backend
+		want bool
+	}{
+		"deleter":                 {&replBackend{}, true},
+		"no DeleteSubtree":        {&noopBackend{}, false},
+		"deleter that cannot now": {&noDeleteHere{}, false},
+	} {
+		o, _ := minimalOrch(t, tc.b)
+		if got := o.canReplaceOn(""); got != tc.want {
+			t.Errorf("%s: canReplaceOn = %v, want %v", name, got, tc.want)
 		}
 	}
 }

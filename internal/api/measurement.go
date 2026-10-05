@@ -77,7 +77,7 @@ func (o *Orchestrator) measCommit(j *job.Job, d time.Duration) {
 }
 
 // measConflict notes that this publish hit an already published path, and
-// whether the remediation replaced it.
+// whether it was replaced.
 func (o *Orchestrator) measConflict(j *job.Job, replaced bool) {
 	if a := o.measFor(j); a != nil {
 		a.mu.Lock()

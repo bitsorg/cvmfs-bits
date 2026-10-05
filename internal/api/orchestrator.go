@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -145,17 +146,18 @@ type Orchestrator struct {
 	Measurements *measure.Writer
 	// measAcc holds the in-flight measurement per job id (map[string]*measAccum).
 	measAcc sync.Map
-	// ReplaceOnConflict authorises the orchestrator to REPLACE an already
-	// published path when a commit fails on it: confirm the conflict against
-	// the published catalogs, delete the existing subtree (the backend's
-	// DeleteSubtree, its own committed transaction), and retry the commit
-	// exactly once. What is destroyed: the published subtree at the job's
-	// path, and nothing else; what recreates it: the retried publish of this
-	// job's payload. Prior revisions still reference the old objects until GC.
+	// ReplaceOnConflict authorises the orchestrator to REPLACE what another
+	// build published at a job's path, for jobs that ask (job.Replace): when
+	// the published hash differs, delete the existing subtree (the backend's
+	// DeleteSubtree, its own committed transaction) and then commit. A failed
+	// commit never deletes anything.
+	// What is destroyed: the published subtree at the job's path, and nothing
+	// else; what recreates it: this job's payload. Prior revisions still
+	// reference the old objects until GC.
 	//
-	// Default false: a conflict then stays a terminal, clearly named error.
-	// This is deliberately an explicit switch — deletion of published state
-	// must never be a side effect nobody asked for.
+	// Default false: such a job then fails with a clearly named error. Both
+	// the node and the job must ask — deletion of published state must never
+	// be a side effect nobody asked for, and a shared root never qualifies.
 	ReplaceOnConflict bool
 
 	// PromoteWorkers is the concurrency of the staged path's server-side copy
@@ -456,6 +458,26 @@ func (o *Orchestrator) HasPublishPath(name string) bool {
 	}
 	b, ok := o.PublishPaths[name]
 	return ok && b != nil
+}
+
+// ReplaceAllowed reports whether jobs may ask to replace content another
+// build published: the node opted in (replace_on_conflict) and can read the
+// published hashes that decide it.
+func (o *Orchestrator) ReplaceAllowed() bool {
+	return o.ReplaceOnConflict && o.Stratum0URL != ""
+}
+
+// canReplaceOn reports whether a publish path's backend can delete a subtree
+// in this deployment.
+func (o *Orchestrator) canReplaceOn(name string) bool {
+	b := o.leaseFor(&job.Job{PublishPath: name})
+	if _, ok := b.(subtreeDeleter); !ok {
+		return false
+	}
+	if c, ok := b.(interface{ CanDeleteSubtree() bool }); ok {
+		return c.CanDeleteSubtree()
+	}
+	return true
 }
 
 // CoarseSupported reports whether this deployment can accumulate coarse
@@ -2092,10 +2114,19 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	leaseCancel()     // release leaseCtx resources early; Commit uses the parent ctx
 
 	// Holding the repository's slot here, so every earlier commit has landed.
-	skip, preErr := o.preCommitChecks(ctx, j, &req, logger)
+	skip, replace, preErr := o.preCommitChecks(ctx, j, &req, logger)
+	if preErr == nil && replace {
+		preErr = o.replaceFirst(ctx, j, &req, logger)
+	}
 	if preErr != nil || skip {
-		if abErr := o.abortLeaseDetachedErr(j, token); abErr != nil {
-			logger.Warn("releasing the unused lease failed", "error", abErr)
+		held := token
+		if replace { // replaceFirst released that one and may hold a new one
+			held = j.LeaseToken
+		}
+		if held != "" {
+			if abErr := o.abortLeaseDetachedErr(j, held); abErr != nil {
+				logger.Warn("releasing the unused lease failed", "error", abErr)
+			}
 		}
 		j.LeaseToken = ""
 		if o.GatewayQueue != nil {
@@ -2139,52 +2170,38 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 				"hint", "mount "+filepath.Join(o.CVMFSMount, j.Repo))
 			// Fall through to provenance + StatePublished.
 		} else {
-			// Conflict remediation (replace_on_conflict): a conflict-shaped
-			// failure on a confirmed-occupied path may delete the existing
-			// subtree and retry the commit ONCE. attempted=false means the
-			// remediation did not apply (flag off, not a conflict, path not
-			// occupied, or the backend cannot delete) and the original error
-			// continues below unchanged.
-			attempted, remErr := o.replaceOnConflict(ctx, j, &req, commitErr, logger)
-			if attempted {
-				if remErr != nil {
-					span.RecordError(remErr)
-					logger.Error("conflict replacement failed", "error", remErr)
-					return o.abortJob(ctx, j, remErr)
+			// Replacement is decided before the commit (preCommitChecks), on
+			// the published hash; a failed commit never deletes anything.
+			//
+			// A DirectGraft commit is rejected with a generic "merge_error" when
+			// the target subtree already exists (receiver TryGraftNestedCatalog →
+			// "invalid attempt to graft nested catalog into existing directory").
+			// Confirm against the published catalog and surface a clear, terminal
+			// "already published" error instead of the cryptic gateway reason —
+			// a package/version publishes once and is never retried.
+			if o.Stratum0URL != "" && j.Path != "" &&
+				strings.Contains(commitErr.Error(), "merge_error") {
+				if exists, exErr := cvmfscatalog.PathExists(ctx, nil, o.Stratum0URL, j.Repo, j.Path); exErr == nil && exists {
+					clearErr := Classify(ErrClassPermanent, fmt.Errorf(
+						"already published: %s/%s already exists in the repository and "+
+							"was not replaced: replacement happens only before the commit, "+
+							"when the published hash is readable and differs, for a job that "+
+							"sends replace on a node with replace_on_conflict",
+						j.Repo, j.Path))
+					span.RecordError(clearErr)
+					logger.Error("commit rejected: target already published",
+						"repo", j.Repo, "path", j.Path)
+					return o.abortJob(ctx, j, clearErr)
 				}
-				commitErr = nil // replaced; continue to provenance + StatePublished
-			} else {
-				// A DirectGraft commit is rejected with a generic "merge_error" when
-				// the target subtree already exists (receiver TryGraftNestedCatalog →
-				// "invalid attempt to graft nested catalog into existing directory").
-				// Confirm against the published catalog and surface a clear, terminal
-				// "already published" error instead of the cryptic gateway reason —
-				// a package/version publishes once and is never retried.
-				if o.Stratum0URL != "" && j.Path != "" &&
-					strings.Contains(commitErr.Error(), "merge_error") {
-					if exists, exErr := cvmfscatalog.PathExists(ctx, nil, o.Stratum0URL, j.Repo, j.Path); exErr == nil && exists {
-						// Deliberately does NOT say "replace_on_conflict off":
-						// this is also reached with the flag ON when the publish
-						// path cannot delete a subtree, or when the remediation's
-						// own existence check was inconclusive. The Info/Warn
-						// logged by replaceOnConflict says which.
-						clearErr := Classify(ErrClassPermanent, fmt.Errorf(
-							"already published: %s/%s already exists in the repository; "+
-								"a package/version publishes once, and it was not replaced "+
-								"(replacement is off, unsupported on this publish path, or "+
-								"was not applicable — see the preceding log lines)",
-							j.Repo, j.Path))
-						span.RecordError(clearErr)
-						logger.Error("commit rejected: target already published",
-							"repo", j.Repo, "path", j.Path)
-						return o.abortJob(ctx, j, clearErr)
-					}
-				}
-				span.RecordError(commitErr)
-				logger.Error("commit failed", "error", commitErr)
-				return o.abortJob(ctx, j, commitErr)
 			}
+			span.RecordError(commitErr)
+			logger.Error("commit failed", "error", commitErr)
+			return o.abortJob(ctx, j, commitErr)
 		}
+	}
+	if replace {
+		o.measConflict(j, true)
+		logger.Info("replaced", "repo", j.Repo, "path", j.Path)
 	}
 	o.Obs.Metrics.JobPhaseDuration.WithLabelValues("commit").Observe(time.Since(commitPhaseStart).Seconds())
 	o.measCommit(j, time.Since(commitPhaseStart))
@@ -2417,23 +2434,23 @@ func (o *Orchestrator) webhookPublished(j *job.Job) {
 
 // preCommitChecks looks at the published catalogs just before a commit, with
 // the repository's slot held so they reflect every earlier commit. It returns
-// true when the job's identity is already published -- a rerun queued behind
-// the original, which committing would only fail on the existing entries --
-// and an error when it is published by a different build (IdentityHash does
-// not match), which must not pass as this one. Otherwise it sets
-// req.BaseExists for the ingest path. Lookup failures leave things as they
-// were: commit, and ask for the nested catalog.
-func (o *Orchestrator) preCommitChecks(ctx context.Context, j *job.Job, req *lease.CommitRequest, logger *slog.Logger) (bool, error) {
+// skip when the job's identity is already published -- a rerun queued behind
+// the original, which committing would only fail on the existing entries.
+// When another build published there (IdentityHash does not match) it
+// returns replace if the job asked for it and the node allows it, and an
+// error otherwise, so another build's content never passes as this one.
+// Otherwise it sets req.BaseExists for the ingest path. Lookup failures leave
+// things as they were: commit, and ask for the nested catalog.
+func (o *Orchestrator) preCommitChecks(ctx context.Context, j *job.Job, req *lease.CommitRequest, logger *slog.Logger) (skip, replace bool, err error) {
 	if o.Stratum0URL == "" {
-		return false, nil
+		return false, false, nil
 	}
-	// Not with replace_on_conflict, whose point is to overwrite.
-	if j.IdentityPath != "" && !o.ReplaceOnConflict {
-		exists, err := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, j.IdentityPath)
+	if j.IdentityPath != "" {
+		exists, exErr := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, j.IdentityPath)
 		switch {
-		case err != nil:
+		case exErr != nil:
 			logger.Warn("identity check failed — committing anyway",
-				"identity_path", j.IdentityPath, "error", err)
+				"identity_path", j.IdentityPath, "error", exErr)
 		case exists && j.IdentityHash != "":
 			got, found, herr := publishedHashFn(ctx, o.Stratum0URL, j.Repo, j.IdentityPath)
 			if herr != nil {
@@ -2441,27 +2458,45 @@ func (o *Orchestrator) preCommitChecks(ctx context.Context, j *job.Job, req *lea
 					"identity_path", j.IdentityPath, "error", herr)
 				break
 			}
-			if !found || got != j.IdentityHash {
-				return false, Classify(ErrClassPermanent, fmt.Errorf("%s is already published by another build "+
-					"(hash %q, this job %q); not overwriting it", j.IdentityPath, got, j.IdentityHash))
+			if found && got == j.IdentityHash {
+				logger.Info("already published since submission — skipping the commit",
+					"identity_path", j.IdentityPath)
+				return true, false, nil
 			}
-			logger.Info("already published since submission — skipping the commit",
-				"identity_path", j.IdentityPath)
-			return true, nil
+			// Only content recognisably another build's: a readable, different
+			// hash. No hash there (a shared root, no .meta.json) never qualifies.
+			if found && got != "" && o.replaces(j) {
+				logger.Warn("published by another build — replacing it",
+					"path", j.Path, "published_hash", got, "job_hash", j.IdentityHash)
+				return false, true, nil
+			}
+			return false, false, Classify(ErrClassPermanent, fmt.Errorf("%s is already published by another build "+
+				"(hash %q, this job %q); not overwriting it (needs replace on the job and "+
+				"replace_on_conflict on the node)", j.IdentityPath, got, j.IdentityHash))
 		case exists:
 			logger.Info("already published since submission — skipping the commit",
 				"identity_path", j.IdentityPath)
-			return true, nil
+			return true, false, nil
 		}
 	}
 	// The exact entry a second nested catalog would collide with.
 	if _, ingest := o.leaseFor(j).(*lease.IngestBackend); ingest && j.Path != "" {
 		marker := strings.TrimSuffix(j.Path, "/") + "/.cvmfscatalog"
-		if exists, err := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, marker); err == nil {
+		if exists, exErr := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, marker); exErr == nil {
 			req.BaseExists = exists
 		}
 	}
-	return false, nil
+	return false, false, nil
+}
+
+// replaces reports whether j may replace what is published at its path: the
+// node allows it, the job asked, and its identity is its own path with a
+// hash, so only content recognisably another build's is ever replaced.
+// Submission enforces the same; this keeps a spooled job from older code honest.
+func (o *Orchestrator) replaces(j *job.Job) bool {
+	return o.ReplaceAllowed() && j.Replace && j.IdentityHash != "" &&
+		strings.Trim(j.Path, "/") != "" &&
+		path.Clean(j.IdentityPath) == path.Clean(j.Path)
 }
 
 // publishedHashFn is a test seam for the published package hash.
@@ -2490,131 +2525,92 @@ func publishedPackageHash(ctx context.Context, stratum0URL, repo, p string) (str
 // catalogs on stratum0.
 var pathExistsFn = cvmfscatalog.PathExists
 
-// subtreeDeleter is the capability replaceOnConflict needs from a publish
+// subtreeDeleter is the capability replaceFirst needs from a publish
 // backend: remove a published subtree in a committed transaction of its own.
-// A backend without it leaves conflicts as terminal errors.
+// A backend without it cannot replace.
 //
-// Implementing this is NOT just about being able to delete. The remediation
-// retries by calling Commit with the same CommitRequest, so a backend may
-// only implement it when all three hold — today they hold for IngestBackend
-// and StagedBackend:
+// Implementing this is NOT just about being able to delete. The commit after
+// the delete uses the CommitRequest built before it, under a fresh lease, so
+// a backend may only implement it when all three hold — today they hold for
+// IngestBackend and StagedBackend:
 //
-//  1. Commit is self-contained: no catalog/objects were uploaded in an
-//     earlier phase that a plain Commit retry would omit. Ingest re-ingests
-//     the spool tar; the staged retry re-grafts objects already promoted into
-//     the store, so both republish in full.
-//  2. Heartbeat is a no-op: the remediation does not restart one, so a
-//     backend holding a renewable lease would retry unattended. The staged
-//     path's heartbeat is already cancelled before the commit.
+//  1. Commit is self-contained: no catalog/objects were uploaded under the
+//     released lease that the commit would omit. Ingest ingests the spool
+//     tar; the staged commit grafts objects already promoted into the store.
+//  2. Heartbeat is a no-op by then: none is restarted for the fresh lease.
+//     Run cancels the heartbeat before preCommitChecks.
 //  3. Commit does not depend on OldRootHash: the delete advances the
 //     repository root, so any root read before it is stale — and the graft
 //     does NOT enforce old_root_hash (proven on the testbed), so the stale
-//     value the retry still carries is harmless.
+//     value the request still carries is harmless.
 type subtreeDeleter interface {
 	DeleteSubtree(ctx context.Context, repo, relPath string) error
 }
 
-// replaceOnConflict applies the replace_on_conflict policy to a failed commit:
-// if the failure is conflict-shaped, the path is CONFIRMED occupied in the
-// published catalogs, the deployment opted in, and the backend can delete —
-// then delete the existing subtree and retry the commit exactly once.
-//
-// Returns (false, nil) when the remediation does not apply: the caller must
-// then treat the original commit error as before. Returns (true, nil) when the
-// path was replaced and the retried commit succeeded; (true, err) when
-// remediation was attempted and failed — err carries the whole story and the
-// job must abort with it.
+// replaceFirst deletes the subtree another build published at j's path, so
+// that the commit that follows publishes this job's content in its place
+// instead of failing on it. preCommitChecks decided it: the published hash
+// differs, the job asked, the node allows.
 //
 // Ordering guarantees: the caller holds the per-repo commit serialisation
 // lock, so no other job of this repository can interleave between the delete
-// and the retry. The window in which the path does not exist is nevertheless
-// real (two revisions), and is the documented cost of the policy.
-func (o *Orchestrator) replaceOnConflict(ctx context.Context, j *job.Job,
-	req *lease.CommitRequest, commitErr error, logger *slog.Logger) (bool, error) {
-	if !o.ReplaceOnConflict || j.Path == "" || o.Stratum0URL == "" {
-		return false, nil
-	}
-	// Conflict-shaped only: the producer-side UNIQUE constraint abort
-	// (tar-based paths) or the receiver's graft refusal (staged path). Any
-	// other failure — network, spool, gateway — must never trigger deletion.
-	msg := commitErr.Error()
-	if !strings.Contains(msg, "UNIQUE constraint") &&
-		!strings.Contains(msg, "merge_error") {
-		return false, nil
-	}
+// and the commit. The path is nevertheless absent for one revision, the
+// documented cost of replacing.
+func (o *Orchestrator) replaceFirst(ctx context.Context, j *job.Job,
+	req *lease.CommitRequest, logger *slog.Logger) error {
 	backend := o.leaseFor(j)
 	deleter, ok := backend.(subtreeDeleter)
 	if !ok {
-		logger.Info("replace_on_conflict: conflict-shaped failure, but this "+
-			"publish path cannot delete a subtree — leaving the error terminal",
-			"path", j.Path, "publish_path", j.PublishPath)
-		return false, nil
+		return o.cannotReplace(j, nil)
 	}
-	// Confirm against the published catalogs. The error string alone is not
-	// evidence; the walk is. An inconclusive walk means no deletion.
-	exists, exErr := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, j.Path)
-	if exErr != nil {
-		logger.Warn("replace_on_conflict: existence check failed — not replacing",
-			"repo", j.Repo, "path", j.Path, "error", exErr)
-		return false, nil
-	}
-	if !exists {
-		return false, nil
-	}
-
-	o.measConflict(j, false) // confirmed occupied; replaced only if the retry lands
-	logger.Warn("replace_on_conflict: path already published — deleting the "+
-		"existing subtree and retrying the commit once",
+	o.measConflict(j, false) // replaced only once the commit lands
+	logger.Warn("deleting the subtree another build published, before the commit",
 		"repo", j.Repo, "path", j.Path,
 		"destroys", "the published subtree at this path only; prior revisions "+
 			"keep their objects until GC")
-	// Release the job's lease before deleting. A failed staged graft returns
-	// merge_error WITHOUT releasing its gateway lease (StagedBackend.Commit ->
-	// CommitFinalizeOnly), and DeleteSubtree acquires a gateway lease on the
-	// same path, so a still-open lease makes the delete fail path_busy
-	// (seen on the testbed). On the ingest path Commit already freed the slot and
-	// IngestBackend.Abort is an idempotent no-op, so this is safe there too.
+	// Release the job's lease before deleting: the delete takes the
+	// repository's slot (ingest, `cvmfs_server ingest -f`) or a gateway lease
+	// on the same path (staged), which a lease still held would block. The
+	// commit lock keeps the repository to this job meanwhile.
 	if j.LeaseToken != "" {
 		if relErr := backend.Abort(ctx, j.LeaseToken); relErr != nil {
-			return true, fmt.Errorf("replace_on_conflict: could not release the "+
-				"conflicting lease on %s/%s before deleting the subtree: %w",
-				j.Repo, j.Path, relErr)
+			return fmt.Errorf("replace: could not release the lease on %s/%s "+
+				"before deleting the subtree: %w", j.Repo, j.Path, relErr)
 		}
 		j.LeaseToken = ""
 	}
 	if delErr := deleter.DeleteSubtree(ctx, j.Repo, j.Path); delErr != nil {
 		// A backend that implements the method but cannot do the work in this
-		// deployment declines exactly as one without the method does. The
-		// staged path is such a backend: it borrows the capability from the
-		// ingest path, which may not be enabled.
+		// deployment (the staged path without the ingest path) declines.
 		if errors.Is(delErr, lease.ErrSubtreeDeleteUnsupported) {
-			logger.Info("replace_on_conflict: conflict-shaped failure, but this "+
-				"deployment cannot delete a subtree — leaving the error terminal",
-				"path", j.Path, "publish_path", j.PublishPath, "reason", delErr)
-			return false, nil
+			return o.cannotReplace(j, delErr)
 		}
-		return true, fmt.Errorf("replace_on_conflict: commit failed on occupied "+
-			"path %s/%s (%v); deleting the existing subtree then also failed: %w",
-			j.Repo, j.Path, commitErr, delErr)
+		return fmt.Errorf("replace: deleting the subtree another build published "+
+			"at %s/%s failed: %w", j.Repo, j.Path, delErr)
 	}
 	token, acqErr := backend.Acquire(ctx, j.Repo, j.Path)
 	if acqErr != nil {
-		return true, fmt.Errorf("replace_on_conflict: subtree %s/%s deleted, but "+
-			"re-acquiring for the retry failed — the path is now ABSENT until "+
-			"republished: %w", j.Repo, j.Path, acqErr)
+		return fmt.Errorf("replace: subtree %s/%s deleted, but re-acquiring for "+
+			"the commit failed — the path is now ABSENT until republished: %w",
+			j.Repo, j.Path, acqErr)
 	}
 	j.LeaseToken = token
 	req.Token = token
-	logger.Info("replace_on_conflict: retrying the commit",
-		"repo", j.Repo, "path", j.Path)
-	if retryErr := backend.Commit(ctx, *req); retryErr != nil {
-		return true, fmt.Errorf("replace_on_conflict: subtree %s/%s deleted, but "+
-			"the retried commit failed — the path is now ABSENT until "+
-			"republished: %w", j.Repo, j.Path, retryErr)
+	// The subtree, and with it its nested catalog, is gone: ask for a new one.
+	req.BaseExists = false
+	return nil
+}
+
+// cannotReplace is the permanent failure of a job whose publish path cannot
+// delete a subtree here; nothing was deleted.
+func (o *Orchestrator) cannotReplace(j *job.Job, cause error) error {
+	err := fmt.Errorf("%s/%s is published by another build and replace was "+
+		"requested, but publish path %q cannot delete a subtree here",
+		j.Repo, j.Path, j.PublishPath)
+	if cause != nil {
+		err = fmt.Errorf("%w: %w", err, cause)
 	}
-	o.measConflict(j, true)
-	logger.Info("replace_on_conflict: replaced", "repo", j.Repo, "path", j.Path)
-	return true, nil
+	return Classify(ErrClassPermanent, err)
 }
 
 // abortJob ends a failed attempt. A retryable failure within the retry window

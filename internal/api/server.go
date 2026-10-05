@@ -285,6 +285,24 @@ func (s *Server) SetAllowedPublishPrefixes(prefixes []string) {
 	s.allowedPublishPrefixes = out
 }
 
+// validateReplace accepts replace only where it can mean one thing: the
+// job's own path, on a node that allows replacing. What is then replaced is
+// decided at commit time, by a readable published hash that differs from
+// identity_hash; a shared root (a view, a modules directory) has none.
+func (s *Server) validateReplace(finalize bool, subPath, identity, hash string) error {
+	switch {
+	case s.orch == nil || !s.orch.ReplaceAllowed():
+		return fmt.Errorf("replace is not enabled on this prepub (replace_on_conflict)")
+	case finalize:
+		return fmt.Errorf("replace does not apply to a finalize job")
+	case strings.Trim(subPath, "/") == "":
+		return fmt.Errorf("replace never applies to the repository root")
+	case identity == "" || path.Clean(identity) != path.Clean(subPath) || hash == "":
+		return fmt.Errorf("replace requires identity_path equal to path and an identity_hash")
+	}
+	return nil
+}
+
 // validateIdentityPath accepts an empty identity, or one at or under the job's
 // path: a job may only claim to be satisfied by content inside its own lease.
 func validateIdentityPath(subPath, identity string) error {
@@ -767,6 +785,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		preWarm                   *bool    // optional: nil = not requested
 		identityPath              string   // optional: see job.IdentityPath
 		identityHash              string   // optional: see job.IdentityHash
+		replace                   bool     // optional: see job.Replace
 	)
 
 	jobID := uuid.New().String()
@@ -1152,6 +1171,15 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 			preWarm = &v
 		}
+		if raw := field("replace"); raw != "" {
+			v, convErr := strconv.ParseBool(strings.TrimSpace(raw))
+			if convErr != nil {
+				os.RemoveAll(jobDir)
+				http.Error(w, `{"error":"replace must be a boolean"}`, http.StatusBadRequest)
+				return
+			}
+			replace = v
+		}
 
 		if repo == "" {
 			os.RemoveAll(jobDir)
@@ -1247,6 +1275,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if replace {
+		if err := s.validateReplace(finalize, subPath, identityPath, identityHash); err != nil {
+			os.RemoveAll(jobDir)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+	}
 
 	// Containment: a payload job must publish inside this deployment's authorized
 	// CVMFS namespace. Finalize carries no path and only commits packages that
@@ -1271,6 +1306,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":"publish path %q is not configured on this prepub (available: %s)"}`,
 			jsonEscape(publishPath), jsonEscape(strings.Join(s.orch.PublishPathNames(), ", "))),
 			http.StatusBadRequest)
+		return
+	}
+	if replace && !s.orch.canReplaceOn(publishPath) {
+		os.RemoveAll(jobDir)
+		http.Error(w, fmt.Sprintf(`{"error":"publish path %q cannot replace published content; use ingest"}`,
+			jsonEscape(publishPath)), http.StatusBadRequest)
 		return
 	}
 	// direct_s3 is a property of the ingest path: it becomes --direct-s3 on
@@ -1493,6 +1534,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		j.IdentityPath = path.Clean(identityPath)
 		j.IdentityHash = identityHash
 	}
+	j.Replace = replace
 
 	// Record the original filename and size for the console tooltip.
 	// Use Stat on the spool copy since the original may have been moved.
@@ -2457,6 +2499,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		// MaxTarSize lets a producer refuse an oversized package itself
 		// instead of uploading it to be cut off.
 		MaxTarSize int64 `json:"max_tar_size"`
+		// ReplaceAllowed lets a producer refuse a package another build
+		// published before uploading it, when this node cannot replace it.
+		ReplaceAllowed bool `json:"replace_allowed"`
 		// ReplayCache surfaces the fail-closed counter: a non-zero
 		// rejected_full means signed requests are being refused for capacity
 		// reasons, which looks like an auth problem from the client side and
@@ -2471,6 +2516,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if s.orch != nil {
 		body.PublishPaths = s.orch.PublishPathNames()
 		body.FinalizeReady = s.orch.IngestConfigPrefix != "" && s.orch.CoarseSupported()
+		body.ReplaceAllowed = s.orch.ReplaceAllowed()
 	}
 
 	w.Header().Set("Content-Type", "application/json")

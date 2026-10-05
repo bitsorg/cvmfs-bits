@@ -80,9 +80,9 @@ type fileConfig struct {
 	IngestPublish      *bool  `yaml:"ingest_publish"`
 	IngestPublishOwner string `yaml:"ingest_publish_owner"`
 
-	// ReplaceOnConflict lets a commit that fails on an already published path
-	// delete the existing subtree and retry once (--replace-on-conflict).
-	// Destructive by design, so it is opt-in and defaults to off.
+	// ReplaceOnConflict lets a job that asks for it replace what another build
+	// published at its path (--replace-on-conflict). Destructive by design, so
+	// it is opt-in, defaults to off, and never applies to a job that did not ask.
 	ReplaceOnConflict *bool `yaml:"replace_on_conflict"`
 	// PreWarm makes Stratum 1 pre-warming available (--prewarm); jobs opt in.
 	PreWarm *bool `yaml:"prewarm"`

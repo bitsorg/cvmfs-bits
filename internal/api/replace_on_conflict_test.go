@@ -19,10 +19,8 @@ import (
 
 // realConflictErr reproduces (trimmed, otherwise verbatim) the commit error
 // observed on the testbed on 2026-08-15 — prepub log, jobs e0adbb19 and the
-// 170-job re-runs of 12:52Z and 16:2xZ. The remediation keys on the UNIQUE
-// constraint marker inside it, so the test must use the real shape, not a
-// convenient sentinel: a fake that diverges from the system it fakes hides
-// exactly this kind of bug.
+// 170-job re-runs of 12:52Z and 16:2xZ. It is the commit failure after which
+// nothing may be deleted, in its real shape rather than a convenient sentinel.
 var realConflictErr = errors.New(`cvmfs_server ingest into "el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3": exit status 1 (output: terminate called after throwing an instance of 'ECvmfsException'
   what():  PANIC: cvmfs/catalog_rw.cc : 168
 failed to add '/el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3/lib64/libgomp.so' (parent '/el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3') to catalog '/el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3': UNIQUE constraint failed: catalog.md5path_1, catalog.md5path_2
@@ -30,12 +28,12 @@ Aborted (core dumped)
 Synchronization failed)`)
 
 // replBackend implements lease.Backend plus DeleteSubtree, recording the call
-// order the remediation makes.
+// order the replacement makes.
 type replBackend struct {
 	calls      []string
 	deleteErr  error
 	acquireErr error
-	commitErr  error // returned by Commit (the RETRY commit in these tests)
+	commitErr  error // returned by Commit
 	abortErr   error // returned by Abort (the pre-delete lease release)
 }
 
@@ -69,9 +67,6 @@ func (b *replBackend) DeleteSubtree(_ context.Context, repo, rel string) error {
 	return b.deleteErr
 }
 
-// plainBackend is a lease.Backend that can NOT delete a subtree.
-type plainBackend struct{ replBackend }
-
 // stubPathExists swaps the package seam, restoring the ORIGINAL on cleanup
 // (captured before the swap — capturing after restores the stub itself, a bug
 // this repo has met before).
@@ -93,184 +88,67 @@ func replOrch(t *testing.T, b lease.Backend, flagOn bool) *Orchestrator {
 }
 
 func replJob() *job.Job {
-	return &job.Job{ID: "j1", Repo: "test-repo.example.com",
-		Path: "el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3"}
+	const p = "el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3"
+	return &job.Job{ID: "j1", Repo: "test-repo.example.com", Path: p,
+		IdentityPath: p, IdentityHash: "this-build", Replace: true}
 }
 
-func TestReplaceOnConflict_ReplacesAndRetriesOnce(t *testing.T) {
+// The open lease is released BEFORE the delete: the delete takes the
+// repository's slot (ingest) or a gateway lease on the same path (staged), so
+// a lease still held would block it. Then a fresh lease for the commit, and a
+// new nested catalog, since the old one went with the subtree.
+//
+// NEGATIVE CONTROL: remove the pre-delete Abort in replaceFirst and this
+// fails — "abort" no longer precedes "delete" in the recorded call order.
+func TestReplaceFirst_ReleasesDeletesAndReacquires(t *testing.T) {
 	b := &replBackend{}
 	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
-	req := &lease.CommitRequest{Token: "orig-token"}
+	j := replJob()
+	j.LeaseToken = "orig-lease"
+	req := &lease.CommitRequest{Token: "orig-lease", BaseExists: true}
 
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(), req,
-		realConflictErr, o.Obs.Logger)
-	if !attempted || err != nil {
-		t.Fatalf("want (true, nil), got (%v, %v)", attempted, err)
+	if err := o.replaceFirst(context.Background(), j, req, o.Obs.Logger); err != nil {
+		t.Fatalf("replaceFirst: %v", err)
 	}
 	want := []string{
+		"abort:orig-lease",
 		"delete:el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3",
 		"acquire",
-		"commit:retry-token",
 	}
 	if strings.Join(b.calls, "|") != strings.Join(want, "|") {
 		t.Errorf("call order = %v, want %v", b.calls, want)
 	}
-	if req.Token != "retry-token" {
-		t.Errorf("req.Token = %q — the retry must not reuse the released token", req.Token)
+	if j.LeaseToken != "retry-token" || req.Token != "retry-token" {
+		t.Errorf("tokens job=%q req=%q, want the re-acquired one", j.LeaseToken, req.Token)
+	}
+	if req.BaseExists {
+		t.Error("BaseExists still true: the commit must create the nested catalog again")
 	}
 }
 
-// A real conflict arrives with the job's lease still OPEN: the staged graft
-// path returns merge_error without releasing it (seen on the testbed). The
-// remediation must release that lease BEFORE DeleteSubtree, because the delete
-// (cvmfs_server ingest -f) acquires a gateway lease on the same path and would
-// otherwise fail path_busy.
-//
-// NEGATIVE CONTROL: remove the pre-delete Abort in replaceOnConflict and this
-// fails — "abort" no longer precedes "delete" in the recorded call order.
-func TestReplaceOnConflict_ReleasesTheOpenLeaseBeforeDeleting(t *testing.T) {
-	b := &replBackend{}
-	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
-	j := replJob()
-	j.LeaseToken = "orig-lease" // the still-open lease from the failed commit
-	req := &lease.CommitRequest{Token: "orig-token"}
-
-	attempted, err := o.replaceOnConflict(context.Background(), j, req,
-		realConflictErr, o.Obs.Logger)
-	if !attempted || err != nil {
-		t.Fatalf("want (true, nil), got (%v, %v)", attempted, err)
-	}
-	want := []string{
-		"abort:orig-lease", // the still-open lease, by its token, released first
-		"delete:el9-x86_64/Packages/GCC-Toolchain/v14.2.0-alice2-3",
-		"acquire",
-		"commit:retry-token",
-	}
-	if strings.Join(b.calls, "|") != strings.Join(want, "|") {
-		t.Errorf("call order = %v, want the lease released before the delete: %v",
-			b.calls, want)
-	}
-	if j.LeaseToken != "retry-token" {
-		t.Errorf("LeaseToken = %q, want the re-acquired token", j.LeaseToken)
-	}
-}
-
-// If the conflicting lease cannot be released, the delete would fail path_busy
-// anyway: fail fast with a legible error and do NOT delete a subtree we cannot
-// then republish.
-//
-// NEGATIVE CONTROL: make the pre-delete Abort ignore its error and this fails —
-// "delete" appears and the remediation returns (true, nil).
-func TestReplaceOnConflict_LeaseReleaseFailureAbortsBeforeDeleting(t *testing.T) {
+// If the lease cannot be released, the delete would be blocked anyway: fail
+// with a legible error and do NOT delete a subtree we cannot then republish.
+// The token is kept so the release can be retried.
+func TestReplaceFirst_LeaseReleaseFailureDoesNotDelete(t *testing.T) {
 	b := &replBackend{abortErr: errors.New("gateway: 503 releasing lease")}
 	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
 	j := replJob()
 	j.LeaseToken = "orig-lease"
 
-	attempted, err := o.replaceOnConflict(context.Background(), j,
-		&lease.CommitRequest{Token: "orig-token"}, realConflictErr, o.Obs.Logger)
-	if !attempted || err == nil {
-		t.Fatalf("want (true, err), got (%v, %v)", attempted, err)
+	if err := o.replaceFirst(context.Background(), j, &lease.CommitRequest{}, o.Obs.Logger); err == nil {
+		t.Fatal("want an error")
 	}
 	if strings.Contains(strings.Join(b.calls, "|"), "delete") {
-		t.Errorf("the subtree was deleted despite a failed lease release: %v", b.calls)
+		t.Errorf("deleted despite a failed lease release: %v", b.calls)
 	}
-	// The token must be RETAINED so abortJob can retry the release; clearing it
-	// on a failed Abort would leak the lease until it expires.
 	if j.LeaseToken != "orig-lease" {
 		t.Errorf("LeaseToken = %q, want it retained after a failed release", j.LeaseToken)
 	}
 }
 
-// NEGATIVE CONTROL: with the flag off nothing is deleted and nothing retried,
-// whatever the error looks like. Remove the flag check from replaceOnConflict
-// and this fails.
-func TestReplaceOnConflict_FlagOffDoesNothing(t *testing.T) {
-	b := &replBackend{}
-	o := replOrch(t, b, false)
-	stubPathExists(t, true, nil)
-
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-		&lease.CommitRequest{}, realConflictErr, o.Obs.Logger)
-	if attempted || err != nil {
-		t.Fatalf("want (false, nil), got (%v, %v)", attempted, err)
-	}
-	if len(b.calls) != 0 {
-		t.Errorf("backend was touched with the flag off: %v", b.calls)
-	}
-}
-
-// NEGATIVE CONTROL: a failure that is not conflict-shaped must never delete,
-// even with the flag on and the path genuinely occupied — network and spool
-// errors are not licences to destroy published state.
-func TestReplaceOnConflict_NonConflictErrorDoesNothing(t *testing.T) {
-	b := &replBackend{}
-	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
-
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-		&lease.CommitRequest{}, errors.New("gateway: connection refused"),
-		o.Obs.Logger)
-	if attempted || err != nil {
-		t.Fatalf("want (false, nil), got (%v, %v)", attempted, err)
-	}
-	if len(b.calls) != 0 {
-		t.Errorf("backend was touched for a non-conflict error: %v", b.calls)
-	}
-}
-
-// The error string alone is not evidence: when the published catalogs do NOT
-// have the path, or cannot answer, no deletion happens and the original error
-// stands.
-func TestReplaceOnConflict_UnconfirmedPathDoesNothing(t *testing.T) {
-	for name, tc := range map[string]struct {
-		exists bool
-		err    error
-	}{
-		"absent":       {exists: false, err: nil},
-		"inconclusive": {exists: false, err: errors.New("stratum0 unreachable")},
-	} {
-		t.Run(name, func(t *testing.T) {
-			b := &replBackend{}
-			o := replOrch(t, b, true)
-			stubPathExists(t, tc.exists, tc.err)
-
-			attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-				&lease.CommitRequest{}, realConflictErr, o.Obs.Logger)
-			if attempted || err != nil {
-				t.Fatalf("want (false, nil), got (%v, %v)", attempted, err)
-			}
-			if len(b.calls) != 0 {
-				t.Errorf("backend was touched: %v", b.calls)
-			}
-		})
-	}
-}
-
-func TestReplaceOnConflict_BackendWithoutDeleteLeavesErrorTerminal(t *testing.T) {
-	b := &plainBackend{}
-	// Hand the orchestrator ONLY the lease.Backend surface: a type assertion
-	// inside replaceOnConflict must not find DeleteSubtree.
-	var iface lease.Backend = backendOnly{b}
-	o := replOrch(t, iface, true)
-	stubPathExists(t, true, nil)
-
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-		&lease.CommitRequest{}, realConflictErr, o.Obs.Logger)
-	if attempted || err != nil {
-		t.Fatalf("want (false, nil), got (%v, %v)", attempted, err)
-	}
-	if len(b.calls) != 0 {
-		t.Errorf("backend was touched: %v", b.calls)
-	}
-}
-
 // backendOnly hides every method except the lease.Backend interface, so the
 // embedded type's DeleteSubtree is not reachable by assertion.
-type backendOnly struct{ b *plainBackend }
+type backendOnly struct{ b *replBackend }
 
 func (w backendOnly) Acquire(ctx context.Context, repo, path string) (string, error) {
 	return w.b.Acquire(ctx, repo, path)
@@ -285,54 +163,77 @@ func (w backendOnly) Abort(ctx context.Context, token string) error { return w.b
 func (w backendOnly) NeedsPipeline() bool                           { return false }
 func (w backendOnly) Probe(ctx context.Context) error               { return nil }
 
-func TestReplaceOnConflict_DeleteFailureCarriesBothErrors(t *testing.T) {
+// unsupportedDeleter implements the capability but cannot do the work here --
+// the shape StagedBackend has when this prepub offers no ingest path.
+type unsupportedDeleter struct {
+	replBackend
+	deletes int
+}
+
+func (b *unsupportedDeleter) DeleteSubtree(_ context.Context, _, _ string) error {
+	b.deletes++
+	return fmt.Errorf("wrapped: %w", lease.ErrSubtreeDeleteUnsupported)
+}
+
+// A backend that cannot delete, by type or in this deployment, fails the job
+// permanently: retrying would only decline again.
+func TestReplaceFirst_CannotDeleteIsPermanent(t *testing.T) {
+	plain := &replBackend{}
+	for name, b := range map[string]lease.Backend{
+		"no DeleteSubtree": backendOnly{plain},
+		"unsupported here": &unsupportedDeleter{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			o := replOrch(t, b, true)
+			err := o.replaceFirst(context.Background(), replJob(), &lease.CommitRequest{}, o.Obs.Logger)
+			if err == nil || ClassOf(err) != ErrClassPermanent {
+				t.Fatalf("err = %v (class %v), want a permanent error", err, ClassOf(err))
+			}
+		})
+	}
+	if len(plain.calls) != 0 {
+		t.Errorf("a backend without DeleteSubtree was touched: %v", plain.calls)
+	}
+}
+
+func TestReplaceFirst_DeleteFailureNamesThePath(t *testing.T) {
 	b := &replBackend{deleteErr: errors.New("cvmfs_server ingest -f: exit status 1")}
 	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
 
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-		&lease.CommitRequest{}, realConflictErr, o.Obs.Logger)
-	if !attempted || err == nil {
-		t.Fatalf("want (true, err), got (%v, %v)", attempted, err)
+	err := o.replaceFirst(context.Background(), replJob(), &lease.CommitRequest{}, o.Obs.Logger)
+	if err == nil {
+		t.Fatal("want an error")
 	}
-	for _, needle := range []string{"UNIQUE constraint", "ingest -f"} {
+	for _, needle := range []string{"GCC-Toolchain", "ingest -f"} {
 		if !strings.Contains(err.Error(), needle) {
 			t.Errorf("error %q does not carry %q", err, needle)
 		}
 	}
-	if strings.Contains(strings.Join(b.calls, "|"), "commit") {
-		t.Errorf("commit was retried after a failed delete: %v", b.calls)
+	if strings.Contains(strings.Join(b.calls, "|"), "acquire") {
+		t.Errorf("re-acquired after a failed delete: %v", b.calls)
 	}
 }
 
-func TestReplaceOnConflict_RetryFailureNamesTheAbsentPath(t *testing.T) {
-	b := &replBackend{commitErr: errors.New("gateway: commit_lease failed")}
+// The subtree is already gone when the re-acquire fails: say the path is absent.
+func TestReplaceFirst_AcquireFailureSaysThePathIsAbsent(t *testing.T) {
+	b := &replBackend{acquireErr: errors.New("gateway: path_busy")}
 	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
 
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-		&lease.CommitRequest{}, realConflictErr, o.Obs.Logger)
-	if !attempted || err == nil {
-		t.Fatalf("want (true, err), got (%v, %v)", attempted, err)
-	}
-	// The subtree is gone and the retry failed: the operator must be told the
-	// path is now absent, not left to infer it.
-	if !strings.Contains(err.Error(), "ABSENT") {
-		t.Errorf("error %q does not state the path is now absent", err)
+	err := o.replaceFirst(context.Background(), replJob(), &lease.CommitRequest{}, o.Obs.Logger)
+	if err == nil || !strings.Contains(err.Error(), "ABSENT") {
+		t.Errorf("error %v does not state the path is now absent", err)
 	}
 }
 
 // ── Run()-level wiring ────────────────────────────────────────────────────────
 
-// runBackend is a mockBackend that ALSO deletes subtrees, and whose Commit
-// fails the first time with the real conflict error and succeeds after.
-// It is the whole point of the feature seen from the outside: a job whose
-// first commit hits an occupied path must still reach StatePublished.
+// runBackend counts commits and deletes; with failEach every commit fails
+// with the real conflict error.
 type runBackend struct {
 	mu       sync.Mutex
 	commits  int
 	deletes  int
-	failEach bool // when true, EVERY commit fails (delete cannot rescue it)
+	failEach bool
 }
 
 func (b *runBackend) Acquire(_ context.Context, _, _ string) (string, error) {
@@ -345,7 +246,7 @@ func (b *runBackend) Commit(_ context.Context, _ lease.CommitRequest) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.commits++
-	if b.failEach || b.commits == 1 {
+	if b.failEach {
 		return realConflictErr
 	}
 	return nil
@@ -360,133 +261,102 @@ func (b *runBackend) DeleteSubtree(_ context.Context, _, _ string) error {
 	return nil
 }
 
-// The wiring test the direct unit tests cannot give: a conflict-shaped commit
-// failure carries the job all the way to StatePublished, with the lease token
-// cleared exactly as a first-try success leaves it.
-//
-// NEGATIVE CONTROL: with ReplaceOnConflict false (below) the same job fails.
-func TestRun_ConflictIsReplacedAndJobPublishes(t *testing.T) {
-	b := &runBackend{}
+func (b *runBackend) counts() (commits, deletes int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.commits, b.deletes
+}
+
+// runReplace runs one job through Run on a node that allows replacing, with
+// publishedHash at the job's path (found=false when empty).
+func runReplace(t *testing.T, b *runBackend, publishedHash string, jobAsks bool) (*job.Job, error) {
+	t.Helper()
 	o, sp := minimalOrch(t, b)
 	o.Stratum0URL = "http://stratum0.test"
 	o.ReplaceOnConflict = true
 	stubPathExists(t, true, nil)
+	stubHash(t, publishedHash, publishedHash != "")
 	j := newIncomingJob(t, sp)
-
-	if err := o.Run(context.Background(), j, nil); err != nil {
-		t.Fatalf("Run: %v", err)
+	j.IdentityPath, j.IdentityHash, j.Replace = j.Path, "this-build", jobAsks
+	if err := sp.WriteManifest(j); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
 	}
-	if j.State != job.StatePublished {
-		t.Errorf("state = %q, want %q", j.State, job.StatePublished)
-	}
-	if j.LeaseToken != "" {
-		t.Errorf("LeaseToken = %q, want cleared", j.LeaseToken)
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.deletes != 1 || b.commits != 2 {
-		t.Errorf("deletes=%d commits=%d, want 1 and 2 (delete then retry once)",
-			b.deletes, b.commits)
-	}
+	return j, o.Run(context.Background(), j, nil)
 }
 
-func TestRun_ConflictWithFlagOffFailsTheJob(t *testing.T) {
+// Replace if different, end to end: another build's hash at the job's own
+// path is deleted BEFORE the commit, so the job publishes with one commit.
+func TestRun_DifferentHashIsReplacedBeforeTheCommit(t *testing.T) {
 	b := &runBackend{}
-	o, sp := minimalOrch(t, b)
-	o.Stratum0URL = "http://stratum0.test"
-	o.ReplaceOnConflict = false
-	stubPathExists(t, true, nil)
-	j := newIncomingJob(t, sp)
-
-	if err := o.Run(context.Background(), j, nil); err == nil {
-		t.Fatal("Run succeeded with the flag off; want the conflict to be terminal")
+	j, err := runReplace(t, b, "other-build", true)
+	if err != nil || j.State != job.StatePublished {
+		t.Fatalf("Run: %v, state %q; want published", err, j.State)
 	}
-	if j.State != job.StateFailed {
-		t.Errorf("state = %q, want %q", j.State, job.StateFailed)
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.deletes != 0 {
-		t.Errorf("deletes=%d with the flag off; want 0", b.deletes)
+	if c, d := b.counts(); d != 1 || c != 1 {
+		t.Errorf("deletes=%d commits=%d, want 1 and 1 (delete, then one commit)", d, c)
 	}
 }
 
-// A retry that fails again must abort the job — and must not loop.
-func TestRun_RetryFailureAbortsWithoutLooping(t *testing.T) {
+// Nothing is deleted unless the content is recognisably another build's: the
+// same hash skips; no readable hash (a shared root, or no .meta.json) and a
+// job that did not ask both fail.
+//
+// NEGATIVE CONTROL: replace on !found in preCommitChecks and the "no hash"
+// case deletes once.
+func TestRun_ReplaceDeletesOnlyAnotherBuildsContent(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		published string
+		asks      bool
+		wantState job.State
+	}{
+		{"same hash skips", "this-build", true, job.StatePublished},
+		{"no published hash fails", "", true, job.StateFailed},
+		{"job did not ask fails", "other-build", false, job.StateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &runBackend{}
+			j, _ := runReplace(t, b, tc.published, tc.asks)
+			if j.State != tc.wantState {
+				t.Errorf("state = %q, want %q", j.State, tc.wantState)
+			}
+			if c, d := b.counts(); d != 0 || c != 0 {
+				t.Errorf("deletes=%d commits=%d, want 0 and 0", d, c)
+			}
+		})
+	}
+}
+
+// A conflicting commit is never followed by a delete, whatever the node
+// allows: replacement is decided before the commit or not at all.
+func TestRun_ConflictFailsTheJobAndDeletesNothing(t *testing.T) {
+	for name, asks := range map[string]bool{"job asks": true, "job does not ask": false} {
+		t.Run(name, func(t *testing.T) {
+			b := &runBackend{failEach: true}
+			o, sp := minimalOrch(t, b)
+			o.Stratum0URL = "http://stratum0.test"
+			o.ReplaceOnConflict = true
+			stubPathExists(t, true, nil)
+			j := newIncomingJob(t, sp)
+			j.Replace = asks
+
+			if err := o.Run(context.Background(), j, nil); err == nil {
+				t.Fatal("Run succeeded; want the conflict to fail the job")
+			}
+			if c, d := b.counts(); d != 0 || c != 1 {
+				t.Errorf("deletes=%d commits=%d, want 0 and 1", d, c)
+			}
+		})
+	}
+}
+
+// A replacement whose commit then fails is not deleted again.
+func TestRun_ReplacedFirstIsNotRetriedAgain(t *testing.T) {
 	b := &runBackend{failEach: true}
-	o, sp := minimalOrch(t, b)
-	o.Stratum0URL = "http://stratum0.test"
-	o.ReplaceOnConflict = true
-	stubPathExists(t, true, nil)
-	j := newIncomingJob(t, sp)
-
-	if err := o.Run(context.Background(), j, nil); err == nil {
-		t.Fatal("Run succeeded though every commit failed")
+	if _, err := runReplace(t, b, "other-build", true); err == nil {
+		t.Fatal("Run succeeded though the commit failed")
 	}
-	if j.State != job.StateFailed {
-		t.Errorf("state = %q, want %q", j.State, job.StateFailed)
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.commits != 2 || b.deletes != 1 {
-		t.Errorf("commits=%d deletes=%d, want exactly 2 and 1 (retry is once, not a loop)",
-			b.commits, b.deletes)
-	}
-}
-
-// The acquire-failure branch: the subtree is already gone, so the operator
-// must be told the path is absent rather than left with a bare lease error.
-func TestReplaceOnConflict_AcquireFailureSaysThePathIsAbsent(t *testing.T) {
-	b := &replBackend{acquireErr: errors.New("gateway: path_busy")}
-	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
-
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-		&lease.CommitRequest{}, realConflictErr, o.Obs.Logger)
-	if !attempted || err == nil {
-		t.Fatalf("want (true, err), got (%v, %v)", attempted, err)
-	}
-	if !strings.Contains(err.Error(), "ABSENT") {
-		t.Errorf("error %q does not state the path is now absent", err)
-	}
-	if strings.Contains(strings.Join(b.calls, "|"), "commit") {
-		t.Errorf("commit was attempted after a failed acquire: %v", b.calls)
-	}
-}
-
-// unsupportedDeleter implements the capability but cannot do the work here --
-// the shape StagedBackend has when this prepub offers no ingest path.
-type unsupportedDeleter struct {
-	replBackend
-	deletes int
-}
-
-func (b *unsupportedDeleter) DeleteSubtree(_ context.Context, _, _ string) error {
-	b.deletes++
-	return fmt.Errorf("wrapped: %w", lease.ErrSubtreeDeleteUnsupported)
-}
-
-// "Cannot delete here" must leave the error terminal, exactly as a backend
-// without the method does -- not report a failed remediation, which would
-// claim an attempt that removed nothing.
-//
-// NEGATIVE CONTROL: drop the errors.Is(ErrSubtreeDeleteUnsupported) branch in
-// replaceOnConflict and this fails with attempted=true and a non-nil error.
-func TestReplaceOnConflict_UnsupportedDeleteIsDeclinedNotFailed(t *testing.T) {
-	b := &unsupportedDeleter{}
-	o := replOrch(t, b, true)
-	stubPathExists(t, true, nil)
-
-	attempted, err := o.replaceOnConflict(context.Background(), replJob(),
-		&lease.CommitRequest{Token: "orig-token"}, realConflictErr, o.Obs.Logger)
-
-	if attempted {
-		t.Error("an unsupported delete must not count as an attempted replacement")
-	}
-	if err != nil {
-		t.Errorf("err = %v, want nil so the original commit error stays terminal", err)
-	}
-	if b.deletes != 1 {
-		t.Errorf("the delete should have been tried once, got %d", b.deletes)
+	if c, d := b.counts(); d != 1 || c != 1 {
+		t.Errorf("deletes=%d commits=%d, want 1 and 1", d, c)
 	}
 }

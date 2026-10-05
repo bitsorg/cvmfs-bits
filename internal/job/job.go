@@ -356,6 +356,11 @@ type Job struct {
 	// (its .meta.json) to count as this job's. Optional; a different hash
 	// there fails the job instead of passing another build's content as it.
 	IdentityHash string `json:"identity_hash,omitempty"`
+	// Replace asks for content another build published at Path to be
+	// replaced: when the hash at IdentityPath (which must equal Path) differs
+	// from IdentityHash, the subtree is deleted before this job commits. Only
+	// a node with replace_on_conflict honours it; the same hash still skips.
+	Replace bool `json:"replace,omitempty"`
 
 	// Attempts counts the runs that ended in a retryable failure. Such a job
 	// goes back to incoming and runs again at NextAttemptAt, until it publishes

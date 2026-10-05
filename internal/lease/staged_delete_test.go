@@ -48,6 +48,12 @@ func TestStagedBackend_WithoutARemoverSaysSoAndDeletesNothing(t *testing.T) {
 	if !errors.Is(err, ErrSubtreeDeleteUnsupported) {
 		t.Fatalf("err = %v, want ErrSubtreeDeleteUnsupported", err)
 	}
+	if b.CanDeleteSubtree() {
+		t.Error("CanDeleteSubtree = true without a remover")
+	}
+	if !NewStagedBackend(&Client{}, &recordingRemover{}).CanDeleteSubtree() {
+		t.Error("CanDeleteSubtree = false with a remover")
+	}
 }
 
 // A real failure must NOT be mistaken for "unsupported": one leaves the error

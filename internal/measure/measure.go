@@ -73,7 +73,7 @@ type Record struct {
 	BytesRaw        *int64 `json:"bytes_raw,omitempty"`
 	BytesCompressed *int64 `json:"bytes_compressed,omitempty"`
 
-	// ── conflict remediation (replace_on_conflict) ──
+	// ── replacement (replace_on_conflict) ──
 	Conflicted bool `json:"conflicted,omitempty"`
 	Replaced   bool `json:"replaced,omitempty"`
 

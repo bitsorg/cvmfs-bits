@@ -180,7 +180,7 @@ func main() {
 	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs. Requires cvmfs_server on PATH and a mountless gateway registration (cvmfs_server connect-gw -P) for each repository [publisher]")
 	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
-	replaceOnConflict := flag.Bool("replace-on-conflict", false, "REPLACE an already published path when a commit fails on it: confirm the conflict against the published catalogs, delete the existing subtree in its own transaction, and retry the commit once. Destroys the published subtree at the conflicting path (prior revisions keep their objects until GC); off, a conflict stays a terminal error [publisher]")
+	replaceOnConflict := flag.Bool("replace-on-conflict", false, "Allow a job that asks for it (replace=true) to REPLACE what another build published at its own path: when the published .meta.json hash differs from the job's, delete the existing subtree in its own transaction, then commit. Destroys the published subtree at that path (prior revisions keep their objects until GC); jobs that do not ask are never replaced [publisher]")
 	promoteWorkers := flag.Int("promote-workers", envInt("PREPUB_PROMOTE_WORKERS", cas.DefaultPromoteWorkers), "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (measured: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half. Env: PREPUB_PROMOTE_WORKERS [publisher]")
 	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
 	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize [publisher]")
@@ -692,9 +692,9 @@ func runPublisher(
 		"min_concurrent_jobs", minConcurrentJobs)
 
 	if replaceOnConflict {
-		obs.Logger.Warn("replace_on_conflict ENABLED: a commit that fails on an " +
-			"already published path deletes the existing subtree and retries once " +
-			"(destructive; the conflict is confirmed against the published " +
+		obs.Logger.Warn("replace_on_conflict ENABLED: a job that asks (replace=true) " +
+			"replaces what another build published at its own path " +
+			"(destructive; decided by the published hash, confirmed against the " +
 			"catalogs before anything is deleted)")
 	}
 

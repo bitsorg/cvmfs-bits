@@ -604,7 +604,7 @@ func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3, objectL
 // DeleteSubtree removes a published nested-catalog subtree at the repo-relative
 // path, in its own gateway transaction, via `cvmfs_server ingest -f <path>`.
 //
-// It exists for conflict remediation (replace_on_conflict): the tar-based
+// It exists for replacement (replace_on_conflict): the tar-based
 // publish paths ADD, they never replace — an occupied path dies in swissknife
 // on the catalog.md5path UNIQUE constraint — so a re-publish must first drop
 // the existing subtree and then run the unchanged, proven publish.
@@ -624,7 +624,7 @@ func (b *IngestBackend) DeleteSubtree(ctx context.Context, repo, relPath string)
 	base := strings.Trim(relPath, "/")
 	if base == "" {
 		return fmt.Errorf("ingest backend: refusing to delete the repository "+
-			"root of %q: conflict remediation replaces one published path, "+
+			"root of %q: replacing deletes one published path, "+
 			"never a repository", repo)
 	}
 	token, err := b.Acquire(ctx, repo, base)

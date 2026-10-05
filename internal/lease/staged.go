@@ -33,14 +33,14 @@ import (
 // with a different failure mode, and a job must name the one it means.
 type StagedBackend struct {
 	*Client
-	// remover deletes a published subtree for conflict remediation. Nil when
+	// remover deletes a published subtree for replacement. Nil when
 	// the deployment offers no path that can run `cvmfs_server`, in which case
 	// DeleteSubtree reports ErrSubtreeDeleteUnsupported rather than pretending.
 	remover subtreeRemover
 }
 
 // subtreeRemover is the one capability the staged path borrows for
-// remediation. Deleting a published subtree is repository-level work
+// replacement. Deleting a published subtree is repository-level work
 // (`cvmfs_server ingest -f <path> <repo>`) and has nothing to do with how the
 // content originally arrived, so the staged path delegates rather than
 // carrying a second copy of it.
@@ -94,6 +94,10 @@ func (b *StagedBackend) DeleteSubtree(ctx context.Context, repo, relPath string)
 	}
 	return b.remover.DeleteSubtree(ctx, repo, relPath)
 }
+
+// CanDeleteSubtree reports whether DeleteSubtree can do the work here, i.e.
+// whether this prepub also offers the ingest path it borrows the delete from.
+func (b *StagedBackend) CanDeleteSubtree() bool { return b.remover != nil }
 
 // NeedsPipeline reports false: a staged job carries no payload to process.
 func (b *StagedBackend) NeedsPipeline() bool { return false }

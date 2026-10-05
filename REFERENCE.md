@@ -379,7 +379,7 @@ A complete example configuration is in
 | `stratum0_url` | `--stratum0-url` | | empty | Stratum 0 HTTP base including `/cvmfs`, e.g. `http://stratum0.example.org/cvmfs`. Needed (gateway mode) to build subtree catalogs, to read the current root hash, for `POST /api/v1/published`, the already-published check of `POST /api/v1/reserve`, `identity_path` and `replace_on_conflict` |
 | `repo_name` | `--repo-name` | | empty | Repository name. Used to find `server.conf` for `cas.type: s3` and as the repository listed in the discovery document. An invalid name ([Conventions](#conventions)) stops startup |
 | `cvmfs_mount` | `--cvmfs-mount` | | `/cvmfs` | Repository mount root for the `local` backend and the base for `ingest -b` |
-| `replace_on_conflict` | `--replace-on-conflict` | | `false` | When a commit fails on an already published path: confirm the conflict in the published catalogs, delete the subtree in its own transaction and retry once. Destructive; works for the `ingest` and `staged` paths (needs `--ingest-publish` for `cvmfs_server`) |
+| `replace_on_conflict` | `--replace-on-conflict` | | `false` | Allow jobs that send `replace=true` to replace what another build published at their own path: when the published hash differs from `identity_hash`, delete the subtree in its own transaction, then commit. Jobs that do not ask are never replaced, and a failed commit never deletes anything. Destructive; works for the `ingest` and `staged` paths (needs `--ingest-publish` for `cvmfs_server`) |
 | `prewarm` | `--prewarm` | | `false` | Make Stratum 1 pre-warming available; jobs opt in with `prewarm`. Set by `install.sh --prewarm` / `--no-prewarm` |
 
 Gateway credentials are environment variables only:
@@ -713,6 +713,7 @@ Always `200`:
   "auth_mode": "both",
   "finalize_ready": true,
   "max_tar_size": 10737418240,
+  "replace_allowed": false,
   "replay_cache": {"entries": 12, "rejected_full": 0}
 }
 ```
@@ -724,6 +725,7 @@ Always `200`:
 | `auth_mode` | `bearer`, `both` or `hmac` |
 | `finalize_ready` | `true` when `ingest_config_prefix` is set and the default backend is gateway mode, i.e. coarse builds can be finalized; always `false` in local mode |
 | `max_tar_size` | Largest accepted tar, bytes |
+| `replace_allowed` | `true` when jobs may send `replace` (`replace_on_conflict` and `stratum0_url` set) |
 | `replay_cache.entries`, `replay_cache.rejected_full` | Nonces held; signed requests refused because the cache was full |
 
 The health check does not test the gateway or the CAS; those are probed once
@@ -753,7 +755,8 @@ parts in total).
 | `finalize` | `true` | Finalize job for `build_id`: carries no payload (a sent tar is dropped) |
 | `prewarm` | bool | Ask to pre-warm Stratum 1s for this job (default off); effective only on a node started with `--prewarm`, otherwise ignored with a log line. `true` only on the default path, or on `ingest` with `direct_s3` and `object_list` |
 | `identity_path` | string | Repository-relative path, at or under `path`, whose presence means this content is already published. Checked just before the commit: if present the job ends `published` without committing |
-| `identity_hash` | string | Expected `package.hash` in `<identity_path>/.meta.json`; a different hash fails the job instead of skipping |
+| `identity_hash` | string | Expected `package.hash` in `<identity_path>/.meta.json`; a different hash fails the job instead of skipping, unless `replace` |
+| `replace` | bool | Replace content another build published here: when `<identity_path>/.meta.json` has a hash that differs from `identity_hash`, the subtree at `path` is deleted, then this job commits (one revision without it). A path without a readable hash is never replaced. Requires `identity_path` equal to `path`, an `identity_hash`, a path other than the root, the `ingest` or `staged` path, and `replace_on_conflict` on the node; otherwise `400`. The same hash still skips |
 | `tag_name` | string | Named snapshot tag for the commit; up to 255 characters of `A-Z a-z 0-9 . _ -` |
 | `tag_description` | string | Tag description |
 | `webhook_url` | URL | Absolute `http://` or `https://` URL with a host; called when the job is published or fails ([Webhooks](#webhooks)) |
@@ -784,14 +787,14 @@ the staging directory; a refused request leaves it where it was. Body at most
 | `tar_sha256` (required) | Verified before the job is accepted |
 
 `staging_prefix` and `catalog_hash` are refused in this form; `finalize`,
-`identity_path`, `identity_hash`, `direct_s3` and `object_list` are not read.
+`identity_path`, `identity_hash`, `replace`, `direct_s3` and `object_list` are not read.
 
 **Responses.**
 
 | Status | When |
 |---|---|
 | `202` | Accepted: `{"job_id":"..."}` |
-| `400` | Missing `repo`; invalid repository name ([Conventions](#conventions)); invalid `webhook_url`; malformed path, `identity_path`, tag, boolean or integer; missing `tar`; `tar_sha256` mismatch; publish path not offered; a field used on the wrong path (`direct_s3`, `object_list`, `staging_prefix`, `catalog_hash`, `prewarm`, `coarse`); `staging_prefix` without `catalog_hash` or the reverse; staged job with a tar; `finalize` or `coarse` without `build_id`; too many parts; duplicate `tar` part; broken multipart; invalid JSON; `tar_path` outside `staging_root` or missing; signed upload without `tar_sha256` |
+| `400` | Missing `repo`; invalid repository name ([Conventions](#conventions)); invalid `webhook_url`; malformed path, `identity_path`, tag, boolean or integer; missing `tar`; `tar_sha256` mismatch; publish path not offered; a field used on the wrong path (`direct_s3`, `object_list`, `staging_prefix`, `catalog_hash`, `prewarm`, `coarse`); `staging_prefix` without `catalog_hash` or the reverse; staged job with a tar; `finalize` or `coarse` without `build_id`; `replace` without what it requires (see `replace`); too many parts; duplicate `tar` part; broken multipart; invalid JSON; `tar_path` outside `staging_root` or missing; signed upload without `tar_sha256` |
 | `401` | Authentication failed, or the signature does not match the fields or payload |
 | `403` | Target outside `allowed_publish_prefixes` (finalize jobs are exempt) |
 | `413` | Tar larger than `max_tar_size_gib` (refused from `Content-Length` before reading when possible), or a field over 1 MiB |
