@@ -527,6 +527,9 @@ func runPublisher(
 	// Local mode does not require cvmfs_gateway, a CAS, or a gateway secret.
 
 	var casBackend cas.Backend
+	// The S3 config prepub's own store reads (cas type s3), also handed to the
+	// direct-S3 ingest so both upload paths share credentials and tuning.
+	var s3ConfigPath string
 	var leaseBackend lease.Backend
 	var gatewayQueue *api.GatewayQueue // non-nil only in gateway mode
 	// The gateway client itself, kept so publish paths that are the gateway in
@@ -572,10 +575,12 @@ func runPublisher(
 			}
 			casBackend = lfs
 		case "s3":
-			// Settings come from the repository's OWN configuration, never from
-			// a private copy: the prepub writes into the bucket the repository
-			// is served from, so a divergent bucket/alias/credential would
-			// publish catalogs referencing objects no client can fetch.
+			// Settings come from the server.conf named here and the S3 config
+			// its CVMFS_UPSTREAM_STORAGE points to. It must describe the bucket
+			// the repository is served from: a divergent bucket/alias/credential
+			// would publish catalogs referencing objects no client can fetch.
+			// install.sh --s3-conf-from writes prepub's own copy and refreshes
+			// its CVMFS_S3_* lines from the repository's on every update.
 			serverConf := casServerConf
 			if serverConf == "" {
 				if repoName == "" {
@@ -603,8 +608,16 @@ func runPublisher(
 			}
 			obs.Logger.Info("CAS backend: s3",
 				"endpoint", s3b.Endpoint(), "bucket", s3b.Bucket(),
-				"alias", s3b.Alias(), "server_conf", serverConf)
+				"alias", s3b.Alias(), "server_conf", serverConf, "s3_config", st.ConfigPath)
 			casBackend = s3b
+			// cvmfs_server re-splits its command line through a shell, so a
+			// path it would split or interpret is refused here, not mangled.
+			if !safeShellPath(st.ConfigPath) {
+				obs.Logger.Error("S3 config path is unsafe to hand to cvmfs_server",
+					"s3_config", st.ConfigPath, "fix", "use an absolute path of letters, digits and ._/@+-")
+				os.Exit(1)
+			}
+			s3ConfigPath = st.ConfigPath
 		default:
 			obs.Logger.Error("unknown CAS type", "type", casType)
 			os.Exit(1)
@@ -654,6 +667,9 @@ func runPublisher(
 			// holds nested sub-catalogs.
 			NestedCatalog: true,
 			Owner:         ingestPublishOwner,
+			// The same S3 config as prepub's own store, so direct-S3 ingests
+			// never fall back to whatever file sits at cvmfs_server's default.
+			S3Config: s3ConfigPath,
 		}, obs)
 		if err := ib.Probe(context.Background()); err != nil {
 			obs.Logger.Error("--ingest-publish requested but the ingest backend is unusable", "error", err)
@@ -661,7 +677,7 @@ func runPublisher(
 		}
 		publishPaths["ingest"] = ib
 		obs.Logger.Info("publish path available: ingest (cvmfs_server ingest — gateway does chunking/dedup/catalogs)",
-			"cvmfs_mount", cvmfsMount, "owner", ingestPublishOwner)
+			"cvmfs_mount", cvmfsMount, "owner", ingestPublishOwner, "direct_s3_config", s3ConfigPath)
 
 		if publishMode == "local" {
 			// Supported, and the natural way to exercise both paths against one
@@ -1497,4 +1513,18 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// safeShellPath reports whether p is an absolute path cvmfs_server can be given
+// unquoted: its ingest re-splits the command line through a shell.
+func safeShellPath(p string) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	for _, c := range p {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._/@+-", c)) {
+			return false
+		}
+	}
+	return true
 }

@@ -63,7 +63,7 @@ offers are listed in the startup log and in `publish_paths` of
 |---|---|---|---|
 | `prepub` (default; also the empty name) with `publish_mode: gateway` | always in gateway mode | Pipeline before the lease: chunk, compress, dedup (`CAS.Exists` per object), write objects to the CAS, build the subtree catalog(s); then lease, upload catalog(s), commit | The only path that can pre-warm Stratum 1s before the commit and the only path that accumulates coarse builds |
 | `prepub` with `publish_mode: local` | always in local mode | `cvmfs_server transaction <repo>`, extract the tar under `<cvmfs_mount>/<repo>/<path>`, `cvmfs_server publish <repo>` | No gateway, no CAS, no pipeline; runs on the Stratum 0 with the repository mounted |
-| `ingest` | `--ingest-publish` | `cvmfs_server ingest -t <tar> -b <path> [-c] [-u <owner>] [--direct-s3 [--object-list]] <repo>`; the gateway does chunking, dedup and catalogs | Needs `cvmfs_server` on `PATH` and a mountless gateway registration (`cvmfs_server connect-gw -P`) per repository; one gateway transaction per package; with `direct_s3`, `object_list` and `prewarm`, pre-warms right after the commit |
+| `ingest` | `--ingest-publish` | `cvmfs_server ingest -t <tar> -b <path> [-c] [-u <owner>] [--direct-s3 [--s3-config <file>] [--object-list]] <repo>`; the gateway does chunking, dedup and catalogs | Needs `cvmfs_server` on `PATH` and a mountless gateway registration (`cvmfs_server connect-gw -P`) per repository; one gateway transaction per package; with `direct_s3`, `object_list` and `prewarm`, pre-warms right after the commit |
 | `staged` | gateway mode with `cas.type: s3` | A producer has already written the objects under an S3 `staging_prefix` and built the catalog (`catalog_hash`); cvmfs-prepub promotes the objects into the store with server-side copies and grafts the catalog | No tar payload; needs a gateway with the graft endpoint; always grafts |
 
 The commit granularity follows from the path: `ingest`, `staged` and the
@@ -394,7 +394,7 @@ Gateway credentials are environment variables only:
 |---|---|---|---|---|
 | `cas.type` | `--cas-type` | | `localfs` | `localfs` or `s3` (gateway mode only) |
 | `cas.root` | `--cas-root` | | `/var/lib/cvmfs-prepub/cas` | localfs: the repository's storage directory (objects under `data/xx/...`). Receiver: its CAS root |
-| `cas.server_conf` | `--cas-server-conf` | | `/etc/cvmfs/repositories.d/<repo_name>/server.conf` | For `s3`: the repository's `server.conf`; its `CVMFS_UPSTREAM_STORAGE` names the S3 config file that supplies endpoint, bucket, alias and credentials. Startup fails if neither this nor `repo_name` is set |
+| `cas.server_conf` | `--cas-server-conf` | | `/etc/cvmfs/repositories.d/<repo_name>/server.conf` | For `s3`: a `server.conf` whose `CVMFS_UPSTREAM_STORAGE` names the S3 config file that supplies endpoint, bucket, alias and credentials; `install.sh --s3-conf-from` writes prepub's own, which names itself ([INSTALL.md](INSTALL.md#step-2--repository-credentials)). The direct-S3 ingest gets that S3 config as `--s3-config`. Startup fails if neither this nor `repo_name` is set |
 | `promote_workers` | `--promote-workers` | `PREPUB_PROMOTE_WORKERS` | `16` | Concurrent server-side copies when promoting a staged job's objects; must be >= 1, values above 256 are clamped |
 
 ### Optional paths and coarse finalize
@@ -764,7 +764,7 @@ parts in total).
 | `webhook_url` | URL | Absolute `http://` or `https://` URL with a host; called when the job is published or fails ([Webhooks](#webhooks)) |
 | `preload_exe` | string | Repository-relative executable; with `preload_paths`, the pipeline writes a `.<name>.cvmfspreload` list next to it |
 | `preload_paths` | JSON array of strings | Repository-relative paths the executable opens at startup |
-| `direct_s3` | bool | `ingest` path only: pass `--direct-s3` to `cvmfs_server ingest` |
+| `direct_s3` | bool | `ingest` path only: pass `--direct-s3` to `cvmfs_server ingest`, with `--s3-config` naming prepub's own S3 config when `cas.type` is `s3` |
 | `object_list` | bool | `ingest` path only, requires `direct_s3`: collect the S3 object list |
 | `staging_prefix` | string | `staged` path only: S3 prefix holding the prepared objects; slash-separated segments of `[A-Za-z0-9._-]`, at most 128 bytes, last segment not `data` |
 | `catalog_hash` | string | `staged` path only: the subtree catalog to graft, 40 lowercase hex characters followed by `C` |

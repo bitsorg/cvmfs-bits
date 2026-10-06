@@ -373,3 +373,21 @@ func TestApplyFileConfig_CatalogCache(t *testing.T) {
 		t.Errorf("dir=%q, want the command line's", v.catalogCacheDir)
 	}
 }
+
+// The S3 config path is handed unquoted to cvmfs_server, whose ingest re-splits
+// its command line through a shell.
+func TestSafeShellPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/etc/cvmfs-prepub/bits.cern.ch.s3.server.conf": true,
+		"/etc/cvmfs/keys/a_b@c+d-e.conf":                true,
+		"relative/s3.conf":                              false,
+		"/etc/with space.conf":                          false,
+		"/etc/x;rm -rf /":                               false,
+		"/etc/$(id).conf":                               false,
+		"":                                              false,
+	} {
+		if got := safeShellPath(p); got != want {
+			t.Errorf("safeShellPath(%q) = %v, want %v", p, got, want)
+		}
+	}
+}

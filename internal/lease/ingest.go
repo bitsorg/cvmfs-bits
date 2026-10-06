@@ -63,6 +63,8 @@ type IngestBackend struct {
 	// owner, when set, is passed as `ingest -u <owner>` so ingested files are
 	// owned by the repository owner rather than by whoever the tar says.
 	owner string
+	// s3Config, when set, is passed as --s3-config with --direct-s3.
+	s3Config string
 	// skipAncestorDirs disables the parent-directory materialisation in
 	// ensureAncestors. The zero value materialises, because not doing it turns
 	// a publish into a wasted upload plus a gateway panic.
@@ -95,6 +97,10 @@ type IngestOptions struct {
 	NestedCatalog bool
 	// Owner passes -u to cvmfs_server ingest. Optional.
 	Owner string
+	// S3Config is passed as --s3-config with --direct-s3: the S3 config the
+	// direct-S3 upload uses. Empty leaves cvmfs_server to find one
+	// (CVMFS_INGEST_DIRECT_S3_CONFIG, then /etc/cvmfs/<repo>.s3.conf).
+	S3Config string
 	// SkipAncestorDirs disables creating the parent directory chain of a
 	// publish target that does not exist yet (see ensureAncestors). Off by
 	// default — the zero value materialises — because the failure it prevents
@@ -113,6 +119,7 @@ func NewIngestBackend(opt IngestOptions, obs *observe.Provider) *IngestBackend {
 		cvmfsMount:       mount,
 		nestedCatalog:    opt.NestedCatalog,
 		owner:            opt.Owner,
+		s3Config:         opt.S3Config,
 		skipAncestorDirs: opt.SkipAncestorDirs,
 		mounted:          isMountPoint,
 		warned:           make(map[string]bool),
@@ -593,10 +600,15 @@ func (b *IngestBackend) commitArgs(repo, base, tarPath string, directS3, objectL
 	}
 	if directS3 {
 		// Data objects go straight to S3; only catalogs traverse the gateway.
-		// cvmfs_server finds the config itself (--s3-config,
-		// CVMFS_INGEST_DIRECT_S3_CONFIG, or /etc/cvmfs/<repo>.s3.conf); the
-		// file's presence is NOT the trigger, whatever an earlier prototype did.
+		// The file's presence is NOT the trigger, whatever an earlier
+		// prototype did. Name the config explicitly when prepub knows it (its
+		// own S3 store's): left to itself, cvmfs_server falls back to
+		// CVMFS_INGEST_DIRECT_S3_CONFIG or /etc/cvmfs/<repo>.s3.conf, and a
+		// stray file at that default once hung a publish for hours.
 		args = append(args, "--direct-s3")
+		if b.s3Config != "" {
+			args = append(args, "--s3-config", b.s3Config)
+		}
 	}
 	// Only meaningful with --direct-s3, and cvmfs_server aborts the transaction
 	// if given one without the other, so never emit it alone. The path names

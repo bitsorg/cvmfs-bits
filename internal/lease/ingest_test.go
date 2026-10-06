@@ -268,3 +268,28 @@ func TestCommitArgs_NoNewCatalogOnExistingBase(t *testing.T) {
 		t.Error("existing base: want no -c")
 	}
 }
+
+// The direct-S3 ingest is told which S3 config to use when prepub knows it, and
+// only with --direct-s3, the one mode that reads it. The repository stays last.
+//
+// NEGATIVE CONTROL: drop the --s3-config append in commitArgs and the first
+// case fails; drop its directS3 guard and the second does.
+func TestCommitArgs_S3ConfigOnlyWithDirectS3(t *testing.T) {
+	b := NewIngestBackend(IngestOptions{S3Config: "/etc/cvmfs-prepub/r.s3.server.conf"}, newTestObs(t))
+	got := strings.Join(b.commitArgs("r", "base", "/t.tar", true, false, false), " ")
+	if want := "--direct-s3 --s3-config /etc/cvmfs-prepub/r.s3.server.conf r"; !strings.HasSuffix(got, want) {
+		t.Errorf("direct-S3 args = %q, want suffix %q", got, want)
+	}
+	if got := strings.Join(b.commitArgs("r", "base", "/t.tar", false, false, false), " "); strings.Contains(got, "--s3-config") {
+		t.Errorf("--s3-config without --direct-s3: %q", got)
+	}
+	withList := strings.Join(b.commitArgs("r", "base", "/t.tar", true, true, false), " ")
+	if !strings.Contains(withList, "--direct-s3 --s3-config /etc/cvmfs-prepub/r.s3.server.conf --object-list ") ||
+		!strings.HasSuffix(withList, " r") {
+		t.Errorf("with the object list: %q", withList)
+	}
+	plain := NewIngestBackend(IngestOptions{}, newTestObs(t))
+	if got := strings.Join(plain.commitArgs("r", "base", "/t.tar", true, false, false), " "); strings.Contains(got, "--s3-config") {
+		t.Errorf("--s3-config without a configured path: %q", got)
+	}
+}

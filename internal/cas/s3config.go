@@ -32,6 +32,11 @@ import (
 
 // S3Settings is the resolved configuration for the S3 CAS backend.
 type S3Settings struct {
+	// ConfigPath is the S3 config file these settings were read from (the
+	// file CVMFS_UPSTREAM_STORAGE names). The direct-S3 ingest is handed the
+	// same file, so both upload paths use one set of credentials and tuning.
+	ConfigPath string
+
 	// RepoAlias is the key prefix every object lives under. upload_s3.cc:478
 	// builds "<repository_alias>/data/<hash-path>", so this must match the
 	// repository's own alias exactly or the client fetches 404s.
@@ -213,6 +218,7 @@ func LoadS3SettingsFromServerConf(serverConfPath string) (S3Settings, error) {
 		DNSBuckets: !strings.EqualFold(strings.TrimSpace(s3kv["CVMFS_S3_DNS_BUCKETS"]), "false"),
 		ACL:        s3kv["CVMFS_S3_X_AMZ_ACL"],
 	}
+	out.ConfigPath = s3ConfPath
 	if out.ACL == "" {
 		// Same default as upload_s3.cc:60. Do NOT leave this empty: objects
 		// uploaded without a readable ACL are served as 403 and the client

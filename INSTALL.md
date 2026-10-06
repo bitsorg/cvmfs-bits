@@ -118,6 +118,7 @@ down; check `journalctl`).
 | `--user NAME` | install, update | run the services as NAME ([section 2.4](#24-service-account-and-spool-location)) |
 | `--spool-dir DIR` | install, update | spool root ([section 2.4](#24-service-account-and-spool-location)) |
 | `--prewarm`, `--no-prewarm` | install, update | publisher: set `prewarm: true` or `false` in `config.yaml` ([section 7](#7-stratum-1-pre-warming)); without either it is left as it is |
+| `--s3-conf-from FILE` | install, update | publisher: write prepub's own S3 config (the file `cas.server_conf` names) from the repository's S3 config FILE ([Step 2](#step-2--repository-credentials)); later updates refresh it from the same FILE without the option |
 | `--purge-legacy` | install, uninstall | remove the legacy bits-console spool daemon without asking ([section 2.5](#25-legacy-bits-console-spool-daemon)) |
 | `--legacy-spool DIR` | install, uninstall | legacy spool location (default `/mnt/build/bits/spool`) |
 | `--keep-spool`, `--keep-user` | uninstall | preserve the spool, the account |
@@ -212,23 +213,52 @@ and note the paths of its `cvmfs_swissknife` and libraries for
 
 ### Step 2 — repository credentials
 
-The S3 CAS reads the repository's own configuration, so these files must exist
-on the publisher (copy them from the gateway host):
+prepub reads its S3 settings from one file of its own, the one `cas.server_conf`
+names (by convention `/etc/cvmfs-prepub/<repo>.s3.server.conf`). The S3 store
+reads it, and a direct-S3 ingest gets the same file as
+`cvmfs_server ingest --s3-config`, so both upload paths use the same
+credentials and tuning, and nothing depends on a file at a default path.
 
-| File | Used for |
-|---|---|
-| `/etc/cvmfs/repositories.d/<repo>/server.conf` | `cas.server_conf`; its `CVMFS_UPSTREAM_STORAGE` names the S3 config |
-| the S3 config it names (usually `/etc/cvmfs/keys/<repo>.s3.conf`) | endpoint, bucket, credentials, repository alias |
-| `<ingest_config_prefix>/<repo>/{config,gatewaykey,pubkey}` | coarse-publish finalize: the `ingestsql` gateway client configuration (`config` sets `CVMFS_GATEWAY`, `CVMFS_STRATUM0`, `CVMFS_HTTP_PROXY`, `CVMFS_UPSTREAM_STORAGE`) |
+1. Copy the repository's S3 `server.conf` from the gateway host to that path.
+   Only its `CVMFS_UPSTREAM_STORAGE=S3,<tmp>,<alias>@<file>` line matters: it
+   gives the alias, the object key prefix in the bucket.
+2. With `repo_name`, `cas.type: s3` and `cas.server_conf` set in
+   `config.yaml` ([Step 3](#step-3--configure)), run `install.sh` with
+   `--s3-conf-from` and the repository's S3 config (the file holding
+   `CVMFS_S3_HOST`, the bucket and the keys, usually
+   `/etc/cvmfs/keys/<repo>.s3.conf`):
 
-```sh
-sudo chown root:cvmfs-prepub /etc/cvmfs/keys/<repo>.s3.conf
-sudo chmod 0640              /etc/cvmfs/keys/<repo>.s3.conf
-```
+   ```sh
+   sudo ./install.sh update --s3-conf-from /etc/cvmfs/keys/<repo>.s3.conf
+   ```
+
+   It rewrites the file as: a header naming the source, a
+   `CVMFS_UPSTREAM_STORAGE` that names the file itself (alias and temp dir
+   kept), the source's `CVMFS_S3_*` lines, and a tuning block, first
+   `CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=64`. The file is
+   `root:cvmfs-prepub 0640`; a copy that was there before is kept once as
+   `<file>.orig`. The source itself is never changed.
+3. Every later `install.sh update` refreshes the `CVMFS_S3_*` lines from the
+   recorded source, so a key rotation reaches prepub with the next update.
+   Below the tuning marker it keeps comments and only these keys:
+   `CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS`, `CVMFS_S3_TIMEOUT`,
+   `CVMFS_S3_MAX_RETRIES`, `CVMFS_S3_PEEK_BEFORE_PUT`; anything else there is
+   dropped with a warning, so endpoint, bucket and credentials always come from
+   the source.
+
+With `cas.type: s3`, prepub passes `--s3-config` to every direct-S3 ingest,
+naming the S3 config its `cas.server_conf` points to; this holds for an
+existing setup too, before `--s3-conf-from` is used. It overrides
+`CVMFS_INGEST_DIRECT_S3_CONFIG` in `/etc/cvmfs/repositories.d/<repo>/server.conf`
+and `/etc/cvmfs/<repo>.s3.conf`, so remove those (`install.sh` warns about the
+first). Without an S3 store, `cvmfs_server` still uses them.
 
 The service refuses an S3 config that is world-accessible or group-writable.
 S3 credentials come only from that file, never from `AWS_*` environment
-variables or an instance role. Protect the finalize prefix the same way:
+variables or an instance role. The coarse-publish finalize needs
+`<ingest_config_prefix>/<repo>/{config,gatewaykey,pubkey}` (the `ingestsql`
+gateway client configuration; `config` sets `CVMFS_GATEWAY`, `CVMFS_STRATUM0`,
+`CVMFS_HTTP_PROXY`, `CVMFS_UPSTREAM_STORAGE`); protect it the same way:
 `gatewaykey` is a secret.
 
 ### Step 3 — configure
@@ -253,7 +283,7 @@ repo_name: software.example.org
 
 cas:
   type: s3
-  server_conf: /etc/cvmfs/repositories.d/software.example.org/server.conf
+  server_conf: /etc/cvmfs-prepub/software.example.org.s3.server.conf   # step 2
 
 # Coarse-publish finalize (bits-console's default mode needs it).
 ingest_config_prefix: /etc/cvmfs-prepub/ingest
@@ -428,8 +458,10 @@ serialised.
 Direct S3 is chosen per job: a job submitted with `direct_s3=true` (in
 bits-console, the Build dialog's direct-S3 option) runs
 `cvmfs_server ingest --direct-s3`, which writes data objects straight to S3,
-reading `/etc/cvmfs/<repo>.s3.conf`, and sends only catalogs through the
-gateway. The file's presence alone does not enable it, and the installed
+and sends only catalogs through the gateway. With `cas.type: s3` prepub adds
+`--s3-config` with its own S3 config ([Step 2](#step-2--repository-credentials));
+otherwise `cvmfs_server` uses `CVMFS_INGEST_DIRECT_S3_CONFIG` or
+`/etc/cvmfs/<repo>.s3.conf`. The file's presence alone does not enable it, and the installed
 `cvmfs_server` must support `--direct-s3`.
 
 A mountless publisher cannot create the parent directories of a new target, so

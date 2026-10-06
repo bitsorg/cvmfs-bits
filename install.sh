@@ -58,6 +58,13 @@
 #                       INSTALL.md section 7 on ExecStart.
 #   --no-prewarm        Publisher: turn it off again (prewarm: false).
 #                       Without either option the setting is left as it is.
+#   --s3-conf-from FILE Publisher: write prepub's own S3 config, the file
+#                       cas.server_conf names, from FILE (the repository's S3
+#                       config, e.g. /etc/cvmfs/keys/<repo>.s3.conf): its
+#                       CVMFS_S3_* lines plus a tuning block that is kept.
+#                       prepub's S3 store and the direct-S3 ingest both use
+#                       it. Later updates refresh the CVMFS_S3_* lines from
+#                       the same FILE without the option. root:cvmfs-prepub 0640.
 #
 # ── UNINSTALL OPTIONS ──────────────────────────────────────────────────────────
 #   --mode MODE         What to uninstall:
@@ -162,6 +169,7 @@ SERVICE_USER=""
 SERVICE_GROUP=""
 SPOOL_DIR=""
 PREWARM=""   # "", true or false: --prewarm / --no-prewarm
+S3_CONF_FROM=""   # --s3-conf-from: the repository's S3 config to copy from
 
 # uninstall-specific
 KEEP_SPOOL=false
@@ -389,6 +397,8 @@ while [[ $# -gt 0 ]]; do
         --spool-dir)       shift; SPOOL_DIR="${1:-}" ;;
         --prewarm)         PREWARM=true ;;
         --no-prewarm)      PREWARM=false ;;
+        --s3-conf-from)    shift; S3_CONF_FROM="${1:-}"
+                           [ -n "$S3_CONF_FROM" ] || die "--s3-conf-from needs a file" ;;
         # uninstall options
         --keep-spool)      KEEP_SPOOL=true ;;
         --purge-cas)       PURGE_CAS=true ;;
@@ -630,8 +640,8 @@ stratum0_url: http://localhost/cvmfs   # e.g. http://stratum0.example.org/cvmfs
 cas:
   type: localfs
   root: /srv/cvmfs/cas
-  # type: s3                 # bucket/credentials come from the repo's server.conf
-  # server_conf: /etc/cvmfs/repositories.d/your-repo.example.org/server.conf
+  # type: s3                 # bucket/credentials: install.sh --s3-conf-from (INSTALL.md step 2)
+  # server_conf: /etc/cvmfs-prepub/your-repo.example.org.s3.server.conf
 
 pipeline:
   # Keep these matched to MemoryMax in the unit file: peak RSS scales with
@@ -717,6 +727,137 @@ install_config_template() {
         chown "root:${ACCESS_GROUP}" "$env_file"
         chmod 0600 "$env_file"
         ok "Secrets env skeleton written: ${env_file}"
+    fi
+}
+
+# set_s3_conf -- write prepub's own S3 config: the file cas.server_conf names.
+#
+# One file is both the server.conf prepub's S3 store reads (its
+# CVMFS_UPSTREAM_STORAGE names the file itself) and the S3 config prepub hands
+# to the direct-S3 ingest (--s3-config), so both upload paths use the same
+# credentials and tuning and nothing depends on a file at a default path. The
+# CVMFS_S3_* lines are copied from the source (--s3-conf-from, else the source
+# recorded in the file) on every install/update; tuning keys after the marker
+# are kept. It holds the S3 secret: root:${ACCESS_GROUP} 0640, written through a
+# mktemp file (0600) so it is never readable by others.
+S3_TUNING_MARK="# -- prepub tuning: install.sh keeps the lines below on update --"
+S3_SOURCE_TAG="# source: "
+# Only these may be tuned below the marker: everything else (endpoint, bucket,
+# credentials, ACL, the upstream line) comes from the source, so a stale or
+# planted line there can neither outlive a key rotation nor redirect uploads.
+S3_TUNING_KEYS="CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS CVMFS_S3_TIMEOUT CVMFS_S3_MAX_RETRIES CVMFS_S3_PEEK_BEFORE_PUT"
+set_s3_conf() {
+    local cfg="${CONFIG_DIR}/config.yaml" dst repo src="$S3_CONF_FROM"
+    if [[ "$MODE" != "publisher" && "$MODE" != "all" ]]; then
+        [ -n "$src" ] && warn "--s3-conf-from only applies to the publisher — ignored"
+        return 0
+    fi
+    if [ "$(read_yaml_key "$cfg" cas type "")" != "s3" ]; then
+        [ -n "$src" ] && err "S3 config not written: --s3-conf-from needs cas.type: s3 in ${cfg}"
+        return 0
+    fi
+    dst=$(read_yaml_key "$cfg" cas server_conf "")
+    if [ -z "$src" ]; then
+        # Without the option: refresh only a file this function wrote before.
+        [ -n "$dst" ] && [ -f "$dst" ] && [ ! -L "$dst" ] || return 0
+        src=$(sed -n "s|^${S3_SOURCE_TAG}||p" "$dst" | head -1 | tr -d '\r')
+        [ -n "$src" ] || return 0
+    fi
+    repo=$(read_yaml_key "$cfg" "" repo_name "")
+    [ -n "$repo" ] || { err "S3 config not written: repo_name is not set in ${cfg}"; return 0; }
+    [ -n "$dst" ] || { err "S3 config not written: set cas.server_conf in ${cfg} (e.g. ${CONFIG_DIR}/${repo}.s3.server.conf)"; return 0; }
+    # Lexically canonical and directly under CONFIG_DIR: no "..", no "//".
+    if [ "$(realpath -ms -- "$dst")" != "$dst" ]; then
+        err "S3 config not written: cas.server_conf (${dst}) is not a canonical absolute path"; return 0
+    fi
+    case "$dst" in
+        "${CONFIG_DIR}"/*) ;;
+        *) err "S3 config not written: cas.server_conf (${dst}) is outside ${CONFIG_DIR}"; return 0 ;;
+    esac
+    src=$(realpath -m -- "$src")
+    if [ "$src" = "$(realpath -m -- "$dst")" ]; then
+        err "S3 config not written: the source is cas.server_conf itself — name the repository's S3 config"; return 0
+    fi
+    if [ ! -r "$src" ] || ! grep -qE '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_HOST=' "$src"; then
+        err "S3 config not written: ${src} is not readable or has no CVMFS_S3_HOST"; return 0
+    fi
+    if grep -qF -- "$S3_TUNING_MARK" "$src"; then
+        err "S3 config not written: ${src} is a prepub S3 config, not the repository's"; return 0
+    fi
+
+    # The alias (the object key prefix in the bucket) and temp dir come from the
+    # CVMFS_UPSTREAM_STORAGE already there, above the marker: the S3 server.conf
+    # copied from the gateway host, or a file written here before. Never guessed —
+    # a wrong alias publishes catalogs whose objects no client finds.
+    local alias="" tmpdir="/var/spool/cvmfs/${repo}/tmp" up="" f1 f2 f3
+    if [ -f "$dst" ]; then
+        up=$(awk -v m="$S3_TUNING_MARK" '{ sub(/\r$/, "") } $0 == m { exit } { print }' "$dst" \
+             | sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_UPSTREAM_STORAGE=//p' | tail -1 | tr -d "\"'")
+    fi
+    if [ -n "$up" ]; then
+        IFS=, read -r f1 f2 f3 <<<"$up"
+        [ -n "$f3" ] && tmpdir="$f2"
+        up="${up##*,}"
+        [[ "$up" == *@* ]] && alias="${up%%@*}"
+    fi
+    if [ -z "$alias" ]; then
+        err "S3 config not written: no S3 alias in ${dst} — copy the repository's S3 server.conf (CVMFS_UPSTREAM_STORAGE=S3,...,<alias>@...) there first"
+        return 0
+    fi
+
+    # Tuning kept from a file written here before (allowed keys and comments
+    # only); the default otherwise.
+    local tuning="CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=64" dropped=""
+    if [ -f "$dst" ] && [ ! -L "$dst" ] && tr -d '\r' < "$dst" | grep -qxF -- "$S3_TUNING_MARK"; then
+        local kept="" line key
+        while IFS= read -r line; do
+            line="${line%$'\r'}"
+            key=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z0-9_]+)=.*/\2/p' <<<"$line")
+            if [ -z "$key" ] || [[ " ${S3_TUNING_KEYS} " == *" ${key} "* ]]; then
+                kept+="${line}"$'\n'
+            else
+                dropped+=" ${key}"
+            fi
+        done < <(awk -v m="$S3_TUNING_MARK" '{ sub(/\r$/, "") } found { print } $0 == m { found = 1 }' "$dst")
+        tuning="${kept%$'\n'}"
+    fi
+    [ -n "$dropped" ] && warn "dropped from the tuning block of ${dst} (not tunable here):${dropped}"
+
+    if $DRY_RUN; then
+        dry "Write ${dst} from ${src} (alias ${alias})"
+        return 0
+    fi
+    # A file not written here (a copied server.conf) is kept once, for reference,
+    # with the same protection as the new one in case it held a secret.
+    if [ -f "$dst" ] && [ ! -L "$dst" ] && ! grep -qF -- "$S3_TUNING_MARK" "$dst" && [ ! -e "${dst}.orig" ]; then
+        run "Keep the previous ${dst} as ${dst}.orig" install -o root -g "$ACCESS_GROUP" -m 0640 "$dst" "${dst}.orig"
+    fi
+    local tmp
+    tmp=$(mktemp "${dst}.XXXXXX") || { err "cannot create a temporary file next to ${dst}"; return 0; }
+    if {
+        echo "# cvmfs-prepub S3 settings for ${repo}, written by install.sh. prepub's S3 store"
+        echo "# reads it (CVMFS_UPSTREAM_STORAGE names this file) and the direct-S3 ingest gets"
+        echo "# it as --s3-config. The CVMFS_S3_* lines are copied from the source on every"
+        echo "# install/update; below the tuning marker only these are kept: ${S3_TUNING_KEYS}."
+        echo "${S3_SOURCE_TAG}${src}"
+        echo "CVMFS_UPSTREAM_STORAGE=S3,${tmpdir},${alias}@${dst}"
+        grep -E '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_' "$src" | tr -d '\r'
+        echo "$S3_TUNING_MARK"
+        [ -z "$tuning" ] || printf '%s\n' "$tuning"
+    } > "$tmp" && chown "root:${ACCESS_GROUP}" "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$dst"; then
+        ok "S3 config ${dst} written from ${src} (root:${ACCESS_GROUP} 0640)"
+    else
+        rm -f "$tmp"
+        err "could not write ${dst}"
+        return 0
+    fi
+
+    local rconf="/etc/cvmfs/repositories.d/${repo}/server.conf"
+    if [ -f "$rconf" ] && grep -q '^[[:space:]]*CVMFS_INGEST_DIRECT_S3_CONFIG=' "$rconf"; then
+        warn "${rconf} sets CVMFS_INGEST_DIRECT_S3_CONFIG; prepub passes --s3-config, which overrides it — remove the line"
+    fi
+    if [ "$ACTION" = "install" ] && svc_active "$SVC_PUB"; then
+        warn "${SVC_PUB} is running: restart it to apply (systemctl restart ${SVC_PUB})"
     fi
 }
 
@@ -1153,10 +1294,10 @@ report_new_keys() {
 do_update() {
     if $DRY_RUN; then
         printf "\n${BOLD}cvmfs-prepub update  [DRY RUN]  mode=%s${RESET}\n" "$MODE"
-        printf "${DIM}No changes will be made.  Configuration is not modified (only the prewarm key, with --prewarm/--no-prewarm).${RESET}\n"
+        printf "${DIM}No changes will be made.  config.yaml is not modified (only the prewarm key, with --prewarm/--no-prewarm).${RESET}\n"
     else
         printf "\n${BOLD}cvmfs-prepub update  mode=%s${RESET}\n" "$MODE"
-        info "Configuration, secrets, spool and CAS are preserved."
+        info "Configuration, spool and CAS are preserved; prepub's S3 config is refreshed from its source."
         confirm "Update cvmfs-prepub binaries on this host?" || { printf "Aborted.\n"; exit 0; }
     fi
 
@@ -1198,6 +1339,7 @@ do_update() {
     update_units
     update_config_report
     set_prewarm
+    set_s3_conf
     maybe_daemon_reload
 
     if [ ${#was_active[@]} -gt 0 ]; then
@@ -1231,9 +1373,9 @@ do_update() {
             info "Check the log:   journalctl -u ${SVC_RCV} -n 30 --no-pager"
         fi
         if [ -n "$PREWARM" ]; then
-            info "Configuration: only prewarm was set (${PREWARM}); no secrets were touched."
+            info "config.yaml: only prewarm was set (${PREWARM})."
         else
-            info "Configuration was not modified; no secrets were touched."
+            info "config.yaml was not modified."
         fi
     fi
 }
@@ -1288,6 +1430,7 @@ do_install() {
     install_binaries
     install_config_template
     set_prewarm
+    set_s3_conf
     install_units
     enable_start_services
     install_health_check

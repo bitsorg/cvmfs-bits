@@ -722,3 +722,29 @@ func TestWithTimeout_NeverExtendsTheCaller(t *testing.T) {
 		t.Fatal("withTimeout outlived its parent")
 	}
 }
+
+// The layout install.sh --s3-conf-from writes: one file that is both the
+// server.conf and the S3 config (its CVMFS_UPSTREAM_STORAGE names itself),
+// group-readable, with tuning keys prepub does not use. ConfigPath reports it,
+// so the direct-S3 ingest is handed the same file.
+func TestLoadS3Settings_SelfReferencingFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "repo.s3.server.conf")
+	body := "# written by install.sh\n" +
+		"CVMFS_UPSTREAM_STORAGE=S3,/var/spool/cvmfs/r/tmp,cvmfs/r@" + f + "\n" +
+		"CVMFS_S3_HOST=s3.cern.ch\nCVMFS_S3_BUCKET=b\nCVMFS_S3_ACCESS_KEY=a\nCVMFS_S3_SECRET_KEY=s\n" +
+		"# -- prepub tuning: install.sh keeps the lines below on update --\n" +
+		"CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=64\n"
+	if err := os.WriteFile(f, []byte(body), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(f, 0o640); err != nil { // independent of the umask
+		t.Fatal(err)
+	}
+	st, err := LoadS3SettingsFromServerConf(f)
+	if err != nil {
+		t.Fatalf("LoadS3SettingsFromServerConf: %v", err)
+	}
+	if st.ConfigPath != f || st.RepoAlias != "cvmfs/r" || st.Bucket != "b" {
+		t.Errorf("ConfigPath=%q alias=%q bucket=%q", st.ConfigPath, st.RepoAlias, st.Bucket)
+	}
+}
