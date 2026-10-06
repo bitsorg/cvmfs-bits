@@ -118,7 +118,8 @@ down; check `journalctl`).
 | `--user NAME` | install, update | run the services as NAME ([section 2.4](#24-service-account-and-spool-location)) |
 | `--spool-dir DIR` | install, update | spool root ([section 2.4](#24-service-account-and-spool-location)) |
 | `--prewarm`, `--no-prewarm` | install, update | publisher: set `prewarm: true` or `false` in `config.yaml` ([section 7](#7-stratum-1-pre-warming)); without either it is left as it is |
-| `--s3-conf-from FILE` | install, update | publisher: write prepub's own S3 config (the file `cas.server_conf` names) from the repository's S3 config FILE ([Step 2](#step-2--repository-credentials)); later updates refresh it from the same FILE without the option |
+| `--s3-conf-from FILE` | install, update | publisher with `cas.type: s3`: the repository's S3 config prepub's own is written from ([Step 2](#step-2--repository-credentials)); default: the source recorded in that file, else `/etc/cvmfs/keys/<repo>.s3.conf` |
+| `--mounted` | install, update | publisher with the ingest path: register the repository as a mounted gateway publisher instead of a mountless one ([section 4.3](#43-the-ingest-path)); only matters for a first registration |
 | `--purge-legacy` | install, uninstall | remove the legacy bits-console spool daemon without asking ([section 2.5](#25-legacy-bits-console-spool-daemon)) |
 | `--legacy-spool DIR` | install, uninstall | legacy spool location (default `/mnt/build/bits/spool`) |
 | `--keep-spool`, `--keep-user` | uninstall | preserve the spool, the account |
@@ -170,7 +171,9 @@ sudo ./install.sh --user cvbits --spool-dir /mnt/cvmfs-prepub --skip-service
 The account must exist; it joins the `cvmfs-prepub` group, which can read the
 config and credential files, and `uninstall` never removes it. Without `--user`,
 `install` and `update` keep the user the installed unit runs as (drop-ins
-included). Without `--spool-dir` the spool is `spool_root` from an existing
+included), else take the repository owner the CVMFS configuration names
+(`CVMFS_USER` in `/etc/cvmfs/repositories.d/<repo_name>/server.conf`, else in
+the S3 `server.conf` at `cas.server_conf`), else use `cvmfs-prepub`. Without `--spool-dir` the spool is `spool_root` from an existing
 `config.yaml`, else `/var/spool/cvmfs-prepub`; a `--spool-dir` that disagrees
 with `spool_root` is refused. A spool path through a symlink is resolved, since
 systemd may refuse a symlink under SELinux (`226/NAMESPACE`).
@@ -222,19 +225,14 @@ credentials and tuning, and nothing depends on a file at a default path.
 1. Copy the repository's S3 `server.conf` from the gateway host to that path.
    Only its `CVMFS_UPSTREAM_STORAGE=S3,<tmp>,<alias>@<file>` line matters: it
    gives the alias, the object key prefix in the bucket.
-2. With `repo_name`, `cas.type: s3` and `cas.server_conf` set in
-   `config.yaml` ([Step 3](#step-3--configure)), run `install.sh` with
-   `--s3-conf-from` and the repository's S3 config (the file holding
-   `CVMFS_S3_HOST`, the bucket and the keys, usually
-   `/etc/cvmfs/keys/<repo>.s3.conf`):
-
-   ```sh
-   sudo ./install.sh update --s3-conf-from /etc/cvmfs/keys/<repo>.s3.conf
-   ```
-
-   It rewrites the file as: a header naming the source, a
+2. Put the repository's S3 config (the file holding `CVMFS_S3_HOST`, the
+   bucket and the keys) at `/etc/cvmfs/keys/<repo>.s3.conf`. With `repo_name`,
+   `cas.type: s3` and `cas.server_conf` set in `config.yaml`
+   ([Step 3](#step-3--configure)), `install.sh install` or `update` picks it
+   up; `--s3-conf-from FILE` names another source. It rewrites the file as: a header naming the source, a
    `CVMFS_UPSTREAM_STORAGE` that names the file itself (alias and temp dir
-   kept), the source's `CVMFS_S3_*` lines, and a tuning block, first
+   kept), the repository owner (`CVMFS_USER`, if the copy had one), the
+   source's `CVMFS_S3_*` lines, and a tuning block, first
    `CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=64`. The file is
    `root:cvmfs-prepub 0640`; a copy that was there before is kept once as
    `<file>.orig`. The source itself is never changed.
@@ -435,17 +433,33 @@ ingest_publish: true
 ingest_publish_owner: cvmfs        # optional: cvmfs_server ingest -u <owner>
 ```
 
-Once per repository on the publisher, register a mountless gateway publisher
-(`-P`: no FUSE mount, no overlay):
+The publisher must be registered with the gateway for `repo_name`, once per
+host. `install.sh install` and `update` do it when `ingest_publish: true`,
+`publish_mode: gateway` and the repository is not registered on the host yet,
+provided the gateway key is in place (copy it from the old publisher or the
+gateway; it is a secret and is never fetched):
 
 ```sh
-sudo mkdir -p /etc/cvmfs/keys
-echo "plain_text <key_id> <secret>" | sudo tee /etc/cvmfs/keys/<repo>.gw >/dev/null
-sudo cvmfs_server connect-gw -P -K \
-    -u http://<gateway>:4929/api/v1 \
-    -w <stratum0-url>/<repo> \
-    -o <owner> <repo>
+sudo install -o root -g <owner group> -m 0640 <copy of the key> /etc/cvmfs/keys/<repo>.gw   # plain_text <key_id> <secret>
+sudo ./install.sh update
 ```
+
+They then run, with values from `config.yaml` and the service user as owner:
+
+```sh
+cvmfs_server connect-gw -P -K -u <gateway.url>/api/v1 -w <stratum0_url>/<repo> -o <owner> <repo>
+```
+
+`-P` registers a mountless publisher (no FUSE mount, no overlay); `--mounted`
+registers a mounted one instead. A mountless publisher cannot create the parent
+directories of a new target, so the gateway must (below). `-K` fetches the
+repository's `.pub` and `.crt` from the gateway (a feature of the bitsorg
+cvmfs build; the gateway needs `enable_key_endpoint: true`). `connect-gw` needs
+the cvmfs client, `curl`, `jq` and `openssl` on the publisher, and no autofs on
+`/cvmfs`. Without the key `install.sh` warns and skips the registration; a
+repository already set up on the host is left as it is. If a registration fails
+half-way, `install.sh` says so: remove it with `cvmfs_server rmfs -f <repo>`
+and re-run `update`.
 
 `cvmfs_server` must be on `PATH` (the service exits at startup otherwise), and
 the service user must be allowed to run `cvmfs_server ingest` for the
@@ -986,6 +1000,7 @@ prefetch budget and the environment-variable equivalents are in
 | 403 on submit | target outside `allowed_publish_prefixes` | extend the list or fix the path |
 | Commit fails with a graft error | gateway without the graft endpoint | `gateway.direct_graft: false` |
 | Service killed during large publishes | `MemoryMax` below what `pipeline.workers` needs | lower workers or raise the limits |
+| `Failed to load environment files: Permission denied`, or the config file unreadable with SELinux enforcing | files copied or moved from a home directory, `/tmp` or another host keep a label systemd may not read (`ausearch -m avc -ts recent`) | `install.sh install`/`update` restore the labels (`restorecon -R` on the config, keys, repository config, binary, units and spool); by hand: `restorecon -Rv /etc/cvmfs-prepub` |
 
 ---
 

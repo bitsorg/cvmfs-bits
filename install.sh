@@ -45,6 +45,9 @@
 # ── INSTALL / UPDATE OPTIONS ───────────────────────────────────────────────────
 #   --user NAME         Run the services as NAME. Default: the user an installed
 #                       unit already runs as (drop-ins included), else the
+#                       publisher's repository owner (CVMFS_USER in
+#                       /etc/cvmfs/repositories.d/<repo>/server.conf or in
+#                       cas.server_conf), else the
 #                       cvmfs-prepub system account, created if missing. Any
 #                       other account (e.g. the repository owner) must exist;
 #                       it is added to the cvmfs-prepub group, which keeps read
@@ -58,13 +61,15 @@
 #                       INSTALL.md section 7 on ExecStart.
 #   --no-prewarm        Publisher: turn it off again (prewarm: false).
 #                       Without either option the setting is left as it is.
-#   --s3-conf-from FILE Publisher: write prepub's own S3 config, the file
-#                       cas.server_conf names, from FILE (the repository's S3
-#                       config, e.g. /etc/cvmfs/keys/<repo>.s3.conf): its
-#                       CVMFS_S3_* lines plus a tuning block that is kept.
-#                       prepub's S3 store and the direct-S3 ingest both use
-#                       it. Later updates refresh the CVMFS_S3_* lines from
-#                       the same FILE without the option. root:cvmfs-prepub 0640.
+#   --s3-conf-from FILE Publisher with cas.type s3: the repository's S3 config
+#                       that prepub's own (the file cas.server_conf names) is
+#                       written from: its CVMFS_S3_* lines plus a tuning block
+#                       that is kept. Default: the source recorded in that file,
+#                       else /etc/cvmfs/keys/<repo>.s3.conf. root:cvmfs-prepub 0640.
+#   --mounted           Publisher with ingest_publish: register the repository
+#                       as a mounted gateway publisher instead of a mountless
+#                       one. Only matters when it is not registered yet; the
+#                       gateway key /etc/cvmfs/keys/<repo>.gw must be in place.
 #
 # ── UNINSTALL OPTIONS ──────────────────────────────────────────────────────────
 #   --mode MODE         What to uninstall:
@@ -128,6 +133,8 @@ readonly BINARY_DIR="/usr/local/bin"
 # No longer shipped: update and uninstall remove a copy left by older installs.
 readonly OLD_PREPUBCTL="${BINARY_DIR}/prepubctl"
 readonly CONFIG_DIR="/etc/cvmfs-prepub"
+# CVMFS server configuration (repositories, keys); overridable for tests only.
+CVMFS_ETC="${CVMFS_ETC:-/etc/cvmfs}"
 readonly DEFAULT_SPOOL_DIR="/var/spool/cvmfs-prepub"
 readonly DEFAULT_CAS_PUB="/srv/cvmfs/cas"
 readonly DEFAULT_CAS_RCV="/srv/cvmfs/stratum1/cas"
@@ -170,6 +177,7 @@ SERVICE_GROUP=""
 SPOOL_DIR=""
 PREWARM=""   # "", true or false: --prewarm / --no-prewarm
 S3_CONF_FROM=""   # --s3-conf-from: the repository's S3 config to copy from
+GW_MOUNTED=false  # --mounted: register a mounted (not mountless) gateway publisher
 
 # uninstall-specific
 KEEP_SPOOL=false
@@ -397,6 +405,7 @@ while [[ $# -gt 0 ]]; do
         --spool-dir)       shift; SPOOL_DIR="${1:-}" ;;
         --prewarm)         PREWARM=true ;;
         --no-prewarm)      PREWARM=false ;;
+        --mounted)         GW_MOUNTED=true ;;
         --s3-conf-from)    shift; S3_CONF_FROM="${1:-}"
                            [ -n "$S3_CONF_FROM" ] || die "--s3-conf-from needs a file" ;;
         # uninstall options
@@ -757,13 +766,28 @@ set_s3_conf() {
         return 0
     fi
     dst=$(read_yaml_key "$cfg" cas server_conf "")
+    repo=$(read_yaml_key "$cfg" "" repo_name "")
     if [ -z "$src" ]; then
-        # Without the option: refresh only a file this function wrote before.
+        # Without the option: the source recorded by an earlier run, else the
+        # repository's S3 config at its conventional place; nothing when
+        # neither exists (the operator has not set this up).
+        # A symlink was put there on purpose: leave it to --s3-conf-from.
         [ -n "$dst" ] && [ -f "$dst" ] && [ ! -L "$dst" ] || return 0
         src=$(sed -n "s|^${S3_SOURCE_TAG}||p" "$dst" | head -1 | tr -d '\r')
-        [ -n "$src" ] || return 0
+        if [ -z "$src" ]; then
+            # The S3 config the copied server.conf names (...@<file>), when it
+            # is on this host, else the conventional place.
+            local named c
+            named=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_UPSTREAM_STORAGE=.*@//p' "$dst" | tail -1 | tr -d "\"'\r")
+            for c in "$named" ${repo:+"${CVMFS_ETC}/keys/${repo}.s3.conf"}; do
+                if [ -n "$c" ] && [ -r "$c" ] && [ "$(realpath -m -- "$c")" != "$(realpath -m -- "$dst")" ]; then
+                    src="$c"
+                    break
+                fi
+            done
+            [ -n "$src" ] || return 0
+        fi
     fi
-    repo=$(read_yaml_key "$cfg" "" repo_name "")
     [ -n "$repo" ] || { err "S3 config not written: repo_name is not set in ${cfg}"; return 0; }
     [ -n "$dst" ] || { err "S3 config not written: set cas.server_conf in ${cfg} (e.g. ${CONFIG_DIR}/${repo}.s3.server.conf)"; return 0; }
     # Lexically canonical and directly under CONFIG_DIR: no "..", no "//".
@@ -799,6 +823,11 @@ set_s3_conf() {
         [ -n "$f3" ] && tmpdir="$f2"
         up="${up##*,}"
         [[ "$up" == *@* ]] && alias="${up%%@*}"
+    fi
+    local owner=""
+    if [ -f "$dst" ]; then
+        owner=$(awk -v m="$S3_TUNING_MARK" '{ sub(/\r$/, "") } $0 == m { exit } { print }' "$dst" \
+                | sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_USER=["'"'"']?([A-Za-z0-9._-]+).*/\2/p' | tail -1)
     fi
     if [ -z "$alias" ]; then
         err "S3 config not written: no S3 alias in ${dst} — copy the repository's S3 server.conf (CVMFS_UPSTREAM_STORAGE=S3,...,<alias>@...) there first"
@@ -841,6 +870,8 @@ set_s3_conf() {
         echo "# install/update; below the tuning marker only these are kept: ${S3_TUNING_KEYS}."
         echo "${S3_SOURCE_TAG}${src}"
         echo "CVMFS_UPSTREAM_STORAGE=S3,${tmpdir},${alias}@${dst}"
+        # The repository owner, kept for repo_service_user (prepub ignores it).
+        [ -z "$owner" ] || echo "CVMFS_USER=${owner}"
         grep -E '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_' "$src" | tr -d '\r'
         echo "$S3_TUNING_MARK"
         [ -z "$tuning" ] || printf '%s\n' "$tuning"
@@ -852,12 +883,133 @@ set_s3_conf() {
         return 0
     fi
 
-    local rconf="/etc/cvmfs/repositories.d/${repo}/server.conf"
+    local rconf="${CVMFS_ETC}/repositories.d/${repo}/server.conf"
     if [ -f "$rconf" ] && grep -q '^[[:space:]]*CVMFS_INGEST_DIRECT_S3_CONFIG=' "$rconf"; then
         warn "${rconf} sets CVMFS_INGEST_DIRECT_S3_CONFIG; prepub passes --s3-config, which overrides it — remove the line"
     fi
     if [ "$ACTION" = "install" ] && svc_active "$SVC_PUB"; then
         warn "${SVC_PUB} is running: restart it to apply (systemctl restart ${SVC_PUB})"
+    fi
+}
+
+# repo_service_user -- the repository owner named in /etc/cvmfs (CVMFS_USER of
+# the repository's own server.conf, else of the S3 server.conf copied from the
+# gateway host to cas.server_conf), so a publisher runs as the account that may
+# publish without --user. Empty when neither names one.
+repo_service_user() {
+    local cfg="${CONFIG_DIR}/config.yaml" repo f u
+    repo=$(config_repo)
+    [ -n "$repo" ] || return 0
+    for f in "${CVMFS_ETC}/repositories.d/${repo}/server.conf" "$(read_yaml_key "$cfg" cas server_conf "")"; do
+        [ -n "$f" ] && [ -f "$f" ] || continue
+        u=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_USER=["'"'"']?([A-Za-z0-9._-]+).*/\2/p' "$f" | tail -1)
+        [ -n "$u" ] || continue
+        # A service with an HTTP API never runs as root, and a name from a
+        # gateway-host copy may not exist here: fall back to the default.
+        if ! id -u "$u" &>/dev/null; then
+            warn "CVMFS_USER ${u} (${f}) has no account on this host — not used as the service user" >&2
+        elif [ "$(id -u "$u")" = 0 ]; then
+            warn "CVMFS_USER ${u} (${f}) is root — not used as the service user" >&2
+        else
+            echo "$u"
+        fi
+        return 0
+    done
+}
+
+# config_repo -- repo_name from config.yaml when it is a valid repository name
+# (it ends up in paths and commands run as root), else empty.
+config_repo() {
+    local repo
+    repo=$(read_yaml_key "${CONFIG_DIR}/config.yaml" "" repo_name "")
+    [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && echo "$repo"
+    return 0
+}
+
+# connect_gw -- register this host as a gateway publisher of repo_name, once:
+# `cvmfs_server connect-gw` with the gateway, Stratum 0 and owner from the
+# configuration, mountless (-P) unless --mounted. Runs only for the ingest path
+# in gateway mode; a repository already registered here is left as it is. The
+# gateway key (/etc/cvmfs/keys/<repo>.gw) is a secret and is never fetched:
+# copy it from the old publisher or the gateway first. The repository's .pub
+# and .crt come from the gateway (-K).
+connect_gw() {
+    [[ "$MODE" == "publisher" || "$MODE" == "all" ]] || return 0
+    local cfg="${CONFIG_DIR}/config.yaml" repo gw s0 rconf key up
+    [ -f "$cfg" ] || return 0
+    [ "$(read_yaml_key "$cfg" "" ingest_publish "")" = "true" ] || return 0
+    [ "$(read_yaml_key "$cfg" "" publish_mode gateway)" = "gateway" ] || return 0
+    repo=$(config_repo)
+    [ -n "$repo" ] || { warn "Gateway registration skipped: repo_name in ${cfg} is not set or not a repository name"; return 0; }
+    rconf="${CVMFS_ETC}/repositories.d/${repo}/server.conf"
+    if [ -f "$rconf" ]; then
+        up=$(sed -nE 's/^[[:space:]]*CVMFS_UPSTREAM_STORAGE=//p' "$rconf" | tail -1 | tr -d "\"'")
+        case "$up" in
+            gw,*) skip "${repo} already registered on this host (${up##*,})" ;;
+            *)    warn "${repo} is set up on this host but not as a gateway publisher (${up:-no upstream}) — not changed" ;;
+        esac
+        return 0
+    fi
+    gw=$(read_yaml_key "$cfg" gateway url ""); gw="${gw%/}"; gw="${gw%/api/v1}"
+    s0=$(read_yaml_key "$cfg" "" stratum0_url ""); s0="${s0%/}"
+    if [ -z "$gw" ] || [ -z "$s0" ]; then
+        err "Gateway registration of ${repo} skipped: gateway.url and stratum0_url must be set in ${cfg}"
+        return 0
+    fi
+    key="${CVMFS_ETC}/keys/${repo}.gw"
+    if [ ! -f "$key" ]; then
+        warn "Gateway registration of ${repo} skipped: ${key} is missing — copy the gateway key"
+        warn "  (plain_text <key_id> <secret>, root:${SERVICE_GROUP} 0640) from the old publisher, then re-run update"
+        return 0
+    fi
+    local args=(connect-gw -K -u "${gw}/api/v1" -w "${s0}/${repo}" -o "$SERVICE_USER" "$repo")
+    $GW_MOUNTED || args=(connect-gw -P "${args[@]:1}")
+    command -v cvmfs_server &>/dev/null || { err "Gateway registration of ${repo}: cvmfs_server is not installed"; return 0; }
+    if $DRY_RUN; then
+        dry "cvmfs_server ${args[*]}"
+        return 0
+    fi
+    local out
+    if out=$(cvmfs_server "${args[@]}" </dev/null 2>&1); then
+        ok "Registered ${repo} with ${gw} ($($GW_MOUNTED && echo mounted || echo mountless), owner ${SERVICE_USER})"
+        $GW_MOUNTED || info "Mountless: the gateway must create parent directories (CVMFS_GW_MKDIR_PARENTS=true in its server.conf for ${repo})"
+    else
+        err "cvmfs_server ${args[*]} failed:"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/       /' >&2
+        # mkfs writes the repository's server.conf early, so a later failure
+        # leaves a half registration that the next run would take as done.
+        [ -f "$rconf" ] && warn "  partly registered: remove it (cvmfs_server rmfs -f ${repo}), fix the cause, re-run update"
+    fi
+}
+
+# selinux_restore -- reset the SELinux labels of everything this installation
+# uses. Files copied or moved from elsewhere (a home directory, /tmp, another
+# host) keep a label systemd may not read: "Failed to load environment files:
+# Permission denied" with an AVC denial for init_t.
+selinux_restore() {
+    command -v selinuxenabled &>/dev/null && selinuxenabled || return 0
+    command -v restorecon &>/dev/null || return 0
+    local repo p paths=() top=()
+    repo=$(config_repo)
+    for p in "$CONFIG_DIR" "${BINARY_DIR}/cvmfs-prepub" "${BINARY_DIR}/cvmfs-prepub-receiver" \
+             "${UNIT_DIR}/${SVC_PUB}.service" "${UNIT_DIR}/${SVC_PUB}.service.d" \
+             "${UNIT_DIR}/${SVC_RCV}.service" "${UNIT_DIR}/${SVC_RCV}.service.d" \
+             "${CVMFS_ETC}/keys" ${repo:+"${CVMFS_ETC}/repositories.d/${repo}"}; do
+        [ -e "$p" ] && paths+=("$p")
+    done
+    # The spool only at its top: its job files inherit the label, and walking
+    # them would lengthen every update's downtime.
+    for p in "$SPOOL_DIR" "${SPOOL_DIR}/tmp"; do [ -e "$p" ] && top+=("$p"); done
+    if $DRY_RUN; then
+        dry "restorecon -R ${paths[*]}; restorecon ${top[*]}"
+        return 0
+    fi
+    local out
+    if out=$( { [ ${#paths[@]} -eq 0 ] || restorecon -R "${paths[@]}"; } 2>&1 &&
+              { [ ${#top[@]} -eq 0 ] || restorecon "${top[@]}"; } 2>&1 ); then
+        ok "SELinux labels restored ($(( ${#paths[@]} + ${#top[@]} )) paths)"
+    else
+        warn "restorecon reported a problem (labels may be unchanged): $(printf '%s' "$out" | tail -2)"
     fi
 }
 
@@ -1340,6 +1492,8 @@ do_update() {
     update_config_report
     set_prewarm
     set_s3_conf
+    connect_gw
+    selinux_restore
     maybe_daemon_reload
 
     if [ ${#was_active[@]} -gt 0 ]; then
@@ -1431,7 +1585,9 @@ do_install() {
     install_config_template
     set_prewarm
     set_s3_conf
+    connect_gw
     install_units
+    selinux_restore
     enable_start_services
     install_health_check
 
@@ -1487,6 +1643,11 @@ if [ -z "$SERVICE_USER" ]; then
     # not hand the spool back to the default account behind the service's back.
     _unit="$SVC_PUB"; [[ "$MODE" == "receiver" ]] && _unit="$SVC_RCV"
     has_systemd && SERVICE_USER="$(systemctl show -p User --value "${_unit}.service" 2>/dev/null || true)"
+    # Else the repository owner /etc/cvmfs names: the account that may publish.
+    if [ -z "$SERVICE_USER" ] && [[ "$MODE" != "receiver" && "$ACTION" != uninstall ]]; then
+        SERVICE_USER="$(repo_service_user)"
+        [ -z "$SERVICE_USER" ] || info "Service user ${SERVICE_USER}: the repository owner (CVMFS_USER)"
+    fi
     SERVICE_USER="${SERVICE_USER:-$DEFAULT_USER}"
 fi
 # Files are owned by the user's primary group (its own, for a new account).
