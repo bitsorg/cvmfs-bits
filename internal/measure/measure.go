@@ -66,6 +66,13 @@ type Record struct {
 	BackendS  *float64 `json:"backend_s,omitempty"`  // the publish tool itself
 	PipelineS *float64 `json:"pipeline_s,omitempty"` // chunk/compress/upload
 
+	// PrecheckS is the already-published check (catalog reads from Stratum0),
+	// made under the commit lock just BEFORE CommitS starts. AncestorsS is
+	// part of CommitS outside BackendS: creating the target's parent
+	// directories. The delete before a replace is in none of these.
+	PrecheckS  *float64 `json:"precheck_s,omitempty"`
+	AncestorsS *float64 `json:"ancestors_s,omitempty"`
+
 	// ── volume ──
 	TarBytes *int64 `json:"tar_bytes,omitempty"`
 	Objects  *int   `json:"objects,omitempty"`

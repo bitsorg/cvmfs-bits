@@ -2118,7 +2118,9 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	leaseCancel()     // release leaseCtx resources early; Commit uses the parent ctx
 
 	// Holding the repository's slot here, so every earlier commit has landed.
+	precheckStart := time.Now()
 	skip, replace, preErr := o.preCommitChecks(ctx, j, &req, logger)
+	o.measPrecheck(j, time.Since(precheckStart))
 	if preErr == nil && replace {
 		preErr = o.replaceFirst(ctx, j, &req, logger)
 	}

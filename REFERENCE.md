@@ -1004,7 +1004,10 @@ Record fields: `ts`, `build_id`, `job_id`, `repo`, `path`, `publish_path`,
 `incomplete:<state>` for a job that ended elsewhere, e.g. an accumulated
 member), `total_s`, `queued_s`, `lock_wait_s` (waiting for the repository's
 commit lock, which serialises its publishes), `commit_s`, `backend_s`, `pipeline_s`,
-`tar_bytes`, `objects`, `objects_exact`, `bytes_raw`, `bytes_compressed`,
+`precheck_s` (the already-published check, made under the commit lock just
+before `commit_s` starts), `ancestors_s` (the part of `commit_s` before the
+publish tool runs that creates the target's parent directories; the delete
+before a replace is in neither), `tar_bytes`, `objects`, `objects_exact`, `bytes_raw`, `bytes_compressed`,
 `conflicted`, `replaced`, `error` (the real cause, truncated). Times are
 seconds; absent values are omitted.
 
@@ -1548,6 +1551,7 @@ minimum level. Lines about a job carry `job_id`. Useful messages:
 | `rejected unauthenticated request` | warn | `401`; `reason` says why |
 | `job attempt failed — will retry` | warn | Retry scheduled; `next_attempt_at` |
 | `job failed` | error | Terminal failure with the real error and `class` |
+| `ingest backend: timeline` | info, warn on failure | One per publish: the non-blank output lines of the `cvmfs_server ingest` call with the seconds since it started (`+4.1s …`, or `+5.0s..+605.0s …` for a line that took that long to finish), so the time can be split between opening the transaction, swissknife and closing it. At most the first 40 and last 20 lines, each cut at 300 bytes; the ancestors transaction and the delete before a replace are not included |
 | `lease abort failed — stale lease left on gateway` | error | The lease stays until the gateway expires it |
 | `build will NOT be auto-published: some jobs failed` | error | A sealed build with failed members |
 | `replay cache is filling up …` | warn | The nonce cache is at 80 % |

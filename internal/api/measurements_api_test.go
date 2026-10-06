@@ -366,3 +366,43 @@ func TestOrchestrator_RecordsTheCommitLockWait(t *testing.T) {
 		t.Errorf("lock_wait_s = %v, want >= 0.09", got)
 	}
 }
+
+// ancestorsBackend reports an ancestors step, as the ingest backend does.
+type ancestorsBackend struct{ mockBackend }
+
+func (b *ancestorsBackend) Commit(ctx context.Context, req lease.CommitRequest) error {
+	if req.Stats != nil {
+		req.Stats.Ancestors = 250 * time.Millisecond
+	}
+	return b.mockBackend.Commit(ctx, req)
+}
+
+// The parts of the commit phase outside the publish tool are recorded: the
+// pre-commit checks and the backend's ancestors step.
+//
+// NEGATIVE CONTROL: drop the measPrecheck call in Run and precheck_s is
+// absent; drop the AncestorsS assignment in measFinish and ancestors_s is.
+func TestOrchestrator_RecordsPrecheckAndAncestors(t *testing.T) {
+	backend := &ancestorsBackend{}
+	o, sp := minimalOrch(t, backend)
+	o.PublishPaths = map[string]lease.Backend{"ingest": backend}
+	w := withMeasurements(t, o)
+
+	j := newIncomingJob(t, sp)
+	j.PublishPath = "ingest"
+	j.BuildID = "b-phases"
+	if err := o.Run(context.Background(), j, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	recs, err := w.Read("b-phases")
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("Read: %v, %d records", err, len(recs))
+	}
+	if recs[0].PrecheckS == nil {
+		t.Error("precheck_s absent")
+	}
+	if got := recs[0].AncestorsS; got == nil || *got != 0.25 {
+		t.Errorf("ancestors_s = %v, want 0.25", got)
+	}
+}

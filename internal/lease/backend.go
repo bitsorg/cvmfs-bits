@@ -147,6 +147,10 @@ type PublishStats struct {
 	// Backend is the tool-level duration: for the ingest path, exactly the
 	// wall clock of `cvmfs_server ingest`, excluding lease and ancestors.
 	Backend time.Duration
+	// Ancestors is the time spent making sure the target's parent
+	// directories exist before the publish (ingest path; it can open its own
+	// transaction).
+	Ancestors time.Duration
 	// TarBytes is the payload handed to the backend, when it takes one.
 	TarBytes *int64
 	// Objects is the number of data objects the backend confirmed. Only the

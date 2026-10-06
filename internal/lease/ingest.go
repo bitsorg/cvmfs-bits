@@ -4,9 +4,9 @@
 package lease
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path"
@@ -231,7 +231,12 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 	// Do this BEFORE the ingest, not after a failure: the payload is already
 	// on disk and the gateway would otherwise accept the whole upload and only
 	// then panic during the commit merge.
-	if err := b.ensureAncestors(ctx, repo, req.CVMFSDir); err != nil {
+	ancestorsStart := time.Now()
+	err := b.ensureAncestors(ctx, repo, req.CVMFSDir)
+	if req.Stats != nil {
+		req.Stats.Ancestors = time.Since(ancestorsStart)
+	}
+	if err != nil {
 		return err
 	}
 
@@ -272,18 +277,17 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 		}
 	}
 
-	// Two shapes, because collecting the list needs Start/Wait around the pipe
-	// and cvmfsServerOutput uses CombinedOutput, which does both itself. The
-	// no-list branch is the pre-existing call, untouched.
+	// Two shapes, because collecting the list needs Start/Wait around the
+	// extra pipe; both capture the combined output with its timeline.
 	var (
 		out       string
-		err       error
 		listed    int
 		readToEOF bool
 	)
 	var confirmed []string
+	var tl *timeline
 	if useObjectList {
-		out, readToEOF, err = b.cvmfsServerOutputWithObjectList(ctx,
+		out, tl, readToEOF, err = b.cvmfsServerListTimed(ctx,
 			func(line string) {
 				listed++
 				if req.ConfirmedObjects != nil {
@@ -293,8 +297,9 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 				}
 			}, args...)
 	} else {
-		out, err = b.cvmfsServerOutput(ctx, args...)
+		out, tl, err = b.cvmfsServerTimed(ctx, args...)
 	}
+	b.logTimeline(repo, base, tl, err)
 
 	if err != nil {
 		if useObjectList {
@@ -357,18 +362,27 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 func (b *IngestBackend) cvmfsServerOutputWithObjectList(
 	ctx context.Context, onLine func(string), args ...string,
 ) (string, bool, error) {
+	out, _, readToEOF, err := b.cvmfsServerListTimed(ctx, onLine, args...)
+	return out, readToEOF, err
+}
+
+// cvmfsServerListTimed is cvmfsServerOutputWithObjectList that also returns
+// when each output line arrived.
+func (b *IngestBackend) cvmfsServerListTimed(
+	ctx context.Context, onLine func(string), args ...string,
+) (string, *timeline, bool, error) {
 	cmd := newCvmfsServerCmd(ctx, args...)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	tl := newTimeline()
+	cmd.Stdout = tl
+	cmd.Stderr = tl
 
 	readToEOF, err := runWithObjectList(ctx, cmd, b.obs.Logger, onLine)
 
-	out := strings.TrimSpace(buf.String())
+	out := strings.TrimSpace(tl.Output())
 	if out != "" {
 		b.obs.Logger.Debug("cvmfs_server", "args", args, "output", truncateLog(out))
 	}
-	return out, readToEOF, err
+	return out, tl, readToEOF, err
 }
 
 // ensureAncestors creates the parent directory chain of cvmfsDir when it does
@@ -694,11 +708,36 @@ func (b *IngestBackend) Probe(_ context.Context) error {
 // ── subprocess helpers ────────────────────────────────────────────────────────
 
 func (b *IngestBackend) cvmfsServerOutput(ctx context.Context, args ...string) (string, error) {
+	out, _, err := b.cvmfsServerTimed(ctx, args...)
+	return out, err
+}
+
+// cvmfsServerTimed runs cvmfs_server and returns its combined output, as
+// CombinedOutput did, and when each line of it arrived.
+func (b *IngestBackend) cvmfsServerTimed(ctx context.Context, args ...string) (string, *timeline, error) {
 	cmd := newCvmfsServerCmd(ctx, args...)
-	raw, err := cmd.CombinedOutput()
-	out := strings.TrimSpace(string(raw))
+	tl := newTimeline()
+	cmd.Stdout = tl
+	cmd.Stderr = tl
+	err := cmd.Run()
+	out := strings.TrimSpace(tl.Output())
 	if out != "" {
 		b.obs.Logger.Debug("cvmfs_server", "args", args, "output", truncateLog(out))
 	}
-	return out, err
+	return out, tl, err
+}
+
+// logTimeline logs when each line of a publish's output arrived: at Info for
+// every publish, so the steps of any slow one can be read afterwards, and at
+// Warn for a failed one.
+func (b *IngestBackend) logTimeline(repo, base string, tl *timeline, err error) {
+	if tl == nil {
+		return
+	}
+	level := slog.LevelInfo
+	if err != nil {
+		level = slog.LevelWarn
+	}
+	b.obs.Logger.Log(context.Background(), level, "ingest backend: timeline",
+		"repo", repo, "base", base, "lines", len(tl.Lines()), "timeline", tl.String())
 }

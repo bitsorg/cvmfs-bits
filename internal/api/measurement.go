@@ -39,6 +39,8 @@ type measAccum struct {
 	commitKnown bool
 	lockWait    time.Duration
 	lockWaited  bool
+	precheck    time.Duration
+	prechecked  bool
 }
 
 // measBegin starts recording for a job. Safe when measurements are disabled.
@@ -84,6 +86,16 @@ func (o *Orchestrator) measLockWait(j *job.Job, d time.Duration) {
 		a.mu.Lock()
 		a.lockWait += d
 		a.lockWaited = true
+		a.mu.Unlock()
+	}
+}
+
+// measPrecheck records the time spent on the checks made before a commit
+// (is it already published, by this build or another).
+func (o *Orchestrator) measPrecheck(j *job.Job, d time.Duration) {
+	if a := o.measFor(j); a != nil {
+		a.mu.Lock()
+		a.precheck, a.prechecked = d, true
 		a.mu.Unlock()
 	}
 }
@@ -175,6 +187,12 @@ func (o *Orchestrator) measFinish(j *job.Job, outcome string, cause error) {
 	}
 	if a.stats.Backend > 0 {
 		rec.BackendS = measure.Secs(a.stats.Backend)
+	}
+	if a.prechecked {
+		rec.PrecheckS = measure.Secs(a.precheck)
+	}
+	if a.stats.Ancestors > 0 {
+		rec.AncestorsS = measure.Secs(a.stats.Ancestors)
 	}
 	if a.stats.TarBytes != nil {
 		rec.TarBytes = a.stats.TarBytes
