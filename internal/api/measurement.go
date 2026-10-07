@@ -171,6 +171,8 @@ func (o *Orchestrator) measFinish(j *job.Job, outcome string, cause error) {
 		Repo:        j.Repo,
 		Path:        j.Path,
 		PublishPath: publishPath,
+		DirectS3:    j.DirectS3,
+		ObjectList:  j.ObjectList,
 		Outcome:     outcome,
 		TotalS:      now.Sub(start).Seconds(),
 		Conflicted:  a.conflicted,

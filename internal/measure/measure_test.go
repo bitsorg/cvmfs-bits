@@ -358,3 +358,26 @@ func TestObjectsExactIsEmittedEvenWhenFalse(t *testing.T) {
 		t.Errorf("an inexact count was not marked as such: %s", blob)
 	}
 }
+
+// Records carry the node that wrote them, and direct_s3 even when false: an
+// old record has no field, which must not read as "through the gateway".
+func TestAppend_StampsHostAndEmitsDirectS3(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := NewWriter(dir)
+	_ = w.Append(Record{BuildID: "b", JobID: "j"})
+	_ = w.Append(Record{BuildID: "b", JobID: "k", Host: "other", DirectS3: true, ObjectList: true})
+	recs, err := w.Read("b")
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("Read: %v, %d records", err, len(recs))
+	}
+	if host, _ := os.Hostname(); recs[0].Host != host {
+		t.Errorf("host = %q, want %q", recs[0].Host, host)
+	}
+	if recs[1].Host != "other" || !recs[1].DirectS3 || !recs[1].ObjectList {
+		t.Errorf("explicit fields not kept: %+v", recs[1])
+	}
+	blob, _ := os.ReadFile(filepath.Join(dir, "b.ndjson"))
+	if !strings.Contains(string(blob), `"direct_s3":false`) {
+		t.Errorf("direct_s3=false was not emitted: %s", blob)
+	}
+}

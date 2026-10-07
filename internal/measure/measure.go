@@ -48,6 +48,13 @@ type Record struct {
 	Repo        string    `json:"repo"`
 	Path        string    `json:"path"`
 	PublishPath string    `json:"publish_path"` // ingest | staged | prepub
+	// Host is the prepub node that wrote the record, so records gathered
+	// from several nodes can be told apart.
+	Host string `json:"host,omitempty"`
+	// DirectS3 is emitted even when false: an older record has no field, and
+	// "not recorded" must stay distinguishable from "through the gateway".
+	DirectS3   bool `json:"direct_s3"`
+	ObjectList bool `json:"object_list,omitempty"`
 	// Outcome is "published", "failed", or "incomplete:<state>" for a job
 	// that reached neither -- a package accumulated against a coarse build
 	// being the normal case.
@@ -137,8 +144,9 @@ func truncateMiddle(s string, max int) string {
 // never fail a publish, so every error is returned for logging and otherwise
 // dropped by the caller.
 type Writer struct {
-	dir string
-	mu  sync.Mutex
+	dir  string
+	host string
+	mu   sync.Mutex
 }
 
 // NewWriter creates the directory and returns a Writer. A nil *Writer is
@@ -150,7 +158,8 @@ func NewWriter(dir string) (*Writer, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("measurements dir %q: %w", dir, err)
 	}
-	return &Writer{dir: dir}, nil
+	host, _ := os.Hostname() // best-effort: an empty host is omitted
+	return &Writer{dir: dir, host: host}, nil
 }
 
 // unsafeName matches everything not allowed in a build id used as a filename.
@@ -190,6 +199,9 @@ func (w *Writer) Append(r Record) error {
 	}
 	if r.Timestamp.IsZero() {
 		r.Timestamp = time.Now().UTC()
+	}
+	if r.Host == "" {
+		r.Host = w.host
 	}
 	r.Error = truncateMiddle(r.Error, maxErrLen)
 	line, err := json.Marshal(r)

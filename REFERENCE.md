@@ -1000,6 +1000,8 @@ array (`latest` selects the most recently written build). Query parameters:
 | `summary=1` | A summary object instead of the records |
 
 Record fields: `ts`, `build_id`, `job_id`, `repo`, `path`, `publish_path`,
+`host` (the prepub node that wrote it), `direct_s3` (always present; absent only
+in records written before it existed), `object_list`,
 `outcome` (`published`, `already_published`, `failed`, `retry`, or
 `incomplete:<state>` for a job that ended elsewhere, e.g. an accumulated
 member), `total_s`, `queued_s`, `lock_wait_s` (waiting for the repository's

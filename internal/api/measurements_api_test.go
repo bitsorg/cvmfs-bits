@@ -191,6 +191,33 @@ func TestOrchestrator_WritesARecordOnSuccess(t *testing.T) {
 	if recs[0].JobID != j.ID || recs[0].TotalS <= 0 {
 		t.Errorf("identity/timing wrong: %+v", recs[0])
 	}
+	if recs[0].DirectS3 || recs[0].ObjectList {
+		t.Errorf("transport flags set without being asked: %+v", recs[0])
+	}
+}
+
+// The record says which upload path the job asked for, so a comparison does
+// not need the service log.
+func TestOrchestrator_RecordsTheDirectS3Request(t *testing.T) {
+	backend := &mockBackend{}
+	o, sp := minimalOrch(t, backend)
+	o.PublishPaths = map[string]lease.Backend{"ingest": backend}
+	w := withMeasurements(t, o)
+
+	j := newIncomingJob(t, sp)
+	j.PublishPath = "ingest"
+	j.BuildID = "b-s3"
+	j.DirectS3, j.ObjectList = true, true
+	if err := o.Run(context.Background(), j, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	recs, err := w.Read("b-s3")
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("Read: %v, %d records", err, len(recs))
+	}
+	if !recs[0].DirectS3 || !recs[0].ObjectList || recs[0].Host == "" {
+		t.Errorf("record = %+v", recs[0])
+	}
 }
 
 // A failed publish is recorded too, with the REAL cause — not the generic
