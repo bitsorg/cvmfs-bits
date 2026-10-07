@@ -219,6 +219,17 @@ func LoadS3SettingsFromServerConf(serverConfPath string) (S3Settings, error) {
 		ACL:        s3kv["CVMFS_S3_X_AMZ_ACL"],
 	}
 	out.ConfigPath = s3ConfPath
+	// The direct-S3 ingest gets this file and writes objects under
+	// CVMFS_S3_REPO_ALIAS (the repository name when unset). One that names
+	// another prefix than the store's alias splits a publish across two places
+	// in the bucket, and the ingest half is never served.
+	if ra, ok := s3kv["CVMFS_S3_REPO_ALIAS"]; ok {
+		if got := strings.Trim(strings.TrimSpace(ra), "/"); got != "" && got != alias {
+			return out, fmt.Errorf("%s: CVMFS_S3_REPO_ALIAS %q differs from the repository alias %q "+
+				"of CVMFS_UPSTREAM_STORAGE: the direct-S3 ingest would write where the store does not",
+				s3ConfPath, got, alias)
+		}
+	}
 	if out.ACL == "" {
 		// Same default as upload_s3.cc:60. Do NOT leave this empty: objects
 		// uploaded without a readable ACL are served as 403 and the client

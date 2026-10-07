@@ -394,7 +394,7 @@ Gateway credentials are environment variables only:
 |---|---|---|---|---|
 | `cas.type` | `--cas-type` | | `localfs` | `localfs` or `s3` (gateway mode only) |
 | `cas.root` | `--cas-root` | | `/var/lib/cvmfs-prepub/cas` | localfs: the repository's storage directory (objects under `data/xx/...`). Receiver: its CAS root |
-| `cas.server_conf` | `--cas-server-conf` | | `/etc/cvmfs/repositories.d/<repo_name>/server.conf` | For `s3`: a `server.conf` whose `CVMFS_UPSTREAM_STORAGE` names the S3 config file that supplies endpoint, bucket, alias and credentials; `install.sh --s3-conf-from` writes prepub's own, which names itself ([INSTALL.md](INSTALL.md#step-2--repository-credentials)). The direct-S3 ingest gets that S3 config as `--s3-config`. Startup fails if neither this nor `repo_name` is set |
+| `cas.server_conf` | `--cas-server-conf` | | `/etc/cvmfs/repositories.d/<repo_name>/server.conf` | For `s3`: a `server.conf` whose `CVMFS_UPSTREAM_STORAGE` names the S3 config file that supplies endpoint, bucket, alias and credentials; `install.sh --s3-conf-from` writes prepub's own, which names itself ([INSTALL.md](INSTALL.md#step-2--repository-credentials)). The direct-S3 ingest gets that S3 config as `--s3-config` and writes objects under its `CVMFS_S3_REPO_ALIAS`, which install.sh sets to the alias; startup fails if the file names another one, or if neither this nor `repo_name` is set |
 | `promote_workers` | `--promote-workers` | `PREPUB_PROMOTE_WORKERS` | `16` | Concurrent server-side copies when promoting a staged job's objects; must be >= 1, values above 256 are clamped |
 
 ### Optional paths and coarse finalize

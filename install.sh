@@ -872,7 +872,11 @@ set_s3_conf() {
         echo "CVMFS_UPSTREAM_STORAGE=S3,${tmpdir},${alias}@${dst}"
         # The repository owner, kept for repo_service_user (prepub ignores it).
         [ -z "$owner" ] || echo "CVMFS_USER=${owner}"
-        grep -E '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_' "$src" | tr -d '\r'
+        grep -E '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_' "$src" \
+            | grep -vE '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_REPO_ALIAS=' | tr -d '\r'
+        # The direct-S3 ingest writes objects under this prefix; without it, under
+        # the repository name, which the bucket does not serve when they differ.
+        echo "CVMFS_S3_REPO_ALIAS=${alias}"
         echo "$S3_TUNING_MARK"
         [ -z "$tuning" ] || printf '%s\n' "$tuning"
     } > "$tmp" && chown "root:${ACCESS_GROUP}" "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$dst"; then

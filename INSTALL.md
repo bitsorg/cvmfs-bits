@@ -232,7 +232,9 @@ credentials and tuning, and nothing depends on a file at a default path.
    up; `--s3-conf-from FILE` names another source. It rewrites the file as: a header naming the source, a
    `CVMFS_UPSTREAM_STORAGE` that names the file itself (alias and temp dir
    kept), the repository owner (`CVMFS_USER`, if the copy had one), the
-   source's `CVMFS_S3_*` lines, and a tuning block, first
+   source's `CVMFS_S3_*` lines, `CVMFS_S3_REPO_ALIAS=<alias>` (the prefix the
+   direct-S3 ingest writes objects under; it needs a cvmfs carrying that key,
+   which otherwise writes under the repository name), and a tuning block, first
    `CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=64`. The file is
    `root:cvmfs-prepub 0640`; a copy that was there before is kept once as
    `<file>.orig`. The source itself is never changed.

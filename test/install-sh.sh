@@ -40,6 +40,7 @@ cfg "$D"
 check "written"                 "grep -q '^OK: S3 config' $W/out"
 check "self-referencing upstream" "grep -qx 'CVMFS_UPSTREAM_STORAGE=S3,/var/spool/cvmfs/r/tmp,cvmfs/r@$D' $D"
 check "keys copied"             "grep -qx 'CVMFS_S3_SECRET_KEY=SK1' $D"
+check "direct-S3 prefix = alias" "grep -qx 'CVMFS_S3_REPO_ALIAS=cvmfs/r' $D"
 check "default tuning"          "grep -qx 'CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=64' $D"
 check "source recorded absolute" "grep -qx '# source: $W/keys/r.s3.conf' $D"
 check "mode 0640"               "[ \$(stat -c %a $D) = 640 ]"
@@ -50,7 +51,7 @@ cp "$D" "$W/before"; run
 check "refresh is byte-identical" "cmp -s $D $W/before"
 
 # 3. Key rotation and tuning edits: keys refreshed, allowed tuning kept, the rest dropped.
-printf 'CVMFS_S3_HOST=s3.example\nCVMFS_S3_BUCKET=b\nCVMFS_S3_ACCESS_KEY=AK2\nCVMFS_S3_SECRET_KEY=SK2\n' > "$W/keys/r.s3.conf"
+printf 'CVMFS_S3_HOST=s3.example\nCVMFS_S3_BUCKET=b\nCVMFS_S3_ACCESS_KEY=AK2\nCVMFS_S3_SECRET_KEY=SK2\nCVMFS_S3_REPO_ALIAS=wrong\n' > "$W/keys/r.s3.conf"
 sed -i 's/=64$/=32/' "$D"
 printf '# note\nCVMFS_S3_TIMEOUT=60\nCVMFS_S3_SECRET_KEY=STALE\nCVMFS_UPSTREAM_STORAGE=S3,/t,evil@/tmp/x\n' >> "$D"
 run
@@ -58,6 +59,7 @@ check "rotated key"             "grep -qx 'CVMFS_S3_SECRET_KEY=SK2' $D && ! grep
 check "allowed tuning kept"     "grep -qx 'CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=32' $D && grep -qx 'CVMFS_S3_TIMEOUT=60' $D && grep -qx '# note' $D"
 check "planted upstream dropped" "! grep -q evil $D && grep -q 'dropped from the tuning block' $W/out"
 check "alias unchanged"         "grep -qx 'CVMFS_UPSTREAM_STORAGE=S3,/var/spool/cvmfs/r/tmp,cvmfs/r@$D' $D"
+check "source's REPO_ALIAS replaced" "[ \$(grep -c CVMFS_S3_REPO_ALIAS $D) = 1 ] && grep -qx 'CVMFS_S3_REPO_ALIAS=cvmfs/r' $D"
 
 # 4. Refusals.
 S3_CONF_FROM="$D" run;               check "source = destination refused" "grep -q 'is cas.server_conf itself' $W/out"

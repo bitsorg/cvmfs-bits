@@ -102,6 +102,39 @@ CVMFS_S3_USE_HTTPS=yes
 	}
 }
 
+// The direct-S3 ingest writes under CVMFS_S3_REPO_ALIAS; one that names another
+// prefix than the store's alias must stop prepub, not split a publish.
+func TestLoadS3SettingsRepoAliasMustMatch(t *testing.T) {
+	for _, c := range []struct {
+		line    string
+		wantErr bool
+	}{
+		{"", false},
+		{"CVMFS_S3_REPO_ALIAS=cvmfs/r.cern.ch\n", false},
+		{"CVMFS_S3_REPO_ALIAS=/cvmfs/r.cern.ch/\n", false},
+		{"CVMFS_S3_REPO_ALIAS=r.cern.ch\n", true},
+	} {
+		dir := t.TempDir()
+		s3conf := filepath.Join(dir, "s3.conf")
+		body := "CVMFS_S3_HOST=h\nCVMFS_S3_BUCKET=b\nCVMFS_S3_ACCESS_KEY=a\nCVMFS_S3_SECRET_KEY=s\n" + c.line
+		if err := os.WriteFile(s3conf, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		serverConf := filepath.Join(dir, "server.conf")
+		if err := os.WriteFile(serverConf, []byte(
+			"CVMFS_UPSTREAM_STORAGE=S3,/tmp,cvmfs/r.cern.ch@"+s3conf+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadS3SettingsFromServerConf(serverConf)
+		if (err != nil) != c.wantErr {
+			t.Errorf("%q: err = %v, want error %v", c.line, err, c.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), "CVMFS_S3_REPO_ALIAS") {
+			t.Errorf("%q: error does not name the key: %v", c.line, err)
+		}
+	}
+}
+
 func TestLoadS3SettingsRejectsNonS3Upstream(t *testing.T) {
 	dir := t.TempDir()
 	serverConf := filepath.Join(dir, "server.conf")
