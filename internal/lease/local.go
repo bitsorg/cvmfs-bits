@@ -104,6 +104,30 @@ func (b *LocalBackend) Heartbeat(_ context.Context, _ string, _ time.Duration, _
 	return func() {} // no-op cancel
 }
 
+// ErrPublishInterrupted reports a publish killed by context cancellation or
+// timeout. It exists so the error CLASS does not depend on why the context
+// ended: cvmfs_server's own error is frequently ctx.Err() verbatim -- exec
+// returns it when Start sees a done context, and again when the process exits
+// 0 at the deadline -- and context.DeadlineExceeded satisfies net.Error, so
+// wrapping it makes ClassOf say "transient" and invites a retry of a publish
+// that may already be in the repository. Wrapping this instead keeps one
+// class, chosen deliberately; the cause is still in the message.
+var ErrPublishInterrupted = errors.New("publish interrupted")
+
+// interruptedPublishErr builds the error for a publish killed by cancellation
+// or timeout.
+//
+// Both causes are formatted with %v, never %w, so that neither can reach
+// errors.Is: cvmfs_server's own error IS ctx.Err() in reachable cases (exec
+// returns it when Start sees a done context, and again when the process exits 0
+// at the deadline), and context.DeadlineExceeded satisfies net.Error, so
+// wrapping it would make ClassOf report "transient" and invite a retry of a
+// publish that may already be in the repository. Only the sentinel is wrapped.
+func interruptedPublishErr(repo string, ctxErr, pubErr error, markerSeen bool) error {
+	return fmt.Errorf("%w: cvmfs_server publish %q (%v; commit marker seen: %t): %v",
+		ErrPublishInterrupted, repo, ctxErr, markerSeen, pubErr)
+}
+
 // Commit extracts the tar at req.TarPath into req.CVMFSDir and then runs
 // cvmfs_server publish on the repository identified by req.Token.
 //
@@ -113,6 +137,11 @@ func (b *LocalBackend) Heartbeat(_ context.Context, _ string, _ time.Duration, _
 //     semaphore is released.  Caller should treat as published.
 //   - any other error:            publish failed before or during cvmfs_server;
 //     semaphore is NOT released so Abort can still abort the open transaction.
+//     This includes an interrupted publish (ctx cancelled or timed out), where
+//     the output is a fragment of a killed run and its markers cannot be
+//     trusted — before the process group was killed on cancel, that case simply
+//     never returned, so ErrCommittedNotRemounted implied a finished commit by
+//     accident rather than by design.
 func (b *LocalBackend) Commit(ctx context.Context, req CommitRequest) error {
 	repo := req.Token // for local backend, token == repo name
 
@@ -141,6 +170,34 @@ func (b *LocalBackend) Commit(ctx context.Context, req CommitRequest) error {
 	}
 
 	if pubErr != nil {
+		// A cancelled context means we killed cvmfs_server mid-publish, so the
+		// output is a fragment of an interrupted run and its markers cannot be
+		// trusted. Before the process-group kill this branch was unreachable on
+		// timeout — the publish simply never returned — so "marker printed =>
+		// commit finished" held by accident. It no longer does: a kill that
+		// lands after the marker would otherwise be reported as
+		// ErrCommittedNotRemounted, which the orchestrator treats as published.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Deliberately NOT evicting: this is an "any other error" return, so
+			// the semaphore stays held and Abort can still close the open
+			// transaction, per the contract above.
+			//
+			// ctxErr is formatted with %s, not %w, on purpose. Wrapping it makes
+			// the class depend on WHY the context ended — context.DeadlineExceeded
+			// satisfies net.Error so ClassOf calls it transient and the publisher
+			// retries, while context.Canceled is internal and it does not. A
+			// publish killed after the commit marker may already be in the
+			// repository, so retrying risks the duplicate publishes this whole
+			// change set exists to stop. One deterministic class, chosen rather
+			// than inherited; the marker is reported so an operator can tell
+			// which side of the commit it died on.
+			b.obs.Logger.Warn("local backend: publish interrupted",
+				"repo", repo, "cause", ctxErr.Error(),
+				"committed_marker", strings.Contains(out, "Exporting repository manifest"),
+				"output", logOut)
+			return interruptedPublishErr(repo, ctxErr, pubErr,
+				strings.Contains(out, "Exporting repository manifest"))
+		}
 		if strings.Contains(out, "Exporting repository manifest") {
 			// Phase 1 (catalog commit) succeeded; only the FUSE remount failed.
 			b.obs.Logger.Warn("local backend: catalog committed but FUSE remount failed",
@@ -219,7 +276,7 @@ const maxCvmfsLogBytes = 8192
 // always returned regardless of exit status so callers can inspect specific
 // markers; only the structured-log entry is capped at maxCvmfsLogBytes.
 func (b *LocalBackend) cvmfsServerOutput(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "cvmfs_server", args...)
+	cmd := newCvmfsServerCmd(ctx, args...)
 	raw, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(raw))
 	if out != "" {
@@ -247,6 +304,14 @@ func (b *LocalBackend) cvmfsServerOutput(ctx context.Context, args ...string) (s
 //   - Absolute symlink targets are allowed: CVMFS repositories legitimately
 //     contain symlinks into host paths (e.g. /lib64/ld-linux.so.2).  A
 //     warning is logged so operators can audit if needed.
+//   - LINK-THEN-WRITE is refused: no write ever resolves THROUGH a symlink.
+//     A malicious tar can place a symlink entry (x -> /etc/…) and then a
+//     regular-file/hard-link entry at x or x/file — the lexical prefix check
+//     passes while the actual open() would follow the link and write (or,
+//     for a hard-link source, READ) outside destDir. Every write target and
+//     hard-link source therefore has its path components Lstat-verified to
+//     not be symlinks, and an existing symlink at the final element is
+//     rejected rather than followed.
 //
 // Timestamps: ModTime and AccessTime from the tar header are applied to each
 // regular file and hard-link copy via os.Chtimes.
@@ -282,6 +347,11 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 		if target != destDir && !strings.HasPrefix(target, prefix) {
 			return fmt.Errorf("tar entry %q escapes destination directory", hdr.Name)
 		}
+		// Refuse to operate THROUGH a symlinked path component (see the
+		// link-then-write note in the function doc).
+		if err := rejectSymlinkComponents(destDir, target); err != nil {
+			return fmt.Errorf("tar entry %q: %w", hdr.Name, err)
+		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -292,6 +362,10 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent for %q: %w", target, err)
+			}
+			if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("tar entry %q: refusing to write through an "+
+					"existing symlink", hdr.Name)
 			}
 			if err := writeFile(target, hdr, tr); err != nil {
 				return fmt.Errorf("writing %q: %w", hdr.Name, err)
@@ -306,8 +380,21 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 				return fmt.Errorf("hard link %q source %q escapes destination directory",
 					hdr.Name, hdr.Linkname)
 			}
+			// The SOURCE is read with os.Open (follows symlinks): a symlink
+			// planted at src would copy an arbitrary HOST file into the repo.
+			if err := rejectSymlinkComponents(destDir, src); err != nil {
+				return fmt.Errorf("hard link %q source: %w", hdr.Name, err)
+			}
+			if fi, err := os.Lstat(src); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("hard link %q: source %q is a symlink",
+					hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent for hard link %q: %w", target, err)
+			}
+			if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("hard link %q: refusing to write through an "+
+					"existing symlink", hdr.Name)
 			}
 			if err := copyFile(src, target, hdr); err != nil {
 				return fmt.Errorf("copying hard link %q from %q: %w",
@@ -333,6 +420,37 @@ func extractTar(ctx context.Context, tarPath, destDir string, obs *observe.Provi
 
 		default:
 			// Devices, FIFOs, etc. — skip silently.
+		}
+	}
+	return nil
+}
+
+// rejectSymlinkComponents verifies that no EXISTING path component of target's
+// parent chain below destDir is a symlink.  destDir is fresh per extraction,
+// so any symlink found there was planted by an earlier entry of the same tar —
+// following it would let that entry redirect this one's write (or a hard-link
+// source's read) outside destDir.  Components that do not exist yet are fine:
+// they will be created as real directories by the caller's MkdirAll.
+func rejectSymlinkComponents(destDir, target string) error {
+	rel, err := filepath.Rel(destDir, filepath.Dir(target))
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	cur := destDir
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, part)
+		fi, err := os.Lstat(cur)
+		if os.IsNotExist(err) {
+			return nil // rest of the chain will be created fresh
+		}
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %q is a symlink", cur)
 		}
 	}
 	return nil

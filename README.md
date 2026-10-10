@@ -1,181 +1,156 @@
 # cvmfs-prepub
 
-A fast, resilient Go service that pre-processes software releases and publishes
-them into [CVMFS](https://cernvm.cern.ch/fs/) **without holding the repository
-transaction lock during file processing**, then distributes them to Stratum 1
-replicas over an **authenticated, pull-based control plane (WebSocket + TLS)**.
+cvmfs-prepub is a publishing service for [CVMFS](https://cernvm.cern.ch/fs/)
+repositories. Build nodes upload a software package as a tar archive over an
+HTTP API. The service unpacks, compresses, hashes and deduplicates the content
+and writes it to the repository storage before it takes the repository lock.
+It then builds the catalog and commits it through `cvmfs_gateway`. Stratum 1
+receivers can optionally pull the new objects from the publisher, so the
+replicas are warm when clients ask for the new release.
 
-> **This README describes the current system: the bits publish pipeline plus the
-> pull-over-wss path for authentication and coordination.** Earlier push / SSE /
-> external-broker options still exist in the tree but are deprecated; they are
-> summarised in [REFERENCE.md Part VIII §46](REFERENCE.md). For the full design,
-> diagrams, and security model see [REFERENCE.md Part VIII](REFERENCE.md).
+Contents: [Why](#why) · [What it does](#what-it-does) ·
+[Architecture](#architecture) · [Requirements](#requirements) ·
+[Quick start](#quick-start) · [Security](#security) ·
+[Monitoring](#monitoring) · [Documentation](#documentation)
 
-## The problem
+## Why
 
-The standard CVMFS workflow holds an exclusive Stratum 0 lock for the whole of
-tar extraction, compression, hashing, and CAS upload — serialising work that is
-intrinsically parallel — and then leaves Stratum 1 replicas to fetch every new
-object from scratch after the catalog flips.
+- With `cvmfs_server publish`, the repository lock is held while every file is
+  extracted, compressed, hashed and uploaded. Publishes to the same repository
+  queue behind each other, even though most of that work could run in parallel.
+- After the catalog flip, every Stratum 1 replica has to fetch all new objects
+  from scratch. The first clients after a release hit cold caches.
 
 ## What it does
 
-1. **Pre-processes in parallel, lock-free** — unpack, SHA-256 hash, compress, and
-   deduplicate against the existing CAS, with no overlay filesystem and no lock.
-2. **Uploads objects to the CAS** (local FS or S3) before acquiring a gateway lease.
-3. **Coordinates a pull** — the publisher *announces* a transaction on an embedded
-   MQTT-over-WebSocket broker; Stratum 1 receivers fetch a signed manifest and
-   **pull** only the objects they are missing (content-addressed, hash-verified),
-   warming before the catalog flip.
-4. **Commits catalogs natively in Go** via the `cvmfs_gateway` lease API (CVMFS
-   schema-2.5 SQLite); no `cvmfs` client tools on the publisher.
-5. **Recovers from crashes** — every state transition is an atomic rename backed
-   by a WAL journal, and transaction manifests are persisted to disk.
+- **Does the work before the lease.** Unpacking, zlib compression, SHA-1
+  content hashing (the CVMFS content key), deduplication and upload all happen
+  without a lock. The gateway lease is taken only after the upload, and the
+  catalog is built natively in Go ([CATALOG.md](CATALOG.md)).
+- **Offers several publish paths.** `prepub` (the default) is the pipeline
+  described above. `ingest` hands the tar to `cvmfs_server ingest`. `staged`
+  (gateway mode with an S3 CAS) grafts objects and a catalog that the producer
+  has prepared. A local backend (`publish_mode: local`) runs `cvmfs_server` on
+  the same host, with no gateway.
+- **Publishes whole builds at once.** On the default path in gateway mode, jobs
+  that carry a `build_id` accumulate, and the build is committed in one
+  transaction when it is finalized.
+- **Survives crashes.** Every job lives in an on-disk spool with a journal.
+  After a restart, jobs resume. Retryable failures are retried with backoff
+  for up to `retry_window` (24 hours by default).
+- **Can pre-warm Stratum 1.** With `--prewarm`, receivers are told about the
+  transactions of jobs that ask for it (`prewarm=true`) and start pulling
+  objects: before the commit, or right after it on ingest with an object list. This is best
+  effort: the commit never waits for receivers.
+- **Authenticates the API.** Clients send a bearer token or HMAC-signed
+  requests. Signed requests mean the shared secret never travels.
 
-## Current status
-
-The publish pipeline and the pull-over-wss control plane are implemented and
-validated end-to-end in the testbed (`make test-pull-wss` → 2/2 receivers warmed).
-Security hardening is complete:
-
-| Property | Mechanism |
-|---|---|
-| **Transport confidentiality** | Broker over `wss://`; enrollment/revocation over HTTPS |
-| **Mutual authentication** | Per-node challenge/response enrollment → scoped bearer token used as the MQTT password |
-| **Least-privilege ACL** | Receivers may publish only their own `ready`/`presence`; only the publisher may `announce`/`publish` |
-| **Discovery integrity** | Discovery document signed with **Ed25519**; receivers verify with the public key only |
-| **No master secret on receivers** | Receivers hold only their own per-node key + the discovery public key |
-| **DoS resistance** | Stateless challenge nonce, per-IP + global rate limiting, request/connection bounds |
-| **Revocation** | `prepub revoke <node>` → denylist + active disconnect of live sessions |
-| **Durability** | Manifests persisted to disk; survive a publisher restart |
-
-## Architecture at a glance
+## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph Build["Build farm — O(10) platforms (elastic)"]
-    B1[bits builder]
-    B2[bits builder]
-  end
-  subgraph S0["Stratum 0 — cvmfs-prepub"]
-    API["REST API :8080"]
-    PIPE["Publish pipeline<br/>unpack -> dedup -> compress -> CAS"]
-    COMMIT["Commit via cvmfs_gateway lease"]
-    BROKER["Embedded MQTT broker (wss :1882)"]
-    ENROLL["TLS enroll / revoke :8443"]
-    DISCO["Signed discovery /.cvmfsbits"]
-    MSTORE["Durable manifest store"]
-  end
-  GW["cvmfs_gateway"]
-  subgraph S1["Stratum 1 receivers (elastic)"]
-    R1[receiver]
-    R2[receiver]
-  end
-  CDN["Object serving — CVMFS web / CDN"]
-  B1 --> API
-  B2 --> API
-  API --> PIPE --> COMMIT --> GW
-  PIPE --> MSTORE
-  COMMIT -->|announce / published| BROKER
-  R1 -->|1 verify discovery| DISCO
-  R2 -->|1 verify discovery| DISCO
-  R1 -->|2 enroll| ENROLL
-  R2 -->|2 enroll| ENROLL
-  R1 -->|3 subscribe + token| BROKER
-  R2 -->|3 subscribe + token| BROKER
-  R1 -->|4 GET manifest| MSTORE
-  R2 -->|4 GET manifest| MSTORE
-  R1 -->|5 pull objects| CDN
-  R2 -->|5 pull objects| CDN
+  B["Build nodes"] -->|"submit tar (HTTP API)"| P["cvmfs-prepub (publisher)"]
+  P -->|"objects"| S["Stratum 0 storage (local FS or S3)"]
+  P -->|"lease, catalogs, commit"| G["cvmfs_gateway"]
+  G -->|"new revision"| S
+  R["Stratum 1 receivers (optional)"] -.->|"pull manifests and objects"| P
 ```
 
-## Quick start
-
-```sh
-# Build
-make build
-
-# In-process cluster simulation of a full publish
-make run-sim
-
-# Full pull-over-wss end-to-end test (in cvmfs-testbed)
-make test-pull-wss
-
-# Run the publisher with the embedded wss control plane + auth
-./cvmfs-prepub \
-  --distribute-mode pull \
-  --gateway-url https://localhost:4929 \
-  --cas-type localfs --cas-root /srv/cvmfs/cas \
-  --spool-root /var/spool/cvmfs-prepub --listen :8080 \
-  --embedded-broker-ws-addr :1882 \
-  --control-plane-url wss://s0.example.org:1882 \
-  --embedded-broker-tls-cert broker.crt --embedded-broker-tls-key broker.key \
-  --broker-ca-cert ca.crt \
-  --embedded-broker-auth \
-  --enroll-tls-addr :8443 --enroll-url https://s0.example.org:8443 \
-  --discovery-signing-key discovery.key \
-  --pull-object-base-url https://s0.example.org/cvmfs
-
-# Run a Stratum 1 receiver in pull mode (holds no master secret)
-PREPUB_NODE_KEY=<hex per-node key> \
-./cvmfs-prepub --mode receiver --distribute-mode pull \
-  --node-id stratum1-a --repos test.cvmfs.io \
-  --discovery-url https://s0.example.org:8080 \
-  --receiver-stratum0-url https://s0.example.org:8080 \
-  --broker-ca-cert ca.crt --discovery-verify-key discovery.pub \
-  --broker-auth
-
-# Revoke a node (denylist + active disconnect)
-./cvmfs-prepub revoke stratum1-a --enroll-url https://s0.example.org:8443 --ca-cert ca.crt
-```
-
-See [INSTALL.md](INSTALL.md) for full deployment and the testbed `README` for the
-containerised cluster.
-
-## Security at a glance
-
-The master secret (`PREPUB_HMAC_SECRET`) lives **only on the Stratum 0 publisher**.
-Each receiver is provisioned with just its own per-node key (`PREPUB_NODE_KEY =
-HMAC(master, node)`) and the Ed25519 discovery **public** key — so a compromised
-receiver can enrol only as itself and cannot mint publisher tokens, forge commit
-notifications, verify-and-forge discovery, or revoke peers. Full trust-boundary
-table, threat model, and sequence diagrams: [REFERENCE.md Part VIII](REFERENCE.md).
-
-## Repository layout (control-plane + pull path)
-
-```
-cvmfs-bits/
-├── cmd/prepub/                 # Service binary + `revoke` subcommand
-│   ├── main.go                 #   publisher/receiver wiring
-│   ├── embedded_broker.go      #   in-process Mochi MQTT broker (wss)
-│   ├── broker_auth.go          #   token auth hook, role ACL, revocation denylist
-│   ├── control_tls.go          #   TLS enroll/revoke listener + revoke CLI
-│   └── discovery.go            #   signed discovery (Ed25519 / HMAC fallback)
-├── internal/
-│   ├── api/                    # REST server + Orchestrator (pipeline + commit + coordinate)
-│   ├── pipeline/               # unpack, dedup, compress, upload, catalog
-│   ├── distribute/
-│   │   ├── credential/         # enrollment, scoped tokens, IP rate limiter
-│   │   ├── serve/              # object + manifest serving, signed discovery, durable store
-│   │   ├── puller/             # receiver-side pull (missing-set, verify, install)
-│   │   ├── commit/             # three-phase commit / admission
-│   │   └── receiver/           # receiver agent (wss control plane)
-│   ├── broker/                 # paho MQTT client wrapper (ws/wss + creds)
-│   ├── cas/  lease/  spool/  gc/  provenance/
-└── REFERENCE.md  README.md  INSTALL.md  Makefile
-```
+The publisher and the receivers are the same binary, `cvmfs-prepub`. Receivers
+connect out to the publisher; Stratum 0 never connects to a Stratum 1.
 
 ## Requirements
 
-- Go 1.22+
-- `cvmfs_gateway` ≥ 1.2 (lease/payload API; not required in local mode)
-- Write access to the CAS backend (local FS or S3)
-- HTTP read access to the Stratum 0 CAS / object endpoint (receivers pull objects)
-- Outbound `wss` (broker port) and HTTPS (discovery/enroll) from each Stratum 1 to
-  Stratum 0 — **no inbound ports required at Stratum 1** in the pull path
+- Linux and Go 1.24 or later (see `go.mod`).
+- **Gateway mode (production):** a `cvmfs_gateway` for the repository, write
+  access to the repository storage (a local directory, or the S3 bucket named
+  in the repository's `server.conf`), and the Stratum 0 HTTP URL. The default
+  direct-graft commit needs a gateway with the graft endpoint; on a stock
+  gateway, set `gateway.direct_graft: false`.
+- **Local mode (trial or single host):** `cvmfs_server` and an existing
+  repository on the same host.
+- The `ingest` path needs `cvmfs_server` on the publisher; finalizing whole
+  builds needs `cvmfs_swissknife` and `--ingest-config-prefix`. See
+  [INSTALL.md](INSTALL.md#4-publish-backends-and-paths).
+
+## Quick start
+
+This is a **local trial**. It uses the local backend, which runs
+`cvmfs_server transaction` and `cvmfs_server publish` on this host, so it does
+not use the gateway pipeline. It needs a repository that already exists here
+(for example one created with `cvmfs_server mkfs test.example.org`). Run the
+service as the repository owner. For a production setup with a gateway,
+follow [INSTALL.md](INSTALL.md).
+
+Build the binary. It is written to `bin/cvmfs-prepub`:
+
+```sh
+make build
+```
+
+Write a minimal configuration, `trial.yaml`:
+
+```yaml
+publish_mode: local                    # cvmfs_server on this host; no gateway, no CAS
+spool_root: /var/tmp/prepub-trial/spool
+server:
+  listen: "127.0.0.1:8080"
+```
+
+Start the service. It refuses to start without an API token:
+
+```sh
+export PREPUB_API_TOKEN=$(openssl rand -hex 32)
+bin/cvmfs-prepub --config trial.yaml
+```
+
+In a second shell (export the same `PREPUB_API_TOKEN`), check health:
+
+```sh
+curl -s http://127.0.0.1:8080/api/v1/health
+# {"status":"healthy","publish_paths":["prepub"],"auth_mode":"both",...}
+```
+
+Submit one package. `path` is relative to the repository root:
+
+```sh
+mkdir -p demo/bin && printf '#!/bin/sh\necho hello\n' > demo/bin/hello
+tar -C demo -cf demo.tar .
+curl -s -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+  -F repo=test.example.org -F path=demo/1.0 -F tar=@demo.tar \
+  http://127.0.0.1:8080/api/v1/jobs
+# {"job_id":"<id>"}   (HTTP 202)
+curl -s -H "Authorization: Bearer $PREPUB_API_TOKEN" \
+  http://127.0.0.1:8080/api/v1/jobs/<id>
+# "state":"published" when done; the files appear under /cvmfs/test.example.org/demo/1.0
+```
+
+The web console at `http://127.0.0.1:8080/` lists the jobs; it asks for the
+API token.
+
+## Security
+
+The API listener is plain HTTP. Put a TLS reverse proxy in front of it when it
+is reachable beyond the host. `PREPUB_API_TOKEN` is accepted either as a bearer
+token or as the key for HMAC-signed requests; `--auth-mode` (`bearer`, `both`
+or `hmac`) selects which. Gateway credentials come from `CVMFS_GATEWAY_KEY_ID`
+and `CVMFS_GATEWAY_SECRET`. For pre-warming, only the publisher holds the
+master secret; each receiver gets its own per-node key. See
+[INSTALL.md](INSTALL.md#5-api-authentication-and-secrets) and
+[REFERENCE.md](REFERENCE.md#7-security-model).
 
 ## Monitoring
 
-Every significant operation emits an OpenTelemetry span; Prometheus metrics at
-`/api/v1/metrics`; structured `log/slog` JSON logs. `testutil/simulate` runs the
-full pipeline in-process with fake infrastructure for single-`go test` traces.
+`GET /api/v1/health` reports status, publish paths and whether builds can be
+finalized. Prometheus metrics are served at `/api/v1/metrics`; receivers serve
+`/metrics` on `--control-addr`. Logs are `slog` text (`key=value`) on stderr.
+See [REFERENCE.md](REFERENCE.md#9-metrics-and-logs).
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [INSTALL.md](INSTALL.md) | Installing, deploying and operating a publisher and Stratum 1 receivers |
+| [REFERENCE.md](REFERENCE.md) | Architecture, job lifecycle, configuration, REST API, distribution protocol, security, metrics |
+| [CATALOG.md](CATALOG.md) | How catalogs are built and stored |
+| [test/integration/gateway/README.md](test/integration/gateway/README.md) | End-to-end test against a real `cvmfs_gateway` |

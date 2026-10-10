@@ -70,8 +70,9 @@ func TestTransition_InvalidRejectsTerminalToNonTerminal(t *testing.T) {
 // states in gateway mode is rejected.
 func TestTransition_InvalidSkipStates(t *testing.T) {
 	invalid := []struct{ from, to State }{
-		{StateIncoming, StateCommitting},  // skips staging, uploading, leased
-		{StateIncoming, StatePublished},   // skips everything
+		// NOTE: {StateIncoming, StateCommitting} is now VALID — a coarse-publish
+		// finalize job has no pipeline and goes straight to committing.
+		{StateIncoming, StatePublished}, // skips everything
 		{StateStaging, StateLeased},       // skips uploading
 		{StateStaging, StateCommitting},   // skips uploading, leased
 	}

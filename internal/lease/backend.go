@@ -44,7 +44,8 @@ type CommitRequest struct {
 	// CatalogHash is the SHA-1 hash of the CVMFS root catalog (gateway mode).
 	// Unused when AllCatalogHashes are passed via ObjectHashes.
 	CatalogHash string
-	// OldRootHash is the plain hex SHA-1 of the previous root catalog (no suffix).
+	// OldRootHash is the previous root catalog hash as FetchManifestRootHash
+	// returns it: hex digest, algorithm suffix (none for SHA-1), then "C".
 	OldRootHash string
 	// NewRootHashSuffixed is the SHA-1 root catalog hash with CVMFS catalog
 	// content-type suffix 'C' appended (e.g. "abc123...C", 41 chars).  This is
@@ -62,17 +63,38 @@ type CommitRequest struct {
 
 	// DirectGraft requests the fast-path commit on the receiver side.
 	//
-	// When true the commit POST body carries "direct_graft":true, instructing
-	// the cvmfs_receiver to skip DiffRec entirely and graft the pre-built
-	// subtree catalog (already uploaded via SubmitPayload) directly into the
-	// parent catalog.  This is correct only when the lease path is a brand-new
-	// directory with no pre-existing content.
+	// When true the finalise step POSTs to the dedicated gateway graft endpoint
+	// /api/v1/leases/<token>/graft instead of the standard commit endpoint,
+	// instructing the cvmfs_receiver to skip DiffRec entirely and graft the
+	// pre-built subtree catalog (already uploaded via SubmitPayload) directly
+	// into the parent catalog.  This is correct only when the lease path is a
+	// brand-new directory with no pre-existing content.
 	//
 	// Set to false (the default) to use the standard CommitProcessor / DiffRec
 	// path, which works for arbitrary add/remove/modify operations.  Both paths
 	// produce identical repository state for the "publish new subtree" case;
 	// DirectGraft is purely a performance optimisation.
 	DirectGraft bool
+
+	// DirectS3 adds --direct-s3 to `cvmfs_server ingest`, sending data objects
+	// straight to S3 while catalogs still go through the gateway session.
+	// Ignored by backends that do not shell out to cvmfs_server.
+	//
+	// False does not pass --no-direct-s3; it defers to the repository config.
+	DirectS3 bool
+
+	// ObjectList adds --object-list, handing the publisher an inherited pipe
+	// and collecting the data objects it confirmed into S3. Requires DirectS3:
+	// only that uploader writes the list, and cvmfs_server refuses the flag
+	// without it. Ignored by backends that do not shell out to cvmfs_server.
+	ObjectList bool
+
+	// ConfirmedObjects, when non-nil, receives the names of the data objects
+	// the publisher confirmed in S3 (the "ok" lines of the object list, as
+	// CVMFS object names such as "abcdef…P"). It is written only for a
+	// successful publish whose list was read to the end, so a consumer never
+	// sees a partial set, and always before Commit returns.
+	ConfirmedObjects *[]string
 
 	// ── Tagging (gateway mode) ───────────────────────────────────────────────
 
@@ -85,6 +107,12 @@ type CommitRequest struct {
 	// Passed to the gateway commit body; ignored when TagName is empty.
 	TagDescription string
 
+	// BaseExists reports that the target directory is already published. The
+	// ingest path then does not ask for a new nested catalog there: the one it
+	// already is carries its .cvmfscatalog marker, and adding a second one
+	// aborts the ingest on the catalog's unique constraint.
+	BaseExists bool
+
 	// ── Local mode ───────────────────────────────────────────────────────────
 
 	// TarPath is the absolute path to the spool tar file to unpack (local mode).
@@ -93,6 +121,45 @@ type CommitRequest struct {
 	// where the tar contents should be extracted (local mode).
 	// Typically: <cvmfsMount>/<repo>/<path>
 	CVMFSDir string
+
+	// Stats, when non-nil, is filled in by the backend with what only it can
+	// know about this publish -- how long the underlying tool actually took,
+	// how much payload it handed over, how many objects it confirmed. The
+	// orchestrator records it; nothing in the publish depends on it.
+	//
+	// It is per-request rather than backend state on purpose: one backend
+	// serves many concurrent jobs, so anything shared would race.
+	//
+	// CONTRACT: a backend may write Stats only from inside Commit, and every
+	// write must happen-before Commit returns. The orchestrator reads it
+	// after Commit on the same goroutine and takes no lock. A backend that
+	// reports from a goroutine outliving Commit introduces a data race -- the
+	// detector does catch it, so a backend doing that will fail -race tests.
+	Stats *PublishStats
+}
+
+// PublishStats is what a backend reports about one publish. Every field is
+// OPTIONAL and zero means "not measured", which is why the counts are
+// pointers: recording 0 objects for a path that never counted them is the
+// kind of confident-but-wrong number these records exist to replace (the
+// ingest path logged objects=0 for real publishes for weeks).
+type PublishStats struct {
+	// Backend is the tool-level duration: for the ingest path, exactly the
+	// wall clock of `cvmfs_server ingest`, excluding lease and ancestors.
+	Backend time.Duration
+	// Ancestors is the time spent making sure the target's parent
+	// directories exist before the publish (ingest path; it can open its own
+	// transaction).
+	Ancestors time.Duration
+	// TarBytes is the payload handed to the backend, when it takes one.
+	TarBytes *int64
+	// Objects is the number of data objects the backend confirmed. Only the
+	// paths that actually count them set it (ingest: --object-list).
+	Objects *int
+	// ObjectsAuthoritative reports whether Objects is a complete count. A
+	// truncated object-list read yields a number that must not be treated as
+	// the whole set.
+	ObjectsAuthoritative bool
 }
 
 // Backend abstracts CVMFS publish transaction management so the orchestrator

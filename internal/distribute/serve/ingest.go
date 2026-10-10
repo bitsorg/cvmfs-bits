@@ -19,7 +19,7 @@ type ManifestPutter interface {
 
 // ManifestIngestHandler accepts a transaction manifest submitted by a trusted
 // producer — typically the CVMFS gateway — and stores it for receivers to pull
-// (ADR-0001 D3; gateway-submitted manifests). It is a *separate, authenticated*
+// (gateway-submitted manifests). It is a *separate, authenticated*
 // endpoint from the receiver-facing GET, e.g. mounted under the existing
 // authenticated API subrouter:
 //
@@ -32,8 +32,8 @@ type ManifestIngestHandler struct {
 	Store ManifestPutter
 	// MaxBytes caps the request body for both the JSON and NDJSON paths
 	// (0 = 256 MiB default). The cap bounds server memory: the NDJSON path
-	// accumulates objects in memory in P1, so an uncapped stream could OOM the
-	// server. The durable, truly-streaming ingest store lands in P4.
+	// accumulates objects in memory, so an uncapped stream could OOM the
+	// server.
 	MaxBytes int64
 }
 

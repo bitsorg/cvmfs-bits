@@ -43,7 +43,7 @@ func OpenJournal(dir string) *Journal {
 
 // Append writes an entry to the journal and fsyncs.
 //
-// Fix #10: Each line is prefixed with an 8-hex-character CRC32 checksum of
+// Each line is prefixed with an 8-hex-character CRC32 checksum of
 // the JSON payload separated by a space:
 //
 //	<crc32hex> <json>\n
@@ -82,7 +82,7 @@ func (j *Journal) Append(e Entry) error {
 
 // Read reads and verifies all entries from the journal.
 //
-// Fix #10: Any line that fails CRC verification causes Read() to return an
+// Any line that fails CRC verification causes Read() to return an
 // error immediately.  Partial or zero-byte lines at the very end of the file
 // (from an interrupted write) are treated as an integrity failure so that
 // crash recovery never proceeds with incomplete WAL state.

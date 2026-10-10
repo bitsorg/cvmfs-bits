@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"cvmfs.io/prepub/internal/distribute/manifest"
 )
@@ -184,30 +183,6 @@ func TestDiscovery(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cvmfs/other.cern.ch/.cvmfsbits", nil))
 	if rec.Code != 404 {
 		t.Fatalf("unknown repo: code=%d", rec.Code)
-	}
-}
-
-func TestPinner(t *testing.T) {
-	p := NewMemPinner()
-	p.Pin("txn-1", []string{"a", "b"}, time.Hour)
-	p.Pin("txn-2", []string{"b", "c"}, time.Hour)
-	for _, h := range []string{"a", "b", "c"} {
-		if !p.IsPinned(h) {
-			t.Fatalf("%s should be pinned", h)
-		}
-	}
-	p.Release("txn-1")
-	if p.IsPinned("a") {
-		t.Fatalf("a should be unpinned after release")
-	}
-	if !p.IsPinned("b") {
-		t.Fatalf("b still pinned by txn-2 (refcount)")
-	}
-
-	p.Pin("txn-3", []string{"z"}, -time.Second) // already expired
-	released := p.Sweep(time.Now())
-	if len(released) != 1 || released[0] != "txn-3" || p.IsPinned("z") {
-		t.Fatalf("sweep should release txn-3: released=%v pinned=%v", released, p.IsPinned("z"))
 	}
 }
 

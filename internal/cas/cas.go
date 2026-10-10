@@ -20,6 +20,19 @@ import (
 // startup suppress Bloom-filter construction and use, regardless of any
 // --bloom-filter / --bloom-snapshot-dir flags, and fall back to calling
 // Exists() directly for every candidate object.
+// Prober is implemented by backends that can verify connectivity, credentials
+// and access WITHOUT writing anything.
+//
+// The generic startup probe does a write/read/delete round trip, which is fine
+// for a local directory but means every restart deposits (and then removes) a
+// sentinel object in a production object store. A remote backend can prove the
+// same things with a read-only call, so it is offered the chance to.
+type Prober interface {
+	Backend
+	// Probe reports whether the backend is reachable and usable.
+	Probe(ctx context.Context) error
+}
+
 type NativeExistsChecker interface {
 	Backend
 	// ExistsIsNative reports true when Exists() is cheap enough that a

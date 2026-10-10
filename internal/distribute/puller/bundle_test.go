@@ -94,8 +94,7 @@ func TestPullBundleAllPresentNoRequest(t *testing.T) {
 
 	dst, _ := cas.NewLocalFS(t.TempDir())
 	mustPut(t, dst, hA, a) // already present
-	st := NewState(t.TempDir())
-	p := &Puller{Store: dst, State: st}
+	p := &Puller{Store: dst}
 	m := &manifest.Manifest{
 		TransactionID: "b2", Repo: "lhcb.cern.ch", TargetRootHash: "R2",
 		Generator: manifest.GeneratorDiff, Auth: manifest.AuthPublic,
@@ -110,9 +109,5 @@ func TestPullBundleAllPresentNoRequest(t *testing.T) {
 	}
 	if hits != 0 {
 		t.Fatalf("no request should be made when nothing is missing, got %d", hits)
-	}
-	// Nothing missing is still a successful sync → state advances.
-	if root, _ := st.Get("lhcb.cern.ch"); root != "R2" {
-		t.Fatalf("state = %q, want R2", root)
 	}
 }

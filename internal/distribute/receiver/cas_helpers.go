@@ -5,57 +5,51 @@ package receiver
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"cvmfs.io/prepub/internal/cas"
 )
 
-// casPath constructs the CVMFS CAS filesystem path for a given hash.
-// Objects are stored at {root}/{hash[0:2]}/{hash}C where 'C' denotes a
-// compressed (zlib) object — the standard CVMFS on-disk layout.
-// hash must be at least 2 characters long; the caller must validate before calling.
-func casPath(root, hash string) string {
-	if len(hash) < 2 {
-		// This should never happen if the caller validates the hash first;
-		// this is a defensive check.
-		return filepath.Join(root, hash, hash+"C")
-	}
-	return filepath.Join(root, hash[:2], hash+"C")
-}
+// sweepMinAge is how long a temp file must be idle before it counts as orphaned.
+const sweepMinAge = 15 * time.Minute
 
-// sweepTmpFiles removes orphaned ".tmp" files left under the CAS by object
-// writes (puller fetches) that were interrupted by a previous crash. It walks
-// the two-char prefix subdirectories of casRoot and unlinks any stale temp file.
-func sweepTmpFiles(ctx context.Context, casRoot string, logFn func(msg string, args ...any)) error {
-	prefixEntries, err := os.ReadDir(casRoot)
+// sweepTmpFiles removes temp files the CAS store (cas.LocalFS) left under
+// {casRoot}/data/XX/ when a Put was interrupted by a crash. Only files last
+// modified more than sweepMinAge before cutoff are removed, so neither a Put of
+// this process nor one of another writer sharing the CAS root is touched.
+func sweepTmpFiles(ctx context.Context, casRoot string, cutoff time.Time, logFn func(msg string, args ...any)) error {
+	dataDir := filepath.Join(casRoot, "data")
+	shards, err := os.ReadDir(dataDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // CAS not initialised yet — nothing to sweep
 		}
-		return fmt.Errorf("sweepTmpFiles: reading CAS root %q: %w", casRoot, err)
+		return fmt.Errorf("sweepTmpFiles: reading %q: %w", dataDir, err)
 	}
 	var removed int
-	for _, prefixEntry := range prefixEntries {
-		select {
-		case <-ctx.Done():
+	for _, shard := range shards {
+		if ctx.Err() != nil {
 			return ctx.Err()
-		default:
 		}
-		if !prefixEntry.IsDir() || len(prefixEntry.Name()) != 2 {
+		if !shard.IsDir() || len(shard.Name()) != 2 {
 			continue
 		}
-		subDir := filepath.Join(casRoot, prefixEntry.Name())
+		subDir := filepath.Join(dataDir, shard.Name())
 		entries, err := os.ReadDir(subDir)
 		if err != nil {
-			logFn("receiver: sweepTmpFiles skipping unreadable subdir",
-				"dir", subDir, "error", err)
+			logFn("receiver: sweepTmpFiles skipping unreadable subdir", "dir", subDir, "error", err)
 			continue
 		}
 		for _, e := range entries {
-			if !strings.HasSuffix(e.Name(), ".tmp") {
+			if !strings.HasPrefix(e.Name(), cas.TempPrefix) {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil || !info.ModTime().Before(cutoff.Add(-sweepMinAge)) {
 				continue
 			}
 			tmpPath := filepath.Join(subDir, e.Name())
@@ -67,17 +61,7 @@ func sweepTmpFiles(ctx context.Context, casRoot string, logFn func(msg string, a
 		}
 	}
 	if removed > 0 {
-		logFn("receiver: removed orphaned .tmp files", "count", removed)
+		logFn("receiver: removed orphaned CAS temp files", "count", removed)
 	}
 	return nil
-}
-
-// randomToken returns a 32-hex-char (128-bit) random token, used to name the
-// temporary file an object fetch streams into before the atomic rename.
-func randomToken() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("receiver: crypto/rand unavailable: " + err.Error())
-	}
-	return hex.EncodeToString(b[:])
 }

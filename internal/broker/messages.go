@@ -7,66 +7,21 @@ import "time"
 
 // AnnounceMessage is published by a publisher to the announce topic for a
 // specific repository (see AnnounceTopic).  All receivers subscribed to that
-// topic will receive it and decide whether they can participate.
-//
-// The Hashes field carries the full set of CAS hashes in the payload.  Each
-// receiver checks this list against its own CAS (CAS.Exists per hash) to
-// compute the subset it does not yet hold, avoiding unnecessary network
-// transfers.
+// topic receive it and pull the transaction's manifest objects they lack.
 type AnnounceMessage struct {
-	// PayloadID is the publisher's job UUID.  Receivers echo it back in their
-	// ReadyMessage and use it as the session's PayloadID (idempotency key).
+	// PayloadID is the publisher's job UUID.  Receivers use it as the
+	// transaction id: the manifest is at /s1/{payload_id}/manifest.
 	PayloadID string `json:"payload_id"`
 
-	// PublisherID is a stable identifier for the publisher node, used to route
-	// ReadyMessage replies (see ReadyTopic).  Typically the publisher's hostname
-	// or a UUID assigned at startup.
+	// PublisherID is a stable identifier for the publisher node (typically
+	// its hostname). Receivers require it to be set.
 	PublisherID string `json:"publisher_id"`
 
 	// Repo is the repository name this payload targets (e.g. "atlas.cern.ch").
-	// Receivers use this to validate that the announce is for a repo they serve.
 	Repo string `json:"repo"`
 
-	// Hashes is the complete list of CAS object hashes in this payload.
-	// Receivers subtract the objects already in their CAS to compute AbsentHashes.
-	Hashes []string `json:"hashes"`
-
-	// TotalBytes is the total compressed size of all objects.
-	// Used by receivers for disk-space pre-checks.
+	// TotalBytes is the total compressed size of all objects (informational).
 	TotalBytes int64 `json:"total_bytes"`
-}
-
-// ReadyMessage is published by a receiver to the publisher's ready topic
-// (see ReadyTopic) after it has processed an AnnounceMessage.
-//
-// The receiver computes AbsentHashes by checking each hash from the announce
-// against its own local CAS (CAS.Exists), so the publisher only needs to push
-// the objects the receiver actually lacks — without a separate inventory-fetch
-// round-trip.
-type ReadyMessage struct {
-	// NodeID is the receiver's stable identifier (same as Config.NodeID).
-	NodeID string `json:"node_id"`
-
-	// SessionToken is the bearer credential for subsequent PUT requests on
-	// the data channel.  The publisher presents this in Authorization: Bearer
-	// headers when pushing objects to DataURL.
-	SessionToken string `json:"session_token"`
-
-	// DataURL is the base URL of the receiver's plain-HTTP data channel, e.g.
-	// "http://stratum1.cern.ch:9101".  All object PUTs go to
-	//   PUT DataURL/api/v1/objects/{hash}
-	DataURL string `json:"data_url"`
-
-	// AbsentHashes is the subset of the announce's Hashes that the receiver
-	// does not yet hold.  The publisher only pushes these hashes to this
-	// receiver.  An empty slice means the receiver already holds everything
-	// (a no-op push for this node).
-	AbsentHashes []string `json:"absent_hashes"`
-
-	// Error is non-empty when the receiver is unable to participate (e.g.
-	// insufficient disk space, unknown repo, session cap reached).  Publishers
-	// must not count receivers with a non-empty Error field towards quorum.
-	Error string `json:"error,omitempty"`
 }
 
 // PublishedMessage is published by a publisher to the published topic for a
@@ -74,16 +29,8 @@ type ReadyMessage struct {
 // catalog commit — whether via the bits pre-publish pipeline or the native
 // cvmfs_server ingest path.
 //
-// Receivers subscribed to this topic use it as a trigger to pull any new CAS
-// objects from the Stratum 0 that they do not yet hold, so that they are
-// synchronised with the canonical repository state after every commit.
-//
-// When Hashes is non-empty (bits path) the receiver can use it to compute the
-// delta against its local CAS and fetch only the missing objects.
-// When Hashes is empty (native ingest path) the receiver falls back to pulling
-// the new root catalog from Stratum 0 and walking the catalog to discover
-// referenced objects — or simply acknowledges the notification and performs a
-// full snapshot on its next scheduled window.
+// It is retained, so a receiver that missed it (or the announce) gets the
+// latest one on (re)connect and pulls the new root catalog.
 type PublishedMessage struct {
 	// Repo is the CVMFS repository name (e.g. "atlas.cern.ch").
 	Repo string `json:"repo"`
@@ -96,18 +43,11 @@ type PublishedMessage struct {
 	// PublishedAt is the wall-clock time at which the commit completed on the
 	// publisher.  Included for audit / latency-measurement purposes.
 	PublishedAt time.Time `json:"published_at"`
-
-	// Hashes is the full list of CAS object hashes that were part of this
-	// publish.  Populated by the bits pipeline; empty for native ingest.
-	// Receivers subtract the objects already present in their local CAS from
-	// this list to compute the minimal fetch set.
-	Hashes []string `json:"hashes,omitempty"`
 }
 
 // PresenceMessage is published (retained) by a receiver on connect and also
-// sent as the Last-Will-and-Testament with Online=false.  It allows publishers
-// and monitoring systems to discover which receivers are available and which
-// repositories they serve, without querying a central coordination service.
+// sent as the Last-Will-and-Testament with Online=false.  It lets monitoring
+// systems see which receivers are online and which repositories they serve.
 type PresenceMessage struct {
 	// NodeID is the receiver's stable identifier.
 	NodeID string `json:"node_id"`
@@ -115,24 +55,12 @@ type PresenceMessage struct {
 	// Repos is the list of CVMFS repository names served by this receiver.
 	Repos []string `json:"repos"`
 
-	// DataURL is the base URL of the receiver's plain-HTTP data channel.
-	// Included here so monitoring tools can cross-reference presence with
-	// actual data-channel reachability.
-	DataURL string `json:"data_url"`
-
-	// ControlURL is the HTTPS control channel URL of this receiver.
-	// Retained for backward compatibility with tools that use the HTTP
-	// announce protocol.
-	ControlURL string `json:"control_url"`
-
-	// Online is true when the receiver is connected and ready to accept
-	// announce requests.  The LWT publishes this topic with Online=false so
+	// Online is true when the receiver is connected and subscribed to
+	// announces.  The LWT publishes this topic with Online=false so
 	// the broker automatically marks the node offline on unexpected disconnect.
 	Online bool `json:"online"`
 
-	// Ready is true once the receiver is able to answer presence checks.  The
-	// receiver computes the absent-hash set on demand via direct CAS.Exists, so
-	// it is ready as soon as it is online; the LWT/offline presence sets this
-	// to false.
+	// Ready mirrors Online: the receiver is ready as soon as it is connected;
+	// the LWT/offline presence sets this to false.
 	Ready bool `json:"ready"`
 }

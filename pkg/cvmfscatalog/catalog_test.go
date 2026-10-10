@@ -29,17 +29,17 @@ func TestCreateAndUpsert(t *testing.T) {
 	// Upsert a file entry
 	now := time.Now().Unix()
 	fileEntry := Entry{
-		FullPath: "/test.txt",
-		Name:     "test.txt",
-		Hash:     []byte("test_hash_value_1234567890123456"),
-		HashAlgo: HashSha256,
-		CompAlgo: CompZlib,
-		Size:     1024,
-		Mode:     0o100644,
-		Mtime:    now,
-		MtimeNs:  0,
-		UID:      1000,
-		GID:      1000,
+		FullPath:  "/test.txt",
+		Name:      "test.txt",
+		Hash:      []byte("test_hash_value_1234567890123456"),
+		HashAlgo:  HashSha1,
+		CompAlgo:  CompZlib,
+		Size:      1024,
+		Mode:      0o100644,
+		Mtime:     now,
+		MtimeNs:   0,
+		UID:       1000,
+		GID:       1000,
 		LinkCount: 1,
 	}
 
@@ -130,8 +130,21 @@ func TestSymlinkEntry(t *testing.T) {
 	if symlink != "/target" {
 		t.Errorf("Expected symlink '/target', got '%s'", symlink)
 	}
-	if (flags & FlagLink) == 0 {
-		t.Errorf("FlagLink not set in flags: %d", flags)
+	// CVMFS writes symlinks as kFlagFile|kFlagLink (catalog_sql.cc).
+	if flags != FlagFile|FlagLink {
+		t.Errorf("symlink flags = %d, want %d", flags, FlagFile|FlagLink)
+	}
+	// Counted as a symlink, not as a regular file.
+	if cat.delta.SelfSymlink != 1 || cat.delta.SelfRegular != 0 {
+		t.Errorf("delta symlink=%d regular=%d, want 1 and 0",
+			cat.delta.SelfSymlink, cat.delta.SelfRegular)
+	}
+	if err := cat.Remove("/link"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if cat.delta.SelfSymlink != 0 || cat.delta.SelfRegular != 0 {
+		t.Errorf("after remove: symlink=%d regular=%d, want 0 and 0",
+			cat.delta.SelfSymlink, cat.delta.SelfRegular)
 	}
 }
 
@@ -576,7 +589,7 @@ func TestUpsertReplaceUpdatesDelta(t *testing.T) {
 }
 
 // TestCatalogClose verifies that Close() is idempotent and that Finalize sets
-// db to nil so subsequent Close calls are no-ops (Fix H1).
+// db to nil so subsequent Close calls are no-ops.
 func TestCatalogClose(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -601,7 +614,7 @@ func TestCatalogClose(t *testing.T) {
 }
 
 // TestFinalizeNilsDB verifies that Finalize sets c.db = nil so a subsequent
-// Close() is safe (Fix H1).
+// Close() is safe.
 func TestFinalizeNilsDB(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -628,7 +641,7 @@ func TestFinalizeNilsDB(t *testing.T) {
 }
 
 // TestRemoveDeltaNetZero verifies that adding then removing an entry leaves the
-// in-memory delta at zero for all counters (Fix C1 — delta only updated post-commit).
+// in-memory delta at zero for all counters (delta only updated post-commit).
 func TestRemoveDeltaNetZero(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -683,7 +696,7 @@ func TestRemoveDeltaNetZero(t *testing.T) {
 
 // TestUpsertAtomicReplace verifies that replacing an entry with Upsert correctly
 // removes the old row and inserts the new one, with exactly one catalog row
-// and updated delta (Fix C3 — single transaction for replace).
+// and updated delta (single transaction for replace).
 func TestUpsertAtomicReplace(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -753,7 +766,7 @@ func TestUpsertAtomicReplace(t *testing.T) {
 
 // TestCatalogUniqueConstraint verifies that the UNIQUE (md5path_1, md5path_2)
 // constraint on the catalog table prevents a concurrent or buggy caller from
-// inserting a second row for the same path (Fix L3).
+// inserting a second row for the same path.
 //
 // The constraint is enforced at the DB level, so even a raw INSERT (bypassing
 // the transactional upsertEntry logic) must fail.
@@ -792,7 +805,7 @@ func TestCatalogUniqueConstraint(t *testing.T) {
 }
 
 // TestChunksUniqueConstraint verifies that the UNIQUE (md5path_1, md5path_2, offset)
-// constraint on the chunks table prevents duplicate chunk rows (Fix L3).
+// constraint on the chunks table prevents duplicate chunk rows.
 func TestChunksUniqueConstraint(t *testing.T) {
 	tmpdir := t.TempDir()
 	dbPath := filepath.Join(tmpdir, "test.db")
@@ -825,7 +838,7 @@ func TestChunksUniqueConstraint(t *testing.T) {
 // ── N3: UNIQUE indexes survive Open() ────────────────────────────────────────
 
 // TestOpenAppliesUniqueIndexes verifies that Open() enforces UNIQUE constraints
-// even on a catalog whose schema predates the explicit index creation (Fix N3).
+// even on a catalog whose schema predates the explicit index creation.
 // We simulate a "legacy" catalog by stripping the unique index from a freshly
 // created one, re-opening it, and confirming the constraint is reinstated.
 func TestOpenAppliesUniqueIndexes(t *testing.T) {
@@ -922,7 +935,7 @@ func TestRemoveAfterUpsertNoError(t *testing.T) {
 // ── N5: Close() concurrent safety ────────────────────────────────────────────
 
 // TestCloseConcurrentSafe verifies that calling Close() from many goroutines
-// simultaneously does not panic or return a double-close error (Fix N5).
+// simultaneously does not panic or return a double-close error.
 func TestCloseConcurrentSafe(t *testing.T) {
 	tmpdir := t.TempDir()
 	cat, err := Create(filepath.Join(tmpdir, "cat.db"), "")
@@ -957,7 +970,7 @@ func TestCloseConcurrentSafe(t *testing.T) {
 // ── N6: nested_catalogs UNIQUE constraint ────────────────────────────────────
 
 // TestNestedCatalogsUniqueConstraint verifies that inserting a second
-// nested_catalogs row for the same path is rejected at the DB level (Fix N6).
+// nested_catalogs row for the same path is rejected at the DB level.
 func TestNestedCatalogsUniqueConstraint(t *testing.T) {
 	tmpdir := t.TempDir()
 	cat, err := Create(filepath.Join(tmpdir, "cat.db"), "")
@@ -1212,9 +1225,15 @@ func TestTrackAdd_FileSizeCounters(t *testing.T) {
 	specialInfo := entryTrackInfo{flags: FlagFile | FlagFileSpecial, size: 0, chunkCount: 0}
 	cat.trackAdd(specialInfo)
 
-	// ── verify plain file counters ────────────────────────────────────────────
-	if cat.delta.SelfFileSize != 1000 {
-		t.Errorf("SelfFileSize want 1000, got %d", cat.delta.SelfFileSize)
+	// ── verify file_size covers EVERY regular file ────────────────────────────
+	// Cumulative, not exclusive: plain 1000 + chunked 2048 + external 512.
+	// cvmfs_swissknife check adds any IsRegular() entry's size to
+	// self.file_size (swissknife_check.cc:532-534) and then adds the external
+	// and chunked sizes to their own counters in separate `if` blocks
+	// (:566-582) — a chunked file counts in BOTH.
+	if cat.delta.SelfFileSize != 3560 {
+		t.Errorf("SelfFileSize want 3560 (1000 plain + 2048 chunked + 512 external), got %d",
+			cat.delta.SelfFileSize)
 	}
 
 	// ── verify chunked-file counters ──────────────────────────────────────────
@@ -1245,8 +1264,9 @@ func TestTrackAdd_FileSizeCounters(t *testing.T) {
 	if err := cat.Remove("/plain.bin"); err != nil {
 		t.Fatalf("Remove plain: %v", err)
 	}
-	if cat.delta.SelfFileSize != 0 {
-		t.Errorf("SelfFileSize after remove want 0, got %d", cat.delta.SelfFileSize)
+	// 3560 − 1000: the chunked and external contributions remain.
+	if cat.delta.SelfFileSize != 2560 {
+		t.Errorf("SelfFileSize after removing plain want 2560, got %d", cat.delta.SelfFileSize)
 	}
 
 	// ── Remove chunked file: chunked counters must decrease ───────────────────
@@ -1261,6 +1281,12 @@ func TestTrackAdd_FileSizeCounters(t *testing.T) {
 	}
 	if cat.delta.SelfChunkedSize != 0 {
 		t.Errorf("SelfChunkedSize after remove want 0, got %d", cat.delta.SelfChunkedSize)
+	}
+	// Removing the chunked file also drops its file_size contribution, leaving
+	// only the external file's 512 — trackRemove must mirror trackAdd exactly.
+	if cat.delta.SelfFileSize != 512 {
+		t.Errorf("SelfFileSize after removing chunked want 512 (external only), got %d",
+			cat.delta.SelfFileSize)
 	}
 }
 
@@ -1303,8 +1329,17 @@ func TestFinalizeFlushesNewCounters(t *testing.T) {
 	})
 
 	// Verify in-memory delta BEFORE Finalize removes the .db.
-	if cat.delta.SelfFileSize != 500 {
-		t.Errorf("pre-Finalize SelfFileSize want 500, got %d", cat.delta.SelfFileSize)
+	//
+	// file_size covers EVERY regular file: 500 (plain) + 800 (chunked) = 1300.
+	// The counters are cumulative, not mutually exclusive — cvmfs_swissknife
+	// check adds size to self.file_size for any IsRegular() entry
+	// (swissknife_check.cc:532-534) and adds the chunked size to
+	// self.chunked_file_size in a SEPARATE if (:580-582). This test previously
+	// asserted 500, encoding the exclusive reading, which under-reported
+	// file_size by the whole chunked volume in published catalogs.
+	if cat.delta.SelfFileSize != 1300 {
+		t.Errorf("pre-Finalize SelfFileSize want 1300 (plain 500 + chunked 800), got %d",
+			cat.delta.SelfFileSize)
 	}
 	if cat.delta.SelfChunked != 1 {
 		t.Errorf("pre-Finalize SelfChunked want 1, got %d", cat.delta.SelfChunked)
@@ -1326,8 +1361,9 @@ func TestFinalizeFlushesNewCounters(t *testing.T) {
 	}
 
 	// The returned delta must carry the correct counters.
-	if delta.SelfFileSize != 500 {
-		t.Errorf("returned delta SelfFileSize want 500, got %d", delta.SelfFileSize)
+	if delta.SelfFileSize != 1300 {
+		t.Errorf("returned delta SelfFileSize want 1300 (plain 500 + chunked 800), got %d",
+			delta.SelfFileSize)
 	}
 	if delta.SelfChunked != 1 {
 		t.Errorf("returned delta SelfChunked want 1, got %d", delta.SelfChunked)

@@ -1,0 +1,72 @@
+# Integration test: publish through a real cvmfs_gateway.
+#
+# Builds a mountless cvmfs_gateway + cvmfs_receiver from cvmfs@devel, backed by
+# S3 (Garage), and drives a full publish through cvmfs-prepub in gateway mode.
+# This is the only test that exercises the live lease → payload → commit/graft
+# path against the actual gateway; the Go unit tests only cover the client side.
+#
+# It is heavy (builds cvmfs from source), so it runs on demand and on pull
+# requests that touch the gateway client or the fixtures — not on every push.
+
+name: gateway-publish
+
+on:
+    workflow_dispatch:
+        inputs:
+            cvmfs_ref:
+                description: "cvmfs git ref to build the gateway from"
+                required: false
+                default: "devel"
+    pull_request:
+        paths:
+            - "internal/lease/**"
+            - "internal/api/**"
+            - "cmd/prepub/**"
+            - "test/integration/gateway/**"
+            - ".github/workflows/gateway-publish.yml"
+    push:
+        branches:
+            - "gateway-dedicated-graft-endpoint-test"
+
+# A gateway build from source is expensive; don't pile up concurrent runs.
+concurrency:
+    group: gateway-publish-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    gateway-publish:
+        runs-on: ubuntu-latest
+        timeout-minutes: 90
+        env:
+            CVMFS_REF: ${{ github.event.inputs.cvmfs_ref || 'devel' }}
+        steps:
+            - name: Check out cvmfs-bits
+              uses: actions/checkout@v4
+              with:
+                  path: cvmfs-bits
+
+            - name: Check out cvmfs (${{ env.CVMFS_REF }})
+              uses: actions/checkout@v4
+              with:
+                  repository: cvmfs/cvmfs
+                  ref: ${{ env.CVMFS_REF }}
+                  path: cvmfs
+
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version-file: cvmfs-bits/go.mod
+                  cache-dependency-path: cvmfs-bits/go.sum
+
+            - name: Run gateway publish integration test
+              working-directory: cvmfs-bits
+              env:
+                  CVMFS_SRC: ${{ github.workspace }}/cvmfs
+              run: ./test/integration/gateway/run.sh
+
+            - name: Dump gateway logs on failure
+              if: failure()
+              working-directory: cvmfs-bits
+              env:
+                  CVMFS_SRC: ${{ github.workspace }}/cvmfs
+              run: docker compose -f test/integration/gateway/docker-compose.yml logs --no-color || true

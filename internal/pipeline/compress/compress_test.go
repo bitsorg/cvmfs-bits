@@ -14,11 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"cvmfs.io/prepub/internal/pipeline/chunker"
 	"cvmfs.io/prepub/internal/pipeline/unpack"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
-// TestRunContextCancelledNoPanic is a regression test for Fix #P1.
+// TestRunContextCancelledNoPanic is a regression test for a failed sem.Acquire.
 //
 // Before the fix, cancelling the outer context while compress.Run was
 // dispatching work caused sem.Acquire to fail and Run to return *early*,
@@ -371,8 +372,7 @@ func TestRunWithConfig(t *testing.T) {
 }
 
 // TestCompressEntryChunkedGuardNonPositiveChunkSize verifies that
-// compressEntryChunked returns an error for zero and negative chunkSize values
-// (Fix C4).
+// compressEntryChunked returns an error for zero and negative chunkSize values.
 func TestCompressEntryChunkedGuardNonPositiveChunkSize(t *testing.T) {
 	entry := unpack.FileEntry{
 		Path:    "/file.bin",
@@ -392,7 +392,7 @@ func TestCompressEntryChunkedGuardNonPositiveChunkSize(t *testing.T) {
 
 // TestCompressZeroChunkSizeFallsBackToWhole verifies that compressEntry does NOT
 // call compressEntryChunked when chunkSize is 0 — the file should be processed
-// as a single whole object regardless of its size (Fix C4 companion).
+// as a single whole object regardless of its size.
 func TestCompressZeroChunkSizeFallsBackToWhole(t *testing.T) {
 	// Large file: if chunkSize were applied it would be split.
 	data := make([]byte, 16*1024)
@@ -420,7 +420,7 @@ func TestCompressZeroChunkSizeFallsBackToWhole(t *testing.T) {
 }
 
 // TestChunkCompressedSizeMatchesLen verifies that Chunk.CompressedSize equals
-// len(Chunk.Compressed) for every chunk (Fix L1 — was int64(len(compBuf.Bytes()))
+// len(Chunk.Compressed) for every chunk (it was int64(len(compBuf.Bytes()))
 // called twice; now uses compBuf.Len() and an explicit copy).
 func TestChunkCompressedSizeMatchesLen(t *testing.T) {
 	// Make a file large enough to produce multiple chunks.
@@ -504,7 +504,7 @@ func TestChunkedBulkHashIsRawFileHash(t *testing.T) {
 
 // TestChunkBufferReuse verifies that chunks produced on separate iterations are
 // independent — modifying one chunk's Compressed slice does not affect another
-// (Fix L2 — buffer is reset and content is copied, not shared).
+// (the buffer is reset and content is copied, not shared).
 //
 // The approach: save a deep copy of chunk[1].Compressed before mutating
 // chunk[0], then verify chunk[1] is byte-for-byte identical to the saved copy.
@@ -555,5 +555,85 @@ func TestChunkBufferReuse(t *testing.T) {
 				i, chunk1Before[i], b)
 			break
 		}
+	}
+}
+
+// TestCDCSolePieceIsOneChunk is a regression test for the coarse-publish EIO bug.
+//
+// compressEntryCDC used to collapse a file that produced no cut ("sole piece")
+// into a whole-file object with no chunk records.  The pipeline then uploaded it
+// under the BARE hash, because only chunk objects get the 'P' (kSuffixPartial)
+// suffix.
+//
+// That is incompatible with the coarse/ingestsql publish path:
+// swissknife_ingestsql.cc:1433 calls set_is_chunked_file(true) for EVERY file,
+// and CVMFS reads chunk hashes back with kSuffixPartial (catalog_sql.cc:688), so
+// the client requests <hash>P even for a sole piece.  Every file below the chunk
+// grid — nearly all of them — therefore returned EIO, "failed to fetch chunk".
+//
+// A sole piece must now be represented as a one-chunk file so the upload key and
+// the catalog reference agree.
+func TestCDCSolePieceIsOneChunk(t *testing.T) {
+	// Well below ChunkMin, so the detector finds no cut.
+	data := []byte("sole piece, no cut expected")
+	entry := unpack.FileEntry{
+		Path:    "/small.txt",
+		Mode:    0o100644,
+		Size:    int64(len(data)),
+		ModTime: time.Now(),
+		Data:    data,
+	}
+
+	det := chunker.NewXor32(6<<20, 6<<20, 6<<20)
+	result, err := compressEntryCDC(entry, det, 0)
+	if err != nil {
+		t.Fatalf("compressEntryCDC failed: %v", err)
+	}
+
+	if len(result.Chunks) != 1 {
+		t.Fatalf("sole piece produced %d chunks, want exactly 1 (bare-hash upload = EIO)",
+			len(result.Chunks))
+	}
+	ch := result.Chunks[0]
+	if ch.Offset != 0 || ch.UncompressedSize != int64(len(data)) {
+		t.Errorf("chunk covers [%d,+%d), want [0,+%d)", ch.Offset, ch.UncompressedSize, len(data))
+	}
+	// The chunk's CAS key is SHA-1(zlib(chunk)); the file's bulk hash is
+	// SHA-1(raw content).  They must both be present and must differ.
+	wantBulk := sha1.Sum(data) //nolint:gosec // CVMFS protocol requires SHA-1
+	if result.Hash != hex.EncodeToString(wantBulk[:]) {
+		t.Errorf("bulk hash = %s, want SHA-1(raw) = %s", result.Hash, hex.EncodeToString(wantBulk[:]))
+	}
+	if ch.Hash == result.Hash {
+		t.Error("chunk CAS key equals the bulk hash; it must be SHA-1(zlib(chunk))")
+	}
+	if len(ch.Compressed) == 0 || ch.CompressedSize != int64(len(ch.Compressed)) {
+		t.Errorf("chunk compressed bytes = %d, CompressedSize = %d", len(ch.Compressed), ch.CompressedSize)
+	}
+}
+
+// TestCDCEmptyFileIsOneZeroLengthChunk guards the empty-file edge of the same
+// change: ingestsql forces expected_num_chunks to 1 when size == 0
+// (swissknife_ingestsql.cc:1360), so an empty file must carry exactly one
+// zero-length chunk, not zero chunks.
+func TestCDCEmptyFileIsOneZeroLengthChunk(t *testing.T) {
+	entry := unpack.FileEntry{
+		Path:    "/empty",
+		Mode:    0o100644,
+		Size:    0,
+		ModTime: time.Now(),
+		Data:    []byte{},
+	}
+
+	det := chunker.NewXor32(6<<20, 6<<20, 6<<20)
+	result, err := compressEntryCDC(entry, det, 0)
+	if err != nil {
+		t.Fatalf("compressEntryCDC failed: %v", err)
+	}
+	if len(result.Chunks) != 1 {
+		t.Fatalf("empty file produced %d chunks, want exactly 1", len(result.Chunks))
+	}
+	if got := result.Chunks[0].UncompressedSize; got != 0 {
+		t.Errorf("chunk UncompressedSize = %d, want 0", got)
 	}
 }

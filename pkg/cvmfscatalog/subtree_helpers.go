@@ -22,6 +22,53 @@ type catalogChainNode struct {
 	path string // absolute root prefix for this catalog ("" for repo root)
 }
 
+// normalizeDirLinkCounts sets every directory entry's LinkCount to the value
+// CVMFS requires: 2 + (number of immediate subdirectories).
+//
+// The rule is enforced verbatim by cvmfs_swissknife check
+// (swissknife_check.cc:652):
+//
+//	if (this_directory.linkcount() != num_subdirs + 2) → "wrong linkcount"
+//
+// where num_subdirs counts the IsDirectory() children in that directory's
+// listing.  It is the POSIX convention — "." plus ".." plus one ".." from each
+// child directory.  Producers used to hardcode LinkCount: 1, which made check
+// report every directory in the repository (212 in one `make test` run).
+//
+// Non-directories keep their own link count (1 for ordinary files; hardlink
+// groups are converted upstream and are not affected).  Applying this to the
+// full entry list — rather than at each producer — means the pipeline's tar
+// entries, synthetic parent directories and mkdir-p entries all obey the same
+// rule.  Entries are counted by FullPath parentage, so a directory whose
+// children live in a nested (split) catalog still counts them: the mountpoint
+// entry remains a directory in the parent's listing, exactly as check sees it.
+// It returns the resulting link count per directory path, so callers can apply
+// the same value to a nested catalog's own root entry — that copy is
+// synthesized by Create and never appears in this list (see
+// Catalog.SetRootLinkCount).
+func normalizeDirLinkCounts(entries []Entry) map[string]uint32 {
+	subdirs := make(map[string]uint32, len(entries))
+	for i := range entries {
+		if !entries[i].Mode.IsDir() {
+			continue
+		}
+		parent, ok := ParentAbsPath(entries[i].FullPath)
+		if !ok {
+			continue // repo/subtree root has no parent within this entry set
+		}
+		subdirs[parent]++
+	}
+	linkCounts := make(map[string]uint32, len(entries))
+	for i := range entries {
+		if !entries[i].Mode.IsDir() {
+			continue
+		}
+		entries[i].LinkCount = 2 + subdirs[entries[i].FullPath]
+		linkCounts[entries[i].FullPath] = entries[i].LinkCount
+	}
+	return linkCounts
+}
+
 // normalizeLeasePathForNested converts a lease path (e.g. "atlas/24.0") to
 // the CVMFS absolute path ("/atlas/24.0").  An empty lease path stays empty
 // (root-level publish).

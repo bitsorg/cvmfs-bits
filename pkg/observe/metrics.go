@@ -10,51 +10,34 @@ import (
 type Metrics struct {
 	JobsSubmitted           prometheus.Counter
 	JobsCompleted           prometheus.Counter
+	PublishedBytes          prometheus.Counter
 	JobsFailed              prometheus.Counter
 	JobsRecovered           prometheus.Counter
 	JobFailuresByClass      *prometheus.CounterVec
 	PipelineFilesProcessed  prometheus.Counter
 	PipelineBytesCompressed prometheus.Counter
 	PipelineDedupHits       prometheus.Counter
-	// BloomFalsePositives counts filter queries where the filter said "present"
-	// but CAS.Exists() confirmed the object is NOT there.  A rising rate
-	// signals filter saturation — consider widening bloom_filter_capacity.
-	BloomFalsePositives     prometheus.Counter
 	CASUploadDuration       prometheus.Histogram
 	LeaseAcquireDuration    prometheus.Histogram
-	DistributionDuration    *prometheus.HistogramVec
 	SpoolTransitions        *prometheus.CounterVec
 	LeaseHeartbeatErrors    prometheus.Counter
 	PipelineAbortCount      prometheus.Counter
-	CASObjectCount          prometheus.Gauge
-	CASBytesUsed            prometheus.Gauge
-	ReceiverObjectsReceived prometheus.Counter
-	ReceiverBytesReceived   prometheus.Counter
-	ReceiverBloomSize       prometheus.Gauge
-	ReceiverHeartbeatErrors prometheus.Counter
 
 	// Per-phase job duration histograms.
 	// Label "phase" takes values:
-	//   pipeline         — tar unpack + compress + dedup + CAS upload
-	//   ensure_ancestors — root-level ancestor-directory pre-publish
-	//   catalog_merge    — SQLite catalog merge (download + merge + upload)
-	//   commit           — gateway SubmitPayload + Release round-trip
-	//   total_s0         — wall time from job submission to StatePublished
+	//   pipeline       — tar unpack + compress + dedup + CAS upload
+	//   subtree_build  — subtree catalog build and CAS upload
+	//   submit_payload — upload of the subtree catalog(s) to the gateway
+	//   manifest_fetch — .cvmfspublished fetch for old_root_hash
+	//   commit         — gateway commit round-trip
+	//   total_s0       — wall time from job submission to StatePublished
 	JobPhaseDuration *prometheus.HistogramVec
 
-	// ── ADR-0001 pull-based distribution ────────────────────────────────────
-	// Publisher (Stratum 0) side.
-	DistWarmQuorum      *prometheus.CounterVec // result=reached|timeout
-	DistTxn             *prometheus.CounterVec // result=committed|aborted
-	DistCommitDuration  prometheus.Histogram   // three-phase Run wall time
-	DistAdmissionActive prometheus.Gauge       // active pull leases
-	DistAdmissionDenied prometheus.Counter     // lease grants refused (429)
-	DistReconcile       *prometheus.CounterVec // crash recovery, action=commit|abort
+	// ── pull-based distribution ─────────────────────────────────────────────
 	// Receiver (Stratum 1) side.
 	PullTransactions *prometheus.CounterVec // result=warmed|failed
 	PullObjects      *prometheus.CounterVec // result=fetched|skipped|failed
 	PullDuration     prometheus.Histogram   // per-transaction warming wall time
-	PullCatchup      *prometheus.CounterVec // result=ok|incomplete|error
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -66,6 +49,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		JobsCompleted: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "cvmfs_prepub_jobs_completed_total",
 			Help: "Total number of jobs completed successfully.",
+		}),
+		PublishedBytes: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "cvmfs_prepub_published_bytes_total",
+			Help: "Payload bytes of published jobs (the submitted tar; uncompressed content when there is none).",
 		}),
 		JobsFailed: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "cvmfs_prepub_jobs_failed_total",
@@ -91,10 +78,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "cvmfs_prepub_pipeline_dedup_hits_total",
 			Help: "Total number of deduplication hits (Bloom filter + CAS confirmed).",
 		}),
-		BloomFalsePositives: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_bloom_false_positives_total",
-			Help: "Bloom filter false positives: filter said present but CAS confirmed absent. Rising rate indicates filter saturation.",
-		}),
 		CASUploadDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "cvmfs_prepub_cas_upload_duration_seconds",
 			Help:    "Duration of CAS uploads.",
@@ -105,11 +88,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Duration of lease acquisition.",
 			Buckets: prometheus.DefBuckets,
 		}),
-		DistributionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "cvmfs_prepub_distribution_duration_seconds",
-			Help:    "Duration of distribution to Stratum 1.",
-			Buckets: prometheus.DefBuckets,
-		}, []string{"stratum1"}),
 		SpoolTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cvmfs_prepub_spool_transitions_total",
 			Help: "Total number of spool state transitions.",
@@ -122,30 +100,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "cvmfs_prepub_pipeline_abort_count_total",
 			Help: "Total number of aborted pipelines.",
 		}),
-		CASObjectCount: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "cvmfs_prepub_cas_object_count",
-			Help: "Current number of objects in CAS.",
-		}),
-		CASBytesUsed: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "cvmfs_prepub_cas_bytes_used",
-			Help: "Current bytes used in CAS.",
-		}),
-		ReceiverObjectsReceived: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cvmfs_receiver_objects_received_total",
-			Help: "Total number of CAS objects successfully received via PUT.",
-		}),
-		ReceiverBytesReceived: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cvmfs_receiver_bytes_received_total",
-			Help: "Total bytes received via PUT (compressed, on-wire size).",
-		}),
-		ReceiverBloomSize: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "cvmfs_receiver_bloom_size",
-			Help: "Approximate number of objects tracked in the receiver's inventory bloom filter.",
-		}),
-		ReceiverHeartbeatErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cvmfs_receiver_heartbeat_errors_total",
-			Help: "Total coordination-service heartbeat errors.",
-		}),
 		JobPhaseDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "cvmfs_prepub_job_phase_seconds",
 			Help: "Wall-clock duration of each job processing phase.",
@@ -154,32 +108,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15), // 0.1s … 1638s
 		}, []string{"phase"}),
 
-		// ── pull distribution (ADR-0001) ──
-		DistWarmQuorum: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_warm_quorum_total",
-			Help: "Warm-gate outcomes per transaction (result=reached|timeout).",
-		}, []string{"result"}),
-		DistTxn: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_txn_total",
-			Help: "Three-phase distribution transactions by outcome (result=committed|aborted).",
-		}, []string{"result"}),
-		DistCommitDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "cvmfs_prepub_dist_commit_duration_seconds",
-			Help:    "Wall time of the prepare→warm→commit orchestration.",
-			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
-		}),
-		DistAdmissionActive: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "cvmfs_prepub_dist_admission_active",
-			Help: "Currently active receiver pull leases.",
-		}),
-		DistAdmissionDenied: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_admission_denied_total",
-			Help: "Pull lease grants refused because a concurrency cap was reached.",
-		}),
-		DistReconcile: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_prepub_dist_reconcile_total",
-			Help: "Crash-recovery resolutions on restart (action=commit|abort).",
-		}, []string{"action"}),
+		// ── pull distribution ──
 		PullTransactions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cvmfs_receiver_pull_transactions_total",
 			Help: "Pull-warming attempts by outcome (result=warmed|failed).",
@@ -193,10 +122,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:    "Wall time to warm one transaction by pulling its missing objects.",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
 		}),
-		PullCatchup: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "cvmfs_receiver_pull_catchup_total",
-			Help: "Cumulative catch-up runs by outcome (result=ok|incomplete|error).",
-		}, []string{"result"}),
 	}
 }
 
@@ -205,35 +130,21 @@ func (m *Metrics) MustRegister(reg prometheus.Registerer) {
 	reg.MustRegister(
 		m.JobsSubmitted,
 		m.JobsCompleted,
+		m.PublishedBytes,
 		m.JobsFailed,
 		m.JobsRecovered,
 		m.JobFailuresByClass,
 		m.PipelineFilesProcessed,
 		m.PipelineBytesCompressed,
 		m.PipelineDedupHits,
-		m.BloomFalsePositives,
 		m.CASUploadDuration,
 		m.LeaseAcquireDuration,
-		m.DistributionDuration,
 		m.SpoolTransitions,
 		m.LeaseHeartbeatErrors,
 		m.PipelineAbortCount,
-		m.CASObjectCount,
-		m.CASBytesUsed,
-		m.ReceiverObjectsReceived,
-		m.ReceiverBytesReceived,
-		m.ReceiverBloomSize,
-		m.ReceiverHeartbeatErrors,
 		m.JobPhaseDuration,
-		m.DistWarmQuorum,
-		m.DistTxn,
-		m.DistCommitDuration,
-		m.DistAdmissionActive,
-		m.DistAdmissionDenied,
-		m.DistReconcile,
 		m.PullTransactions,
 		m.PullObjects,
 		m.PullDuration,
-		m.PullCatchup,
 	)
 }

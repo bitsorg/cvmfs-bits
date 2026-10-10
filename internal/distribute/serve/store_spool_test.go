@@ -77,7 +77,7 @@ func TestSpoolManifestStoreEvictionBounded(t *testing.T) {
 func TestMemManifestStoreNoLeakAfterDelete(t *testing.T) {
 	s := NewMemManifestStore()
 	ctx := context.Background()
-	// Publish-then-delete many times (the warm-quorum pattern). The eviction
+	// Publish-then-delete many times. The eviction
 	// list must not grow unboundedly past the live set.
 	for i := 0; i < 10000; i++ {
 		id := "txn-" + string(rune('0'+i%10)) + "-" + string(rune('a'+i%26))

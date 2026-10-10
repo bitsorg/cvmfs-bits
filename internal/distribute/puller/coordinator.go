@@ -20,7 +20,7 @@ const defaultMaxManifestBytes = 256 << 20 // 256 MiB
 // Coordinator turns a transaction notification into a pull: it fetches the
 // transaction manifest from Stratum 0 (the cvmfs-prepub endpoint) and runs the
 // Puller. It is the receiver-side glue invoked by the control plane
-// (announce/published) when the receiver runs in pull mode (ADR-0001 D1/D3).
+// (announce/published) when the receiver runs in pull mode.
 type Coordinator struct {
 	// ManifestBase is the base URL where manifests are served (the cvmfs-prepub
 	// endpoint). The manifest for a transaction is at
@@ -34,14 +34,6 @@ type Coordinator struct {
 	Puller     *Puller
 	// MaxManifestBytes caps the manifest body read (0 = 256 MiB default).
 	MaxManifestBytes int64
-	// CatchupBase is the base URL for the cumulative catch-up endpoint
-	// (GET /s1/catchup). Empty falls back to ManifestBase (they are the same S0
-	// endpoint in the default deployment).
-	CatchupBase string
-	// TokenSource, when set, supplies a bearer token attached to catch-up
-	// requests (data-plane auth). Satisfied by *credential.Client.Token. A nil
-	// source sends no Authorization header (open deployments).
-	TokenSource func(ctx context.Context) (string, error)
 }
 
 // OnTransaction fetches the manifest for txnID and pulls the objects the local

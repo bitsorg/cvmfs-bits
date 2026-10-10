@@ -1,10 +1,14 @@
 .PHONY: build test lint clean run-sim
 
+# Version stamped into the binary (cvmfs-prepub --version); empty outside git,
+# where the binary falls back to the go tool's VCS stamp or "dev".
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
+LDFLAGS := -X main.version=$(VERSION)
+
 build:
-	@echo "Building cvmfs-prepub and prepubctl..."
+	@echo "Building cvmfs-prepub..."
 	@mkdir -p bin
-	go build -v -o bin/cvmfs-prepub  ./cmd/prepub
-	go build -v -o bin/prepubctl     ./cmd/prepubctl
+	go build -v -ldflags "$(LDFLAGS)" -o bin/cvmfs-prepub  ./cmd/prepub
 
 test:
 	@echo "Running tests..."

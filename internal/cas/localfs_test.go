@@ -21,7 +21,7 @@ import (
 // upload_local.h: default_backend_file_mode_ = 0666).  With the typical
 // container umask of 0022 this yields 0644, which allows Apache on the
 // stratum0 host to serve the objects over HTTP.  Using 0600 (owner-only)
-// caused 403 responses and CVMFS client EIO errors (Fix #6 was later revised).
+// caused 403 responses and CVMFS client EIO errors (an earlier owner-only mode was reverted).
 //
 // This test accepts any mode that is at least 0644 (owner+group+other read
 // plus owner write) so it is robust across environments with tighter umasks

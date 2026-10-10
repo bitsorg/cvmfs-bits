@@ -22,12 +22,13 @@ type Record struct {
 	PublishedAt time.Time `json:"published_at"`
 
 	// ── CAS outputs ─────────────────────────────────────────────────────────
-	// CatalogHash is the SHA-256 content hash of the compressed SQLite catalog
-	// committed to the gateway.  It uniquely identifies the published revision.
+	// CatalogHash is the SHA-1 content hash (hex) of the compressed root
+	// catalog of the published subtree, i.e. its CVMFS CAS key.
 	CatalogHash string `json:"catalog_hash"`
 
-	// ObjectHashes are the SHA-256 content hashes of every CAS object uploaded
-	// during this job.  Verifiers can use these to walk from a file path in the
+	// ObjectHashes are the SHA-1 content hashes (hex CAS keys, of the
+	// compressed bytes) of every object the job references, followed by its
+	// catalog hashes.  Verifiers can use these to walk from a file path in the
 	// CVMFS catalog back to this Rekor entry via the hash.
 	ObjectHashes []string `json:"object_hashes,omitempty"`
 
@@ -63,6 +64,11 @@ type Record struct {
 	// log at RekorIntegratedTime.
 	RekorSET            string `json:"rekor_set,omitempty"`
 	RekorIntegratedTime int64  `json:"rekor_integrated_time,omitempty"`
+
+	// SignedPayload is the exact JSON whose SHA-256 was signed and sent to
+	// Rekor, set by Submit. Not part of the record itself: it is kept so the
+	// Rekor hash can be recomputed later.
+	SignedPayload []byte `json:"-"`
 }
 
 // Submitted reports whether this record was successfully submitted to Rekor.

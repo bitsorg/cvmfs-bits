@@ -5,13 +5,13 @@
 //
 //   - publisher (default): accepts publish jobs via an HTTP API, coordinates
 //     the pre-publish pipeline (dedup → compress → CAS → gateway commit), and
-//     distributes pre-warmed objects to Stratum 1 receivers before the catalog
-//     flip.
+//     serves objects and manifests that Stratum 1 receivers pull, announced
+//     over the embedded MQTT broker.
 //
-//   - receiver: runs the two-channel Stratum 1 pre-warming server.  An HTTPS
-//     control channel handles announce requests (HMAC-authenticated); a plain-
-//     HTTP data channel accepts object PUTs (per-session bearer token + SHA-256
-//     hash verification).  See REFERENCE.md §20 for the full protocol spec.
+//   - receiver: the Stratum 1 pull agent.  It connects outbound to the
+//     publisher's broker and pulls new objects into its local CAS; its only
+//     listener is a plain-HTTP /metrics endpoint.  See REFERENCE.md (Pull
+//     Distribution Protocol).
 //
 // Select the mode with --mode publisher|receiver.  All flags except --mode,
 // --log-level, and --dev are mode-specific; unrecognised flags for the active
@@ -29,26 +29,107 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"cvmfs.io/prepub/internal/api"
 	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/cas"
 	"cvmfs.io/prepub/internal/distribute"
-	"cvmfs.io/prepub/internal/distribute/commit"
 	"cvmfs.io/prepub/internal/distribute/credential"
 	"cvmfs.io/prepub/internal/distribute/receiver"
 	"cvmfs.io/prepub/internal/distribute/serve"
+	"cvmfs.io/prepub/internal/httpsig"
 	"cvmfs.io/prepub/internal/lease"
+	"cvmfs.io/prepub/internal/measure"
 	"cvmfs.io/prepub/internal/notify"
 	"cvmfs.io/prepub/internal/pipeline"
 	"cvmfs.io/prepub/internal/provenance"
 	"cvmfs.io/prepub/internal/spool"
+	"cvmfs.io/prepub/pkg/cvmfscatalog"
+	"cvmfs.io/prepub/pkg/cvmfsdescriptor"
 	"cvmfs.io/prepub/pkg/observe"
 )
+
+// defaultJobTimeout is 0 — DISABLED — and that is deliberate.
+//
+// A previous version of this file set it to one hour, reasoning that a job which
+// blocks forever holds a concurrency slot forever and should be bounded. The
+// intent was right and the instrument was wrong, in a way that only production
+// showed: on a spool volume delivering single-digit MB/s, six multi-gigabyte
+// packages exceeded the hour while making steady progress, were cancelled
+// mid-unpack, and took a 170-package build down with them. They were not stuck;
+// they were slow, and a wall clock cannot tell the difference.
+//
+// No fixed value can. The same number has to cover a 4 KiB modulefile and a
+// 5.2 GB tar on storage whose speed this process cannot know in advance — any
+// value safe for the second is useless against the first, and any value tight
+// enough to catch a hang will kill legitimate work on slow disks.
+//
+// It was also not bounding what it claimed to. unpack observes the context only
+// between archive entries, so a deadline that expired inside a large member went
+// unnoticed until that member finished: two of those six jobs ran 2h28m and
+// 2h35m past a one-hour deadline before failing.
+//
+// The right instrument measures PROGRESS, not elapsed time: fail a job that has
+// stopped moving, whatever its size, and never one that is merely slow. Until
+// that exists, disabled is the honest default — an operator who wants a ceiling
+// can set --job-timeout, having seen their own storage.
+const defaultJobTimeout = 0
+
+// envInt is the default for a tuning flag, read from an env var so it can be set
+// from the testbed .env (like PREPUB_API_TOKEN already is) without editing the
+// compose or passing flags. Precedence stays flag > config file > env > builtin:
+// an explicit flag or a config value still wins. Empty/garbage keeps the builtin.
+func envInt(name string, builtin int) int {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return builtin
+}
+
+// nodeKeyHex returns a receiver's per-node broker enrollment key (hex), derived
+// as HMAC-SHA256(secret, node). It is the pure, testable core of `prepub node-key`.
+// "publisher" is reserved (the publisher mints its own token) and the empty node
+// is rejected; the master must be at least 16 bytes.
+func nodeKeyHex(secret []byte, node string) (string, error) {
+	if node == "" || node == "publisher" {
+		return "", fmt.Errorf("node must be a receiver id, not empty or 'publisher'")
+	}
+	if len(secret) < 16 {
+		return "", fmt.Errorf("PREPUB_HMAC_SECRET (>= 16 bytes) is required")
+	}
+	return hex.EncodeToString(deriveNodeKey(secret, node)), nil
+}
+
+// runNodeKey implements `prepub node-key <node>`: print the receiver's per-node
+// enrollment key so an operator on the publisher can provision it as the
+// receiver's S1_NODE_KEY (the receiver never holds the master secret).
+func runNodeKey(args []string) {
+	node := ""
+	for _, a := range args {
+		if node == "" && !strings.HasPrefix(a, "-") {
+			node = a
+		}
+	}
+	out, err := nodeKeyHex([]byte(os.Getenv("PREPUB_HMAC_SECRET")), node)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "usage: PREPUB_HMAC_SECRET=<master> prepub node-key <node>")
+		fmt.Fprintln(os.Stderr, "  "+err.Error())
+		os.Exit(2)
+	}
+	fmt.Println(out)
+}
 
 func main() {
 	// ── Flags shared by both modes ────────────────────────────────────────────
@@ -58,10 +139,17 @@ func main() {
 		runRevoke(os.Args[2:])
 		return
 	}
+	// Subcommand: prepub node-key <node> -- print a receiver's per-node broker
+	// enrollment key (hex), derived from PREPUB_HMAC_SECRET on the publisher, so it
+	// can be provisioned to that receiver as S1_NODE_KEY (receivers never
+	// hold the master secret).
+	if len(os.Args) > 1 && os.Args[1] == "node-key" {
+		runNodeKey(os.Args[2:])
+		return
+	}
 	mode := flag.String("mode", "publisher", "Operating mode: publisher or receiver")
-	// ADR-0001 (reserved; not yet active in P0). Data-plane direction and
-	// control-plane transport selectors; parsed now so config/tooling can set
-	// them, wired into behaviour in later phases.
+	showVersion := flag.Bool("version", false, "Print the version and exit")
+	// Pull distribution: embedded broker, control plane, enrollment, object URLs.
 	embeddedBrokerWSAddr := flag.String("embedded-broker-ws-addr", "", "If set, run an in-process MQTT broker with a WebSocket listener at this address (e.g. :1882); the control plane then runs on S0 with no separate broker [publisher]")
 	controlPlaneURL := flag.String("control-plane-url", "", "Control-plane (broker) URL advertised to receivers via discovery, e.g. ws://cvmfs-prepub:1882 or wss://... [publisher]")
 	pullObjectBaseURL := flag.String("pull-object-base-url", "", "Externally reachable base URL for content-addressed object GETs, embedded in pull manifests as {url}/cvmfs/{repo}/data (e.g. http://cvmfs-prepub:8080) [publisher]")
@@ -71,31 +159,46 @@ func main() {
 	enrollTLSAddr := flag.String("enroll-tls-addr", "", "With --embedded-broker-auth and a broker TLS cert, serve enroll/revoke over HTTPS at this bind address (e.g. :8443) so the enrollment token never travels in plaintext [publisher]")
 	enrollURL := flag.String("enroll-url", "", "HTTPS base URL for the TLS enroll/revoke endpoint, advertised to receivers via discovery (e.g. https://cvmfs-prepub:8443) [publisher]")
 	discoverySigningKey := flag.String("discovery-signing-key", "", "PEM Ed25519 private key to sign the discovery document; receivers verify with the matching public key so no shared secret reaches a receiver [publisher]")
-	discoveryVerifyKey := flag.String("discovery-verify-key", "", "PEM Ed25519 public key to verify the signed discovery document [receiver]")
+	discoveryVerifyKey := flag.String("discovery-verify-key", "", "PEM Ed25519 public key; when set, the discovery document must carry a valid signature. Required with --broker-auth [receiver]")
 	pullConcurrencyFlag := flag.Int("pull-concurrency", 0, "Parallel object transfers / bundle requests in pull mode (0 = default 16) [receiver]")
 	pullFilesPerRequest := flag.Int("pull-files-per-request", 0, "Objects per chunked-bundle request in pull mode; >1 enables bundling, 0/1 = per-object [receiver]")
 	pullAuto := flag.Bool("pull-auto", false, "Measure RTT to Stratum 0 and auto-pick --pull-concurrency/--pull-files-per-request from a latency class when they are unset [receiver]")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	devMode := flag.Bool("dev", false, "Development mode: relaxes security checks (NEVER use in production)")
-	config := flag.String("config", "", "Config file path (reserved for future use)")
+	config := flag.String("config", "", "YAML config file; its values apply to flags not set on the command line")
 
 	// ── Publisher-mode flags ───────────────────────────────────────────────────
 	spoolRoot := flag.String("spool-root", "/var/spool/cvmfs-prepub", "Spool root directory [publisher]")
 	stagingRoot := flag.String("staging-root", "", "Directory from which tar_path references (JSON submissions) are allowed; empty disables JSON/tar_path mode [publisher]")
 	listen := flag.String("listen", ":8080", "HTTP listen address for the API server [publisher]")
+	debugListen := flag.String("debug-listen", "", "Address for the pprof/debug listener, e.g. 127.0.0.1:6060. Empty disables it. Bind to loopback only: the profiles include heap contents, which can hold credentials and payload bytes [publisher]")
 	publishMode := flag.String("publish-mode", "gateway", "Publish backend: 'gateway' (cvmfs_gateway HTTP API) or 'local' (cvmfs_server direct, no gateway required) [publisher]")
 	gatewayURL := flag.String("gateway-url", "https://localhost:4929", "cvmfs_gateway URL (must be HTTPS in production; ignored in local publish mode) [publisher]")
+	gatewayAllowPlaintext := flag.Bool("gateway-allow-plaintext", false, "Permit a plaintext http:// gateway URL on a trusted network. Gateway requests are HMAC-SHA256 signed and the secret never transits, so the credential is safe without TLS; what plaintext gives up is confidentiality of the publish and authenticity of gateway responses. Loopback needs no flag. Prefer this over --dev, which also disables the gateway-secret and API-token requirements [publisher]")
 	gatewayDirectGraft := flag.Bool("gateway-direct-graft", true, "Use the direct-graft fast path on commit: skips DiffRec on the receiver and grafts the pre-built subtree catalog directly. Only correct when the lease path has no pre-existing content. Set to false to fall back to the standard DiffRec path (safe for all cases, but slower). [publisher]")
 	cvmfsMount := flag.String("cvmfs-mount", "/cvmfs", "CVMFS repository mount point used in local publish mode [publisher]")
+	authMode := flag.String("auth-mode", "both", "Which credentials the API accepts: 'bearer' (legacy token on every request), 'both' (either — the migration setting), or 'hmac' (signed requests only, so the shared secret never travels) [publisher]")
+	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
+	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs. Requires cvmfs_server on PATH and a gateway registration (cvmfs_server connect-gw, mountless or mounted; install.sh does it) for each repository [publisher]")
+	catalogCacheDir := flag.String("catalog-cache-dir", "", "Directory keeping the published catalogs that existence and hash checks download, by hash (a catalog never changes under its hash). Default: systemd's cache directory ($CACHE_DIRECTORY/catalogs), else <spool>/catalog-cache; prefer local disk over a network spool. 'off' disables [publisher]")
+	catalogCacheMiB := flag.Int("catalog-cache-mib", 1024, "Size limit of --catalog-cache-dir in MiB; the least recently used catalogs are removed beyond it [publisher]")
+	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
+	replaceOnConflict := flag.Bool("replace-on-conflict", false, "Allow a job that asks for it (replace=true) to REPLACE what another build published at its own path: when the published .meta.json hash differs from the job's, delete the existing subtree in its own transaction, then commit. Destroys the published subtree at that path (prior revisions keep their objects until GC); jobs that do not ask are never replaced [publisher]")
+	promoteWorkers := flag.Int("promote-workers", envInt("PREPUB_PROMOTE_WORKERS", cas.DefaultPromoteWorkers), "Concurrent server-side copies when promoting a staged job's objects into the CAS. Latency-bound, not bandwidth-bound: each object costs a HEAD plus a COPY, ~22 ms per object per worker (measured: 720 objects/s at 16), so throughput tracks this number. RAISE IT WITH CARE — jobs promote concurrently, so requests in flight are this x concurrent staged jobs, against a keep-alive pool of 256 per host shared with the upload path; overshooting it churns connections into TIME_WAIT and once cost 64 of 170 jobs in 39 s (internal/cas/s3.go). It also competes with the producer for the same object store, which is usually the slower half. Env: PREPUB_PROMOTE_WORKERS [publisher]")
+	ingestPublishOwner := flag.String("ingest-publish-owner", "", "Owner user for files published via the 'ingest' path (cvmfs_server ingest -u); empty keeps the tar's ownership [publisher]")
+	ingestSwissknife := flag.String("ingest-swissknife", "cvmfs_swissknife", "Path to cvmfs_swissknife used for coarse-publish finalize [publisher]")
+	ingestConfigPrefix := flag.String("ingest-config-prefix", "", "ingestsql gateway-client config prefix dir (-C) for coarse-publish finalize; empty disables finalize [publisher]")
+	ingestEnv := flag.String("ingest-env", "", "Comma-separated extra env for the ingestsql finalize, e.g. 'LD_LIBRARY_PATH=/opt/cvmfs/lib' [publisher]")
 	stratum0URL := flag.String("stratum0-url", "", "Stratum 0 HTTP base URL for catalog merge, e.g. http://stratum0/cvmfs (gateway mode only) [publisher]")
-	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or memory (used in gateway mode only) [publisher]")
+	casType := flag.String("cas-type", "localfs", "CAS backend type: localfs or s3 (gateway mode only). s3 reads bucket/endpoint/credentials from the repository's own server.conf — see --cas-server-conf [publisher]")
 	casRoot := flag.String("cas-root", "/var/lib/cvmfs-prepub/cas", "CAS root directory [publisher|receiver]")
+	casServerConf := flag.String("cas-server-conf", "", "For --cas-type s3: path to the repository's server.conf; its CVMFS_UPSTREAM_STORAGE supplies the S3 alias, bucket, endpoint and credentials. Default: /etc/cvmfs/repositories.d/<repo-name>/server.conf [publisher]")
 
 	// Per-job wall-clock timeout (publisher) — prevents any phase from hanging
-	// indefinitely.  0 (default) disables the timeout for backward compatibility.
+	// indefinitely.  0 (default) disables it; see defaultJobTimeout for why.
 	// When --max-concurrent-jobs is also set, the timeout starts AFTER the job
 	// acquires a concurrency slot, so queue-wait time does not count against it.
-	jobTimeout := flag.Duration("job-timeout", 0, "Maximum wall-clock time a single publish job may run before it is cancelled and failed; 0 disables the timeout [publisher]")
+	jobTimeout := flag.Duration("job-timeout", defaultJobTimeout, "Maximum wall-clock time a single publish job may run before it is cancelled and failed; 0 (the default) disables it, since elapsed time is a poor proxy for a stuck job; with it disabled a job that blocks keeps its concurrency slot. The clock starts after the job acquires a slot, so queueing does not count against it [publisher]")
 
 	// Server-side job concurrency limiter.  Limits how many jobs can run the
 	// pipeline + critical section simultaneously, preventing CPU
@@ -116,8 +219,8 @@ func main() {
 	//
 	// Effective slots = max(min, numCPU - load1min), clamped to [min, max].
 	// As load drops, waiting jobs are released without any delay.
-	minConcurrentJobs := flag.Int("min-concurrent-jobs", 4, "Minimum (guaranteed) number of concurrent jobs regardless of load; 0 = disable dynamic limiting [publisher]")
-	maxConcurrentJobs := flag.Int("max-concurrent-jobs", 0, "Maximum concurrent jobs ceiling (0 = runtime.NumCPU()); effective slots adapt between min and max based on 1-min load average [publisher]")
+	minConcurrentJobs := flag.Int("min-concurrent-jobs", envInt("PREPUB_MIN_CONCURRENT_JOBS", 4), "Minimum (guaranteed) number of concurrent jobs regardless of load; 0 = disable dynamic limiting. Env: PREPUB_MIN_CONCURRENT_JOBS [publisher]")
+	maxConcurrentJobs := flag.Int("max-concurrent-jobs", envInt("PREPUB_MAX_CONCURRENT_JOBS", 0), "Maximum concurrent jobs ceiling (0 = runtime.NumCPU()); effective slots adapt between min and max based on 1-min load average. Env: PREPUB_MAX_CONCURRENT_JOBS [publisher]")
 
 	// Lease path_busy retry window — how long Acquire() will keep retrying when
 	// the gateway reports another publisher holds the lease.  Should be set to
@@ -127,11 +230,38 @@ func main() {
 	leaseRetryMax := flag.Duration("lease-retry-max", 0, "Maximum time to retry lease acquisition when path_busy; 0 = 12 min default (should exceed gateway max_lease_time) [publisher]")
 
 	// Pipeline performance tuning.
-	pipelineUploadConc := flag.Int("pipeline-upload-conc", 4, "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes) [publisher]")
+	prefetch := flag.Bool("prefetch", true, "Run pipeline phase 0 (the tar scan) ahead of the job's concurrency slot. Turn OFF on I/O-bound storage: the look-ahead spills the unpacked tar to disk and the pipeline reads it back, which doubles I/O on the resource that is already the bottleneck to buy overlap nothing is waiting for. Off, each archive is read exactly once, inline [publisher]")
+	prefetchLimit := flag.Int("prefetch-limit", 8, "Budget for concurrent tar scans (pipeline phase 0), in units of 128 MiB. Phase 0 runs BEFORE a job takes a concurrency slot, so it needs its own bound: a producer that uploads a whole build at once would otherwise start one scan per package simultaneously and put every job into I/O wait. Each scan is charged by its tar size, so N ordinary packages or one N*128 MiB package may run at once; over budget, phase 0 runs inline under the job's own slot [publisher]")
+	pipelineUploadConc := flag.Int("pipeline-upload-conc", envInt("PREPUB_PIPELINE_UPLOAD_CONC", 4), "Concurrent dedup+upload workers per job (higher = better throughput for new-object-heavy publishes). Env: PREPUB_PIPELINE_UPLOAD_CONC [publisher]")
+	// Peak memory scales with this. On the default fixed chunk grid with a
+	// spool dir, each compress worker streams one grid block at a time
+	// (~2 x grid resident). A file is held whole in RAM only when unpack kept
+	// it inline (with prefetch, entries over 64 KiB are spilled to disk;
+	// without it, entries up to 1 GiB stay in memory) or with content-defined
+	// chunking. Before streaming, 4 workers reached 6.7 GB RSS and were
+	// OOM-killed on an 8 GB node.
+	pipelineWorkers := flag.Int("pipeline-workers", envInt("PREPUB_PIPELINE_WORKERS", 4), "Concurrent compress workers per job. Peak memory scales with this: each worker holds one chunk-grid block, or one whole file when that file is kept in memory. Lower it (1-2) on memory-constrained hosts. Env: PREPUB_PIPELINE_WORKERS [publisher]")
 	pipelineCompressLevel := flag.Int("pipeline-compress-level", 0, "zlib compression level: 0=default(6), 1=fastest, 9=best; lower levels reduce CPU at cost of slightly larger objects [publisher]")
-	chunkMin := flag.Int64("chunk-min", 4<<20, "CVMFS content-defined chunking: minimum chunk size in bytes [publisher]")
-	chunkAvg := flag.Int64("chunk-avg", 8<<20, "CVMFS content-defined chunking: average chunk size in bytes; 0 disables chunking [publisher]")
-	chunkMax := flag.Int64("chunk-max", 16<<20, "CVMFS content-defined chunking: maximum chunk size in bytes [publisher]")
+	// Default to FIXED cvmfsdescriptor.ChunkGrid chunking (min==avg==max): the
+	// xor32 chunker then cuts at fixed grid boundaries, which coarse publish
+	// (the default mode) requires — ingestsql derives chunk offsets as
+	// i*kChunkSize and the descriptor emitter enforces chunk-count ==
+	// ceil(size/ChunkGrid).
+	//
+	// The grid is 6 MiB, not 24 MiB: ingestsql picks kInternalChunkSize for
+	// internal=1 files (swissknife_ingestsql.cc:1344), and the descriptor always
+	// writes internal=1 so the client fetches content from this repository's CAS
+	// rather than from CVMFS_EXTERNAL_URL. Keep this in lockstep with
+	// cvmfsdescriptor.ChunkGrid — a mismatch trips ingestsql's fatal
+	// "offsets size does not match expected number of chunks" assert.
+	//
+	// Deployments that publish ONLY per-package (never coarse) and want finer
+	// dedup can override with content-defined sizes, e.g. --chunk-min 4194304
+	// --chunk-avg 8388608 --chunk-max 16777216 (or the config.yaml chunking:
+	// block).
+	chunkMin := flag.Int64("chunk-min", cvmfsdescriptor.ChunkGrid, "CVMFS chunk size (bytes): minimum. Default fixed 6 MiB (min==avg==max) for coarse-publish/ingestsql compatibility; set content-defined sizes only for per-package-only deployments [publisher]")
+	chunkAvg := flag.Int64("chunk-avg", cvmfsdescriptor.ChunkGrid, "CVMFS chunk size (bytes): average; 0 disables chunking. Default fixed 6 MiB (see --chunk-min) [publisher]")
+	chunkMax := flag.Int64("chunk-max", cvmfsdescriptor.ChunkGrid, "CVMFS chunk size (bytes): maximum. Default fixed 6 MiB (see --chunk-min) [publisher]")
 
 	// Optional: repository name.  Retained for forward compatibility and to
 	// label publishes; no longer used for dedup seeding (dedup is a direct
@@ -140,7 +270,7 @@ func main() {
 	repoName := flag.String("repo-name", "", "CVMFS repository name (e.g. atlas.cern.ch) [publisher]")
 
 	// ── Stratum 1 distribution flags (publisher) ─────────────────────────────
-	warmQuorum := flag.Float64("warm-quorum", 1.0, "Fraction of authoritative Stratum 1 replicas that must report warm before the catalog commit proceeds (0.5 = majority, 1.0 = all) [publisher]")
+	preWarm := flag.Bool("prewarm", false, "Make Stratum 1 cache pre-warming available: jobs that ask for it (prewarm=true) get the pull announce, before the commit on the prepub path and right after it on ingest with an object list. OFF by default (no S1 receivers => nothing to warm); enable once authoritative receivers exist. Post-commit pull is unaffected [publisher]")
 	// Queue-driven distribution worker flags.
 
 	// Provenance & Rekor transparency log — off by default.
@@ -148,40 +278,40 @@ func main() {
 	rekorServer := flag.String("rekor-server", provenance.DefaultRekorServer, "Rekor transparency log URL [publisher]")
 	rekorSigningKey := flag.String("rekor-signing-key", "", "Path to Ed25519 private key (PEM/PKCS#8) for signing Rekor entries; auto-generated if absent [publisher]")
 	oidcIssuers := flag.String("oidc-issuers", "", "Comma-separated list of allowed OIDC issuer URLs for CI token validation [publisher]")
+	retryWindow := flag.Duration("retry-window", 24*time.Hour, "How long from submission a job that fails for a retryable reason (network, gateway, storage, timeout, unknown tool failure) is retried with backoff before it is failed; conflicts and unreadable payloads fail at once. 0 disables retries [publisher]")
+	maxTarSizeGiB := flag.Int("max-tar-size-gib", 10, "Largest package tar one submission may carry, in GiB; a bigger upload is refused with 413 [publisher]")
+	spoolMinFreeGiB := flag.Int("spool-min-free-gib", 20, "Free space, in GiB, an upload must leave on the spool filesystem, else it is refused with 507; 0 disables the check [publisher]")
+	allowedPublishPrefixes := flag.String("allowed-publish-prefix", "", "Comma-separated CVMFS group-root paths this deployment may publish into, e.g. /cvmfs/repo.cern.ch/lcg,/cvmfs/repo.cern.ch/cms. A reserve/submit whose target falls outside every root is rejected 403. Empty disables the check (publish anywhere) [publisher]")
 
 	// ── Receiver-mode flags ────────────────────────────────────────────────────
 	//
 	// The CAS root for the receiver is shared with --cas-root above so that a
 	// node running both modes (unusual but possible in a test setup) uses the
 	// same directory by default.  Override with --cas-root as needed.
-	controlAddr := flag.String("control-addr", ":9100", "HTTPS listen address for announce requests [receiver]")
-	dataAddr := flag.String("data-addr", ":9101", "Plain-HTTP listen address for object PUTs [receiver]")
-	dataHost := flag.String("data-host", "", "Publicly reachable hostname or IP returned to senders as the data endpoint [receiver]")
-	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate for the control channel [receiver]")
-	tlsKey := flag.String("tls-key", "", "Path to TLS private key for the control channel [receiver]")
-	sessionTTL := flag.Duration("session-ttl", time.Hour, "How long announce sessions remain valid [receiver]")
-	diskHeadroom := flag.Float64("disk-headroom", 1.2, "Multiplier applied to announced payload size when checking available disk space [receiver]")
-
-	// HepCDN coordination service — off by default.
-	nodeID := flag.String("node-id", "", "Stable identifier for this receiver node; defaults to hostname [receiver]")
+	controlAddr := flag.String("control-addr", ":9100", "Plain-HTTP listen address of the receiver's Prometheus /metrics endpoint [receiver]")
+	nodeID := flag.String("node-id", "", "Stable identifier for this receiver node (MQTT client id and presence topic); empty = os.Hostname() [receiver]")
 	repos := flag.String("repos", "", "Comma-separated list of CVMFS repositories served by this receiver (e.g. atlas.cern.ch,cms.cern.ch) [receiver]")
-	// recvStratum0URL is the Stratum 0 base URL the receiver uses to pull CAS
-	// objects on published-notification.  Distinct from --stratum0-url (which
-	// is publisher-mode only) to avoid flag-name collisions in the shared flag
-	// set.  Using --receiver-stratum0-url makes the purpose explicit.
-	recvStratum0URL := flag.String("receiver-stratum0-url", "", "Stratum 0 HTTP base URL used by the receiver to pull objects on commit notification (e.g. http://stratum0/cvmfs) [receiver]")
+	// recvStratum0URL is the publisher (cvmfs-prepub) base URL. Distinct from
+	// --stratum0-url (publisher-mode, a /cvmfs URL) to avoid a flag collision.
+	recvStratum0URL := flag.String("receiver-stratum0-url", "", "cvmfs-prepub publisher base URL, e.g. http://stratum0:8080; the receiver fetches {url}/s1/... (manifests, bundles) and {url}/cvmfs/{repo}/data/... (post-commit objects) [receiver]")
 	discoveryURL := flag.String("discovery-url", "", "Fixed S0 endpoint serving the discovery doc GET {url}/cvmfs/{repo}/.cvmfsbits; the receiver learns its control-plane broker URL from it [receiver]")
-	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs PREPUB_HMAC_SECRET and --discovery-url [receiver]")
+	brokerAuth := flag.Bool("broker-auth", false, "Enrol (challenge/response) and present a bearer token to the control-plane broker; needs S1_NODE_KEY, --discovery-url and --discovery-verify-key [receiver]")
 
-	// MQTT broker — shared by publisher and receiver modes.
-	// When set, receivers connect outbound to the broker and publish retained
-	// presence messages; publishers use pub/sub announce instead of HTTP.
-	// The broker URL uses Paho format: "tls://broker.cern.ch:8883" (production)
-	// or "tcp://localhost:1883" (development).  mTLS cert/key are required in
-	// production; --broker-ca-cert overrides the system CA pool.
-	brokerCACert := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker; empty uses system pool [publisher+receiver]")
+	// Removed receiver flags, still accepted (and ignored) for one release so
+	// existing units do not fail with "flag provided but not defined".
+	deprecatedFlags := []string{"tls-cert", "tls-key", "data-addr", "data-host", "session-ttl", "disk-headroom"}
+	for _, name := range deprecatedFlags {
+		flag.String(name, "", "deprecated, ignored [receiver]")
+	}
+
+	// Broker CA, shared by publisher and receiver modes.
+	brokerCACert := flag.String("broker-ca-cert", "", "Path to PEM CA certificate to verify the MQTT broker and, on a receiver, the discovery and TLS enroll endpoints; empty uses the system pool (TLS enroll requires it) [publisher+receiver]")
 
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("cvmfs-prepub " + versionString())
+		return
+	}
 
 	// ── Config file (applied after flag.Parse so CLI flags take precedence) ───
 	//
@@ -200,16 +330,27 @@ func main() {
 		applyFileConfig(fc, explicit,
 			mode, logLevel, devMode,
 			spoolRoot, stagingRoot, listen, publishMode, gatewayURL, cvmfsMount, casType, casRoot,
+			casServerConf,
 			stratum0URL, repoName,
 			jobTimeout, minConcurrentJobs, maxConcurrentJobs,
-			warmQuorum,
 			brokerCACert,
-			controlAddr, dataAddr, dataHost, tlsCert, tlsKey,
-			sessionTTL, diskHeadroom,
+			controlAddr,
 			nodeID, repos, recvStratum0URL,
 			provenanceEnabled, rekorServer, rekorSigningKey, oidcIssuers,
-			gatewayDirectGraft,
+			allowedPublishPrefixes,
+			gatewayDirectGraft, gatewayAllowPlaintext,
+			authMode,
+			debugListen,
+			signatureSkew,
+			ingestPublish, ingestPublishOwner,
+			replaceOnConflict, measurementsDir,
+			ingestSwissknife, ingestConfigPrefix, ingestEnv,
 			chunkMin, chunkAvg, chunkMax,
+			pipelineWorkers, pipelineUploadConc, prefetchLimit, promoteWorkers, prefetch,
+			maxTarSizeGiB, spoolMinFreeGiB,
+			retryWindow,
+			preWarm,
+			catalogCacheDir, catalogCacheMiB,
 		)
 	}
 
@@ -225,21 +366,42 @@ func main() {
 		Level: parseLogLevel(*logLevel),
 	}))
 
-	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode)
-	obs.Logger.Debug("distribution config (ADR-0001 pull, MQTT-over-wss control plane)")
+	obs.Logger.Info("starting cvmfs-prepub", "mode", *mode, "version", versionString())
+	var ignored []string
+	flag.Visit(func(f *flag.Flag) {
+		if slices.Contains(deprecatedFlags, f.Name) {
+			ignored = append(ignored, "--"+f.Name)
+		}
+	})
+	if len(ignored) > 0 {
+		obs.Logger.Warn("ignoring deprecated flags; remove them from the unit", "flags", strings.Join(ignored, " "))
+	}
+
+	stopDebug, derr := startDebugListener(*debugListen, obs)
+	if derr != nil {
+		obs.Logger.Error("cannot start the debug listener", "error", derr)
+		os.Exit(1)
+	}
+	defer stopDebug()
+	obs.Logger.Debug("distribution config (pull, MQTT-over-wss control plane)")
 
 	switch *mode {
 	case "publisher":
-		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *cvmfsMount, *stratum0URL, *repoName, *casType, *casRoot,
+		setupCatalogCache(obs, *spoolRoot, *catalogCacheDir, *catalogCacheMiB)
+		runPublisher(obs, *devMode, *spoolRoot, *stagingRoot, *listen, *publishMode, *gatewayURL, *gatewayDirectGraft, *gatewayAllowPlaintext, *authMode, *signatureSkew, *cvmfsMount, *ingestPublish, *ingestPublishOwner, *replaceOnConflict, *measurementsDir, *stratum0URL, *repoName, *casType, *casRoot, *casServerConf,
+			*ingestSwissknife, *ingestConfigPrefix, *ingestEnv,
 			*provenanceEnabled, *rekorServer, *rekorSigningKey, *oidcIssuers,
+			*allowedPublishPrefixes,
+			*maxTarSizeGiB, *spoolMinFreeGiB,
+			*retryWindow,
 			*jobTimeout, *leaseRetryMax, *minConcurrentJobs, *maxConcurrentJobs,
-			*pipelineUploadConc, *pipelineCompressLevel,
+			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *promoteWorkers, *prefetch,
 			*chunkMin, *chunkAvg, *chunkMax,
-			*warmQuorum,
+			*preWarm,
 			*brokerCACert,
 			*embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
 	case "receiver":
-		runReceiver(obs, *devMode, *controlAddr, *dataAddr, *dataHost, *tlsCert, *tlsKey, *casRoot, *sessionTTL, *diskHeadroom,
+		runReceiver(obs, *controlAddr, *casRoot,
 			*nodeID, *repos,
 			*brokerCACert,
 			*recvStratum0URL, *discoveryURL, *brokerAuth, *discoveryVerifyKey,
@@ -250,6 +412,27 @@ func main() {
 	}
 }
 
+// setupCatalogCache keeps the published catalogs that existence and hash
+// checks download (cvmfscatalog.SetCatalogCache). Local disk serves it best,
+// hence systemd's cache directory before the spool. A failure costs only the
+// cache, never a publish.
+func setupCatalogCache(obs *observe.Provider, spoolRoot, dir string, mib int) {
+	switch {
+	case strings.EqualFold(strings.TrimSpace(dir), "off"):
+		obs.Logger.Info("catalog cache disabled")
+		return
+	case dir == "" && os.Getenv("CACHE_DIRECTORY") != "":
+		dir = filepath.Join(strings.Split(os.Getenv("CACHE_DIRECTORY"), ":")[0], "catalogs")
+	case dir == "":
+		dir = filepath.Join(spoolRoot, "catalog-cache")
+	}
+	if err := cvmfscatalog.SetCatalogCache(dir, int64(mib)<<20); err != nil {
+		obs.Logger.Warn("catalog cache disabled", "dir", dir, "error", err)
+		return
+	}
+	obs.Logger.Info("catalog cache", "dir", dir, "max_mib", mib)
+}
+
 // runPublisher starts the publisher-mode HTTP API server.  It never returns
 // normally; it blocks until a SIGINT or SIGTERM is received and then performs
 // a graceful shutdown.
@@ -258,14 +441,29 @@ func runPublisher(
 	devMode bool,
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string,
 	gatewayDirectGraft bool,
-	cvmfsMount, stratum0URL, repoName, casType, casRoot string,
+	gatewayAllowPlaintext bool,
+	authMode string,
+	signatureSkew time.Duration,
+	cvmfsMount string,
+	ingestPublish bool,
+	ingestPublishOwner string,
+	replaceOnConflict bool,
+	measurementsDir string,
+	stratum0URL, repoName, casType, casRoot, casServerConf string,
+	ingestSwissknife, ingestConfigPrefix, ingestEnv string,
 	provenanceEnabled bool,
 	rekorServer, rekorSigningKey, oidcIssuers string,
+	allowedPublishPrefixes string,
+	maxTarSizeGiB, spoolMinFreeGiB int,
+	retryWindow time.Duration,
 	jobTimeout, leaseRetryMax time.Duration,
 	minConcurrentJobs, maxConcurrentJobs int,
-	pipelineUploadConc, pipelineCompressLevel int,
+	pipelineWorkers, pipelineUploadConc, pipelineCompressLevel int,
+	prefetchLimit int,
+	promoteWorkers int,
+	prefetch bool,
 	chunkMin, chunkAvg, chunkMax int64,
-	warmQuorum float64,
+	preWarm bool,
 	brokerCACert string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
 	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
@@ -276,9 +474,15 @@ func runPublisher(
 	// brokerURL is derived from the embedded broker (loopback); the publisher's
 	// own announce/published clients connect there. There is no external broker
 	// and no client-cert mTLS — the embedded broker is reached over ws/wss with a
-	// token. warmQuorum is reserved for the warm-gate commit gating (ADR-0001 D6).
+	// token.
 	brokerURL := ""
-	_ = warmQuorum
+	// The repo name builds the server.conf path and the discovery document.
+	if repoName != "" {
+		if err := broker.ValidateRepo(repoName); err != nil {
+			obs.Logger.Error("invalid --repo-name", "error", err)
+			os.Exit(1)
+		}
+	}
 	apiToken := os.Getenv("PREPUB_API_TOKEN")
 	if apiToken == "" {
 		if devMode {
@@ -295,6 +499,25 @@ func runPublisher(
 		obs.Logger.Error("failed to create spool", "error", err)
 		os.Exit(1)
 	}
+	// Jobs per spool state and the host's load, memory and spool disk, on
+	// /api/v1/metrics, for the console's publisher row.
+	if reg, ok := obs.Registry.(prometheus.Registerer); ok {
+		reg.MustRegister(spool.NewCollector(sp))
+	}
+
+	// Keep every temporary file inside the spool filesystem. /tmp is small on a
+	// production node (and with systemd PrivateTmp it can be a tmpfs, i.e. RAM),
+	// yet the publish path writes potentially large temporaries there: catalog
+	// downloads (cvmfscatalog.PathExists), mkdir-p subtree catalogs, buildset
+	// finalize work dirs, and the pipeline's compress spill. Setting TMPDIR
+	// redirects os.MkdirTemp("")/os.CreateTemp("") for this process AND for the
+	// child processes we exec (cvmfs_swissknife, cvmfs_server), which inherit
+	// the environment.
+	if err := setTempRoot(spoolRoot); err != nil {
+		obs.Logger.Error("failed to prepare spool temp directory", "error", err)
+		os.Exit(1)
+	}
+	obs.Logger.Info("temp root", "tmpdir", os.TempDir())
 
 	// ── Publish backend selection ─────────────────────────────────────────────
 	//
@@ -304,23 +527,23 @@ func runPublisher(
 	// Local mode does not require cvmfs_gateway, a CAS, or a gateway secret.
 
 	var casBackend cas.Backend
+	// The S3 config prepub's own store reads (cas type s3), also handed to the
+	// direct-S3 ingest so both upload paths share credentials and tuning.
+	var s3ConfigPath string
 	var leaseBackend lease.Backend
 	var gatewayQueue *api.GatewayQueue // non-nil only in gateway mode
+	// The gateway client itself, kept so publish paths that are the gateway in
+	// all but one respect can share it rather than open a second one. Nil in
+	// local mode, which is what gates the staged path off there.
+	var gwClient *lease.Client
 
 	switch publishMode {
 	case "gateway":
-		// Enforce HTTPS for gateway communication (loopback is accepted as-is
-		// because cvmfs_gateway typically listens on http://localhost:4929).
-		isLoopback := strings.HasPrefix(gatewayURL, "http://localhost") ||
-			strings.HasPrefix(gatewayURL, "http://127.0.0.1") ||
-			strings.HasPrefix(gatewayURL, "http://[::1]")
-		if !strings.HasPrefix(gatewayURL, "https://") && !isLoopback {
-			if devMode {
-				obs.Logger.Warn("SECURITY: gateway URL is not HTTPS — development mode only, NEVER use in production", "url", gatewayURL)
-			} else {
-				obs.Logger.Error("gateway URL must use HTTPS (or http://localhost for local gateway); use --dev to override", "url", gatewayURL)
-				os.Exit(1)
-			}
+		if warn, err := checkGatewayURL(gatewayURL, gatewayAllowPlaintext, devMode); err != nil {
+			obs.Logger.Error(err.Error(), "url", gatewayURL)
+			os.Exit(1)
+		} else if warn != "" {
+			obs.Logger.Warn(warn, "url", gatewayURL)
 		}
 
 		gatewaySecret := os.Getenv("CVMFS_GATEWAY_SECRET")
@@ -351,6 +574,50 @@ func runPublisher(
 				os.Exit(1)
 			}
 			casBackend = lfs
+		case "s3":
+			// Settings come from the server.conf named here and the S3 config
+			// its CVMFS_UPSTREAM_STORAGE points to. It must describe the bucket
+			// the repository is served from: a divergent bucket/alias/credential
+			// would publish catalogs referencing objects no client can fetch.
+			// install.sh --s3-conf-from writes prepub's own copy and refreshes
+			// its CVMFS_S3_* lines from the repository's on every update.
+			serverConf := casServerConf
+			if serverConf == "" {
+				if repoName == "" {
+					// Name the CONFIG-FILE keys, not just the flags: this
+					// service is configured from config.yaml in every real
+					// deployment, and an error naming only flags sends the
+					// operator looking in the wrong file.
+					obs.Logger.Error("cas type s3 needs to know which repository's storage to use",
+						"fix", "in /etc/cvmfs-prepub/config.yaml set cas.server_conf: "+
+							"/etc/cvmfs/repositories.d/<repo>/server.conf  (or set repo_name: <repo> "+
+							"to derive it); equivalently --cas-server-conf / --repo-name")
+					os.Exit(1)
+				}
+				serverConf = "/etc/cvmfs/repositories.d/" + repoName + "/server.conf"
+			}
+			st, err := cas.LoadS3SettingsFromServerConf(serverConf)
+			if err != nil {
+				obs.Logger.Error("failed to load S3 settings", "server_conf", serverConf, "error", err)
+				os.Exit(1)
+			}
+			s3b, err := cas.NewS3(context.Background(), st)
+			if err != nil {
+				obs.Logger.Error("failed to create s3 CAS", "error", err)
+				os.Exit(1)
+			}
+			obs.Logger.Info("CAS backend: s3",
+				"endpoint", s3b.Endpoint(), "bucket", s3b.Bucket(),
+				"alias", s3b.Alias(), "server_conf", serverConf, "s3_config", st.ConfigPath)
+			casBackend = s3b
+			// cvmfs_server re-splits its command line through a shell, so a
+			// path it would split or interpret is refused here, not mangled.
+			if !safeShellPath(st.ConfigPath) {
+				obs.Logger.Error("S3 config path is unsafe to hand to cvmfs_server",
+					"s3_config", st.ConfigPath, "fix", "use an absolute path of letters, digits and ._/@+-")
+				os.Exit(1)
+			}
+			s3ConfigPath = st.ConfigPath
 		default:
 			obs.Logger.Error("unknown CAS type", "type", casType)
 			os.Exit(1)
@@ -361,6 +628,7 @@ func runPublisher(
 			lc.RetryMax = leaseRetryMax
 		}
 		leaseBackend = lc
+		gwClient = lc
 		gatewayQueue = api.NewGatewayQueue(lc, obs)
 		obs.Logger.Info("gateway credentials", "key_id", gatewayKeyID)
 		obs.Logger.Info("publish backend: gateway", "url", gatewayURL,
@@ -377,6 +645,117 @@ func runPublisher(
 		os.Exit(1)
 	}
 
+	// ── Optional publish paths ────────────────────────────────────────────────
+	//
+	// --publish-mode selects the DEFAULT backend; a deployment can additionally
+	// offer alternative paths that a job may name. Today there is one: "ingest",
+	// which hands the tar to `cvmfs_server ingest` so the gateway does the
+	// chunking, dedup and catalogs.
+	//
+	// The registry is keyed by path name now and becomes (repo, path) when one
+	// instance serves several repositories.
+	publishPaths := map[string]lease.Backend{}
+	// Declared out here so the staged path can borrow its DeleteSubtree for
+	// replace_on_conflict: deleting a published subtree is repository-level
+	// work, not a property of how the content arrived.
+	var ib *lease.IngestBackend
+	if ingestPublish {
+		ib = lease.NewIngestBackend(lease.IngestOptions{
+			CVMFSMount: cvmfsMount,
+			// A nested catalog per published package keeps the root catalog
+			// small and is what lets ingest publish into a path that already
+			// holds nested sub-catalogs.
+			NestedCatalog: true,
+			Owner:         ingestPublishOwner,
+			// The same S3 config as prepub's own store, so direct-S3 ingests
+			// never fall back to whatever file sits at cvmfs_server's default.
+			S3Config: s3ConfigPath,
+		}, obs)
+		if err := ib.Probe(context.Background()); err != nil {
+			obs.Logger.Error("--ingest-publish requested but the ingest backend is unusable", "error", err)
+			os.Exit(1)
+		}
+		publishPaths["ingest"] = ib
+		obs.Logger.Info("publish path available: ingest (cvmfs_server ingest — gateway does chunking/dedup/catalogs)",
+			"cvmfs_mount", cvmfsMount, "owner", ingestPublishOwner, "direct_s3_config", s3ConfigPath)
+
+		if publishMode == "local" {
+			// Supported, and the natural way to exercise both paths against one
+			// service. Each publish still uses exactly one path; two jobs on one
+			// repository are kept apart by the orchestrator's per-repo commit
+			// lock, which is backend-agnostic — neither backend's own lock can
+			// see the other's.
+			obs.Logger.Info("both publish paths run cvmfs_server on this node " +
+				"(local + ingest): publishes to one repository are serialised by " +
+				"the per-repo commit lock, different repositories still run in parallel")
+		}
+	}
+
+	// Measurement records (internal/measure). Defaults to <spool>/measurements
+	// so a deployment gets the base without extra configuration; "off"
+	// disables. A failure to create the directory is NOT fatal — losing the
+	// measurements must never cost a publish.
+	measDir := measurementsDir
+	if strings.EqualFold(strings.TrimSpace(measDir), "off") {
+		measDir = ""
+	} else if measDir == "" {
+		measDir = filepath.Join(spoolRoot, "measurements")
+	}
+	measWriter, measErr := measure.NewWriter(measDir)
+	if measErr != nil {
+		obs.Logger.Warn("measurement records disabled: could not create the directory",
+			"dir", measDir, "error", measErr)
+		measWriter = nil
+	} else if measWriter != nil {
+		obs.Logger.Info("measurement records: one line per publish",
+			"dir", measDir, "api", "GET /api/v1/measurements/{build|latest}")
+	}
+
+	// Validate at the edge. cas.PromoteFrom clamps silently three packages
+	// away, so an operator running the A/B this knob exists for would get 16
+	// (or 256) while believing otherwise, and conclude the setting did nothing.
+	if promoteWorkers < 1 {
+		obs.Logger.Error("promote-workers must be at least 1",
+			"got", promoteWorkers)
+		os.Exit(1)
+	}
+	if promoteWorkers > cas.MaxPromoteWorkers {
+		obs.Logger.Warn("promote-workers above the transport's limit; clamping",
+			"got", promoteWorkers, "using", cas.MaxPromoteWorkers)
+	}
+
+	// Tuning banner: the knobs a sweep varies, in one line, so each run's log
+	// self-documents which settings produced its window (all .env-overridable).
+	obs.Logger.Info("publisher tuning",
+		"pipeline_upload_conc", pipelineUploadConc,
+		"pipeline_workers", pipelineWorkers,
+		"promote_workers", promoteWorkers,
+		"max_concurrent_jobs", maxConcurrentJobs,
+		"min_concurrent_jobs", minConcurrentJobs)
+
+	if replaceOnConflict {
+		obs.Logger.Warn("replace_on_conflict ENABLED: a job that asks (replace=true) " +
+			"replaces what another build published at its own path " +
+			"(destructive; decided by the published hash, confirmed against the " +
+			"catalogs before anything is deleted)")
+	}
+
+	// The staged path: content a producer already prepared into the repository's
+	// store, which prepub promotes and grafts. It needs the gateway — grafting
+	// is a gateway endpoint — so it is offered only in gateway mode, and a job
+	// naming it on a local-mode node is rejected at submission rather than
+	// published some other way. It also needs a CAS that can promote the
+	// producer's prefix, which only the S3 CAS can.
+	switch {
+	case gwClient != nil && api.CanPromote(casBackend):
+		publishPaths[api.StagedPublishPath] = lease.NewStagedBackend(gwClient, ib)
+		obs.Logger.Info("publish path available: " + api.StagedPublishPath +
+			" (producer-prepared objects, promoted and grafted — no payload)")
+	case gwClient != nil:
+		obs.Logger.Info("publish path not offered: " + api.StagedPublishPath +
+			" (needs cas type s3)")
+	}
+
 	// Startup probe: confirm backends are reachable before accepting jobs.
 	obs.Logger.Info("running startup probe")
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -387,6 +766,32 @@ func runPublisher(
 	}
 	probeCancel()
 	obs.Logger.Info("startup probe passed")
+	// Say plainly which publish paths this node offers: a job naming one that is
+	// absent is rejected at submission, so an operator debugging a rejected
+	// build should be able to read the answer out of the startup log.
+	pathNames := []string{api.DefaultPublishPath + " (default, " + publishMode + " mode)"}
+	for name := range publishPaths {
+		pathNames = append(pathNames, name)
+	}
+	sort.Strings(pathNames)
+	obs.Logger.Info("publish paths available", "paths", strings.Join(pathNames, ", "))
+
+	// Say whether the coarse-publish finalize can run. This is the one setting
+	// whose absence is invisible from the producer's side: with coarse publish
+	// on (the default) a sealed build is finalized HERE, so an unset config
+	// prefix means every package uploads, the pipeline reports success, and
+	// nothing is ever committed. Silence about it was how that went unnoticed
+	// once already.
+	if ingestConfigPrefix == "" {
+		obs.Logger.Warn("coarse-publish finalize is NOT configured (ingest_config_prefix unset) — " +
+			"builds submitted with a build_id will accumulate and then FAIL to publish, " +
+			"with nothing to tell the producer, which has already exited. Set " +
+			"ingest_config_prefix in config.yaml, or publish with PREPUB_COARSE=false")
+	} else {
+		obs.Logger.Info("coarse-publish finalize configured",
+			"config_prefix", ingestConfigPrefix, "swissknife", ingestSwissknife,
+			"extra_env", len(splitCSV(ingestEnv)))
+	}
 
 	notifyBus := notify.NewBus()
 
@@ -409,6 +814,9 @@ func runPublisher(
 		RekorServer:    rekorServer,
 		SigningKeyPath: rekorSigningKey,
 		OIDCIssuers:    oidcIssuerList,
+		// Audience binding (env, like PREPUB_API_TOKEN): CI OIDC issuers are
+		// global, so without this any workflow anywhere gets Verified=true.
+		OIDCAudience: os.Getenv("PREPUB_OIDC_AUDIENCE"),
 	}
 	provProvider, err := provenance.New(provCfg, spoolRoot, obs)
 	if err != nil {
@@ -425,7 +833,7 @@ func runPublisher(
 	// Embedded control-plane broker (alternative to an external mosquitto): run
 	// an in-process MQTT broker with a WebSocket listener on S0. The publisher's
 	// own broker clients connect on localhost; receivers connect via the URL
-	// advertised in discovery (ADR-0001 D7/D10).
+	// advertised in discovery.
 	var brokerClose func()
 	var enrollSrv *credential.EnrollServer
 	var pubCreds func() (string, string)
@@ -434,8 +842,9 @@ func runPublisher(
 	var revoc *revocation
 	var ctrlTLSClose func()
 	var enrollOverTLS bool
+	var apiRevoke, apiUnrevoke http.Handler // on the API router; nil without broker auth
 	if embeddedBrokerWSAddr != "" {
-		// Build the broker's server TLS config (H1: real wss://). When no cert is
+		// Build the broker's server TLS config (real wss://). When no cert is
 		// configured the listener stays plaintext ws:// (dev), but advertising a
 		// wss:// control-plane URL without a cert is a hard misconfiguration.
 		var brokerTLS *tls.Config
@@ -457,7 +866,14 @@ func runPublisher(
 				os.Exit(1)
 			}
 			ctrlSecret = secret
-			revoc = newRevocation()
+			revPath := filepath.Join(spoolRoot, "revoked-nodes.json")
+			rv, rerr := loadRevocation(revPath)
+			if rerr != nil {
+				obs.Logger.Error("embedded broker: cannot load the revocation list", "path", revPath, "error", rerr)
+				os.Exit(1)
+			}
+			rv.logger = obs.Logger
+			revoc = rv
 			minter := credential.NewMinter(secret)
 			authHook = newBrokerAuthHook(credential.NewVerifier(secret), "publisher", revoc, obs)
 			enrollSrv = credential.NewEnrollServer(&derivedEnrollStore{secret: secret, revoc: revoc},
@@ -478,6 +894,10 @@ func runPublisher(
 			os.Exit(1)
 		}
 		brokerClose = c
+		if revoc != nil {
+			apiRevoke = revokeCore(revoc, authHook, brokerSrv, obs, false)
+			apiUnrevoke = revokeCore(revoc, authHook, brokerSrv, obs, true)
+		}
 		// Serve enroll/revoke over TLS so the enrollment token never travels in plaintext.
 		if embeddedBrokerAuth && enrollTLSAddr != "" {
 			if brokerTLS == nil {
@@ -495,11 +915,12 @@ func runPublisher(
 			enrollOverTLS = true
 		}
 		if brokerURL == "" {
-			scheme := "ws"
-			if brokerTLS != nil {
-				scheme = "wss"
+			u, uerr := localBrokerURL(embeddedBrokerWSAddr, brokerTLS != nil)
+			if uerr != nil {
+				obs.Logger.Error(uerr.Error())
+				os.Exit(1)
 			}
-			brokerURL = scheme + "://localhost" + embeddedBrokerWSAddr
+			brokerURL = u
 		}
 	}
 
@@ -520,7 +941,7 @@ func runPublisher(
 	}
 
 	// Attach the publisher's token credentials to the announce broker config so
-	// the one-shot announce client authenticates to the embedded broker (H3).
+	// the one-shot announce client authenticates to the embedded broker.
 	if pubCreds != nil && distCfg != nil && distCfg.BrokerConfig != nil {
 		distCfg.BrokerConfig.CredentialsProvider = pubCreds
 	}
@@ -547,17 +968,24 @@ func runPublisher(
 		os.Exit(1)
 	}
 	orch := &api.Orchestrator{
-		Spool:        sp,
-		CAS:          casBackend,
-		Lease:        leaseBackend,
-		GatewayQueue: gatewayQueue,
-		CVMFSMount:   cvmfsMount,
-		Stratum0URL:  stratum0URL,
-		DirectGraft:  gatewayDirectGraft,
-		JobTimeout:   jobTimeout,
-		BrokerConfig: publishBrokerCfg,
+		Spool:              sp,
+		CAS:                casBackend,
+		Lease:              leaseBackend,
+		GatewayQueue:       gatewayQueue,
+		CVMFSMount:         cvmfsMount,
+		Stratum0URL:        stratum0URL,
+		DirectGraft:        gatewayDirectGraft,
+		ReplaceOnConflict:  replaceOnConflict,
+		PromoteWorkers:     promoteWorkers,
+		Measurements:       measWriter,
+		IngestSwissknife:   ingestSwissknife,
+		IngestConfigPrefix: ingestConfigPrefix,
+		IngestEnv:          splitCSV(ingestEnv),
+		JobTimeout:         jobTimeout,
+		RetryWindow:        retryWindow,
+		BrokerConfig:       publishBrokerCfg,
 		Pipeline: pipeline.Config{
-			Workers:       4,
+			Workers:       pipelineWorkers,
 			UploadConc:    pipelineUploadConc,
 			CompressLevel: pipelineCompressLevel,
 			ChunkMin:      chunkMin,
@@ -565,9 +993,13 @@ func runPublisher(
 			ChunkMax:      chunkMax,
 			CAS:           casBackend,
 			SpoolDir:      spoolRoot,
-			Obs:           obs,
+			// One setting governs both: no file in a tar can exceed the tar.
+			MaxEntrySize: int64(maxTarSizeGiB) << 30,
+			Obs:          obs,
 		},
+		PublishPaths:      publishPaths,
 		Distribute:        distCfg,
+		PreWarm:           preWarm,
 		Notify:            notifyBus,
 		Provenance:        provProvider,
 		Obs:               obs,
@@ -577,9 +1009,63 @@ func runPublisher(
 
 	if jobTimeout > 0 {
 		obs.Logger.Info("per-job timeout enabled", "job_timeout", jobTimeout)
+	} else {
+		obs.Logger.Warn("per-job timeout DISABLED (--job-timeout 0) — a job that blocks " +
+			"will hold its concurrency slot for the life of the process")
+	}
+
+	orch.SetPrefetchLimit(prefetchLimit)
+	orch.SetPrefetchEnabled(prefetch)
+	if orch.PrefetchEnabled() {
+		obs.Logger.Info("tar prefetch (pipeline phase 0) bounded",
+			"budget_units", prefetchLimit, "unit_bytes", 128<<20,
+			"note", "over budget, phase 0 runs inline under the job's own concurrency slot")
+	} else {
+		obs.Logger.Info("tar prefetch (pipeline phase 0) DISABLED — every job scans its own " +
+			"tar inline, so each archive is read exactly once and nothing is spilled ahead")
 	}
 
 	apiServer := api.New(obs, apiToken, orch, sp, notifyBus, spoolRoot, stagingRoot, minConcurrentJobs, maxConcurrentJobs)
+	// Which credentials the API accepts. Parsed here rather than
+	// inside the server so a typo fails at startup instead of silently falling
+	// back to the most permissive setting.
+	am, amErr := api.ParseAuthMode(authMode)
+	if amErr != nil {
+		obs.Logger.Error("invalid --auth-mode", "error", amErr)
+		os.Exit(1)
+	}
+	apiServer.SetAuthMode(am)
+	// Before the listener is up: this rebuilds the replay cache to match.
+	if signatureSkew != httpsig.DefaultSkew {
+		apiServer.SetSignatureSkew(signatureSkew)
+		obs.Logger.Info("API auth: signature skew overridden",
+			"skew", signatureSkew.String(), "nonce_retention", (2 * signatureSkew).String())
+	}
+	switch am {
+	case api.AuthHMAC:
+		obs.Logger.Info("API auth: signed requests only — the shared secret does not travel")
+	case api.AuthBearer:
+		obs.Logger.Warn("API auth: bearer only — the shared secret travels on every request; " +
+			"anyone who observes one holds publish rights until it is rotated")
+	default:
+		obs.Logger.Warn("API auth: bearer or signed (migration setting) — the bearer path still " +
+			"puts the shared secret on the wire; switch to auth_mode=hmac once publishers sign, then rotate the token")
+	}
+	apiServer.SetUploadLimits(int64(maxTarSizeGiB)<<30, int64(spoolMinFreeGiB)<<30)
+	obs.Logger.Info("upload limits", "max_tar_size_gib", maxTarSizeGiB, "spool_min_free_gib", spoolMinFreeGiB)
+	if allowedPublishPrefixes != "" {
+		apiServer.SetAllowedPublishPrefixes(strings.Split(allowedPublishPrefixes, ","))
+		obs.Logger.Info("publish namespace containment enabled", "allowed_prefixes", allowedPublishPrefixes)
+	}
+
+	if apiRevoke != nil {
+		if apiServer.MountRevoke(apiRevoke, apiUnrevoke) {
+			obs.Logger.Info("control-plane: revoke available on the API",
+				"routes", "POST "+api.RevokePath+", POST "+api.UnrevokePath)
+		} else {
+			obs.Logger.Warn("control-plane: API revoke routes not mounted: PREPUB_API_TOKEN is empty (API auth off)")
+		}
+	}
 
 	// Control-plane DoS limiter (internet-exposed; no firewall assumed).
 	ctrlRateLimit := credential.NewIPRateLimiter(5, 10, 4096, 100, 200)
@@ -606,13 +1092,9 @@ func runPublisher(
 		obs.Logger.Info("control-plane: discovery advertising broker", "url", controlPlaneURL)
 	}
 
-	// ADR-0001: serve objects + manifests (incl. the gateway POST ingest) so
+	// Pull distribution: serve objects + manifests (incl. the gateway POST ingest) so
 	// Stratum 1 can pull on a prepare announce. Pull is the only distribution mode.
 	{
-		// Admission control (ADR D6): cap concurrent receiver pulls and issue one
-		// lease per node at a time. Limits are conservative defaults for the small
-		// Stratum 1 fleet; make them configurable when the benchmark (P5) lands.
-		admission := commit.NewAdmission(commit.Options{MaxConcurrent: 16, MaxPerNode: 1})
 		plaintextEnroll := enrollSrv
 		if enrollOverTLS {
 			plaintextEnroll = nil // enrollment is served over TLS only
@@ -620,11 +1102,10 @@ func runPublisher(
 		apiServer.MountDistributeServing(api.DistributeServing{
 			CAS:       casBackend,
 			Manifests: pullManifestStore,
-			Admission: admission,
 			Enroll:    plaintextEnroll,
 			RateLimit: ctrlRateLimit.Middleware,
 		})
-		obs.Logger.Info("ADR-0001: pull-mode distribute serving enabled")
+		obs.Logger.Info("pull-mode distribute serving enabled")
 	}
 
 	// Crash-recovery: re-run jobs that were interrupted by a previous crash.
@@ -638,6 +1119,22 @@ func runPublisher(
 		os.Exit(1)
 	}
 
+	// Consumed exactly once, before any job is looked at: was the previous exit
+	// graceful? Jobs interrupted by an operator restart must not be charged a
+	// recovery attempt, or restarting the service during a large publish
+	// destroys it — three restarts terminally failed a 174-package build.
+	afterCleanShutdown := sp.TakeCleanShutdown()
+	if len(inProgressJobs) > 0 {
+		if afterCleanShutdown {
+			obs.Logger.Info("previous shutdown was clean — in-flight jobs resume without "+
+				"counting a failed attempt", "jobs", len(inProgressJobs))
+		} else {
+			obs.Logger.Warn("previous exit was NOT clean — in-flight jobs are recovered and "+
+				"the attempt is counted; a job that keeps killing the service will be failed",
+				"jobs", len(inProgressJobs), "max_recoveries", api.MaxRecoveries)
+		}
+	}
+
 	var recoveryWg sync.WaitGroup
 	for _, j := range inProgressJobs {
 		j := j
@@ -645,7 +1142,7 @@ func runPublisher(
 		recoveryWg.Add(1)
 		go func() {
 			defer recoveryWg.Done()
-			if err := orch.Recover(recoverCtx, j); err != nil {
+			if err := apiServer.RecoverJob(recoverCtx, j, afterCleanShutdown); err != nil {
 				obs.Logger.Error("job recovery failed", "job_id", j.ID, "error", err)
 			}
 		}()
@@ -690,25 +1187,46 @@ func runPublisher(
 		obs.Logger.Warn("timed out waiting for recovery goroutines")
 	}
 
+	// LAST, deliberately: the marker means "we got all the way through a clean
+	// shutdown". Written earlier, a crash partway through would leave it behind
+	// and the interrupted jobs would get a free pass they had not earned. If
+	// this write fails the next start simply treats the exit as a crash, which
+	// is the safe direction.
+	if err := sp.MarkCleanShutdown(); err != nil {
+		obs.Logger.Warn("could not record a clean shutdown — in-flight jobs will be "+
+			"charged a recovery attempt on the next start", "error", err)
+	}
+
 	obs.Logger.Info("shutdown complete")
 }
 
-// runReceiver starts the two-channel Stratum 1 pre-warming server.  It never
-// returns normally; it blocks until a SIGINT or SIGTERM is received and then
-// performs a graceful shutdown.
-//
-// The HMAC shared secret is read from the PREPUB_HMAC_SECRET environment
-// variable.  It must be identical on the publisher and all receivers.  When
-// --dev is set the HMAC check is skipped and the control channel uses plain
-// HTTP instead of TLS (never use in production).
+// parseReceiverRepos parses the comma-separated --repos value. At least one
+// repository is required: without one the receiver never fetches discovery
+// and so never connects.
+func parseReceiverRepos(reposFlag string) ([]string, error) {
+	var repoList []string
+	for _, r := range strings.Split(reposFlag, ",") {
+		if trimmed := strings.TrimSpace(r); trimmed != "" {
+			if err := broker.ValidateRepo(trimmed); err != nil {
+				return nil, fmt.Errorf("invalid --repos entry: %w", err)
+			}
+			repoList = append(repoList, trimmed)
+		}
+	}
+	if len(repoList) == 0 {
+		return nil, fmt.Errorf("receiver mode requires at least one repository: " +
+			"set --repos (comma-separated) or `repos` in the config file")
+	}
+	return repoList, nil
+}
+
+// runReceiver starts the Stratum 1 pull receiver.  It never returns normally;
+// it blocks until a SIGINT or SIGTERM is received and then performs a graceful
+// shutdown.
 func runReceiver(
 	obs *observe.Provider,
-	devMode bool,
-	controlAddr, dataAddr, dataHost string,
-	tlsCert, tlsKey string,
+	controlAddr string,
 	casRoot string,
-	sessionTTL time.Duration,
-	diskHeadroom float64,
 	nodeID, reposFlag string,
 	brokerCACert string,
 	stratum0URL string,
@@ -723,48 +1241,35 @@ func runReceiver(
 	// There is no external --broker-url and no client-cert mTLS. Pull is the only
 	// distribution mode.
 	brokerURL := ""
-	brokerClientCert := ""
-	brokerClientKey := ""
-	// Load the HMAC shared secret from the environment.  In DevMode the
-	// receiver skips HMAC verification entirely, so the secret is not required.
-	hmacSecret := os.Getenv("PREPUB_HMAC_SECRET")
-	if hmacSecret == "" && !devMode {
-		obs.Logger.Error("PREPUB_HMAC_SECRET environment variable must be set (or use --dev for testing)")
+	// A receiver does NOT hold the master secret. Announce authenticity comes
+	// from the authenticated control-plane broker (token + ACL) and TLS, not a
+	// shared HMAC — so PREPUB_HMAC_SECRET is neither read nor required here. The
+	// receiver's only key is its own per-node S1_NODE_KEY (see --broker-auth).
+
+	if err := checkReceiverAuthConfig(brokerAuth, discoveryVerifyKey); err != nil {
+		obs.Logger.Error("control-plane: " + err.Error())
 		os.Exit(1)
 	}
-	if hmacSecret == "" && devMode {
-		obs.Logger.Warn("SECURITY: PREPUB_HMAC_SECRET not set — HMAC verification disabled (development mode only)")
+
+	if nodeID == "" {
+		nodeID, _ = os.Hostname()
 	}
 
-	// Validate TLS configuration early so the error is reported before any
-	// listeners are bound.  In DevMode TLS is not used.
-	if !devMode {
-		if tlsCert == "" || tlsKey == "" {
-			obs.Logger.Error("--tls-cert and --tls-key are required for the control channel (or use --dev for testing)")
-			os.Exit(1)
-		}
-		if _, err := os.Stat(tlsCert); err != nil {
-			obs.Logger.Error("TLS certificate file not found", "path", tlsCert, "error", err)
-			os.Exit(1)
-		}
-		if _, err := os.Stat(tlsKey); err != nil {
-			obs.Logger.Error("TLS key file not found", "path", tlsKey, "error", err)
-			os.Exit(1)
-		}
-	}
-
-	// Parse --repos flag into a slice of repository names.
-	var repoList []string
-	for _, r := range strings.Split(reposFlag, ",") {
-		if trimmed := strings.TrimSpace(r); trimmed != "" {
-			repoList = append(repoList, trimmed)
-		}
+	repoList, err := parseReceiverRepos(reposFlag)
+	if err != nil {
+		obs.Logger.Error(err.Error())
+		os.Exit(1)
 	}
 
 	enrollBase := discoveryURL
 	if discoveryURL != "" && len(repoList) > 0 {
+		discoHTTP, herr := discoveryHTTPClient(brokerCACert)
+		if herr != nil {
+			obs.Logger.Error("control-plane: loading discovery CA", "error", herr)
+			os.Exit(1)
+		}
 		discoCtx, discoStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		d, derr := fetchDiscoveryWithRetry(discoCtx, discoveryURL, repoList[0], obs)
+		d, derr := fetchDiscoveryWithRetry(discoCtx, discoHTTP, discoveryURL, repoList[0], obs)
 		discoStop()
 		if derr != nil {
 			if discoCtx.Err() != nil {
@@ -774,21 +1279,13 @@ func runReceiver(
 			obs.Logger.Error("control-plane: discovery failed", "error", derr)
 			os.Exit(1)
 		}
-		if brokerAuth {
-			if discoveryVerifyKey == "" {
-				obs.Logger.Error("control-plane: --discovery-verify-key is required under --broker-auth (Ed25519-only discovery)")
-				os.Exit(1)
-			}
-			vf, verr := ed25519VerifierFromFile(discoveryVerifyKey)
-			if verr != nil {
-				obs.Logger.Error("loading discovery verify key", "error", verr)
-				os.Exit(1)
-			}
-			verified := d.Verify(vf)
-			if !verified {
-				obs.Logger.Error("control-plane: discovery signature verification FAILED — refusing advertised broker (possible MITM)")
-				os.Exit(1)
-			}
+		// Verified whenever a key is configured, not only under --broker-auth.
+		if verr := verifyDiscovery(d, discoveryVerifyKey); verr != nil {
+			obs.Logger.Error("control-plane: " + verr.Error())
+			os.Exit(1)
+		}
+		if discoveryVerifyKey == "" {
+			obs.Logger.Warn("control-plane: discovery document NOT verified (no --discovery-verify-key)")
 		}
 		if d.ControlPlane.Type != "" && d.ControlPlane.Type != "mqtt" {
 			obs.Logger.Error("control-plane: discovery advertised unsupported transport", "type", d.ControlPlane.Type)
@@ -808,24 +1305,22 @@ func runReceiver(
 
 	var brokerCreds func() (string, string)
 	if brokerAuth {
-		// Per-node enrollment key: prefer the provisioned PREPUB_NODE_KEY (hex) so
-		// the receiver never holds the master secret; fall back to deriving it from
-		// the master (legacy / dev).
+		// Per-node enrollment key: the receiver is provisioned with its own
+		// S1_NODE_KEY (hex) and NEVER holds the master secret. There is no
+		// fallback to deriving it from PREPUB_HMAC_SECRET — a compromised receiver
+		// could otherwise derive any node's key and mint publisher tokens. Generate
+		// the key on the publisher with `prepub node-key <node>`.
 		var nodeKey []byte
-		if nk := strings.TrimSpace(os.Getenv("PREPUB_NODE_KEY")); nk != "" {
+		if nk := strings.TrimSpace(os.Getenv("S1_NODE_KEY")); nk != "" {
 			b, derr := hex.DecodeString(nk)
 			if derr != nil || len(b) == 0 {
-				obs.Logger.Error("PREPUB_NODE_KEY must be non-empty hex")
+				obs.Logger.Error("S1_NODE_KEY must be non-empty hex")
 				os.Exit(1)
 			}
 			nodeKey = b
 		} else {
-			secret := []byte(os.Getenv("PREPUB_HMAC_SECRET"))
-			if len(secret) < 16 {
-				obs.Logger.Error("--broker-auth requires PREPUB_NODE_KEY (hex) or PREPUB_HMAC_SECRET (>= 16 bytes)")
-				os.Exit(1)
-			}
-			nodeKey = deriveNodeKey(secret, nodeID)
+			obs.Logger.Error("--broker-auth requires S1_NODE_KEY (hex); provision it on the publisher with `PREPUB_HMAC_SECRET=<master> prepub node-key " + nodeID + "` and set it on this receiver")
+			os.Exit(1)
 		}
 		if discoveryURL == "" {
 			obs.Logger.Error("--broker-auth requires --discovery-url (the enroll endpoint base)")
@@ -856,26 +1351,14 @@ func runReceiver(
 	}
 	cfg := receiver.Config{
 		ControlAddr:               controlAddr,
-		DataAddr:                  dataAddr,
-		DataHost:                  dataHost,
-		TLSCert:                   tlsCert,
-		TLSKey:                    tlsKey,
-		HMACSecret:                hmacSecret,
 		CASRoot:                   casRoot,
-		SessionTTL:                sessionTTL,
-		DiskHeadroom:              diskHeadroom,
-		DevMode:                   devMode,
 		NodeID:                    nodeID,
 		Repos:                     repoList,
 		Stratum0URL:               stratum0URL,
-		PullMode:                  true,
-		PullManifestBase:          stratum0URL, // points at the cvmfs-prepub endpoint
 		PullConcurrency:           pullConcurrency,
 		PullFilesPerRequest:       pullFilesPerRequest,
 		PullAuto:                  pullAuto,
 		BrokerURL:                 brokerURL,
-		BrokerClientCert:          brokerClientCert,
-		BrokerClientKey:           brokerClientKey,
 		BrokerCACert:              brokerCACert,
 		Obs:                       obs,
 		BrokerCredentialsProvider: brokerCreds,
@@ -894,9 +1377,8 @@ func runReceiver(
 
 	obs.Logger.Info("receiver ready",
 		"control_addr", controlAddr,
-		"data_addr", dataAddr,
+		"node_id", nodeID,
 		"cas_root", casRoot,
-		"dev_mode", devMode,
 	)
 
 	// Block until a signal is received, then shut down gracefully.
@@ -931,4 +1413,118 @@ func parseLogLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// checkGatewayURL decides whether prepub may talk to the gateway at this URL.
+// It returns a warning to log (possibly empty) or an error that must abort
+// startup.
+//
+// HTTPS is the default requirement, but plaintext is a defensible choice on a
+// trusted network and this is why: every gateway request is signed with
+// HMAC-SHA256 over a canonical string, and the shared secret NEVER travels — so
+// unlike a bearer token, an observer of the wire cannot replay or steal the
+// credential. What plaintext costs is confidentiality of what is being
+// published (paths, sizes, hashes, and the catalog objects streamed on commit)
+// and authenticity of the gateway's RESPONSES, which an on-path attacker could
+// forge. That is a site decision, not something this service can make.
+//
+// Loopback is accepted without any flag: cvmfs_gateway conventionally listens
+// on http://localhost:4929 and there is no network to observe.
+//
+// The opt-in is deliberately separate from --dev. --dev also drops the
+// gateway-secret and API-token requirements, so using it to permit a plaintext
+// gateway would silently disable authentication as well — the opposite of what
+// a site making an informed transport choice wants.
+func checkGatewayURL(gatewayURL string, allowPlaintext, devMode bool) (warn string, err error) {
+	if strings.HasPrefix(gatewayURL, "https://") {
+		return "", nil
+	}
+	isLoopback := strings.HasPrefix(gatewayURL, "http://localhost") ||
+		strings.HasPrefix(gatewayURL, "http://127.0.0.1") ||
+		strings.HasPrefix(gatewayURL, "http://[::1]")
+	if isLoopback {
+		return "", nil
+	}
+	switch {
+	case allowPlaintext:
+		return "gateway URL is not HTTPS — permitted by --gateway-allow-plaintext. " +
+			"Requests are HMAC-SHA256 signed and the secret never transits, so the " +
+			"credential is not exposed; what is exposed is the content of the publish " +
+			"(paths, sizes, hashes, catalog objects) and the authenticity of gateway " +
+			"responses. Ensure this hop stays on a trusted network", nil
+	case devMode:
+		return "SECURITY: gateway URL is not HTTPS — development mode only, NEVER use in production", nil
+	default:
+		return "", fmt.Errorf("gateway URL must use HTTPS (loopback is exempt). " +
+			"If this hop is on a trusted internal network, set --gateway-allow-plaintext " +
+			"(config gateway.allow_plaintext) — gateway auth is HMAC-signed and does not " +
+			"depend on TLS. Do NOT use --dev for this: it also disables the gateway-secret " +
+			"and API-token requirements")
+	}
+}
+
+// setTempRoot points TMPDIR at <spoolRoot>/tmp so that no temporary file lands
+// on the (small, possibly tmpfs-backed) system /tmp. It is deliberately called
+// after spool.New so the spool root is known to exist and be writable.
+//
+// An operator-supplied TMPDIR is honoured: if it is already set to a usable
+// directory we leave it alone, so a deployment can put temporaries on a
+// dedicated volume.
+func setTempRoot(spoolRoot string) error {
+	if cur := os.Getenv("TMPDIR"); cur != "" {
+		// Must be a directory we can actually write to: an unwritable TMPDIR
+		// fails every os.MkdirTemp at publish time instead of here at startup.
+		if fi, err := os.Stat(cur); err == nil && fi.IsDir() {
+			probe, perr := os.CreateTemp(cur, ".prepub-probe-")
+			if perr == nil {
+				name := probe.Name()
+				probe.Close()
+				os.Remove(name)
+				return nil
+			}
+		}
+		// Fall through and use the spool: an unusable TMPDIR is worse than
+		// useless, and silently ignoring it is better than refusing to start.
+	}
+	dir := filepath.Join(spoolRoot, "tmp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+	// The spool may have been created with a laxer umask by a previous version.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("chmod %s: %w", dir, err)
+	}
+	if err := os.Setenv("TMPDIR", dir); err != nil {
+		return fmt.Errorf("setting TMPDIR: %w", err)
+	}
+	return nil
+}
+
+// splitCSV splits a comma-separated flag value into a slice, trimming spaces and
+// dropping empty entries. Returns nil for an empty string.
+func splitCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// safeShellPath reports whether p is an absolute path cvmfs_server can be given
+// unquoted: its ingest re-splits the command line through a shell.
+func safeShellPath(p string) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	for _, c := range p {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._/@+-", c)) {
+			return false
+		}
+	}
+	return true
 }

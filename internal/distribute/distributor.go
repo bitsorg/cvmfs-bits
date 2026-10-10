@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package distribute holds the publisher-side distribution configuration for
-// ADR-0001 pull distribution. The legacy HTTP push data plane and the
+// pull distribution. The legacy HTTP push data plane and the
 // per-endpoint worker pool have been removed: the pre-commit announce is now
 // published directly on the embedded control-plane broker by the API
 // orchestrator (see internal/api.Orchestrator.publishAnnounce), and Stratum 1
@@ -17,8 +17,8 @@ import (
 // Config carries the control-plane broker configuration the publisher uses to
 // emit the pre-commit announce. It is attached to the API Orchestrator as
 // Distribute; a nil Config (or empty BrokerConfig.BrokerURL) disables the
-// announce, in which case receivers converge on the post-commit published
-// broadcast and the .cvmfspublished backstop poll.
+// announce, in which case receivers converge on the retained post-commit
+// published message.
 type Config struct {
 	// Obs provides logging and metrics.
 	Obs *observe.Provider

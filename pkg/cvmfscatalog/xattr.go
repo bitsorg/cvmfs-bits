@@ -20,21 +20,25 @@ import (
 // Generated keys (regular files only):
 //
 //   - user.cvmfs.hash — hex content hash with CVMFS algorithm suffix
-//     (e.g. "abc123…-" for SHA-256, "abc123…" for SHA-1).
+//     (e.g. "abc123…" for SHA-1, "abc123…-rmd160"); whole-file objects only.
 //   - user.cvmfs.compression — compression algorithm name: "zlib" or "none".
 //   - user.cvmfs.chunk_list — (chunked files only) newline-separated list of
 //     "offset:size:hash" records, one per chunk.
 //
 // Returns nil for directories and symlinks, which carry no content hash.
 func SyntheticAttrs(e *Entry) map[string][]byte {
-	if !e.Mode.IsRegular() || len(e.Hash) == 0 {
+	if !e.Mode.IsRegular() || (len(e.Hash) == 0 && len(e.Chunks) == 0) {
 		return nil
 	}
 
 	m := make(map[string][]byte, 3)
 
-	// user.cvmfs.hash — hex content hash with algorithm suffix.
-	m["user.cvmfs.hash"] = []byte(hex.EncodeToString(e.Hash) + HashSuffix(e.HashAlgo))
+	// user.cvmfs.hash — hex content hash with algorithm suffix.  Absent for
+	// chunked files, whose bulk hash is NULL (the CVMFS client then has no
+	// user.cvmfs.hash either).
+	if len(e.Hash) > 0 {
+		m["user.cvmfs.hash"] = []byte(hex.EncodeToString(e.Hash) + HashSuffix(e.HashAlgo))
+	}
 
 	// user.cvmfs.compression — human-readable algorithm name.
 	switch e.CompAlgo {

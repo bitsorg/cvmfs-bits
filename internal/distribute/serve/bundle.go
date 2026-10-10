@@ -16,7 +16,7 @@ const maxBundleHashes = 100000
 
 // BundleHandler serves many CAS objects in a single streamed response, so a
 // receiver fetching a large delta of small objects pays one request/round-trip
-// instead of one per object (ADR-0001 P-A, the "archiving on top" option). It is
+// instead of one per object. It is
 // an optimisation over the per-object ObjectHandler, not a replacement: objects
 // are still content-addressed and individually hash-verified by the receiver.
 //

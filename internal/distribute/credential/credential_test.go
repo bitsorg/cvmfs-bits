@@ -17,15 +17,15 @@ func TestTokenMintVerify(t *testing.T) {
 	m := NewMinter([]byte("server-secret-0123456789abcdef"))
 	v := NewVerifier([]byte("server-secret-0123456789abcdef"))
 
-	tok, _, err := m.Mint("s1-a", "catchup", "n1", time.Minute)
+	tok, _, err := m.Mint("s1-a", "control", "n1", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := v.Verify(tok, "catchup")
+	c, err := v.Verify(tok, "control")
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if c.Node != "s1-a" || c.Scope != "catchup" {
+	if c.Node != "s1-a" || c.Scope != "control" {
 		t.Fatalf("claims wrong: %+v", c)
 	}
 
@@ -34,11 +34,11 @@ func TestTokenMintVerify(t *testing.T) {
 		t.Fatal("wrong scope must be rejected")
 	}
 	// Wrong secret rejected (forgery).
-	if _, err := NewVerifier([]byte("different-secret")).Verify(tok, "catchup"); err == nil {
+	if _, err := NewVerifier([]byte("different-secret")).Verify(tok, "control"); err == nil {
 		t.Fatal("token from a different secret must be rejected")
 	}
 	// Tampered payload rejected.
-	if _, err := v.Verify("x"+tok, "catchup"); err == nil {
+	if _, err := v.Verify("x"+tok, "control"); err == nil {
 		t.Fatal("tampered token must be rejected")
 	}
 }
@@ -46,8 +46,8 @@ func TestTokenMintVerify(t *testing.T) {
 func TestTokenExpiry(t *testing.T) {
 	m := NewMinter([]byte("k"))
 	v := &Verifier{secret: []byte("k")} // zero leeway
-	tok, _, _ := m.Mint("s1", "catchup", "n", -time.Second)
-	if _, err := v.Verify(tok, "catchup"); err == nil {
+	tok, _, _ := m.Mint("s1", "control", "n", -time.Second)
+	if _, err := v.Verify(tok, "control"); err == nil {
 		t.Fatal("expired token must be rejected")
 	}
 }
@@ -72,7 +72,7 @@ func TestEnrollChallengeResponseSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
-	claims, err := v.Verify(tok, "catchup")
+	claims, err := v.Verify(tok, "control")
 	if err != nil || claims.Node != "s1-a" {
 		t.Fatalf("verify enrolled token: err=%v claims=%+v", err, claims)
 	}
@@ -135,47 +135,5 @@ func TestEnrollNonceIsOneTimeAndBound(t *testing.T) {
 	// Replay the same nonce → rejected (consumed).
 	if code := post("s1-a", ch.Nonce, mac); code != http.StatusUnauthorized {
 		t.Fatalf("nonce replay must be 401, got %d", code)
-	}
-}
-
-func TestRequireTokenMiddleware(t *testing.T) {
-	m := NewMinter([]byte("sek"))
-	v := NewVerifier([]byte("sek"))
-	protected := RequireToken(v, "catchup")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, ok := ClaimsFrom(r.Context())
-		if !ok || c.Node == "" {
-			t.Error("claims not propagated to handler")
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	srv := httptest.NewServer(protected)
-	defer srv.Close()
-
-	// No token → 401.
-	resp, _ := srv.Client().Get(srv.URL)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("missing token: %d", resp.StatusCode)
-	}
-	// Valid token → 200.
-	tok, _, _ := m.Mint("s1", "catchup", "n", time.Minute)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
-	resp2, _ := srv.Client().Do(req)
-	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("valid token: %d", resp2.StatusCode)
-	}
-
-	// nil verifier disables the gate (handler reached without a token).
-	open := RequireToken(nil, "catchup")(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	osrv := httptest.NewServer(open)
-	defer osrv.Close()
-	r3, _ := osrv.Client().Get(osrv.URL)
-	r3.Body.Close()
-	if r3.StatusCode != http.StatusOK {
-		t.Fatalf("nil verifier should pass through: %d", r3.StatusCode)
 	}
 }

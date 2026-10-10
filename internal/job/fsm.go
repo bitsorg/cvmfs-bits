@@ -14,11 +14,13 @@ import "fmt"
 // repository sub-path with far less contention.
 //
 // New order: incoming → staging → uploading → [distributing →] leased → committing → published
-//                                                  ↑
-//                             uploading → leased  (fast path: no Stratum 1s)
+//
+//	                     ↑
+//	uploading → leased  (fast path: no Stratum 1s)
 var validTransitions = map[State]map[State]bool{
 	StateIncoming: {
-		StateStaging: true, // gateway mode: compress/dedup pipeline starts immediately
+		StateStaging:    true, // gateway mode: compress/dedup pipeline starts immediately
+		StateCommitting: true, // coarse-publish finalize job: no pipeline, commits the build
 		// Local mode fast path: NeedsPipeline()==false → skip staging/uploading and
 		// acquire the cvmfs_server transaction directly.  The orchestrator is
 		// responsible for checking NeedsPipeline() before taking this path; the FSM
@@ -36,13 +38,15 @@ var validTransitions = map[State]map[State]bool{
 	StateUploading: {
 		StateDistributing: true,
 		StateLeased:       true, // fast path: no Stratum 1s → acquire lease directly
+		StateAccumulated:  true, // coarse publish: record entries, defer commit to finalize
 		StateAborted:      true,
 		StateFailed:       true,
 	},
 	StateDistributing: {
-		StateLeased:  true, // lease acquired HERE — after all replicas have the objects
-		StateAborted: true,
-		StateFailed:  true,
+		StateLeased:      true, // S1 pre-warming was only enqueued; the lease does not wait for it
+		StateAccumulated: true, // coarse publish: record entries, defer commit to finalize
+		StateAborted:     true,
+		StateFailed:      true,
 	},
 	StateLeased: {
 		StateCommitting: true, // only the commit window needs the lease
@@ -54,9 +58,10 @@ var validTransitions = map[State]map[State]bool{
 		StateAborted:   true,
 		StateFailed:    true,
 	},
-	StatePublished: {},
-	StateAborted:   {},
-	StateFailed:    {},
+	StateAccumulated: {},
+	StatePublished:   {},
+	StateAborted:     {},
+	StateFailed:      {},
 }
 
 // Transition validates that a state transition from→to is allowed.
@@ -73,5 +78,5 @@ func Transition(from, to State) error {
 
 // IsTerminal returns true if the state is a terminal state.
 func IsTerminal(s State) bool {
-	return s == StatePublished || s == StateAborted || s == StateFailed
+	return s == StatePublished || s == StateAccumulated || s == StateAborted || s == StateFailed
 }

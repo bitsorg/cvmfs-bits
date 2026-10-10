@@ -8,6 +8,7 @@ package job
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -35,6 +36,80 @@ func ValidateTagName(name string) error {
 	return nil
 }
 
+// ValidCatalogHash reports whether h names a CVMFS catalog object: hex digits
+// carrying the catalog content-type suffix.
+//
+// The suffix is not decoration. It is part of the CAS key, so a bare hash names
+// a different object than the catalog; and the receiver refuses a graft whose
+// hash lacks it outright — "DirectGraft requires a catalog hash",
+// receiver/commit_processor.cc. Rejecting it at ingress names the field, where
+// rejecting it at commit costs a lease and a promotion first and reports only
+// that the graft failed.
+//
+// Exactly 40 lower-case hex digits plus the suffix. Not a length window: this
+// stack computes CAS keys with SHA-1 and nothing else (cvmfshash.HashReader),
+// so 40 is the only width it can produce or resolve. The wider algorithms the
+// C++ receiver recognises are rendered "<hex>-rmd160" / "<hex>-shake128", which
+// a hex-only rule would reject anyway — a window of 41..51 hex characters
+// therefore admits nothing real while looking permissive.
+func ValidCatalogHash(h string) bool {
+	if len(h) != 41 || h[40] != CatalogHashSuffix {
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		c := h[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidStagingPrefix reports whether p is usable as an S3 key prefix for a
+// staged publish.
+//
+// The value is producer-supplied and becomes the base of every key a promotion
+// lists and copies, so it is validated here rather than trusted. The failure it
+// mainly guards is not traversal — the promotion validates each key it derives —
+// but SILENCE: a prefix that is merely wrong lists nothing, copies nothing, and
+// returns no error, leaving a graft to run against objects that were never
+// promoted. That is the "202 for a request that does nothing" this handler
+// exists to refuse.
+//
+// Rules: 1..128 bytes, slash-separated segments of [A-Za-z0-9._-], no empty
+// segment, no "." or "..", no leading or trailing slash. A final "data" segment
+// is refused specifically: the promotion appends "/data/" itself, so
+// "<prefix>/data" is the likeliest producer mistake and its symptom is an empty
+// listing rather than an error.
+func ValidStagingPrefix(p string) bool {
+	if p == "" || len(p) > 128 {
+		return false
+	}
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		if s == "" || s == "." || s == ".." {
+			return false
+		}
+		if i == len(segs)-1 && s == "data" {
+			return false
+		}
+		for j := 0; j < len(s); j++ {
+			c := s[j]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case c == '.' || c == '_' || c == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// CatalogHashSuffix is the CVMFS content-type suffix for catalog objects
+// (shash::kSuffixCatalog).
+const CatalogHashSuffix = 'C'
+
 // State represents a job's position in the FSM lifecycle.
 type State string
 
@@ -51,6 +126,11 @@ const (
 	StateLeased State = "leased"
 	// StateCommitting is the final gateway publish stage.
 	StateCommitting State = "committing"
+	// StateAccumulated is a terminal state for a coarse-publish package job:
+	// its objects are uploaded and its catalog entries recorded into
+	// the build accumulator, awaiting the single end-of-build finalize commit.
+	// The job itself does not commit to the gateway.
+	StateAccumulated State = "accumulated"
 	// StatePublished is the successful terminal state.
 	StatePublished State = "published"
 	// StateAborted is when the job was explicitly cancelled.
@@ -86,6 +166,12 @@ type Provenance struct {
 	RekorLogIndex       int64  `json:"rekor_log_index,omitempty"`
 	RekorIntegratedTime int64  `json:"rekor_integrated_time,omitempty"`
 	RekorSET            string `json:"rekor_set,omitempty"`
+	// SignedRecordFile names the sidecar in the job directory holding the
+	// exact record JSON whose SHA-256 is in the Rekor entry, so the hash can
+	// be recomputed; SignedRecordSHA256 is that hash (hex). The record is kept
+	// out of the manifest because it lists every object hash.
+	SignedRecordFile   string `json:"signed_record_file,omitempty"`
+	SignedRecordSHA256 string `json:"signed_record_sha256,omitempty"`
 }
 
 // Job represents a single CVMFS publish job, with persistent state that survives
@@ -101,6 +187,75 @@ type Job struct {
 	Path string
 	// PackageName is an optional human-readable package name.
 	PackageName string
+	// BuildID identifies the run that produced this job -- the CI pipeline.
+	// It is IDENTITY, not behaviour: the views, the signed common manifest and
+	// the measurement records are all keyed on it, and every job of a run
+	// carries it whatever publish path it takes. Whether the packages
+	// accumulate into one commit is Coarse, below.
+	// Empty preserves the legacy per-package commit behaviour.
+	BuildID string `json:"build_id,omitempty"`
+	// Coarse says this job takes part in its build's ONE commit (coarse
+	// accumulate + finalize) rather than committing on arrival.
+	//
+	// Separate from BuildID on purpose. BuildID is the CI pipeline that
+	// produced the job -- the same identity the views and the signed common
+	// manifest are keyed on, and the one an operator uses to find a run's
+	// monitoring records. Inferring "accumulate" from "has an identity" meant
+	// the per-package paths had to send NO build id at all, which left their
+	// measurement records unattributable and made every run land in one
+	// undifferentiated file.
+	// Nil means "not stated" -- which is what every manifest written before
+	// this field existed looks like. IsCoarse() then falls back to the old
+	// inference, so a job recovered across the upgrade still accumulates
+	// instead of silently committing on its own and stranding its build.
+	Coarse *bool `json:"coarse,omitempty"`
+	// Finalize marks this job as the coarse-publish finalize for BuildID: instead
+	// of pipelining a tar, the orchestrator publishes all of the build's
+	// accumulated packages in one ingestsql commit. Carries no payload.
+	Finalize bool `json:"finalize,omitempty"`
+
+	// DirectS3 asks the ingest backend to pass --direct-s3, so cvmfs_server
+	// uploads data objects straight to S3 and only catalogs traverse the
+	// gateway. Per job on purpose: it is the knob the two publish paths are
+	// compared with, and requiring a reconfigure to switch would mean the two
+	// measurements were taken against different deployments.
+	//
+	// Absent/false does NOT pass --no-direct-s3: it leaves the decision to the
+	// repository config, whose default is off.
+	DirectS3 bool `json:"direct_s3,omitempty"`
+
+	// ObjectList asks the ingest backend to collect the list of data objects
+	// the publisher confirmed into S3, so it can later pre-warm Stratum 1
+	// without re-deriving the set. Only the direct-S3 uploader produces it, so
+	// it is meaningless without DirectS3: ingress rejects the combination
+	// with a 400, and the backend drops it with a warning if it ever arrives.
+	//
+	// A separate knob from DirectS3 rather than implied by it: it changes what
+	// the publisher reports, not how it publishes, so keeping it independent
+	// lets its cost be measured on its own.
+	ObjectList bool `json:"object_list,omitempty"`
+
+	// StagingPrefix names an S3 key prefix, in the repository's own bucket,
+	// that a producer has already filled with prepared CVMFS objects — chunked,
+	// compressed and hashed by the canonical publisher running on the build
+	// node. prepub promotes them into the CAS with a server-side copy instead of
+	// receiving and re-processing a tar.
+	//
+	// Set together with CatalogHash; either alone is refused at ingress. The two
+	// are what make the graft possible: the objects must be in the CAS before
+	// the receiver can fetch the catalog that references them.
+	StagingPrefix string `json:"staging_prefix,omitempty"`
+
+	// CatalogHash is the subtree catalog the producer built, as a suffixed
+	// CVMFS hash (…C). It becomes new_root_hash on the gateway's graft
+	// endpoint, and the receiver downloads it from stratum0 by that hash — so
+	// it must name an object the promotion has placed in the CAS.
+	//
+	// Suffixed, not bare: the receiver refuses a graft whose hash does not carry
+	// the catalog suffix ("DirectGraft requires a catalog hash",
+	// receiver/commit_processor.cc).
+	CatalogHash string `json:"catalog_hash,omitempty"`
+
 	// TarPath is the absolute path to the tar file in spool storage.
 	TarPath string
 	// TarName is the original base filename of the submitted tar (e.g.
@@ -141,6 +296,16 @@ type Job struct {
 	FailedAtState string `json:"failed_at_state,omitempty"`
 	// RecoveryCount is the number of times this job has been reset for recovery.
 	RecoveryCount int `json:"recovery_count,omitempty"`
+	// InterruptCount is the number of times this job was reset because the
+	// SERVICE was restarted cleanly under it, as opposed to failing.
+	//
+	// These are counted apart from RecoveryCount because they are not evidence
+	// of anything wrong with the job. A `systemctl restart` during a large
+	// publish interrupts every in-flight job, and counting that as a failed
+	// attempt meant three routine restarts during one debugging session
+	// terminally failed an entire 174-package build. Tracked anyway, so a
+	// restart loop cannot re-run a job forever.
+	InterruptCount int `json:"interrupt_count,omitempty"`
 	// WebhookURL is an optional URL to POST when the job reaches a terminal state.
 	WebhookURL string `json:"webhook_url,omitempty"`
 	// TagName is the optional CVMFS snapshot tag to create for this publish.
@@ -166,6 +331,47 @@ type Job struct {
 	// startup run.  Only paths present in the submitted tar produce CAS hashes.
 	PreloadPaths []string `json:"preload_paths,omitempty"`
 
+	// PublishPath selects how this package reaches the repository:
+	//
+	//	"" / "prepub" — compress + dedup + CAS, then a gateway commit. Supports
+	//	                pre-warming and coarse (whole-build) publish.
+	//	"ingest"      — hand the tar to `cvmfs_server ingest` and let the gateway
+	//	                do the chunking, dedup and catalogs.
+	//
+	// The name must resolve to a backend the deployment actually has; a job
+	// naming an unserviceable path is rejected at submission.
+	PublishPath string `json:"publish_path,omitempty"`
+	// PreWarm requests (or declines) Stratum 1 cache pre-warming for this job.
+	// Nil means "use the node's default" (--prewarm), which is off. Only the
+	// prepub publish path can pre-warm — the ingest path commits through the
+	// gateway, so there is nothing to announce before the catalog flip.
+	PreWarm *bool `json:"prewarm,omitempty"`
+	// IdentityPath is the repo-relative path whose presence means this job's
+	// content is already published (the package directory, or one modulefile
+	// inside a shared modules directory). Optional; at or under Path. A job
+	// whose identity has appeared since submission (a rerun queued behind the
+	// original) finishes as published without committing.
+	IdentityPath string `json:"identity_path,omitempty"`
+	// IdentityHash is the build hash the content at IdentityPath must carry
+	// (its .meta.json) to count as this job's. Optional; a different hash
+	// there fails the job instead of passing another build's content as it.
+	IdentityHash string `json:"identity_hash,omitempty"`
+	// Replace asks for content another build published at Path to be
+	// replaced: when the hash at IdentityPath (which must equal Path) differs
+	// from IdentityHash, the subtree is deleted before this job commits. Only
+	// a node with replace_on_conflict honours it; the same hash still skips.
+	Replace bool `json:"replace,omitempty"`
+
+	// Attempts counts the runs that ended in a retryable failure. Such a job
+	// goes back to incoming and runs again at NextAttemptAt, until it publishes
+	// or its retry window (counted from CreatedAt) runs out.
+	Attempts int `json:"attempts,omitempty"`
+	// NextAttemptAt is when a job waiting to retry runs again; nil otherwise.
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	// LastError is the cause of the latest failed attempt (truncated). Error
+	// keeps the generic operator-facing text.
+	LastError string `json:"last_error,omitempty"`
+
 	// ── Per-stage timestamps (gateway/bits path only) ─────────────────────────
 	// All times are zero-value when the stage was not reached or not applicable.
 	// Callers can compute per-phase duration from successive timestamps.
@@ -178,13 +384,6 @@ type Job struct {
 	// Distribution runs asynchronously — the job proceeds to StateLeased
 	// without waiting for it to complete.
 	DistributingStartedAt time.Time `json:"distributing_started_at,omitempty"`
-	// DistributingEndedAt is when background S1 pre-warming finished.
-	// May be after PublishedAt since distribution is fire-and-forget.
-	DistributingEndedAt time.Time `json:"distributing_ended_at,omitempty"`
-	// DistributionConfirmed is the number of S1 endpoints that confirmed all objects.
-	DistributionConfirmed int `json:"distribution_confirmed,omitempty"`
-	// DistributionTotal is the total number of S1 endpoints attempted.
-	DistributionTotal int `json:"distribution_total,omitempty"`
 	// LeasedAt is when the gateway lease was successfully acquired.
 	LeasedAt time.Time `json:"leased_at,omitempty"`
 	// CommittingAt is when the commit phase started (after catalog merge).
@@ -205,4 +404,31 @@ func NewJob(id, repo, packageName, tarPath string) *Job {
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
+}
+
+// DefaultPublishPathName is the name of the default publish path. Duplicated
+// from api.DefaultPublishPath because job cannot import api (cycle); the two
+// are pinned together by TestDefaultPublishPathNamesAgree.
+const DefaultPublishPathName = "prepub"
+
+// IsCoarse reports whether this job accumulates into its build's single
+// commit rather than committing on arrival.
+//
+// A nil Coarse means the producer did not say -- either an older producer, or
+// a manifest written before the field existed. Fall back to what prepub used
+// to infer: a build id on the default publish path meant "accumulate". Without
+// this, a job recovered across the upgrade would take the per-package path,
+// its build would never reach its expected member count, and the remaining
+// packages of that build would never be published.
+func (j *Job) IsCoarse() bool {
+	if j == nil {
+		return false
+	}
+	if j.Finalize {
+		return false // the finalize IS the commit; it does not accumulate
+	}
+	if j.Coarse != nil {
+		return *j.Coarse
+	}
+	return j.BuildID != "" && (j.PublishPath == "" || j.PublishPath == DefaultPublishPathName)
 }

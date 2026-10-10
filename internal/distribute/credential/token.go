@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
-// Package credential implements the data-plane authentication of ADR-0001: a
-// Stratum 1 enrols with the publisher over the (mutually authenticated) control
-// plane using an out-of-band per-node key, and in return receives a short-lived,
-// scoped bearer token that it presents on critical data-plane endpoints such as
-// GET /s1/catchup. The token is a stateless HMAC-signed assertion, so the data
-// plane verifies it without a database lookup or shared session state.
+// Package credential implements pull-distribution node authentication: a
+// Stratum 1 enrols with the publisher using an out-of-band per-node key, and in
+// return receives a short-lived, scoped bearer token that it presents to the
+// control-plane broker. The token is a stateless HMAC-signed assertion, so it is
+// verified without a database lookup or shared session state.
 //
 // Token wire format (compact, URL-safe):
 //
@@ -30,7 +29,7 @@ import (
 // Claims are the assertions carried by a token.
 type Claims struct {
 	Node  string `json:"node"`  // the Stratum 1 node the token was issued to
-	Scope string `json:"scope"` // capability, e.g. "catchup"
+	Scope string `json:"scope"` // capability, e.g. "control"
 	Exp   int64  `json:"exp"`   // expiry, unix seconds
 	Nonce string `json:"jti"`   // unique id (binds the token to one issuance)
 }
@@ -42,7 +41,7 @@ var ErrToken = errors.New("credential: invalid token")
 var b64 = base64.RawURLEncoding
 
 // Minter issues tokens signed with a server secret. The same secret backs the
-// Verifier on the data plane; keep it on Stratum 0 only.
+// Verifier; keep it on Stratum 0 only.
 type Minter struct {
 	secret []byte
 }

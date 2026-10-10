@@ -3,7 +3,6 @@
 # (e.g. cmd/prepub/ was being silently gitignored by the bare "prepub" pattern)
 /bin/
 /prepub
-/prepubctl
 
 # Go build cache and test output
 *.test
@@ -60,3 +59,21 @@ journal.jsonl
 *.pem
 *.key
 *.crt
+
+# Archives. The keys above (*.key, *.crt, *.pem) were already ignored when a
+# cvmfs.tar.gz containing the repository signing key, the gateway key and the
+# S3 credentials was committed anyway: an ignore pattern only sees the file it
+# is given, not what is packed inside it. So ignore the containers too.
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.zip
+
+# Copies of a CVMFS server configuration tree, which carry keys wholesale.
+/cvmfs/
+/etc/
+*.gw
+*.s3.conf
+.gofmt-leftovers/

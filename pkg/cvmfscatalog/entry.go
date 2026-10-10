@@ -29,13 +29,15 @@ import (
 	"io/fs"
 )
 
-// Hash algorithm IDs (matching CVMFS shash::Algorithms)
+// HashAlgo is a content hash algorithm ID matching CVMFS shash::Algorithms
+// (cvmfs/crypto/hash.h: kMd5=0, kSha1, kRmd160, kShake128).  The zero value
+// means "no hash" (directories, symlinks); MD5 is never used for content.
 type HashAlgo int
 
 const (
-	HashSha1      HashAlgo = 1
-	HashSha256    HashAlgo = 2
-	HashRipeMD160 HashAlgo = 3
+	HashSha1      HashAlgo = 1 // kSha1; flag bits 8-10 = 0
+	HashRipeMD160 HashAlgo = 2 // kRmd160; flag bits 8-10 = 1
+	HashShake128  HashAlgo = 3 // kShake128 (160 output bits); flag bits 8-10 = 2
 )
 
 // Compression algorithm IDs matching CVMFS zlib::Algorithms in compression.h.
@@ -71,12 +73,11 @@ const (
 	FlagFileExternal   = 128
 	// FlagXattr is an INTERNAL prepub flag used only for in-memory statistics
 	// tracking (SelfXattr delta).  It is NEVER written to the SQLite flags
-	// column: the real CVMFS catalog_sql.h occupies bit 14 with
-	// kFlagDirBindMountpoint (0x4000) and has no separate xattr flag bit —
-	// xattr presence is determined purely by whether the xattr BLOB is NULL.
-	// Bits 8-10 = hash algo, bits 11-13 = comp algo, bit 14 = bind-mountpoint,
-	// bit 15 = hidden, bit 16 = direct-I/O.
-	FlagXattr = 1 << 17 // safely above all known CVMFS flag bits; internal only
+	// column: CVMFS has no xattr flag bit — xattr presence is determined by
+	// whether the xattr BLOB is NULL.  CVMFS uses bits 0-7 for entry types,
+	// 8-10 hash algo, 11-13 compression, 14 bind-mountpoint, 15 hidden,
+	// 16 direct-I/O and 17 bundle trigger, so this sits well above them.
+	FlagXattr  = 1 << 30
 	FlagHidden = 0x8000
 )
 
@@ -93,39 +94,39 @@ const (
 type ChunkRecord struct {
 	Offset int64  // byte offset in the uncompressed file
 	Size   int64  // uncompressed size of this chunk
-	Hash   []byte // raw SHA-256 bytes (= CAS key)
+	Hash   []byte // raw SHA-1 digest of the compressed chunk (= CAS key)
 }
 
 // Entry represents a single catalog entry.
 type Entry struct {
-	FullPath       string         // absolute path e.g. "/foo/bar"; "" for repo root
-	Name           string         // filename only; "" for repo root
-	Hash           []byte         // raw bytes; nil for dirs/symlinks
-	HashAlgo       HashAlgo
-	CompAlgo       CompAlgo
-	Size           int64
-	Mode           fs.FileMode // Go fs.FileMode
-	Mtime          int64       // Unix seconds
-	MtimeNs        int32
-	UID, GID       uint32
-	Symlink        string
-	HardlinkGroup  uint32
-	LinkCount      uint32 // 1 for normal non-hardlinked files/dirs
-	IsHidden       bool
-	IsNestedRoot   bool // set on root entry of a nested catalog
+	FullPath      string // absolute path e.g. "/foo/bar"; "" for repo root
+	Name          string // filename only; "" for repo root
+	Hash          []byte // raw bytes; nil for dirs/symlinks
+	HashAlgo      HashAlgo
+	CompAlgo      CompAlgo
+	Size          int64
+	Mode          fs.FileMode // Go fs.FileMode
+	Mtime         int64       // Unix seconds
+	MtimeNs       int32
+	UID, GID      uint32
+	Symlink       string
+	HardlinkGroup uint32
+	LinkCount     uint32 // 1 for normal non-hardlinked files/dirs
+	IsHidden      bool
+	IsNestedRoot  bool // set on root entry of a nested catalog
 	// IsDelete marks this entry as an explicit deletion request.  When true,
 	// BuildSubtree removes the path from the catalog instead of upserting it.
 	// Prefer setting this field over relying on nil Hash to signal deletion —
 	// the nil-Hash convention is fragile: a regular file with a missing hash
 	// is indistinguishable from an intentional deletion.
-	IsDelete       bool          `json:"is_delete,omitempty"`
-	Chunks         []ChunkRecord // for chunked files
+	IsDelete bool          `json:"is_delete,omitempty"`
+	Chunks   []ChunkRecord // for chunked files
 	// Xattr holds extended attributes to store in the catalog xattr BLOB.
 	// A nil map means no xattrs; FlagXattr is set in the flags column when
 	// this map is non-empty.  User xattrs (from the source tar PAX headers)
 	// and synthetic xattrs (user.cvmfs.hash, user.cvmfs.compression,
 	// user.cvmfs.chunk_list) are merged here before the entry is written.
-	Xattr          map[string][]byte
+	Xattr map[string][]byte
 }
 
 // MD5Path returns (md5path_1, md5path_2) for the given absolute CVMFS path.
@@ -151,7 +152,9 @@ func ParentAbsPath(absPath string) (string, bool) {
 	return "", true // "/foo" → parent is root ""
 }
 
-// UnixMode converts Go fs.FileMode to the Unix mode integer stored in the catalog.
+// UnixMode converts Go fs.FileMode to the Unix mode integer stored in the
+// catalog.  CVMFS stores st_mode verbatim and classifies entries with the
+// S_IS* macros on it, so special files need their real S_IF* type bits.
 func UnixMode(m fs.FileMode) int64 {
 	var t int64
 	switch {
@@ -159,10 +162,16 @@ func UnixMode(m fs.FileMode) int64 {
 		t = 0o040000
 	case m&fs.ModeSymlink != 0:
 		t = 0o120000
-	case m.IsRegular():
-		t = 0o100000
+	case m&fs.ModeNamedPipe != 0:
+		t = 0o010000 // S_IFIFO
+	case m&fs.ModeSocket != 0:
+		t = 0o140000 // S_IFSOCK
+	case m&fs.ModeCharDevice != 0:
+		t = 0o020000 // S_IFCHR (Go sets ModeDevice too)
+	case m&fs.ModeDevice != 0:
+		t = 0o060000 // S_IFBLK
 	default:
-		t = 0o100000
+		t = 0o100000 // S_IFREG
 	}
 	perm := int64(m.Perm())
 	if m&fs.ModeSetuid != 0 {
@@ -187,7 +196,7 @@ func (e *Entry) Flags() int {
 			f |= FlagDirNestedRoot
 		}
 	case e.Mode&fs.ModeSymlink != 0:
-		f = FlagLink
+		f = FlagFile | FlagLink // as CVMFS writes symlinks (catalog_sql.cc)
 	case e.Mode.IsRegular():
 		f = FlagFile
 		if len(e.Chunks) > 0 {
@@ -221,19 +230,18 @@ func (e *Entry) Hardlinks() int64 {
 // HashSuffix returns the CVMFS algorithm suffix string for a given HashAlgo.
 //
 //	SHA-1      → ""   (no suffix — the default and most common case)
-//	SHA-256    → "-"
-//	RipeMD-160 → "~"
+//	RIPEMD-160 → "-rmd160"
+//	SHAKE-128  → "-shake128"
 //
-// The suffix is appended to the hex hash when constructing CAS object paths
-// and catalog content-type identifiers (e.g. "abc123...C" for catalogs).
+// These match shash::kAlgorithmIds in cvmfs/crypto/hash.cc.  The suffix
+// follows the hex digest in hash strings and CAS object paths, before any
+// content-type suffix (e.g. "<hex>-rmd160C" for a catalog).
 func HashSuffix(algo HashAlgo) string {
 	switch algo {
-	case HashSha1:
-		return ""
-	case HashSha256:
-		return "-"
 	case HashRipeMD160:
-		return "~"
+		return "-rmd160"
+	case HashShake128:
+		return "-shake128"
 	default:
 		return ""
 	}
@@ -241,5 +249,5 @@ func HashSuffix(algo HashAlgo) string {
 
 // HashAlgoFromFlags extracts the hash algorithm from a flags value.
 func HashAlgoFromFlags(flags int) HashAlgo {
-	return HashAlgo(((flags>>flagHashShift)&7) + 1)
+	return HashAlgo(((flags >> flagHashShift) & 7) + 1)
 }

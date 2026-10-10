@@ -50,7 +50,7 @@ func buildTar(entries []struct{ name, content string }) []byte {
 }
 
 // TestPipelineDuplicatePathFails verifies that a tar containing two entries
-// with the same path is rejected with an error (Fix L5 — previously the second
+// with the same path is rejected with an error (previously the second
 // entry silently overwrote the first in resultsByPath, producing a catalog with
 // two rows for the same path but only one hash retained).
 func TestPipelineDuplicatePathFails(t *testing.T) {
@@ -113,7 +113,7 @@ func TestPipelineUniquePaths(t *testing.T) {
 // ── N7: chunk-meta allocation outside resultMu ────────────────────────────────
 
 // TestPipelineChunkedFileMetaIsCorrect verifies that the chunk metadata stored
-// in resultsByPath (now assembled outside the mutex, Fix N7) is faithfully
+// in resultsByPath (now assembled outside the mutex) is faithfully
 // propagated to the returned CatalogEntries.  We run a chunked pipeline and
 // confirm that the catalog entry for the large file carries the right number of
 // chunk records and non-empty hashes.
@@ -166,6 +166,33 @@ func TestPipelineChunkedFileMetaIsCorrect(t *testing.T) {
 			t.Errorf("chunk %d: expected non-empty Hash", i)
 		}
 	}
+	// CVMFS leaves a chunked file's bulk hash NULL.
+	if chunkedEntry.Hash != nil {
+		t.Errorf("chunked entry Hash = %x, want nil", chunkedEntry.Hash)
+	}
+	if _, ok := chunkedEntry.Xattr["user.cvmfs.hash"]; ok {
+		t.Error("chunked entry must not carry user.cvmfs.hash")
+	}
+}
+
+// A file below the chunk size keeps its whole-file hash.
+func TestPipelineWholeFileKeepsHash(t *testing.T) {
+	obs := newTestObs(t)
+	cfg := Config{Workers: 1, ChunkSize: 1 << 20, CAS: fakecas.New(obs), SpoolDir: t.TempDir(), Obs: obs}
+	result, err := RunFromReader(context.Background(),
+		bytes.NewReader(buildTar([]struct{ name, content string }{{"small.txt", "hello"}})), cfg)
+	if err != nil {
+		t.Fatalf("RunFromReader: %v", err)
+	}
+	for _, e := range result.CatalogEntries {
+		if e.Name == "small.txt" {
+			if len(e.Hash) != 20 || len(e.Chunks) != 0 {
+				t.Errorf("hash=%x chunks=%d, want a 20-byte hash and no chunks", e.Hash, len(e.Chunks))
+			}
+			return
+		}
+	}
+	t.Fatal("small.txt not found")
 }
 
 // ── Prefetch tests ────────────────────────────────────────────────────────────

@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package serve implements the Stratum-0 HTTP serving side of pull-based
-// distribution (ADR-0001 P1): the content-addressed object endpoint, the
-// transaction-manifest endpoint, the signed .cvmfsbits discovery document, and
-// the GC pin registry. Handlers are framework-agnostic http.Handlers so they can
+// distribution: the content-addressed object endpoint, the
+// transaction-manifest endpoint and the signed .cvmfsbits discovery document.
+// Handlers are framework-agnostic http.Handlers so they can
 // be mounted on the existing gorilla/mux router when the pull path is activated.
 package serve
 
@@ -22,13 +22,13 @@ type ObjectStore interface {
 	Size(ctx context.Context, hash string) (int64, error)
 }
 
-// ObjectHandler serves content-addressed CAS objects for S1 pull (ADR D5). The
+// ObjectHandler serves content-addressed CAS objects for S1 pull. The
 // URL mirrors the CVMFS data layout:
 //
 //	GET /cvmfs/{repo}/data/{xx}/{rest}
 //
-// Objects are immutable, so responses are cacheable (default auth: public, D8).
-// The client verifies the hash (R3); a 404 means "not yet present" (GC race /
+// Objects are immutable, so responses are cacheable (default auth: public).
+// The client verifies the hash; a 404 means "not yet present" (GC race /
 // ordering) and the client should retry.
 type ObjectHandler struct {
 	Store ObjectStore

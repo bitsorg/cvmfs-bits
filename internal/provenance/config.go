@@ -3,7 +3,10 @@
 
 package provenance
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 const (
 	// DefaultRekorServer is the public Sigstore transparency log.
@@ -51,6 +54,14 @@ type Config struct {
 	//   "https://gitlab.example.com"                   — self-hosted GitLab
 	OIDCIssuers []string
 
+	// OIDCAudience, when non-empty, is the audience value CI OIDC tokens must
+	// carry (aud claim). CI issuers are global, so without this any workflow
+	// anywhere can obtain Verified=true; set it to your deployment's URL and
+	// mint tokens with that audience in CI. When OIDCIssuers is set, an empty
+	// audience is a fatal misconfiguration: the provider refuses to start
+	// (fail closed) — see checkOIDCAudience.
+	OIDCAudience string
+
 	// HTTPTimeout caps each outbound HTTP call to Rekor or the OIDC discovery
 	// and JWKS endpoints.  Defaults to 20 s.
 	HTTPTimeout time.Duration
@@ -72,4 +83,18 @@ func (c Config) httpTimeout() time.Duration {
 
 func (c Config) oidcEnabled() bool {
 	return len(c.OIDCIssuers) > 0
+}
+
+// checkOIDCAudience enforces the fail-closed audience requirement: CI OIDC
+// issuers are global (all of GitHub/GitLab mint from the same issuer), so with
+// issuers configured but no audience set, a token minted for any other relying
+// party would verify here and yield Verified=true (confused deputy). Callers
+// (New) refuse to start when this returns an error.
+func (c Config) checkOIDCAudience() error {
+	if c.oidcEnabled() && c.OIDCAudience == "" {
+		return fmt.Errorf("OIDC issuers configured (%v) but no OIDC audience set: "+
+			"set PREPUB_OIDC_AUDIENCE to this deployment's audience so tokens minted "+
+			"for other relying parties are rejected", c.OIDCIssuers)
+	}
+	return nil
 }

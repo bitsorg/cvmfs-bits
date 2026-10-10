@@ -23,10 +23,12 @@ import (
 
 const (
 	// probeHash is a well-known sentinel value used for the CAS round-trip.
-	// It is the SHA-256 hash of the empty string, which the probe writes and
-	// immediately deletes.  Using a fixed value makes it easy to filter out
-	// probe artefacts in CAS audits.
-	probeHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	// It must be a VALID CVMFS CAS key or backends that validate keys reject
+	// it: CVMFS accepts SHA-1 (40 hex), RIPEMD-160 (47) and SHAKE-128 (49);
+	// a 64-char SHA-256 is not in the enum and panics the C++ receiver.
+	// This is the first 40 hex chars of SHA-256("") — valid in shape,
+	// recognisable in an audit, and not the hash of any real content.
+	probeHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4"
 
 	// probeTimeout is the per-operation deadline applied to each probe step.
 	probeTimeout = 10 * time.Second
@@ -62,6 +64,21 @@ func runCASProbe(ctx context.Context, backend cas.Backend, obs *observe.Provider
 		defer span.End()
 	}
 
+	// Prefer a read-only probe when the backend offers one: a remote object
+	// store should not be written to just because the service restarted.
+	if p, okProber := backend.(cas.Prober); okProber {
+		if err := p.Probe(pctx); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Was it already there? Then it is not ours to remove.
+	preExisting, err := backend.Exists(pctx, probeHash)
+	if err != nil {
+		return fmt.Errorf("exists check: %w", err)
+	}
+
 	if err := backend.Put(pctx, probeHash, strings.NewReader(""), 0); err != nil {
 		return fmt.Errorf("put: %w", err)
 	}
@@ -74,8 +91,10 @@ func runCASProbe(ctx context.Context, backend cas.Backend, obs *observe.Provider
 		return fmt.Errorf("object not found after put")
 	}
 
-	if err := backend.Delete(pctx, probeHash); err != nil {
-		return fmt.Errorf("delete: %w", err)
+	if !preExisting {
+		if err := backend.Delete(pctx, probeHash); err != nil {
+			return fmt.Errorf("delete: %w", err)
+		}
 	}
 
 	return nil

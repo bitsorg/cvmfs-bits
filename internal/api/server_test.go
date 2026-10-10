@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,6 +37,34 @@ func newTestServer(t *testing.T) (*Server, *spool.Spool, *Orchestrator) {
 	nb := notify.NewBus()
 	orch := &Orchestrator{Spool: sp, Notify: nb, Obs: obs}
 	srv := New(obs, "" /*no auth*/, orch, sp, nb, dir, dir, 0 /*minConcurrentJobs: disabled*/, 0 /*maxConcurrentJobs: numCPU*/)
+
+	// Drain in-flight job goroutines before the temp dir is removed.
+	//
+	// submitJob returns 202 and processes the job on a goroutine that keeps
+	// writing into the spool — moving the job between state directories — after
+	// the test body has returned. t.TempDir's RemoveAll then races it and fails
+	// the test with "directory not empty", pointing at a state dir the job was
+	// still populating. That is a test-lifecycle bug, not a product one, and it
+	// is timing-dependent: it reproduces on some machines and not others.
+	//
+	// Ordering is what makes this work: t.TempDir above registered its removal
+	// first, and cleanups run LIFO, so this drain runs before it. Registering it
+	// any earlier would not.
+	//
+	// All three waits, mirroring Shutdown's phase 1 — jobWg alone is not enough.
+	// Auto-finalize is detached from the job that triggered it and webhook
+	// delivery has its own group, so either can still be running when jobWg has
+	// drained. Waiting on jobWg only left TestSubmitJob_TarBeforeFields failing
+	// intermittently, which is how this was found.
+	//
+	// Not srv.Shutdown: it dereferences s.httpServer, which these tests never
+	// construct.
+	t.Cleanup(func() {
+		srv.jobWg.Wait()
+		orch.finalizeWg.Wait()
+		orch.webhookWg.Wait()
+	})
+
 	return srv, sp, orch
 }
 
@@ -45,10 +74,10 @@ func withMuxVars(r *http.Request, vars map[string]string) *http.Request {
 	return setMuxVars(r, vars) // implemented in server_muxvars_test.go
 }
 
-// ── Fix #2: job goroutine WaitGroup ──────────────────────────────────────────
+// ── job goroutine WaitGroup ──────────────────────────────────────────────────
 
 // TestShutdown_WaitsForInFlightJob verifies that Shutdown blocks until all
-// background job goroutines finish (Fix #2).
+// background job goroutines finish.
 func TestShutdown_WaitsForInFlightJob(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -77,7 +106,7 @@ func TestShutdown_WaitsForInFlightJob(t *testing.T) {
 }
 
 // TestShutdown_RespectsContextDeadline verifies that Shutdown returns when its
-// context expires even if jobs are still running (Fix #2).
+// context expires even if jobs are still running.
 func TestShutdown_RespectsContextDeadline(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -95,7 +124,7 @@ func TestShutdown_RespectsContextDeadline(t *testing.T) {
 	}
 }
 
-// ── Fix #3: CancelJob and real abort handler ──────────────────────────────────
+// ── CancelJob and real abort handler ──────────────────────────────────────────
 
 func TestCancelJob_RegisterUnregister(t *testing.T) {
 	orch := &Orchestrator{}
@@ -256,5 +285,54 @@ func TestAbortHandler_NotRunning(t *testing.T) {
 	srv.abortJobHandler(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Errorf("want 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestListJobs_IncludesAccumulated: coarse-publish package jobs end in
+// "accumulated"; the job list must show them (the console charts count them).
+func TestListJobs_IncludesAccumulated(t *testing.T) {
+	srv, sp, _ := newTestServer(t)
+	for id, st := range map[string]job.State{
+		"job-acc": job.StateAccumulated, "job-pub": job.StatePublished} {
+		j := job.NewJob(id, "repo.cern.ch", "", "")
+		j.State = st
+		if err := sp.WriteManifest(j); err != nil {
+			t.Fatalf("WriteManifest: %v", err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	srv.listJobs(rec, httptest.NewRequest("GET", "/api/v1/jobs", nil))
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	states := map[string]any{}
+	for _, j := range got {
+		states[j["job_id"].(string)] = j["state"]
+		// Unset timestamps are omitted, not sent as year 1.
+		if _, ok := j["published_at"]; ok {
+			t.Errorf("%v: zero published_at was sent: %v", j["job_id"], j["published_at"])
+		}
+	}
+	if states["job-acc"] != "accumulated" || states["job-pub"] != "published" {
+		t.Errorf("want both jobs listed, got %v", states)
+	}
+}
+
+// TestPublishedHandler_NeedsRepoPathAndStratum0: bad bodies are 400, and with no
+// stratum0 to read from the answer is 501 (the producer then just publishes).
+func TestPublishedHandler_NeedsRepoPathAndStratum0(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	for body, want := range map[string]int{
+		`{"repo":"repo.cern.ch"}`:            http.StatusBadRequest,
+		`not json`:                           http.StatusBadRequest,
+		`{"repo":"repo.cern.ch","path":"a"}`: http.StatusNotImplemented,
+	} {
+		rec := httptest.NewRecorder()
+		srv.publishedHandler(rec, httptest.NewRequest("POST", "/api/v1/published",
+			strings.NewReader(body)))
+		if rec.Code != want {
+			t.Errorf("%s: got %d, want %d (%s)", body, rec.Code, want, rec.Body.String())
+		}
 	}
 }

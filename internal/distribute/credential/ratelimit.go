@@ -4,6 +4,7 @@
 package credential
 
 import (
+	"container/list"
 	"net"
 	"net/http"
 	"strings"
@@ -12,13 +13,17 @@ import (
 )
 
 // IPRateLimiter is a dependency-free per-client-IP token-bucket rate limiter
-// with a bounded set of tracked IPs (FIFO eviction) plus a global ceiling.
+// with a bounded set of tracked IPs (LRU eviction) plus a global ceiling.
 // Requests over budget receive 429. It defends the (internet-exposed) control
 // endpoints against request floods without relying on a firewall (R-DoS).
+//
+// Eviction is least-recently-USED, not FIFO: every request refreshes its IP to
+// most-recently-used, so a flood of one-shot spoofed IPs evicts other one-shot
+// entries rather than a legitimate client that keeps making requests.
 type IPRateLimiter struct {
 	mu      sync.Mutex
-	buckets map[string]*ipBucket
-	order   []string
+	ll      *list.List               // access order: most-recently-used at Front, LRU at Back
+	buckets map[string]*list.Element // ip -> element whose Value is *ipBucket
 	maxIPs  int
 	rate    float64 // tokens/sec per IP
 	burst   float64
@@ -31,6 +36,7 @@ type IPRateLimiter struct {
 }
 
 type ipBucket struct {
+	ip     string // kept so the map entry can be removed when this bucket is evicted
 	tokens float64
 	last   time.Time
 }
@@ -38,8 +44,11 @@ type ipBucket struct {
 // NewIPRateLimiter builds a limiter: perIPPerSec/perIPBurst bound a single IP,
 // globalPerSec/globalBurst bound all traffic, maxIPs caps tracked IPs.
 func NewIPRateLimiter(perIPPerSec, perIPBurst float64, maxIPs int, globalPerSec, globalBurst float64) *IPRateLimiter {
+	if maxIPs < 1 {
+		maxIPs = 1 // never silently disable per-IP tracking
+	}
 	return &IPRateLimiter{
-		buckets: map[string]*ipBucket{}, maxIPs: maxIPs,
+		ll: list.New(), buckets: map[string]*list.Element{}, maxIPs: maxIPs,
 		rate: perIPPerSec, burst: perIPBurst,
 		gTokens: globalBurst, gRate: globalPerSec, gBurst: globalBurst, gLast: time.Now(),
 	}
@@ -57,17 +66,19 @@ func (l *IPRateLimiter) allow(ip string, now time.Time) bool {
 	if l.gTokens < 1 {
 		return false
 	}
-	// Per-IP bucket.
-	b := l.buckets[ip]
-	if b == nil {
-		if len(l.buckets) >= l.maxIPs && len(l.order) > 0 {
-			old := l.order[0]
-			l.order = l.order[1:]
-			delete(l.buckets, old)
+	// Per-IP bucket (LRU: refresh on hit, evict the least-recently-used).
+	var b *ipBucket
+	if el := l.buckets[ip]; el != nil {
+		l.ll.MoveToFront(el) // this IP is now most-recently-used
+		b = el.Value.(*ipBucket)
+	} else {
+		if len(l.buckets) >= l.maxIPs {
+			if back := l.ll.Back(); back != nil { // evict the least-recently-used IP
+				delete(l.buckets, l.ll.Remove(back).(*ipBucket).ip)
+			}
 		}
-		b = &ipBucket{tokens: l.burst, last: now}
-		l.buckets[ip] = b
-		l.order = append(l.order, ip)
+		b = &ipBucket{ip: ip, tokens: l.burst, last: now}
+		l.buckets[ip] = l.ll.PushFront(b)
 	}
 	b.tokens += l.rate * now.Sub(b.last).Seconds()
 	if b.tokens > l.burst {

@@ -14,7 +14,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// defaultClient is the fallback for nil *http.Client parameters: unlike
+// http.DefaultClient it carries a timeout, so a stalled Stratum0/gateway can
+// never hang a caller indefinitely (JobTimeout defaults to disabled).
+var defaultClient = &http.Client{Timeout: 60 * time.Second}
 
 // ErrCatalogNotFound is returned by DownloadCatalog when the server responds
 // with HTTP 404.  Callers use this sentinel to distinguish "catalog missing /
@@ -23,7 +29,7 @@ var ErrCatalogNotFound = errors.New("catalog not found (404)")
 
 // Manifest represents a parsed .cvmfspublished manifest.
 type Manifest struct {
-	RootHash string   // plain hex hash (no suffix)
+	RootHash string   // hex digest without the algorithm suffix
 	HashAlgo HashAlgo // algorithm inferred from the suffix on the C field
 	RepoName string
 	Revision uint64
@@ -58,16 +64,17 @@ func ParseManifest(data []byte) (*Manifest, error) {
 
 		switch key {
 		case 'C':
-			// Detect algorithm from suffix before stripping it.
-			switch {
-			case strings.HasSuffix(value, "-"):
-				m.HashAlgo = HashSha256
-			case strings.HasSuffix(value, "~"):
-				m.HashAlgo = HashRipeMD160
-			default:
-				m.HashAlgo = HashSha1
+			// The C field is the hex digest followed by the CVMFS algorithm
+			// suffix ("" for SHA-1, "-rmd160", "-shake128").
+			m.HashAlgo = HashSha1
+			m.RootHash = value
+			for _, a := range []HashAlgo{HashRipeMD160, HashShake128} {
+				if s := HashSuffix(a); strings.HasSuffix(value, s) {
+					m.HashAlgo = a
+					m.RootHash = strings.TrimSuffix(value, s)
+					break
+				}
 			}
-			m.RootHash = strings.TrimSuffix(strings.TrimSuffix(value, "-"), "~")
 		case 'N':
 			m.RepoName = value
 		case 'S':
@@ -99,8 +106,8 @@ func ParseManifest(data []byte) (*Manifest, error) {
 
 // FetchManifestRootHash performs a lightweight GET of the .cvmfspublished
 // manifest for the given repository and returns the current root catalog hash
-// with the CVMFS catalog content-type suffix 'C' appended (e.g. "abc123...C",
-// 41 chars for SHA-1).
+// with its algorithm suffix and the CVMFS catalog content-type suffix 'C'
+// appended (e.g. "abc123...C", 41 chars for SHA-1; "abc123...-rmd160C").
 //
 // Returns ("", nil) when the repository has never been published (HTTP 404).
 // This is used by the orchestrator to obtain old_root_hash after acquiring a
@@ -112,7 +119,7 @@ func ParseManifest(data []byte) (*Manifest, error) {
 // in which case http.DefaultClient is used.
 func FetchManifestRootHash(ctx context.Context, client *http.Client, stratum0URL, repo string) (string, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient
 	}
 	manifestURL := stratum0URL + "/" + repo + "/.cvmfspublished"
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
@@ -147,27 +154,33 @@ func FetchManifestRootHash(ctx context.Context, client *http.Client, stratum0URL
 	}
 	// Append 'C' (CVMFS catalog content-type suffix) so the receiver's
 	// LoadCatalogByHash assertion (assert kSuffixCatalog == effective_hash.suffix)
-	// is satisfied.  ParseManifest already strips any algorithm suffix ("-", "~"),
-	// leaving a plain hex hash.
-	return manifest.RootHash + "C", nil
+	// is satisfied.  The algorithm suffix goes before it, as in CVMFS hash
+	// strings and CAS paths.
+	return manifest.RootHash + HashSuffix(manifest.HashAlgo) + "C", nil
 }
 
 // DownloadObject fetches and decompresses a regular content object (NOT a
 // catalog) from a stratum0 HTTP CAS.  hashHex is the plain hex hash without
 // any suffix; algo is the hash algorithm used to construct the URL suffix
-// ("" for SHA-1, "-" for SHA-256, "~" for RipeMD-160 — matching HashSuffix).
+// ("" for SHA-1, "-rmd160", "-shake128" — see HashSuffix).
 // The function decompresses the zlib-compressed payload and returns the raw
 // bytes.  This is used, for example, to retrieve the .cvmfsdirtab file stored
 // in an existing repository so its split rules can be applied to new entries.
 func DownloadObject(ctx context.Context, client *http.Client, stratum0URL, repoName, hashHex string, algo HashAlgo) ([]byte, error) {
+	return fetchObject(ctx, client, stratum0URL, repoName, hashHex+HashSuffix(algo))
+}
+
+// fetchObject downloads and decompresses the CAS object named by name: the
+// hex digest followed by its algorithm and content-type suffixes.
+func fetchObject(ctx context.Context, client *http.Client, stratum0URL, repoName, name string) ([]byte, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient
 	}
-	suffix := HashSuffix(algo)
-	// CVMFS CAS path: data/<first2>/<remaining38>[suffix]
-	// The filename is hash[2:], NOT the full hash — matching shash::MakePath().
-	casPath := hashHex[:2] + "/" + hashHex[2:] + suffix
-	url := stratum0URL + "/" + repoName + "/data/" + casPath
+	if len(name) < 3 {
+		return nil, fmt.Errorf("invalid object name %q: too short", name)
+	}
+	// CVMFS CAS path: data/<first2>/<rest>, matching shash::MakePath().
+	url := stratum0URL + "/" + repoName + "/data/" + name[:2] + "/" + name[2:]
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -200,7 +213,7 @@ func DownloadObject(ctx context.Context, client *http.Client, stratum0URL, repoN
 // The result is written to destPath as a plain (decompressed) SQLite file.
 func DownloadCatalog(ctx context.Context, client *http.Client, stratum0URL, repoName, hashHex, destPath string) error {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient
 	}
 
 	// Construct the CAS path: data/<first2>/<remaining38>C
@@ -239,11 +252,13 @@ func DownloadCatalog(ctx context.Context, client *http.Client, stratum0URL, repo
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
 	}
-	defer out.Close()
-
 	if _, err := io.Copy(out, zr); err != nil {
+		out.Close()
 		return fmt.Errorf("writing decompressed catalog: %w", err)
 	}
-
+	// A failed close can mean the data never reached the file.
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("writing decompressed catalog: %w", err)
+	}
 	return nil
 }

@@ -10,14 +10,14 @@ import (
 )
 
 // ControlPlaneRef names the control-plane transport and endpoint an S1 should
-// connect to (ADR D7/D10).
+// connect to.
 type ControlPlaneRef struct {
 	Type string `json:"type"` // "mqtt" | "sse"
 	URL  string `json:"url"`
 }
 
 // Discovery is the signed bootstrap document served at
-// GET /cvmfs/{repo}/.cvmfsbits (ADR D10). An S1's only required configuration is
+// GET /cvmfs/{repo}/.cvmfsbits. An S1's only required configuration is
 // its Stratum 0 URL; it fetches this to learn where the control plane is and
 // which repos this S0 serves.
 type Discovery struct {

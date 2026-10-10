@@ -31,19 +31,11 @@ const defaultReconnectWait = 5 * time.Second
 // Config holds the parameters needed to connect to the MQTT broker.
 type Config struct {
 	// BrokerURL is the broker address in Paho URL format, e.g.:
-	//   "tls://broker.cern.ch:8883"   (mTLS — recommended for production)
+	//   "tls://broker.cern.ch:8883"   (TLS — recommended for production)
 	//   "tcp://localhost:1883"          (plain TCP — development only)
 	// An empty BrokerURL means MQTT is disabled; callers should check this
 	// before constructing a Client.
 	BrokerURL string
-
-	// ClientCert is the path to the PEM-encoded client TLS certificate.
-	// Required when BrokerURL uses the "tls://" scheme.
-	ClientCert string
-
-	// ClientKey is the path to the PEM-encoded client TLS private key.
-	// Required when BrokerURL uses the "tls://" scheme.
-	ClientKey string
 
 	// CACert is the path to the PEM-encoded CA certificate used to verify the
 	// broker's server certificate.  When empty the system certificate pool is
@@ -59,8 +51,8 @@ type Config struct {
 	// CredentialsProvider, when set, supplies fresh credentials on each
 	// (re)connect — this is how short-lived tokens refresh without a reconnect
 	// storm; it takes precedence over Username/Password.
-	Username string
-	Password string
+	Username            string
+	Password            string
 	CredentialsProvider func() (username, password string)
 }
 
@@ -70,11 +62,11 @@ type Config struct {
 // Client is safe to use from multiple goroutines.  The underlying Paho client
 // handles automatic reconnection; callers do not need to handle CONNACK errors.
 type Client struct {
-	cfg            Config
-	inner          mqtt.Client
-	connected      atomic.Bool
-	reconnectMu    sync.Mutex
-	reconnectHook  func() // called on every reconnect (not the initial connect)
+	cfg           Config
+	inner         mqtt.Client
+	connected     atomic.Bool
+	reconnectMu   sync.Mutex
+	reconnectHook func() // called on every reconnect (not the initial connect)
 }
 
 // SetReconnectHandler registers fn to be called each time the client
@@ -124,15 +116,15 @@ func New(cfg Config) (*Client, error) {
 		opts.SetPassword(cfg.Password)
 	}
 
-	// Configure mTLS when a client certificate is provided.
+	// Configure TLS server verification when a CA certificate is provided.
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("broker: building TLS config: %w", err)
 	}
 	if tlsCfg != nil {
-		// Certificates were supplied but the URL scheme won't activate TLS —
-		// the Paho library ignores SetTLSConfig for plain tcp:// or ws://.
-		// Return an error rather than silently dropping the certs.
+		// A CA was supplied but the URL scheme won't activate TLS — the
+		// Paho library ignores SetTLSConfig for plain tcp:// or ws://.
+		// Return an error rather than silently dropping it.
 		if err := validateTLSScheme(cfg.BrokerURL); err != nil {
 			return nil, err
 		}
@@ -267,46 +259,23 @@ func validateTLSScheme(brokerURL string) error {
 	}
 }
 
-// buildTLSConfig constructs a *tls.Config from the broker Config.
-// Returns nil (no TLS) when neither cert nor CA is specified, which is
-// appropriate for plain tcp:// connections.
+// buildTLSConfig constructs a *tls.Config that verifies the broker against
+// cfg.CACert.  Returns nil when no CA is specified: plain tcp:// then, and
+// for tls:// Paho falls back to the system pool.  Clients authenticate with
+// the MQTT username/password, not with certificates.
 func buildTLSConfig(cfg Config) (*tls.Config, error) {
-	hasCert := cfg.ClientCert != "" || cfg.ClientKey != ""
-	hasCA := cfg.CACert != ""
-	if !hasCert && !hasCA {
-		return nil, nil // plain TCP, no TLS
+	if cfg.CACert == "" {
+		return nil, nil
 	}
-
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+	pem, err := os.ReadFile(cfg.CACert)
+	if err != nil {
+		return nil, fmt.Errorf("reading CA cert %q: %w", cfg.CACert, err)
 	}
-
-	// Load the CA certificate for server verification.
-	if hasCA {
-		pem, err := os.ReadFile(cfg.CACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert %q: %w", cfg.CACert, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("parsing CA cert %q: no valid PEM blocks found", cfg.CACert)
-		}
-		tlsCfg.RootCAs = pool
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("parsing CA cert %q: no valid PEM blocks found", cfg.CACert)
 	}
-
-	// Load the client certificate for mTLS.
-	if hasCert {
-		if cfg.ClientCert == "" || cfg.ClientKey == "" {
-			return nil, fmt.Errorf("both --broker-client-cert and --broker-client-key must be set together")
-		}
-		cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
-		if err != nil {
-			return nil, fmt.Errorf("loading client keypair (%q, %q): %w", cfg.ClientCert, cfg.ClientKey, err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-
-	return tlsCfg, nil
+	return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}, nil
 }
 
 // NewWithLWT is like New but also configures a Last-Will-and-Testament on the

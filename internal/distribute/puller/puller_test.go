@@ -31,7 +31,7 @@ func mustPut(t *testing.T, c cas.Backend, hash string, b []byte) {
 func TestPullVerifiesSkipsAndRejectsCorrupt(t *testing.T) {
 	ctx := context.Background()
 
-	// Source CAS on "S0", served via the P1 object handler.
+	// Source CAS on "S0", served via serve.ObjectHandler.
 	src, err := cas.NewLocalFS(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -60,8 +60,7 @@ func TestPullVerifiesSkipsAndRejectsCorrupt(t *testing.T) {
 	}
 	mustPut(t, dst, hPresent, present)
 
-	st := NewState(t.TempDir())
-	p := &Puller{Store: dst, Fetcher: &HTTPFetcher{}, Slots: 3, State: st}
+	p := &Puller{Store: dst, Fetcher: &HTTPFetcher{}, Slots: 3}
 	m := &manifest.Manifest{
 		TransactionID: "t1", Repo: "cms.cern.ch", TargetRootHash: "ROOT",
 		BaseURLs:  []string{base},
@@ -86,13 +85,9 @@ func TestPullVerifiesSkipsAndRejectsCorrupt(t *testing.T) {
 	if ok, _ := dst.Exists(ctx, hBad); ok {
 		t.Fatalf("corrupt object must NOT be installed")
 	}
-	// State must NOT advance on a failed pull.
-	if root, _ := st.Get("cms.cern.ch"); root != "" {
-		t.Fatalf("state advanced on failed pull: %q", root)
-	}
 }
 
-func TestPullSuccessAdvancesState(t *testing.T) {
+func TestPullSuccess(t *testing.T) {
 	ctx := context.Background()
 	src, err := cas.NewLocalFS(t.TempDir())
 	if err != nil {
@@ -110,8 +105,7 @@ func TestPullSuccessAdvancesState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := NewState(t.TempDir())
-	p := &Puller{Store: dst, Fetcher: &HTTPFetcher{}, State: st}
+	p := &Puller{Store: dst, Fetcher: &HTTPFetcher{}}
 	m := &manifest.Manifest{
 		TransactionID: "t2", Repo: "lhcb.cern.ch", TargetRootHash: "ROOT2",
 		BaseURLs:  []string{srv.URL + "/cvmfs/lhcb.cern.ch/data"},
@@ -125,12 +119,18 @@ func TestPullSuccessAdvancesState(t *testing.T) {
 	if err != nil || res.Fetched != 2 || res.Failed != 0 {
 		t.Fatalf("pull: err=%v res=%+v", err, res)
 	}
-	if root, _ := st.Get("lhcb.cern.ch"); root != "ROOT2" {
-		t.Fatalf("state not advanced: %q", root)
-	}
 	for _, h := range []string{hA, hB} {
 		if ok, _ := dst.Exists(ctx, h); !ok {
 			t.Fatalf("object %s not installed", h)
 		}
+	}
+}
+
+// TestHexPrefixStripsCatalogSuffix: "C" is a hex digit, so the uppercase
+// suffix must not be taken as part of the digest.
+func TestHexPrefixStripsCatalogSuffix(t *testing.T) {
+	h := "96037fbe4b2bada4c7636ae7d970260cd565c70c"
+	if got := hexPrefix(h + "C"); got != h {
+		t.Fatalf("hexPrefix(%sC) = %q, want %q", h, got, h)
 	}
 }

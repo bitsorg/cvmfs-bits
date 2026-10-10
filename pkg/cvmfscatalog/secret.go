@@ -33,35 +33,31 @@ func SharePath(token, contentPath string) string {
 // SharesDirEntry returns the Entry for the .shares root directory (always hidden).
 func SharesDirEntry(mtime int64) Entry {
 	return Entry{
-		FullPath:   SharesRoot,
-		Name:       SharesRoot,
-		Mode:       fs.ModeDir | 0o700,
-		Size:       4096,
-		Mtime:      mtime,
-		MtimeNs:    0,
-		UID:        0,
-		GID:        0,
-		LinkCount:  1,
-		IsHidden:   true,
-		HashAlgo:   HashSha256,
-		CompAlgo:   CompZlib,
+		FullPath:  SharesRoot,
+		Name:      SharesRoot,
+		Mode:      fs.ModeDir | 0o700,
+		Size:      4096,
+		Mtime:     mtime,
+		MtimeNs:   0,
+		UID:       0,
+		GID:       0,
+		LinkCount: 1,
+		IsHidden:  true,
 	}
 }
 
 // TokenDirEntry returns the Entry for .shares/<token>/ directory (always hidden).
 func TokenDirEntry(token string, mtime int64) Entry {
 	return Entry{
-		FullPath:   SharesRoot + "/" + token,
-		Name:       token,
-		Mode:       fs.ModeDir | 0o700,
-		Size:       4096,
-		Mtime:      mtime,
-		MtimeNs:    0,
-		UID:        0,
-		GID:        0,
-		LinkCount:  1,
-		IsHidden:   true,
-		HashAlgo:   HashSha256,
-		CompAlgo:   CompZlib,
+		FullPath:  SharesRoot + "/" + token,
+		Name:      token,
+		Mode:      fs.ModeDir | 0o700,
+		Size:      4096,
+		Mtime:     mtime,
+		MtimeNs:   0,
+		UID:       0,
+		GID:       0,
+		LinkCount: 1,
+		IsHidden:  true,
 	}
 }

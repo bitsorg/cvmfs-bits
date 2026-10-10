@@ -9,12 +9,19 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 
 	mqttbroker "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
 
+	"cvmfs.io/prepub/internal/broker"
 	"cvmfs.io/prepub/internal/distribute/credential"
 	"cvmfs.io/prepub/pkg/observe"
 )
@@ -24,7 +31,7 @@ import (
 // bearer token (obtained via the challenge/response enrollment) as the MQTT
 // CONNECT password; the hook verifies the HMAC signature + expiry, records the
 // node identity, and enforces per-role topic ACLs. A revocation denylist plus
-// active disconnect (in-process broker) gives immediate cut-off (H3).
+// active disconnect (in-process broker) gives immediate cut-off.
 type brokerAuthHook struct {
 	mqttbroker.HookBase
 	verifier      *credential.Verifier
@@ -68,8 +75,7 @@ func (h *brokerAuthHook) authNode(token string) (string, bool) {
 
 // aclAllowed is the pure, testable authorization rule. The publisher may do
 // anything; receivers may SUBSCRIBE freely but may only PUBLISH to their own
-// ready/presence topics — they cannot publish announce/published (which would
-// let a forged warm/ready ack push the publisher toward a premature commit).
+// presence topic — not announce/published, nor another node's presence.
 func aclAllowed(node, publisherNode, topic string, write bool) bool {
 	if node != "" && node == publisherNode {
 		return true
@@ -77,7 +83,10 @@ func aclAllowed(node, publisherNode, topic string, write bool) bool {
 	if !write {
 		return true
 	}
-	return strings.Contains(topic, "/ready") || strings.Contains(topic, "/presence")
+	if node == "" || broker.ValidateNodeID(node) != nil {
+		return false
+	}
+	return topic == broker.PresenceTopic(node)
 }
 
 func (h *brokerAuthHook) OnConnectAuthenticate(cl *mqttbroker.Client, pk packets.Packet) bool {
@@ -115,7 +124,7 @@ func (h *brokerAuthHook) OnDisconnect(cl *mqttbroker.Client, _ error, _ bool) {
 
 // Revoke marks a node revoked (future connects refused). Pair with active
 // disconnect of live sessions for immediate cut-off.
-func (h *brokerAuthHook) Revoke(node string) { h.revoc.Revoke(node) }
+func (h *brokerAuthHook) Revoke(node string) error { return h.revoc.Revoke(node) }
 
 // clientsForNode returns the mqtt client-ids currently authenticated as node
 // (used by the revoke command to actively disconnect live sessions).
@@ -132,18 +141,123 @@ func (h *brokerAuthHook) clientsForNode(node string) []string {
 }
 
 // revocation is a shared denylist used by both the enroll key store (refuse new
-// enrollments) and the broker auth hook (refuse new connects).
+// enrollments) and the broker auth hook (refuse new connects). With a path it
+// is persisted there, so a revocation survives a publisher restart.
 type revocation struct {
-	mu  sync.RWMutex
-	set map[string]bool
+	mu     sync.RWMutex
+	set    map[string]bool
+	path   string       // "" => in memory only
+	logger *slog.Logger // nil => slog.Default()
 }
 
 func newRevocation() *revocation { return &revocation{set: map[string]bool{}} }
 
-func (r *revocation) Revoke(node string) {
+// loadRevocation reads the denylist persisted at path; a missing file is an
+// empty list. An unreadable or corrupt file is an error, so startup fails
+// closed rather than silently re-admitting revoked nodes.
+func loadRevocation(path string) (*revocation, error) {
+	r := &revocation{set: map[string]bool{}, path: path}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return r, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var nodes []string
+	if err := json.Unmarshal(b, &nodes); err != nil {
+		return nil, fmt.Errorf("revocation list %s: %w", path, err)
+	}
+	for _, n := range nodes {
+		r.set[n] = true
+	}
+	return r, nil
+}
+
+// Revoke denies node at once. The in-memory entry is kept even when saving
+// fails; the error then means the revocation would not survive a restart.
+func (r *revocation) Revoke(node string) error {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.set[node] = true
-	r.mu.Unlock()
+	return r.saveLocked()
+}
+
+// Unrevoke lifts a revocation. When saving fails the node stays revoked (fail
+// closed), so memory and disk agree.
+func (r *revocation) Unrevoke(node string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.set[node] {
+		return nil
+	}
+	delete(r.set, node)
+	if err := r.saveLocked(); err != nil {
+		r.set[node] = true
+		return err
+	}
+	return nil
+}
+
+// saveLocked persists the list; the caller holds r.mu.
+func (r *revocation) saveLocked() error {
+	if r.path == "" {
+		return nil
+	}
+	nodes := make([]string, 0, len(r.set))
+	for n := range r.set {
+		nodes = append(nodes, n)
+	}
+	sort.Strings(nodes)
+	b, err := json.Marshal(nodes)
+	if err != nil {
+		return err
+	}
+	logger := r.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return writeFileAtomic(r.path, b, logger)
+}
+
+// writeFileAtomic writes data to path (mode 0600) via a temp file and rename,
+// so a crash leaves either the old or the new list, never a torn one.
+func writeFileAtomic(path string, data []byte, logger *slog.Logger) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op after a successful rename
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Make the rename durable. The new list is already in place, so a failure
+	// here is only logged: reporting it as an error would claim the save failed.
+	if d, err := os.Open(filepath.Dir(path)); err != nil {
+		logger.Warn("fsync of directory after rename failed", "path", path, "error", err)
+	} else {
+		if err := d.Sync(); err != nil {
+			logger.Warn("fsync of directory after rename failed", "path", path, "error", err)
+		}
+		d.Close()
+	}
+	return nil
 }
 
 func (r *revocation) IsRevoked(node string) bool {

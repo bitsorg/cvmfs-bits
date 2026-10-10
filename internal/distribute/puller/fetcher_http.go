@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
-// Package puller is the Stratum-1 receiver side of pull-based distribution
-// (ADR-0001 P2): on a notification it fetches a transaction manifest, computes
+// Package puller is the Stratum-1 receiver side of pull-based distribution:
+// on a notification it fetches a transaction manifest, computes
 // the objects it is missing locally, fetches them over HTTP, verifies each
 // content hash, and installs them atomically into the local CAS.
 package puller
@@ -20,13 +20,11 @@ import (
 )
 
 // HTTPFetcher fetches one content-addressed object per GET from the CVMFS data
-// layout (ADR D5, the default transport). Objects are cacheable and the bytes
+// layout (the default transport). Objects are cacheable and the bytes
 // are hash-verified by the caller, so the request may traverse forward proxies.
 type HTTPFetcher struct {
 	Client *http.Client
 }
-
-func (f *HTTPFetcher) Name() string { return "object-http" }
 
 // Fetch GETs obj from base, where base is an object root ending in ".../data"
 // (a Manifest.BaseURLs entry). The returned body must be closed by the caller.

@@ -24,9 +24,9 @@ import (
 // tarEntry describes one entry in a test tar archive.
 type tarEntry struct {
 	name     string
-	typeflag byte      // 0 → tar.TypeReg
+	typeflag byte // 0 → tar.TypeReg
 	content  []byte
-	linkname string    // TypeLink or TypeSymlink target
+	linkname string // TypeLink or TypeSymlink target
 	mode     fs.FileMode
 	modTime  time.Time
 	accTime  time.Time
@@ -432,5 +432,57 @@ func TestExtractTar_ExistingSymlinkOverwrite(t *testing.T) {
 	}
 	if target != "new-target" {
 		t.Errorf("symlink target after overwrite: got %q, want %q", target, "new-target")
+	}
+}
+
+// ── link-then-write hardening (adversarial review round) ─────────────────────
+
+// TestExtractTar_LinkThenWrite verifies the link-then-write attack is refused:
+// a symlink entry pointing outside destDir followed by a regular-file entry
+// whose path resolves THROUGH that symlink must not write outside destDir.
+func TestExtractTar_LinkThenWrite(t *testing.T) {
+	obs := newTestObs(t)
+	dest := t.TempDir()
+	outside := t.TempDir()
+
+	tarPath := buildTar(t, []tarEntry{
+		{name: "x", typeflag: tar.TypeSymlink, linkname: outside},
+		{name: "x/pwn.txt", content: []byte("owned"), mode: 0644},
+	})
+
+	err := extractTar(context.Background(), tarPath, dest, obs)
+	if err == nil {
+		t.Fatal("expected error for write through planted symlink, got nil")
+	}
+	// The escaping write, had it succeeded, would land at outside/pwn.txt
+	// (x -> outside, entry x/pwn.txt). Assert nothing was written there.
+	if _, statErr := os.Stat(filepath.Join(outside, "pwn.txt")); statErr == nil {
+		t.Error("write resolved through the planted symlink to outside destDir")
+	}
+}
+
+// TestExtractTar_HardLinkThroughSymlinkSource verifies a hard-link entry whose
+// SOURCE resolves through a planted symlink cannot copy an arbitrary host file
+// into the repo.
+func TestExtractTar_HardLinkThroughSymlinkSource(t *testing.T) {
+	obs := newTestObs(t)
+	dest := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret")
+	if err := os.WriteFile(secret, []byte("top-secret"), 0600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+
+	tarPath := buildTar(t, []tarEntry{
+		{name: "d", typeflag: tar.TypeSymlink, linkname: outside},
+		{name: "leak", typeflag: tar.TypeLink, linkname: "d/secret"},
+	})
+
+	err := extractTar(context.Background(), tarPath, dest, obs)
+	if err == nil {
+		t.Fatal("expected error for hard link through planted symlink source, got nil")
+	}
+	if b, readErr := os.ReadFile(filepath.Join(dest, "leak")); readErr == nil {
+		t.Errorf("host secret copied into repo: %q", b)
 	}
 }

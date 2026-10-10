@@ -4,6 +4,9 @@
 package main
 
 import (
+	"encoding/hex"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,6 +15,30 @@ import (
 
 	"cvmfs.io/prepub/internal/distribute/credential"
 )
+
+// `prepub node-key <node>` prints the receiver's per-node enrollment key so it
+// can be provisioned as S1_NODE_KEY (the receiver never holds the master).
+func TestNodeKeyHex(t *testing.T) {
+	secret := []byte("0123456789abcdef") // 16 bytes
+	got, err := nodeKeyHex(secret, "receiver-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := hex.EncodeToString(deriveNodeKey(secret, "receiver-1")); got != want {
+		t.Fatalf("nodeKeyHex = %s, want %s", got, want)
+	}
+	if other, _ := nodeKeyHex(secret, "receiver-2"); other == got {
+		t.Fatal("different nodes must yield different keys")
+	}
+	for _, tc := range []struct {
+		node string
+		sec  []byte
+	}{{"", secret}, {"publisher", secret}, {"receiver-1", []byte("short")}} {
+		if _, err := nodeKeyHex(tc.sec, tc.node); err == nil {
+			t.Fatalf("expected error for node=%q secretlen=%d", tc.node, len(tc.sec))
+		}
+	}
+}
 
 func TestBrokerAuthHook(t *testing.T) {
 	secret := []byte("test-secret-at-least-32-bytes-long!!")
@@ -52,11 +79,17 @@ func TestBrokerAuthHook(t *testing.T) {
 	if aclAllowed("stratum1-a", "publisher", "cvmfs/repos/r/published", true) {
 		t.Error("receiver must NOT be allowed to publish published")
 	}
-	if !aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-a/ready", true) {
-		t.Error("receiver must be allowed to publish its ready")
+	if aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-a/ready", true) {
+		t.Error("receiver must NOT be allowed to publish ready")
 	}
 	if !aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-a/presence", true) {
 		t.Error("receiver must be allowed to publish its presence")
+	}
+	if aclAllowed("stratum1-a", "publisher", "cvmfs/receivers/stratum1-b/presence", true) {
+		t.Error("receiver must NOT be allowed to publish another node's presence")
+	}
+	if aclAllowed("stratum1-a", "publisher", "cvmfs/repos/r/presence", true) {
+		t.Error("receiver must NOT publish a non-presence topic containing /presence")
 	}
 	if !aclAllowed("stratum1-a", "publisher", "cvmfs/repos/r/announce", false) {
 		t.Error("receiver must be allowed to subscribe announce")
@@ -89,12 +122,12 @@ func TestBrokerAuthHookConnectionIdentity(t *testing.T) {
 		t.Fatalf("verified node must overwrite forged username: got %q", got)
 	}
 	// Despite the forged "publisher" username, the receiver must NOT be able to
-	// publish announce, and CAN publish its own ready.
+	// publish announce, and CAN publish its own presence.
 	if h.OnACLCheck(recvCl, "cvmfs/repos/r/announce", true) {
 		t.Error("receiver (forged username) must NOT be authorized to publish announce")
 	}
-	if !h.OnACLCheck(recvCl, "cvmfs/receivers/stratum1-a/ready", true) {
-		t.Error("receiver must be authorized to publish its ready")
+	if !h.OnACLCheck(recvCl, "cvmfs/receivers/stratum1-a/presence", true) {
+		t.Error("receiver must be authorized to publish its presence")
 	}
 
 	// The real publisher authenticates and CAN publish announce — and this still
@@ -110,5 +143,57 @@ func TestBrokerAuthHookConnectionIdentity(t *testing.T) {
 	h.OnDisconnect(recvCl, nil, true) // unrelated disconnect must not affect pubCl
 	if !h.OnACLCheck(pubCl, "cvmfs/repos/r/announce", true) {
 		t.Error("publisher must remain authorized to publish announce after an unrelated disconnect")
+	}
+}
+
+// TestRevocationPersists: a revocation is saved (0600, atomically) and is
+// still in force after the list is reloaded, as on a publisher restart.
+func TestRevocationPersists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "revoked-nodes.json")
+	r, err := loadRevocation(path)
+	if err != nil {
+		t.Fatalf("missing file must load as empty: %v", err)
+	}
+	if err := r.Revoke("stratum1-a"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 1 {
+		t.Errorf("temp files left behind: %d entries", len(ents))
+	}
+
+	again, err := loadRevocation(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.IsRevoked("stratum1-a") || again.IsRevoked("stratum1-b") {
+		t.Error("reloaded denylist does not match what was revoked")
+	}
+	if _, ok := (&derivedEnrollStore{secret: []byte("s"), revoc: again}).Key("stratum1-a"); ok {
+		t.Error("revoked node can enroll again after reload")
+	}
+
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadRevocation(path); err == nil {
+		t.Error("a corrupt list must fail closed")
+	}
+
+	// Saving fails: the node is still revoked now, and the caller is told.
+	bad := &revocation{set: map[string]bool{}, path: filepath.Join(dir, "missing", "x.json")}
+	if err := bad.Revoke("stratum1-c"); err == nil || !bad.IsRevoked("stratum1-c") {
+		t.Errorf("err=%v revoked=%v; want an error and the in-memory revocation", err, bad.IsRevoked("stratum1-c"))
+	}
+	// An un-revoke that cannot be saved leaves the node revoked (fail closed).
+	if err := bad.Unrevoke("stratum1-c"); err == nil || !bad.IsRevoked("stratum1-c") {
+		t.Errorf("err=%v revoked=%v; want an error and the node still revoked", err, bad.IsRevoked("stratum1-c"))
 	}
 }

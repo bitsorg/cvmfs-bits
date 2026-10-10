@@ -16,6 +16,10 @@ import (
 	"cvmfs.io/prepub/pkg/cvmfshash"
 )
 
+// TempPrefix names the temp file Put streams into before its atomic rename; a
+// crash can leave one behind under data/XX/.
+const TempPrefix = ".prepub-"
+
 // LocalFS is a filesystem-based content-addressable storage backend.
 // Objects are stored in a data/XX/... directory hierarchy based on their hash.
 type LocalFS struct {
@@ -166,7 +170,7 @@ func (lf *LocalFS) Put(ctx context.Context, hash string, r io.Reader, size int64
 	// os.CreateTemp gives each upload attempt its own uniquely named temp file.
 	// Concurrent uploads of the same hash now race only on the final os.Rename,
 	// which is atomic — the loser's rename overwrites an identical file safely.
-	f, err := os.CreateTemp(dir, ".prepub-")
+	f, err := os.CreateTemp(dir, TempPrefix)
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}

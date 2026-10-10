@@ -4,26 +4,29 @@
 package receiver
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha1" //nolint:gosec // CVMFS CAS key algorithm
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"cvmfs.io/prepub/internal/broker"
+	"cvmfs.io/prepub/internal/cas"
+	"cvmfs.io/prepub/internal/distribute/serve"
 	"cvmfs.io/prepub/pkg/observe"
 )
 
-// makeHash returns a deterministic 64-hex-char CAS hash for the given seed.
-func makeHash(n int) string {
-	return fmt.Sprintf("%064x", n)
-}
-
 // newMQTTTestReceiver creates a Receiver suitable for testing MQTT handler
 // logic. The broker client is left nil so that mqttPublish is a no-op, and
-// PullMode is off so the announce handler exercises decode/validate only.
+// Stratum0URL is empty so the announce handler exercises decode/validate only.
 func newMQTTTestReceiver(t *testing.T, repos ...string) *Receiver {
 	t.Helper()
 	obs, shutdown, err := observe.New("test")
@@ -34,7 +37,6 @@ func newMQTTTestReceiver(t *testing.T, repos ...string) *Receiver {
 
 	cfg := Config{
 		CASRoot: t.TempDir(),
-		DevMode: true,
 		NodeID:  "test-node",
 		Repos:   repos,
 		Obs:     obs,
@@ -72,7 +74,6 @@ func TestStartMQTT_EmptyNodeIDReturnsError(t *testing.T) {
 
 	r, err := New(Config{
 		CASRoot:   t.TempDir(),
-		DevMode:   true,
 		NodeID:    "",
 		BrokerURL: "tcp://localhost:1883",
 		Obs:       obs,
@@ -158,40 +159,53 @@ func TestMqttAnnounceHandler_WellFormed(t *testing.T) {
 		PayloadID:   "job-1",
 		PublisherID: "pub-job-1",
 		Repo:        "atlas.cern.ch",
-		Hashes:      []string{makeHash(1), makeHash(2)},
 	}
 	r.mqttAnnounceHandler(fakeMQTTMessage(t, ann)) // must not panic
 }
 
-// TestSweepTmpFiles verifies that sweepTmpFiles removes *.tmp files and leaves
-// regular CAS object files untouched.
+// TestSweepTmpFiles: stale CAS temp files under data/XX/ are removed; objects
+// and temp files modified within sweepMinAge of the cutoff (a Put that may still
+// be in flight) survive.
 func TestSweepTmpFiles(t *testing.T) {
 	casRoot := t.TempDir()
-	prefix := "ab"
-	dir := filepath.Join(casRoot, prefix)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	store, err := cas.NewLocalFS(casRoot)
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	hash := prefix + fmt.Sprintf("%062x", 1)
-	casFile := filepath.Join(dir, hash+"C")
-	tmpFile := filepath.Join(dir, hash+".deadbeef.tmp")
-	for _, path := range []string{casFile, tmpFile} {
-		if err := os.WriteFile(path, []byte("data"), 0644); err != nil {
+	obj := "ab" + fmt.Sprintf("%038x", 1) + "C"
+	if err := store.Put(context.Background(), obj, bytes.NewReader([]byte("data")), 4); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(casRoot, "data", "ab")
+	stale := filepath.Join(dir, cas.TempPrefix+"stale")
+	fresh := filepath.Join(dir, cas.TempPrefix+"fresh")
+	for _, p := range []string{stale, fresh} {
+		if err := os.WriteFile(p, []byte("partial"), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
+	cutoff := time.Now()
+	old := cutoff.Add(-sweepMinAge - time.Minute)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	recent := cutoff.Add(-sweepMinAge + time.Minute) // before cutoff, inside the margin
+	if err := os.Chtimes(fresh, recent, recent); err != nil {
+		t.Fatal(err)
+	}
 
 	logged := false
-	logFn := func(msg string, _ ...any) { logged = true }
-	if err := sweepTmpFiles(context.Background(), casRoot, logFn); err != nil {
+	if err := sweepTmpFiles(context.Background(), casRoot, cutoff, func(string, ...any) { logged = true }); err != nil {
 		t.Fatalf("sweepTmpFiles: %v", err)
 	}
-	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
-		t.Error(".tmp file should have been removed")
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("stale temp file should have been removed")
 	}
-	if _, err := os.Stat(casFile); err != nil {
-		t.Errorf("CAS file should survive sweep: %v", err)
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("temp file inside the age margin must survive: %v", err)
+	}
+	if ok, _ := store.Exists(context.Background(), obj); !ok {
+		t.Error("CAS object must survive the sweep")
 	}
 	if !logged {
 		t.Error("sweepTmpFiles should log when files are removed")
@@ -201,29 +215,133 @@ func TestSweepTmpFiles(t *testing.T) {
 // TestSweepTmpFiles_NonexistentRoot verifies that a missing CAS root is a no-op.
 func TestSweepTmpFiles_NonexistentRoot(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nonexistent")
-	if err := sweepTmpFiles(context.Background(), missing, func(string, ...any) {}); err != nil {
+	if err := sweepTmpFiles(context.Background(), missing, time.Now(), func(string, ...any) {}); err != nil {
 		t.Errorf("sweepTmpFiles on missing root should not error, got: %v", err)
 	}
 }
 
-// TestCASPath verifies the on-disk layout: objects land at {root}/{hash[:2]}/{hash}C.
-func TestCASPath(t *testing.T) {
-	root := "/srv/cvmfs/cas"
-	hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-	want := filepath.Join(root, "ab", hash+"C")
-	if got := casPath(root, hash); got != want {
-		t.Errorf("casPath = %q, want %q", got, want)
+// newPullReceiver builds a receiver whose Stratum0URL is base.
+func newPullReceiver(t *testing.T, base string, repos ...string) *Receiver {
+	t.Helper()
+	obs, shutdown, err := observe.New("test")
+	if err != nil {
+		t.Fatalf("observe.New: %v", err)
+	}
+	t.Cleanup(shutdown)
+	r, err := New(Config{CASRoot: t.TempDir(), Stratum0URL: base, Repos: repos, Obs: obs})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return r
+}
+
+// TestStratum0URLServesBothPaths checks that one Stratum0URL (the publisher
+// base) serves both the /s1/ manifest and the post-commit root catalog, and
+// that the catalog lands in the receiver's CAS.
+func TestStratum0URLServesBothPaths(t *testing.T) {
+	const repo = "atlas.cern.ch"
+	src, err := cas.NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("compressed root catalog bytes")
+	sum := sha1.Sum(body) //nolint:gosec
+	root := hex.EncodeToString(sum[:])
+	if err := src.Put(context.Background(), root+"C", bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/cvmfs/", &serve.ObjectHandler{Store: src})
+	mux.HandleFunc("/s1/txn-1/manifest", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"transaction_id":"txn-1","repo":%q,"target_root_hash":"r","base_urls":["x"],"generator":"pipeline"}`, repo)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	r := newPullReceiver(t, srv.URL)
+	if _, err := r.pullCoordinator.OnTransaction(context.Background(), "txn-1"); err != nil {
+		t.Fatalf("manifest pull: %v", err)
+	}
+	r.pullFromS0(context.Background(), broker.PublishedMessage{Repo: repo, NewRootHash: root})
+	if ok, _ := r.casStore.Exists(context.Background(), root+"C"); !ok {
+		t.Fatal("root catalog was not pulled into the receiver's CAS")
 	}
 }
 
-// TestRandomToken verifies randomToken returns a 32-hex-char unique token.
-func TestRandomToken(t *testing.T) {
-	a, b := randomToken(), randomToken()
-	if len(a) != 32 {
-		t.Errorf("randomToken length = %d, want 32", len(a))
+// TestMqttAnnounceHandler_IgnoresUnservedRepo: a receiver for [a, b] (which
+// subscribes to the wildcard filter) must not pull an announce for repo c.
+func TestMqttAnnounceHandler_IgnoresUnservedRepo(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release // hold served pulls in flight so they stay observable
+		http.NotFound(w, nil)
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	r := newPullReceiver(t, srv.URL, "a.cern.ch", "b.cern.ch")
+	for _, repo := range []string{"a.cern.ch", "c.cern.ch"} {
+		r.mqttAnnounceHandler(fakeMQTTMessage(t, broker.AnnounceMessage{
+			PayloadID: "job-" + repo, PublisherID: "pub", Repo: repo,
+		}))
 	}
-	if a == b {
-		t.Error("randomToken returned identical tokens on consecutive calls")
+	if _, ok := r.pullInflight.Load("job-a.cern.ch"); !ok {
+		t.Error("announce for served repo a.cern.ch did not start a pull")
 	}
-	_ = time.Now
+	if _, ok := r.pullInflight.Load("job-c.cern.ch"); ok {
+		t.Error("announce for unserved repo c.cern.ch started a pull")
+	}
+}
+
+// TestPullFromS0_RejectsMalformedRootHash: a forged NewRootHash must not be
+// fetched or written anywhere.
+func TestPullFromS0_RejectsMalformedRootHash(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits++
+		http.NotFound(w, req)
+	}))
+	defer srv.Close()
+
+	r := newPullReceiver(t, srv.URL)
+	r.pullFromS0(context.Background(), broker.PublishedMessage{Repo: "r.cern.ch", NewRootHash: "../../x"})
+	if hits != 0 {
+		t.Errorf("malformed root hash reached the network (%d requests)", hits)
+	}
+	if _, err := os.Stat(filepath.Join(r.cfg.CASRoot, "x")); !os.IsNotExist(err) {
+		t.Errorf("malformed root hash wrote outside the CAS layout: %v", err)
+	}
+}
+
+// TestInvalidRepoNamesRejected: a repo name that is not a CVMFS repository
+// name is refused as configuration and never reaches a pull URL from MQTT.
+func TestInvalidRepoNamesRejected(t *testing.T) {
+	obs, shutdown, err := observe.New("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shutdown)
+	if _, err := New(Config{CASRoot: t.TempDir(), Repos: []string{"a..b"}, Obs: obs}); err == nil {
+		t.Error("New accepted --repos entry \"a..b\"")
+	}
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, req)
+	}))
+	defer srv.Close()
+	r := newPullReceiver(t, srv.URL) // no --repos: every valid name is served
+	for _, repo := range []string{"..", "a..b", ".x"} {
+		pm, _ := json.Marshal(broker.PublishedMessage{Repo: repo, NewRootHash: "abcdef"})
+		r.mqttPublishedHandler(&broker.Message{Topic: "cvmfs/repos/x/published", Payload: pm})
+		r.mqttAnnounceHandler(fakeMQTTMessage(t, broker.AnnounceMessage{PayloadID: "p-" + repo, PublisherID: "pub", Repo: repo}))
+		if _, ok := r.pullInflight.Load("p-" + repo); ok {
+			t.Errorf("announce for invalid repo %q started a pull", repo)
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // a published pull would run on a goroutine
+	if n := hits.Load(); n != 0 {
+		t.Errorf("invalid repo names reached the network (%d requests)", n)
+	}
 }

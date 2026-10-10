@@ -5,7 +5,6 @@ package manifest
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
 	"time"
 )
@@ -73,58 +72,6 @@ func TestNDJSONRoundTrip(t *testing.T) {
 		t.Fatalf("streamed objects mismatch: %+v", objs)
 	}
 }
-
-func TestNDJSONStreamHeaderCallbackOrdering(t *testing.T) {
-	m := sample()
-	var buf bytes.Buffer
-	// Encode header + objects piecemeal via the streaming primitives (P4).
-	if err := EncodeNDJSONHeader(&buf, m); err != nil {
-		t.Fatalf("encode header: %v", err)
-	}
-	for i := range m.Objects {
-		if err := EncodeNDJSONObject(&buf, &m.Objects[i]); err != nil {
-			t.Fatalf("encode obj: %v", err)
-		}
-	}
-
-	var headerSeenAt = -1
-	var objCount int
-	hdr, err := DecodeNDJSONStream(&buf,
-		func(h *Manifest) error {
-			if objCount != 0 {
-				t.Fatal("onHeader must fire before any object")
-			}
-			if h.Repo != m.Repo {
-				t.Fatalf("header repo mismatch: %q", h.Repo)
-			}
-			headerSeenAt = objCount
-			return nil
-		},
-		func(o ObjRef) error { objCount++; return nil },
-	)
-	if err != nil {
-		t.Fatalf("decode stream: %v", err)
-	}
-	if headerSeenAt != 0 {
-		t.Fatal("onHeader callback was not invoked before objects")
-	}
-	if objCount != len(m.Objects) || hdr.Repo != m.Repo {
-		t.Fatalf("stream mismatch: objs=%d hdr=%+v", objCount, hdr)
-	}
-}
-
-func TestDecodeNDJSONStreamHeaderErrorAborts(t *testing.T) {
-	m := sample()
-	var buf bytes.Buffer
-	_ = m.EncodeNDJSON(&buf)
-	wantErr := errSentinel
-	_, err := DecodeNDJSONStream(&buf, func(*Manifest) error { return wantErr }, nil)
-	if err != wantErr {
-		t.Fatalf("onHeader error must propagate, got %v", err)
-	}
-}
-
-var errSentinel = fmt.Errorf("sentinel")
 
 func TestMissing(t *testing.T) {
 	m := sample()

@@ -3,12 +3,12 @@
 
 // Package manifest defines the transaction manifest exchanged between a
 // cvmfs-prepub publisher (Stratum 0) and receivers (Stratum 1) under the
-// pull-based distribution model (ADR-0001).
+// pull-based distribution model.
 //
 // A manifest is the authoritative, deduplicated set of CAS objects a
 // transaction adds, plus the metadata a receiver needs to fetch and verify
 // them. Small (incremental) manifests serialise as a single JSON document;
-// large (cold-start / catch-up) manifests serialise as NDJSON — a header line
+// large (cold-start) manifests serialise as NDJSON — a header line
 // followed by one object record per line — so neither side must buffer the
 // whole set in memory.
 package manifest
@@ -26,14 +26,14 @@ type Generator string
 
 const (
 	// GeneratorPipeline: the set came from the publish pipeline's dedup step
-	// (the incremental, authoritative new-object set — ADR D3).
+	// (the incremental, authoritative new-object set).
 	GeneratorPipeline Generator = "pipeline"
 	// GeneratorDiff: the set was computed from a catalog diff
-	// (cvmfs_server diff / catalog walk) for cold-start or catch-up (ADR D4).
+	// (cvmfs_server diff / catalog walk), e.g. for a cold start.
 	GeneratorDiff Generator = "diff"
 )
 
-// Auth is the object-channel authorization policy for a transaction (ADR D8).
+// Auth is the object-channel authorization policy for a transaction.
 type Auth string
 
 const (
@@ -65,10 +65,6 @@ type Manifest struct {
 	CreatedAt      time.Time `json:"created_at"`
 	TotalSize      int64     `json:"total_size"`
 	Objects        []ObjRef  `json:"objects,omitempty"`
-	// Provisional marks a pre-warm manifest whose TargetRootHash is a placeholder
-	// (the real catalog root is unknown until commit). Receivers pull its objects
-	// but MUST NOT record TargetRootHash as the last-synced root.
-	Provisional    bool      `json:"provisional,omitempty"`
 }
 
 // Validate checks the required fields are present and internally consistent.
@@ -119,7 +115,7 @@ func isObjectName(s string) bool {
 }
 
 // Missing returns the subset of Objects for which has(hash) reports false — the
-// receiver-local delta (ADR D3). The receiver supplies a predicate backed by its
+// receiver-local delta. The receiver supplies a predicate backed by its
 // own CAS, so no per-receiver hash list is round-tripped to S0.
 func (m *Manifest) Missing(has func(hash string) bool) []ObjRef {
 	out := make([]ObjRef, 0, len(m.Objects))
@@ -147,54 +143,27 @@ func Decode(r io.Reader) (*Manifest, error) {
 
 // EncodeNDJSON writes the manifest in streaming form: a header line (the
 // manifest metadata with Objects omitted) followed by one ObjRef JSON object per
-// line. Suitable for very large (cold-start / catch-up) deltas.
+// line. Suitable for very large (cold-start) deltas.
 func (m *Manifest) EncodeNDJSON(w io.Writer) error {
-	if err := EncodeNDJSONHeader(w, m); err != nil {
-		return err
+	enc := json.NewEncoder(w)
+	header := *m
+	header.Objects = nil
+	if err := enc.Encode(&header); err != nil {
+		return fmt.Errorf("manifest: encode header: %w", err)
 	}
 	for i := range m.Objects {
-		if err := EncodeNDJSONObject(w, &m.Objects[i]); err != nil {
+		if err := enc.Encode(&m.Objects[i]); err != nil {
 			return fmt.Errorf("manifest: encode object %d: %w", i, err)
 		}
 	}
 	return nil
 }
 
-// EncodeNDJSONHeader writes just the NDJSON header line (manifest metadata with
-// Objects omitted). Pair it with EncodeNDJSONObject to stream an object set that
-// is too large to materialise — e.g. a catch-up diff generated on the fly (ADR
-// D4 / P4), where the producer never holds the whole set in memory.
-func EncodeNDJSONHeader(w io.Writer, m *Manifest) error {
-	header := *m
-	header.Objects = nil
-	if err := json.NewEncoder(w).Encode(&header); err != nil {
-		return fmt.Errorf("manifest: encode header: %w", err)
-	}
-	return nil
-}
-
-// EncodeNDJSONObject writes one ObjRef as a single NDJSON line.
-func EncodeNDJSONObject(w io.Writer, o *ObjRef) error {
-	if err := json.NewEncoder(w).Encode(o); err != nil {
-		return fmt.Errorf("manifest: encode object: %w", err)
-	}
-	return nil
-}
-
 // DecodeNDJSON reads a streaming manifest: it parses the header line and then
 // invokes onObj for each object record without buffering the whole set. The
-// returned Manifest has a nil Objects slice. A nil onObj skips object bodies.
+// returned Manifest has a nil Objects slice. A nil onObj skips object bodies;
+// a non-nil error from onObj aborts the scan and is returned.
 func DecodeNDJSON(r io.Reader, onObj func(ObjRef) error) (*Manifest, error) {
-	return DecodeNDJSONStream(r, nil, onObj)
-}
-
-// DecodeNDJSONStream is the streaming decoder used by catch-up pulls (ADR D4 /
-// P4). It parses the header line, invokes onHeader once (if non-nil) BEFORE any
-// object — so the consumer has the header's BaseURLs/roots before it starts
-// fetching — then invokes onObj for each object record. Neither the header nor
-// the object set is buffered. A non-nil error from onHeader or onObj aborts the
-// scan and is returned to the caller.
-func DecodeNDJSONStream(r io.Reader, onHeader func(*Manifest) error, onObj func(ObjRef) error) (*Manifest, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024) // allow long header lines
 	if !sc.Scan() {
@@ -206,11 +175,6 @@ func DecodeNDJSONStream(r io.Reader, onHeader func(*Manifest) error, onObj func(
 	var m Manifest
 	if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
 		return nil, fmt.Errorf("manifest: decode header: %w", err)
-	}
-	if onHeader != nil {
-		if err := onHeader(&m); err != nil {
-			return nil, err
-		}
 	}
 	for sc.Scan() {
 		line := sc.Bytes()

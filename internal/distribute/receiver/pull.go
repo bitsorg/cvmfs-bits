@@ -15,7 +15,7 @@ import (
 const pullConcurrency = 4
 
 // recordPullMetrics emits the receiver-side pull-distribution metrics for one
-// warming attempt (ADR-0001 monitoring). Safe when metrics are unconfigured.
+// warming attempt. Safe when metrics are unconfigured.
 func (r *Receiver) recordPullMetrics(res puller.Result, err error, dur time.Duration) {
 	if r.cfg.Obs == nil || r.cfg.Obs.Metrics == nil {
 		return
@@ -38,8 +38,8 @@ func (r *Receiver) recordPullMetrics(res puller.Result, err error, dur time.Dura
 	}
 }
 
-// startPull launches a bounded, deduplicated pull for a transaction (ADR-0001
-// pull mode). Concurrent announces for the same transaction are coalesced; when
+// startPull launches a bounded, deduplicated pull for a transaction
+// (pull mode). Concurrent announces for the same transaction are coalesced; when
 // the concurrency limit is reached the announce is dropped — announces are
 // repeated/retained and content addressing makes a dropped warm safe to retry,
 // so dropping is preferable to unbounded resource growth.
@@ -69,21 +69,10 @@ func (r *Receiver) startPull(payloadID, repo string) {
 		if err != nil {
 			r.cfg.Obs.Logger.Warn("pull: transaction failed",
 				"payload_id", payloadID, "repo", repo, "error", err)
-			// Report the failed warm so the publisher does not count this node
-			// toward quorum (it still degrades to a timeout-commit if needed).
-			if r.cfg.OnWarmed != nil {
-				r.cfg.OnWarmed(payloadID, repo, false)
-			}
 			return
 		}
 		r.cfg.Obs.Logger.Info("pull: transaction warmed",
 			"payload_id", payloadID, "repo", repo,
 			"fetched", res.Fetched, "skipped", res.Skipped, "failed", res.Failed)
-		// Ack the warm to the publisher's WarmGate (ADR-0001 D6). A non-nil
-		// Failed count means some objects could not be fetched/verified, so the
-		// node is not warm.
-		if r.cfg.OnWarmed != nil {
-			r.cfg.OnWarmed(payloadID, repo, res.Failed == 0)
-		}
 	}()
 }

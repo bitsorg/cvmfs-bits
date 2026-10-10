@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
-// Command distbench drives the pull-distribution bundling benchmark (ADR-0001
-// P-A). It sweeps a set of simulated round-trip latencies for a fixed object
+// Command distbench drives the pull-distribution bundling benchmark.
+// It sweeps a set of simulated round-trip latencies for a fixed object
 // fan-out and prints, for each, the per-object vs bundled cost and the go/no-go
 // verdict — the evidence for whether to ship object bundling.
 //

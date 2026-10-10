@@ -68,6 +68,11 @@ func TestUnixMode(t *testing.T) {
 		{fs.ModeDir | 0o755, 0o040755},
 		{0o100644, 0o100644},
 		{fs.ModeSymlink | 0o777, 0o120777},
+		{fs.ModeNamedPipe | 0o644, 0o010644},
+		{fs.ModeSocket | 0o755, 0o140755},
+		{fs.ModeDevice | fs.ModeCharDevice | 0o666, 0o020666},
+		{fs.ModeDevice | 0o660, 0o060660},
+		{fs.ModeSetuid | 0o755, 0o104755},
 	}
 
 	for _, tt := range tests {
@@ -88,10 +93,10 @@ func TestEntryFlags(t *testing.T) {
 			name: "regular file",
 			e: Entry{
 				Mode:     0o100644,
-				HashAlgo: HashSha256,
+				HashAlgo: HashRipeMD160,
 				CompAlgo: CompZlib,
 			},
-			want: FlagFile | ((2-1)<<flagHashShift) | (int(CompZlib)<<flagCompShift),
+			want: FlagFile | (1 << flagHashShift) | (int(CompZlib) << flagCompShift),
 		},
 		{
 			name: "directory",
@@ -105,7 +110,7 @@ func TestEntryFlags(t *testing.T) {
 			e: Entry{
 				Mode: fs.ModeSymlink | 0o777,
 			},
-			want: FlagLink,
+			want: FlagFile | FlagLink,
 		},
 		{
 			name: "hidden file",
@@ -187,8 +192,12 @@ func TestHashAlgoFromFlags(t *testing.T) {
 			want:  HashSha1,
 		},
 		{
-			flags: (int(HashSha256) - 1) << flagHashShift,
-			want:  HashSha256,
+			flags: 1 << flagHashShift,
+			want:  HashRipeMD160,
+		},
+		{
+			flags: 2 << flagHashShift,
+			want:  HashShake128,
 		},
 	}
 

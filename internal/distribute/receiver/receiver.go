@@ -1,31 +1,15 @@
 // SPDX-FileCopyrightText: 2026 CERN
 // SPDX-License-Identifier: Apache-2.0
 
-// Package receiver implements the Stratum 1 pre-warming receiver agent.
+// Package receiver implements the Stratum 1 pull receiver agent.
 //
-// The receiver accepts compressed CAS objects pushed by the cvmfs-prepub
-// distributor before the catalog commit, so that Stratum 1 nodes already hold
-// the new objects when the catalog flip occurs and replication becomes
-// catalog-only rather than catalog-plus-objects.
+// The receiver connects outbound to the publisher's MQTT control plane and
+// pulls CAS objects from Stratum 0 into its local CAS: on an announce it fetches
+// the transaction manifest and pulls the missing objects before the catalog
+// flip; on a (retained) published message it fetches the new root catalog.
+// Its only inbound listener is a plain-HTTP /metrics endpoint.
 //
-// It runs two HTTP servers with deliberately different security properties:
-//
-//   - Control channel (HTTPS): handles announce requests authenticated with
-//     HMAC-SHA256.  Protects the shared secret and session tokens.
-//   - Data channel (plain HTTP): handles object PUT requests authenticated with
-//     per-session bearer tokens.  SHA-256 hash verification at the receiver
-//     provides transfer integrity without the CPU overhead of TLS on potentially
-//     gigabytes of already-compressed objects.
-//
-// When BrokerURL is configured the HMAC/HTTP announce path is supplemented (or
-// replaced) by an MQTT control plane: the receiver subscribes to announce
-// topics for its configured repositories, computes the absent set by checking
-// each announced hash directly against its local CAS, and publishes a
-// ReadyMessage carrying its session token and the list of absent hashes — all
-// without any inbound firewall rules (outbound
-// TCP 8883 only).  The data channel (plain HTTP PUT) is unchanged.
-//
-// See REFERENCE.md §20 for the HTTP protocol and §21 for the MQTT control plane.
+// See REFERENCE.md (Pull Distribution Protocol) for the protocol.
 package receiver
 
 import (
@@ -33,7 +17,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -46,107 +29,37 @@ import (
 
 // Config holds the configuration for the receiver agent.
 type Config struct {
-	// ControlAddr is the HTTPS listen address for announce requests.
+	// ControlAddr is the plain-HTTP listen address of the /metrics endpoint.
 	// Defaults to ":9100".
 	ControlAddr string
-
-	// DataAddr is the plain-HTTP listen address for object PUTs.
-	// Defaults to ":9101".
-	DataAddr string
-
-	// DataHost is the publicly reachable hostname or IP of this receiver,
-	// used to construct the data_endpoint URL returned in announce responses.
-	// If empty, the listener's local address is used (suitable for tests).
-	DataHost string
-
-	// TLSCert is the path to the TLS certificate for the control channel.
-	// Required unless DevMode is true.
-	TLSCert string
-
-	// TLSKey is the path to the TLS private key for the control channel.
-	// Required unless DevMode is true.
-	TLSKey string
-
-	// HMACSecret is the shared secret used to verify HMAC-SHA256 signatures on
-	// announce requests.  Must be identical on the sender and all receivers.
-	// Ignored when DevMode is true.
-	HMACSecret string
 
 	// CASRoot is the local CAS root directory where received objects are stored.
 	// Objects are written to {CASRoot}/{hash[0:2]}/{hash}C.
 	CASRoot string
 
-	// SessionTTL controls how long a session remains valid after the announce.
-	// Defaults to 1 hour.
-	SessionTTL time.Duration
-
-	// DiskHeadroom is the multiplier applied to the announced total_bytes when
-	// checking available disk space.  Defaults to 1.2 (20 % margin).
-	DiskHeadroom float64
-
-	// DevMode disables TLS on the control channel and skips HMAC verification.
-	// Never set in production; intended for integration tests only.
-	DevMode bool
-
-	// NodeID is the stable identifier for this receiver node, used in
-	// coordination service registration and heartbeat requests.
-	// Defaults to the system hostname if empty.
+	// NodeID is the stable identifier for this receiver node (MQTT client id
+	// and presence topic). Must be non-empty when BrokerURL is set.
 	NodeID string
 
 	// Repos is the list of CVMFS repository names served by this receiver
-	// (e.g. ["atlas.cern.ch", "cms.cern.ch"]).  Sent during registration so
-	// the coordination service can build the routing table.
+	// (e.g. ["atlas.cern.ch", "cms.cern.ch"]). Empty accepts every repo.
 	Repos []string
 
-	// Stratum0URL is the HTTP base URL of the Stratum 0 server from which new
-	// CAS objects are fetched when a PublishedMessage is received over MQTT.
-	// Must include the /cvmfs path prefix, matching the convention used by the
-	// publisher's Stratum0URL.
-	// Example: "http://stratum0.example.org/cvmfs"
-	// When empty, published-notification-triggered pulls are disabled: the
-	// receiver still subscribes to the published topic and logs notifications,
-	// but takes no action.  This is safe — objects pushed via the bits pipeline
-	// are already present before the commit; the pull is only needed for objects
-	// committed via the native ingest path.
+	// Stratum0URL is the cvmfs-prepub publisher base URL (e.g.
+	// "http://stratum0:8080"). Manifests and bundles are fetched from
+	// {Stratum0URL}/s1/..., post-commit objects from
+	// {Stratum0URL}/cvmfs/{repo}/data/.... Empty disables both pulls.
 	Stratum0URL string
 
-	// BrokerURL is the MQTT broker address (e.g. "tls://broker.cern.ch:8883").
-	// When non-empty the receiver connects to the broker, publishes a retained
-	// presence message, and subscribes to announce topics for the configured
-	// repositories.  This replaces the HTTP coordination service client for
-	// discovery and presence tracking.  The HTTP announce endpoint remains
-	// active for backward compatibility.
-	// Leave empty to disable MQTT (default).
+	// BrokerURL is the MQTT broker address (learned from discovery). When
+	// non-empty the receiver connects, publishes a retained presence message,
+	// and subscribes to the announce and published topics. Empty disables MQTT.
 	BrokerURL string
-
-	// BrokerClientCert is the path to the PEM-encoded client TLS certificate
-	// for authenticating with the MQTT broker.
-	BrokerClientCert string
-
-	// BrokerClientKey is the path to the PEM-encoded client TLS private key.
-	BrokerClientKey string
 
 	// BrokerCACert is the path to the PEM-encoded CA certificate used to
 	// verify the broker's server certificate.  When empty the system pool
 	// is used.
 	BrokerCACert string
-
-	// MaxObjectSize is the maximum body size in bytes accepted for a single
-	// PUT /api/v1/objects/{hash} request.  Requests exceeding this limit are
-	// rejected with HTTP 413 before any bytes are written to disk.
-	// Defaults to 1 GiB (1 << 30).  Set to 0 to use the default.
-	MaxObjectSize int64
-
-	// PullMode enables ADR-0001 pull-based distribution: on a prepare announce
-	// the receiver fetches the transaction manifest and pulls the objects it is
-	// missing, instead of waiting to be pushed to. Default false (legacy push).
-	PullMode bool
-
-	// PullManifestBase is the cvmfs-prepub base URL the receiver fetches
-	// manifests from in pull mode (the manifest for a transaction is at
-	// PullManifestBase + "/s1/{txn}/manifest"). Object locations come from the
-	// manifest's own BaseURLs.
-	PullManifestBase string
 
 	// PullConcurrency bounds parallel object transfers / bundle requests in pull
 	// mode (0 = default 16).
@@ -158,14 +71,6 @@ type Config struct {
 	// PullFilesPerRequest from a latency-class table when they are left unset.
 	PullAuto bool
 
-	// OnWarmed, when set, is invoked exactly once after each pull-mode warming
-	// attempt completes (ADR-0001 D6). warmed is true only when every missing
-	// object was fetched and verified, i.e. the receiver is warm for txn; the
-	// publisher routes a true result into its WarmGate quorum. It MUST NOT block
-	// (it runs on the pull goroutine); the broker publish it typically performs
-	// is fire-and-forget. A nil hook disables the ack (pre-broker / tests).
-	OnWarmed func(payloadID, repo string, warmed bool)
-
 	// BrokerCredentialsProvider, when set, supplies the MQTT username/password
 	// (node id + a freshly-enrolled bearer token) on each broker (re)connect for
 	// the token control plane; nil leaves the connection unauthenticated.
@@ -175,40 +80,7 @@ type Config struct {
 	Obs *observe.Provider
 }
 
-// dataEndpoint returns the base URL of the plain-HTTP data channel as announced
-// to senders in announce responses.
-func (c *Config) dataEndpoint() string {
-	host := c.DataHost
-	if host == "" {
-		host = "localhost"
-	}
-	_, port, _ := net.SplitHostPort(c.DataAddr)
-	if port == "" {
-		port = "9101"
-	}
-	return fmt.Sprintf("http://%s:%s", host, port)
-}
-
-// controlEndpoint returns the base URL of the HTTPS control channel for this
-// receiver, used when registering with the coordination service so that the
-// service can route announce requests to the node.
-func (c *Config) controlEndpoint() string {
-	host := c.DataHost // DataHost is the public hostname; same for both channels
-	if host == "" {
-		host = "localhost"
-	}
-	_, port, _ := net.SplitHostPort(c.ControlAddr)
-	if port == "" {
-		port = "9100"
-	}
-	scheme := "https"
-	if c.DevMode {
-		scheme = "http"
-	}
-	return fmt.Sprintf("%s://%s:%s", scheme, host, port)
-}
-
-// Receiver runs the two-channel pre-warming server.
+// Receiver runs the pull receiver agent.
 type Receiver struct {
 	cfg          Config
 	casStore     cas.Backend        // local CAS used to compute the absent-hash set
@@ -232,8 +104,7 @@ type Receiver struct {
 	// Key: repo name string.  Value: *sync.Mutex.
 	s0PullMu sync.Map
 
-	// pullCoordinator drives ADR-0001 pull-based warming; non-nil only when
-	// cfg.PullMode is set.
+	// pullCoordinator drives all pulls; nil when Stratum0URL is empty.
 	pullCoordinator *puller.Coordinator
 	// pullSem bounds concurrent pull goroutines; pullInflight coalesces
 	// concurrent pulls of the same transaction. Both used only in pull mode.
@@ -247,17 +118,13 @@ func New(cfg Config) (*Receiver, error) {
 	if cfg.CASRoot == "" {
 		return nil, fmt.Errorf("receiver: CASRoot must not be empty")
 	}
-	// HMACSecret is required unless DevMode disables HMAC verification.
-	// TLS cert/key are only required at Start time when actually binding a server;
-	// they are not checked here so that unit tests can call handlers directly.
-	if !cfg.DevMode && cfg.HMACSecret == "" {
-		return nil, fmt.Errorf("receiver: HMACSecret must not be empty (set DevMode to skip HMAC)")
-	}
 	if cfg.ControlAddr == "" {
 		cfg.ControlAddr = ":9100"
 	}
-	if cfg.DataAddr == "" {
-		cfg.DataAddr = ":9101"
+	for _, repo := range cfg.Repos {
+		if err := broker.ValidateRepo(repo); err != nil {
+			return nil, fmt.Errorf("receiver: %w", err)
+		}
 	}
 
 	// Build the local CAS backend used to answer "do I already hold this hash?"
@@ -275,19 +142,32 @@ func New(cfg Config) (*Receiver, error) {
 		bgCancel: bgCancel,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute, // generous for large CAS objects
+			// A dedicated transport sized for the pull worker pool. The nil
+			// default (http.DefaultTransport) keeps only 2 idle connections
+			// per host, so with N concurrent per-object fetches against the
+			// single S0 host every connection beyond 2 was closed after one
+			// response — a TIME_WAIT flood that exhausted ephemeral ports on
+			// large builds ("dial tcp: cannot assign requested address",
+			// thousands of failed objects per pull transaction).
+			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConns:        128,
+				MaxIdleConnsPerHost: 128, // >= max pull concurrency
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
 	}
 
-	// Pull mode (ADR-0001): build the coordinator that fetches manifests and
-	// pulls missing objects into the local CAS on announce.
-	if cfg.PullMode {
+	// Build the coordinator that fetches manifests and pulls missing objects
+	// into the local CAS (announce and published paths).
+	if cfg.Stratum0URL != "" {
 		store := casStore
 		// Resolve transfer tuning: explicit flags win; --pull-auto fills any unset
 		// knob from a measured-RTT latency class; otherwise sensible defaults.
 		n := cfg.PullConcurrency
 		k := cfg.PullFilesPerRequest
 		if cfg.PullAuto && (n == 0 || k == 0) {
-			rtt := probeRTT(bgCtx, r.httpClient, cfg.PullManifestBase)
+			rtt := probeRTT(bgCtx, r.httpClient, cfg.Stratum0URL)
 			an, ak := autoTune(rtt)
 			if n == 0 {
 				n = an
@@ -309,13 +189,12 @@ func New(cfg Config) (*Receiver, error) {
 			mode = "chunked-bundle"
 		}
 		r.pullCoordinator = &puller.Coordinator{
-			ManifestBase: cfg.PullManifestBase,
-			BundleBase:   cfg.PullManifestBase,
+			ManifestBase: cfg.Stratum0URL,
+			BundleBase:   cfg.Stratum0URL,
 			Client:       r.httpClient,
 			Puller: &puller.Puller{
 				Store:           store,
 				Fetcher:         &puller.HTTPFetcher{Client: r.httpClient},
-				State:           puller.NewState(filepath.Join(cfg.CASRoot, ".bits-state")),
 				Slots:           n,
 				FilesPerRequest: k,
 				Client:          r.httpClient,
@@ -350,13 +229,14 @@ func New(cfg Config) (*Receiver, error) {
 // It returns as soon as both listeners are bound; actual request handling
 // continues in background goroutines.  Call Shutdown to stop the servers.
 func (r *Receiver) Start() error {
-	// Remove any ".tmp" files left under the CAS by object fetches that were
-	// interrupted by a previous crash, so they are not mistaken for objects.
+	// Remove CAS temp files left by Puts interrupted in a previous run. The
+	// cutoff is taken before MQTT starts, so no pull of this run is affected.
 	// bgCtx lets Shutdown() interrupt the sweep promptly on a stalling filesystem.
+	cutoff := time.Now()
 	go func() {
-		if err := sweepTmpFiles(r.bgCtx, r.cfg.CASRoot, r.cfg.Obs.Logger.Info); err != nil &&
+		if err := sweepTmpFiles(r.bgCtx, r.cfg.CASRoot, cutoff, r.cfg.Obs.Logger.Info); err != nil &&
 			err != context.Canceled {
-			r.cfg.Obs.Logger.Warn("receiver: .tmp sweep failed", "error", err)
+			r.cfg.Obs.Logger.Warn("receiver: temp-file sweep failed", "error", err)
 		}
 	}()
 

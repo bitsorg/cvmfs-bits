@@ -7,6 +7,8 @@ package spool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,10 +38,10 @@ type Spool struct {
 // from reading sensitive job metadata (lease tokens, manifests). Returns an error
 // if the root directory cannot be created.
 func New(root string, obs *observe.Provider) (*Spool, error) {
-	// Fix #12: Spool directories are 0700 — job metadata (including lease tokens)
+	// Spool directories are 0700 — job metadata (including lease tokens)
 	// must not be readable by other local users.
 	// Directories are listed in FSM order: lease is now acquired after distribution.
-	for _, dir := range []string{".", "incoming", "staging", "uploading", "distributing", "leased", "committing", "published", "failed", "aborted"} {
+	for _, dir := range []string{".", "incoming", "staging", "uploading", "distributing", "leased", "committing", "accumulated", "published", "failed", "aborted"} {
 		path := filepath.Join(root, dir)
 		if err := os.MkdirAll(path, 0700); err != nil {
 			return nil, fmt.Errorf("creating spool directory %q: %w", path, err)
@@ -171,6 +173,16 @@ func (s *Spool) Transition(ctx context.Context, j *job.Job, to job.State) error 
 	// Record metric
 	s.obs.Metrics.SpoolTransitions.WithLabelValues(string(entry.From), string(entry.To)).Inc()
 
+	// Nothing reads a terminal or accumulated (coarse member) job's payload
+	// again, and keeping every one fills the spool. A failure's cause is in
+	// the manifest, the log and the measurements.
+	if job.IsTerminal(to) {
+		tar := filepath.Join(newDir, "payload.tar")
+		if rmErr := os.Remove(tar); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			s.obs.Logger.Warn("cannot remove published payload", "job_id", j.ID, "path", tar, "error", rmErr)
+		}
+	}
+
 	return nil
 }
 
@@ -223,8 +235,8 @@ func (s *Spool) Scan(ctx context.Context) ([]*job.Job, error) {
 // WriteManifest durably persists job metadata to manifest.json in the job directory.
 //
 // Durability: Uses write-to-temp-then-atomic-rename with fsync of the parent directory
-// (Fix #6) to ensure a crash mid-write never leaves a partial or zero-byte manifest.
-// The manifest is written with mode 0600 (Fix #12) so other local users cannot
+// to ensure a crash mid-write never leaves a partial or zero-byte manifest.
+// The manifest is written with mode 0600 so other local users cannot
 // read sensitive data like lease tokens.
 func (s *Spool) WriteManifest(j *job.Job) error {
 	jobDir := s.JobDir(j)
@@ -237,12 +249,18 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 		return fmt.Errorf("marshaling manifest: %w", err)
 	}
 
-	manifestPath := filepath.Join(jobDir, "manifest.json")
-	tmpPath := manifestPath + ".tmp"
+	return s.writeFileAtomic(jobDir, "manifest.json", data)
+}
+
+// writeFileAtomic writes dir/name (mode 0600) via a synced temp file and an
+// atomic rename, so a crash never leaves a partial file, then fsyncs dir.
+func (s *Spool) writeFileAtomic(dir, name string, data []byte) error {
+	path := filepath.Join(dir, name)
+	tmpPath := path + ".tmp"
 
 	// Write to a sibling temp file first.
 	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
-		return fmt.Errorf("writing manifest temp file: %w", err)
+		return fmt.Errorf("writing %s temp file: %w", name, err)
 	}
 
 	// Sync the temp file before renaming so the data is durable on crash.
@@ -252,36 +270,80 @@ func (s *Spool) WriteManifest(j *job.Job) error {
 	f, err := os.OpenFile(tmpPath, os.O_RDWR, 0)
 	if err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("opening manifest temp for sync: %w", err)
+		return fmt.Errorf("opening %s temp for sync: %w", name, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return fmt.Errorf("syncing manifest temp: %w", err)
+		return fmt.Errorf("syncing %s temp: %w", name, err)
 	}
 	f.Close()
 
-	// Atomic rename — the manifest is either the old version or the new one,
+	// Atomic rename — the file is either the old version or the new one,
 	// never a partial write.
-	if err := os.Rename(tmpPath, manifestPath); err != nil {
+	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("renaming manifest: %w", err)
+		return fmt.Errorf("renaming %s: %w", name, err)
 	}
 
-	// Fix #6: fsync the parent directory so the directory entry for the
+	// Fsync the parent directory so the directory entry for the
 	// renamed file is durable.  Without this a crash between the rename and
 	// the next sync could leave the directory pointing at the old inode.
 	// Best-effort: data was already written; a sync failure here does not
 	// corrupt it, but we log it so hardware I/O errors are not silent.
-	if dir, err := os.Open(jobDir); err == nil {
-		if syncErr := dir.Sync(); syncErr != nil {
-			s.obs.Logger.Warn("fsync parent directory after manifest rename failed",
-				"path", jobDir, "error", syncErr)
+	if d, err := os.Open(dir); err == nil {
+		if syncErr := d.Sync(); syncErr != nil {
+			s.obs.Logger.Warn("fsync parent directory after rename failed",
+				"path", dir, "error", syncErr)
 		}
-		dir.Close()
+		d.Close()
 	}
 
 	return nil
+}
+
+// ProvenanceRecordFile is the sidecar, beside manifest.json, holding the
+// exact signed provenance record. It lives in the job directory, so it moves
+// with the job through every state rename.
+const ProvenanceRecordFile = "provenance-record.json"
+
+// WriteProvenanceRecord stores the exact signed provenance record in the
+// job's sidecar and points j.Provenance at it by name and SHA-256, keeping
+// the (possibly large) record out of the manifest. The caller persists the
+// manifest.
+func (s *Spool) WriteProvenanceRecord(j *job.Job, signed []byte) error {
+	if j.Provenance == nil {
+		return fmt.Errorf("job %s has no provenance", j.ID)
+	}
+	if err := s.writeFileAtomic(s.JobDir(j), ProvenanceRecordFile, signed); err != nil {
+		return err
+	}
+	sum := sha256.Sum256(signed)
+	j.Provenance.SignedRecordFile = ProvenanceRecordFile
+	j.Provenance.SignedRecordSHA256 = hex.EncodeToString(sum[:])
+	return nil
+}
+
+// ReadProvenanceRecord returns the job's signed provenance record from its
+// sidecar, checked against the manifest's SHA-256. It returns nil, nil when
+// the job has none.
+func (s *Spool) ReadProvenanceRecord(j *job.Job) ([]byte, error) {
+	p := j.Provenance
+	if p == nil || p.SignedRecordFile == "" {
+		return nil, nil
+	}
+	if filepath.Base(p.SignedRecordFile) != p.SignedRecordFile {
+		return nil, fmt.Errorf("job %s: bad provenance record file name %q", j.ID, p.SignedRecordFile)
+	}
+	data, err := os.ReadFile(filepath.Join(s.JobDir(j), p.SignedRecordFile))
+	if err != nil {
+		return nil, fmt.Errorf("reading provenance record: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != p.SignedRecordSHA256 {
+		return nil, fmt.Errorf("job %s: provenance record does not match its SHA-256", j.ID)
+	}
+	return data, nil
 }
 
 // findJobDir returns the actual on-disk directory for a job, regardless of
@@ -324,7 +386,14 @@ func (s *Spool) findJobDir(id string, hintState job.State) string {
 // ResetForRecovery increments RecoveryCount, clears the lease token and error message,
 // and moves the job directory back to incoming. The caller is responsible for releasing
 // any stale gateway lease before invoking this method.
-func (s *Spool) ResetForRecovery(j *job.Job) error {
+// ResetForRecovery returns a job to StateIncoming so it can be re-processed.
+//
+// countAttempt distinguishes the two reasons a job is found mid-flight at
+// startup. After a crash it is true: the job may be what killed the service, so
+// the attempt counts towards MaxRecoveries and a poisonous job is eventually
+// failed rather than crash-looping. After a clean shutdown it is false — the
+// job was interrupted by an operator, which says nothing about the job.
+func (s *Spool) ResetForRecovery(j *job.Job, countAttempt bool) error {
 	if job.IsTerminal(j.State) {
 		return fmt.Errorf("cannot reset terminal job %s in state %s", j.ID, j.State)
 	}
@@ -339,7 +408,34 @@ func (s *Spool) ResetForRecovery(j *job.Job) error {
 		return fmt.Errorf("resetting job for recovery: cannot find on-disk directory for job %s (state=%s)", j.ID, j.State)
 	}
 
-	j.RecoveryCount++
+	if countAttempt {
+		j.RecoveryCount++
+	} else {
+		j.InterruptCount++
+	}
+	if err := s.moveToIncoming(j, oldDir); err != nil {
+		return err
+	}
+	s.obs.Metrics.JobsRecovered.Inc()
+	return nil
+}
+
+// Requeue puts a job that failed a retryable attempt back in incoming, with
+// its recovery counters untouched: a retry is not a crash or an interruption.
+func (s *Spool) Requeue(j *job.Job) error {
+	if job.IsTerminal(j.State) {
+		return fmt.Errorf("cannot requeue terminal job %s in state %s", j.ID, j.State)
+	}
+	oldDir := s.findJobDir(j.ID, j.State)
+	if oldDir == "" {
+		return fmt.Errorf("requeueing job: cannot find on-disk directory for job %s (state=%s)", j.ID, j.State)
+	}
+	return s.moveToIncoming(j, oldDir)
+}
+
+// moveToIncoming moves the job directory at oldDir to incoming and rewrites
+// its manifest there.
+func (s *Spool) moveToIncoming(j *job.Job, oldDir string) error {
 	j.State = job.StateIncoming
 	j.LeaseToken = ""
 	j.Error = ""
@@ -359,12 +455,10 @@ func (s *Spool) ResetForRecovery(j *job.Job) error {
 		}
 	}
 
-	// Rewrite the manifest with the updated state and recovery count.
+	// Rewrite the manifest with the updated state and counters.
 	if err := s.WriteManifest(j); err != nil {
 		return fmt.Errorf("writing recovery manifest: %w", err)
 	}
-
-	s.obs.Metrics.JobsRecovered.Inc()
 	return nil
 }
 
@@ -397,6 +491,7 @@ func (s *Spool) FindJob(id string) (*job.Job, error) {
 		job.StateLeased,
 		job.StateCommitting,
 		// terminal
+		job.StateAccumulated,
 		job.StatePublished,
 		job.StateFailed,
 		job.StateAborted,
@@ -430,6 +525,7 @@ func (s *Spool) ReadJobJournal(jobID string) ([]Entry, error) {
 		job.StateDistributing,
 		job.StateLeased,
 		job.StateCommitting,
+		job.StateAccumulated,
 		job.StatePublished,
 		job.StateFailed,
 		job.StateAborted,
@@ -512,4 +608,42 @@ func (s *Spool) IncomingBySize(ctx context.Context) ([]*job.Job, error) {
 // or directory already exists.  os.IsExist does not unwrap, so we check both.
 func isErrExist(err error) bool {
 	return os.IsExist(err) || errors.Is(err, os.ErrExist)
+}
+
+// ── Clean-shutdown marker ────────────────────────────────────────────────────
+//
+// The spool cannot otherwise tell "the service was restarted under this job"
+// from "this job killed the service", and the two deserve opposite treatment: a
+// crash-looping job must eventually be failed, while an operator restart must
+// cost a job nothing. A marker written on the way out, and consumed once on the
+// way in, is enough to distinguish them.
+//
+// It is written at the very END of a graceful shutdown, so a crash partway
+// through leaves no marker and the conservative (counted) path is taken.
+
+// cleanShutdownMarker is the sentinel file name in the spool root.
+const cleanShutdownMarker = ".clean-shutdown"
+
+// MarkCleanShutdown records that the service is exiting on purpose.
+func (s *Spool) MarkCleanShutdown() error {
+	path := filepath.Join(s.Root, cleanShutdownMarker)
+	return os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
+}
+
+// TakeCleanShutdown reports whether the previous exit was graceful, and clears
+// the marker so it is honoured exactly once. A crash after this point is a
+// crash, and the jobs it interrupts are counted.
+func (s *Spool) TakeCleanShutdown() bool {
+	path := filepath.Join(s.Root, cleanShutdownMarker)
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	if err := os.Remove(path); err != nil {
+		// Could not clear it: refuse the free pass rather than grant it on
+		// every restart forever.
+		s.obs.Logger.Warn("cannot clear the clean-shutdown marker; treating this start as a crash",
+			"path", path, "error", err)
+		return false
+	}
+	return true
 }

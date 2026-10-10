@@ -10,8 +10,21 @@
 # ACTION (default: install):
 #   install      Install cvmfs-prepub binaries, config, spool, and systemd
 #                units.  Detects legacy bits-console spool services and offers
-#                to clean them up.
-#   uninstall    Remove a cvmfs-prepub installation from this host.
+#                to clean them up.  On a first install (config written from the
+#                template) the units are enabled but NOT started: configure
+#                them, then start them.
+#   update       Upgrade an EXISTING installation in place: replaces the
+#                binaries (and any systemd unit whose content changed, backing
+#                up the previous one first) while PRESERVING config.yaml (only
+#                prewarm changes, with --prewarm/--no-prewarm), env secrets,
+#                receiver.yaml, TLS material, spool and CAS.  Services
+#                are stopped for the swap and restarted only if they were
+#                running.  Fails if the host is not already installed.  Removes
+#                a leftover prepubctl from older installs.  Without --mode it
+#                updates the roles whose units are installed, and never adds
+#                a unit for a role that is not installed.
+#   uninstall    Remove a cvmfs-prepub installation from this host.  Without
+#                --mode it removes the roles whose units are installed.
 #
 # ── INSTALL OPTIONS ────────────────────────────────────────────────────────────
 #   --mode MODE         Role to install on this host:
@@ -29,14 +42,52 @@
 #                       flag the script warns and prompts interactively.
 #   --legacy-spool DIR  Path to legacy spool root (default: /mnt/build/bits/spool)
 #
+# ── INSTALL / UPDATE OPTIONS ───────────────────────────────────────────────────
+#   --user NAME         Run the services as NAME. Default: the user an installed
+#                       unit already runs as (drop-ins included), else the
+#                       publisher's repository owner (CVMFS_USER in
+#                       /etc/cvmfs/repositories.d/<repo>/server.conf or in
+#                       cas.server_conf), else the
+#                       cvmfs-prepub system account, created if missing. Any
+#                       other account (e.g. the repository owner) must exist;
+#                       it is added to the cvmfs-prepub group, which keeps read
+#                       access to the config and credential files.
+#   --spool-dir DIR     Spool root. Default: spool_root from an existing
+#                       config.yaml, else /var/spool/cvmfs-prepub. A symlink is
+#                       resolved: the units name the real directory.
+#   --prewarm           Publisher: make Stratum 1 pre-warming available
+#                       (prewarm: true in config.yaml). Builds still opt in per
+#                       job. Off unless given; also needs the broker flags of
+#                       INSTALL.md section 7 on ExecStart.
+#   --no-prewarm        Publisher: turn it off again (prewarm: false).
+#                       Without either option the setting is left as it is.
+#   --s3-conf-from FILE Publisher with cas.type s3: the repository's S3 config
+#                       that prepub's own (the file cas.server_conf names) is
+#                       written from: its CVMFS_S3_* lines plus a tuning block
+#                       that is kept. Default: the source recorded in that file,
+#                       else /etc/cvmfs/keys/<repo>.s3.conf. root:cvmfs-prepub 0640.
+#   --mounted           Publisher with ingest_publish: register the repository
+#                       as a mounted gateway publisher instead of a mountless
+#                       one. Only matters when it is not registered yet; the
+#                       gateway key /etc/cvmfs/keys/<repo>.gw must be in place.
+#
 # ── UNINSTALL OPTIONS ──────────────────────────────────────────────────────────
 #   --mode MODE         What to uninstall:
-#                         publisher  (default)
+#                         publisher
 #                         receiver
 #                         all
+#                       Default: the roles whose units are installed (both →
+#                       all); with no unit installed, --mode is required.
+#                       The shared binary, /etc/cvmfs-prepub and the service
+#                       account stay while the other role's unit is installed;
+#                       only this role's unit, config file and CAS go then.
 #   --keep-spool        Preserve /var/spool/cvmfs-prepub (job history + WAL).
-#   --keep-cas          Preserve the local CAS data directory.
-#   --keep-user         Preserve the cvmfs-prepub system account.
+#   --purge-cas         Also delete the CAS data directory (cas.root).  The CAS
+#                       is kept by default: for a local-filesystem publisher it
+#                       is the live repository store.  (--keep-cas is accepted
+#                       for compatibility and does nothing.)
+#   --keep-user         Preserve the cvmfs-prepub system account. An account
+#                       given with --user is never removed.
 #
 # ── COMMON OPTIONS ─────────────────────────────────────────────────────────────
 #   --dry-run           Print every action that would be taken; make no changes.
@@ -56,14 +107,20 @@
 #   # Preview install — no changes made
 #   sudo ./install.sh --dry-run
 #
-#   # Remove publisher (keep job history and CAS objects)
-#   sudo ./install.sh uninstall --keep-spool --keep-cas
+#   # Upgrade binaries after a rebuild, keeping all configuration
+#   sudo ./install.sh update
+#
+#   # Preview exactly what an upgrade would change
+#   sudo ./install.sh update --dry-run
+#
+#   # Remove publisher (keep job history; the CAS is always kept by default)
+#   sudo ./install.sh uninstall --keep-spool
 #
 #   # Remove receiver on a Stratum-1 node
 #   sudo ./install.sh uninstall --mode receiver
 #
-#   # Full removal without prompts (automation / CI)
-#   sudo ./install.sh uninstall --mode all --yes
+#   # Full removal, CAS included, without prompts (automation / CI)
+#   sudo ./install.sh uninstall --mode all --purge-cas --yes
 
 set -euo pipefail
 
@@ -73,11 +130,18 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # cvmfs-prepub install targets
 readonly BINARY_DIR="/usr/local/bin"
+# No longer shipped: update and uninstall remove a copy left by older installs.
+readonly OLD_PREPUBCTL="${BINARY_DIR}/prepubctl"
 readonly CONFIG_DIR="/etc/cvmfs-prepub"
-readonly SPOOL_DIR="/var/spool/cvmfs-prepub"
+# CVMFS server configuration (repositories, keys); overridable for tests only.
+CVMFS_ETC="${CVMFS_ETC:-/etc/cvmfs}"
+readonly DEFAULT_SPOOL_DIR="/var/spool/cvmfs-prepub"
 readonly DEFAULT_CAS_PUB="/srv/cvmfs/cas"
 readonly DEFAULT_CAS_RCV="/srv/cvmfs/stratum1/cas"
-readonly SERVICE_USER="cvmfs-prepub"
+readonly DEFAULT_USER="cvmfs-prepub"
+# Group that may read the config and credential files (config dir, env,
+# /etc/cvmfs/keys/<repo>.s3.conf): the service user is always a member.
+readonly ACCESS_GROUP="cvmfs-prepub"
 readonly SVC_PUB="cvmfs-prepub"
 readonly SVC_RCV="cvmfs-prepub-receiver"
 readonly UNIT_DIR="/etc/systemd/system"
@@ -92,6 +156,7 @@ readonly LEGACY_SPOOL_DEFAULT="/mnt/build/bits/spool"
 # ── defaults ──────────────────────────────────────────────────────────────────
 ACTION="install"
 MODE="publisher"
+MODE_SET=false   # --mode given; update/uninstall otherwise detect the roles
 DRY_RUN=false
 YES=false
 
@@ -100,11 +165,25 @@ BIN_DIR="${SCRIPT_DIR}/bin"
 SKIP_SERVICE=false
 PURGE_LEGACY=false
 LEGACY_SPOOL_DIR="$LEGACY_SPOOL_DEFAULT"
+# Set when this run wrote config.yaml / receiver.yaml from the template: such a
+# unit is enabled but not started (it would fail on the unconfigured template).
+FRESH_PUB=false
+FRESH_RCV=false
+STARTED=()   # units started (and seen active) by this install
+
+# install/update: resolved after argument parsing (see "service identity")
+SERVICE_USER=""
+SERVICE_GROUP=""
+SPOOL_DIR=""
+PREWARM=""   # "", true or false: --prewarm / --no-prewarm
+S3_CONF_FROM=""   # --s3-conf-from: the repository's S3 config to copy from
+GW_MOUNTED=false  # --mounted: register a mounted (not mountless) gateway publisher
 
 # uninstall-specific
 KEEP_SPOOL=false
-KEEP_CAS=false
+PURGE_CAS=false    # the CAS is kept unless --purge-cas
 KEEP_USER=false
+KEEP_SHARED=false  # set by do_uninstall: the other role still uses shared files
 
 # ── counters ──────────────────────────────────────────────────────────────────
 DONE=0
@@ -251,24 +330,64 @@ ensure_dir() {
     run "Set mode $path → $mode"       chmod "$mode"  "$path"
 }
 
-# read_cas_root CFG DEFAULT — extract cas.root from a YAML config file.
-read_cas_root() {
-    local cfg="$1" default="$2"
-    if [ ! -f "$cfg" ]; then echo "$default"; return; fi
-    local val
-    val=$(awk '/^cas[[:space:]]*:/{in_cas=1; next}
-               in_cas && /^[^ ]/{in_cas=0}
-               in_cas && /root[[:space:]]*:/{
-                   sub(/.*root[[:space:]]*:[[:space:]]*/,""); print; exit
-               }' "$cfg" 2>/dev/null || true)
+# yaml_scalar — strip a trailing comment and surrounding quotes from stdin.
+yaml_scalar() {
+    sed 's/[[:space:]]#.*//; s/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//'
+}
+
+# in_group USER GROUP — exact membership test ("cvmfs" must not match
+# "cvmfs-prepub", which grep -w would: "-" is not a word character).
+in_group() {
+    id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$2"
+}
+
+# read_yaml_key CFG SECTION KEY DEFAULT — value of KEY under the top-level
+# SECTION of a YAML file (SECTION "" for a top-level key); DEFAULT if unset.
+read_yaml_key() {
+    local cfg="$1" section="$2" key="$3" default="$4" val=""
+    if [ -f "$cfg" ]; then
+        val=$(awk -v s="$section" -v k="$key" '
+            s == "" && $0 ~ "^" k "[[:space:]]*:" {
+                sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
+            s != "" && $0 ~ "^" s "[[:space:]]*:" { in_s = 1; next }
+            in_s && /^[^[:space:]#]/ { in_s = 0 }
+            in_s && $0 ~ "^[[:space:]]+" k "[[:space:]]*:" {
+                sub(/^[^:]*:[[:space:]]*/, ""); print; exit }
+        ' "$cfg" 2>/dev/null | yaml_scalar || true)
+    fi
     echo "${val:-$default}"
+}
+
+# read_cas_root CFG DEFAULT — extract cas.root from a YAML config file.
+read_cas_root() { read_yaml_key "$1" cas root "$2"; }
+
+# local_url ADDR — http://host:port to reach listen address ADDR from this
+# host (":8080" and wildcard hosts become localhost).
+local_url() {
+    local host="${1%:*}" port="${1##*:}"
+    case "$host" in ""|0.0.0.0|"[::]") host=localhost ;; esac
+    echo "http://${host}:${port}"
+}
+
+# Probe URLs from the installed configs (defaults match the binary's flags).
+pub_listen()      { read_yaml_key "${CONFIG_DIR}/config.yaml" server listen ":8080"; }
+pub_health_url()  { echo "$(local_url "$(pub_listen)")/api/v1/health"; }
+rcv_metrics_url() {
+    echo "$(local_url "$(read_yaml_key "${CONFIG_DIR}/receiver.yaml" "" control_addr ":9100")")/metrics"
+}
+
+# remove_old_prepubctl — drop a prepubctl left by an older install, if any.
+remove_old_prepubctl() {
+    if [ -e "$OLD_PREPUBCTL" ] || [ -L "$OLD_PREPUBCTL" ]; then
+        remove_file "$OLD_PREPUBCTL" "obsolete ${OLD_PREPUBCTL} (no longer shipped)"
+    fi
 }
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 # Consume optional positional action (install / uninstall) first.
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        install|uninstall) ACTION="$1"; shift ;;
+        install|update|uninstall) ACTION="$1"; shift ;;
     esac
 fi
 
@@ -276,20 +395,29 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)         DRY_RUN=true ;;
         --yes|-y)          YES=true ;;
-        --mode)            shift; MODE="${1:-}" ;;
+        --mode)            shift; MODE="${1:-}"; MODE_SET=true ;;
         # install options
         --bin-dir)         shift; BIN_DIR="${1:-}" ;;
         --skip-service)    SKIP_SERVICE=true ;;
         --purge-legacy)    PURGE_LEGACY=true ;;
         --legacy-spool)    shift; LEGACY_SPOOL_DIR="${1:-}" ;;
+        --user)            shift; SERVICE_USER="${1:-}" ;;
+        --spool-dir)       shift; SPOOL_DIR="${1:-}" ;;
+        --prewarm)         PREWARM=true ;;
+        --no-prewarm)      PREWARM=false ;;
+        --mounted)         GW_MOUNTED=true ;;
+        --s3-conf-from)    shift; S3_CONF_FROM="${1:-}"
+                           [ -n "$S3_CONF_FROM" ] || die "--s3-conf-from needs a file" ;;
         # uninstall options
         --keep-spool)      KEEP_SPOOL=true ;;
-        --keep-cas)        KEEP_CAS=true ;;
+        --purge-cas)       PURGE_CAS=true ;;
+        --keep-cas)        ;;  # the default now; accepted for compatibility
         --keep-user)       KEEP_USER=true ;;
         --help|-h)         usage ;;
         # allow bare --uninstall / --install as synonyms
         --uninstall)       ACTION="uninstall" ;;
         --install)         ACTION="install" ;;
+        --update)          ACTION="update" ;;
         *) die "Unknown option: '$1'.  Run '${PROG} --help' for usage." ;;
     esac
     shift
@@ -299,6 +427,26 @@ case "$MODE" in
     publisher|receiver|all) ;;
     *) die "Unknown --mode '$MODE'.  Valid values: publisher, receiver, all." ;;
 esac
+
+# installed_mode -- the role(s) whose unit files are installed: all, publisher,
+# receiver, or "" for none.
+installed_mode() {
+    local pub=false rcv=false
+    [ -f "${UNIT_DIR}/${SVC_PUB}.service" ] && pub=true
+    [ -f "${UNIT_DIR}/${SVC_RCV}.service" ] && rcv=true
+    if $pub && $rcv; then echo all
+    elif $pub; then echo publisher
+    elif $rcv; then echo receiver
+    fi
+}
+
+# update and uninstall act on what is installed unless --mode says otherwise:
+# defaulting to publisher would skip a receiver-only host's unit (update) or
+# remove the wrong role (uninstall).
+if ! $MODE_SET && [[ "$ACTION" == "update" || "$ACTION" == "uninstall" ]]; then
+    MODE="$(installed_mode)"
+    [ -n "$MODE" ] || die "No cvmfs-prepub unit found in ${UNIT_DIR} — cannot tell which role to ${ACTION}.  Pass --mode publisher|receiver|all."
+fi
 
 # ── privilege check ───────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || die "This script must be run as root.  Try: sudo $PROG $*"
@@ -359,7 +507,7 @@ install_prereq_check() {
     header "Prerequisites"
     local missing=0
 
-    for bin in cvmfs-prepub prepubctl; do
+    for bin in cvmfs-prepub; do
         local path="${BIN_DIR}/${bin}"
         if [ -f "$path" ] && [ -x "$path" ]; then
             ok "Binary found: $path"
@@ -390,6 +538,8 @@ install_account() {
     header "Service Account"
     if id "$SERVICE_USER" &>/dev/null 2>&1; then
         skip "Account '${SERVICE_USER}' — already exists"
+    elif [[ "$SERVICE_USER" != "$DEFAULT_USER" ]]; then
+        die "Account '${SERVICE_USER}' (--user) does not exist — create it first."
     else
         run "Create system account '${SERVICE_USER}'" \
             useradd -r -s /sbin/nologin \
@@ -397,9 +547,21 @@ install_account() {
                     -c "cvmfs-prepub service" \
                     "$SERVICE_USER"
     fi
+    # A service user of its own (--user) joins the access group, so the
+    # root:cvmfs-prepub config and credential files stay readable to it.
+    if [[ "$SERVICE_USER" != "$ACCESS_GROUP" ]]; then
+        getent group "$ACCESS_GROUP" &>/dev/null ||
+            run "Create group '${ACCESS_GROUP}'" groupadd -r "$ACCESS_GROUP"
+        if in_group "$SERVICE_USER" "$ACCESS_GROUP"; then
+            skip "Account '${SERVICE_USER}' already in group '${ACCESS_GROUP}'"
+        else
+            run "Add '${SERVICE_USER}' to group '${ACCESS_GROUP}' (config and credentials)" \
+                usermod -aG "$ACCESS_GROUP" "$SERVICE_USER"
+        fi
+    fi
     # For local publish mode: add to cvmfs group so cvmfs_server can be called
     if getent group cvmfs &>/dev/null; then
-        if id -nG "$SERVICE_USER" 2>/dev/null | grep -qw "cvmfs"; then
+        if in_group "$SERVICE_USER" cvmfs; then
             skip "Account '${SERVICE_USER}' already in group 'cvmfs'"
         else
             run "Add '${SERVICE_USER}' to group 'cvmfs' (required for local publish mode)" \
@@ -416,17 +578,21 @@ install_dirs() {
 
     case "$MODE" in
         publisher|all)
-            ensure_dir "$SPOOL_DIR"   "${SERVICE_USER}:${SERVICE_USER}" "0700"
-            ensure_dir "$CONFIG_DIR"  "root:${SERVICE_USER}"            "0750"
-            ensure_dir "${CONFIG_DIR}/tls" "root:${SERVICE_USER}"       "0750"
-            ensure_dir "$DEFAULT_CAS_PUB" "${SERVICE_USER}:${SERVICE_USER}" "0750"
+            ensure_dir "$SPOOL_DIR"   "${SERVICE_USER}:${SERVICE_GROUP}" "0700"
+            # Temporaries live on the spool volume, never on /tmp: catalog
+            # downloads and finalize work dirs are far larger than a typical
+            # /tmp, which under systemd PrivateTmp may even be RAM-backed.
+            ensure_dir "${SPOOL_DIR}/tmp" "${SERVICE_USER}:${SERVICE_GROUP}" "0700"
+            ensure_dir "$CONFIG_DIR"  "root:${ACCESS_GROUP}"            "0750"
+            ensure_dir "${CONFIG_DIR}/tls" "root:${ACCESS_GROUP}"       "0750"
+            ensure_dir "$CAS_PUB"     "${SERVICE_USER}:${SERVICE_GROUP}" "0750"
             ;;
     esac
     case "$MODE" in
         receiver|all)
-            ensure_dir "$CONFIG_DIR"  "root:${SERVICE_USER}"            "0750"
-            ensure_dir "${CONFIG_DIR}/tls" "root:${SERVICE_USER}"       "0750"
-            ensure_dir "$DEFAULT_CAS_RCV" "${SERVICE_USER}:${SERVICE_USER}" "0750"
+            ensure_dir "$CONFIG_DIR"  "root:${ACCESS_GROUP}"            "0750"
+            ensure_dir "${CONFIG_DIR}/tls" "root:${ACCESS_GROUP}"       "0750"
+            ensure_dir "$CAS_RCV"     "${SERVICE_USER}:${SERVICE_GROUP}" "0750"
             ;;
     esac
 }
@@ -434,7 +600,7 @@ install_dirs() {
 # install_binaries -- copy pre-built binaries to BINARY_DIR.
 install_binaries() {
     header "Binaries"
-    for bin in cvmfs-prepub prepubctl; do
+    for bin in cvmfs-prepub; do
         local src="${BIN_DIR}/${bin}"
         local dst="${BINARY_DIR}/${bin}"
         run "Install ${bin} → ${dst}" install -m 755 "$src" "$dst"
@@ -442,25 +608,19 @@ install_binaries() {
 }
 
 # install_config_template -- write a starter config if none is present.
-install_config_template() {
-    header "Configuration"
-
-    # Publisher config
-    if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
-        local cfg="${CONFIG_DIR}/config.yaml"
-        if [ -f "$cfg" ]; then
-            skip "${cfg} — already exists (not overwritten)"
-        elif $DRY_RUN; then
-            dry "Write config template → ${cfg}"
-        else
-            cat > "$cfg" <<'EOF'
+# write_config_template_to -- render the CURRENT publisher config template to
+# path $1. Shared by install (writes it when absent) and update (renders to a
+# temp file purely to DIFF against the live config — update never writes it).
+write_config_template_to() {
+    cat > "$1" <<'CFGEOF'
 # /etc/cvmfs-prepub/config.yaml  — generated by install.sh
-# Edit before starting the service.  See INSTALL.md §4 for the full reference.
+# Edit before starting the service.  See REFERENCE.md §3 (Publisher configuration).
+# Every key is optional; an absent key keeps the flag default.
 
 server:
   listen: ":8080"
-  # tls_cert: /etc/cvmfs-prepub/tls/server.crt
-  # tls_key:  /etc/cvmfs-prepub/tls/server.key
+  # auth_mode: both          # bearer | both | hmac
+  # debug_listen: 127.0.0.1:6060
 
 spool_root: /var/spool/cvmfs-prepub
 
@@ -472,37 +632,77 @@ spool_root: /var/spool/cvmfs-prepub
 # cvmfs_mount: /cvmfs
 
 # ── Gateway (only used when publish_mode != local) ────────────────────────────
+# Key id and secret come from CVMFS_GATEWAY_KEY_ID / CVMFS_GATEWAY_SECRET in
+# /etc/cvmfs-prepub/env.
 gateway:
   url: http://localhost:4929
-  key_id: prepub-key-001
-  key_secret_env: CVMFS_GATEWAY_SECRET   # set in /etc/cvmfs-prepub/env
-  lease_ttl: 120s
-  heartbeat_interval: 40s
+  # direct_graft: true       # false forces the DiffRec commit path
+  # allow_plaintext: false   # permit a non-loopback http:// gateway URL
 
-# ── Stratum 0 HTTP endpoint (for manifest fetch and catalog download) ──────────
-# Required for the direct catalog merge (pkg/cvmfscatalog).
-# Use the public HTTP URL of the Stratum 0 CAS — NOT the gateway port (4929).
-stratum0_url: http://localhost:8000   # e.g. http://stratum0.example.org
+# ── Stratum 0 HTTP endpoint (catalog download for the merge) ──────────────────
+# The public HTTP URL of the repositories, including /cvmfs — NOT the gateway
+# port (4929).
+stratum0_url: http://localhost/cvmfs   # e.g. http://stratum0.example.org/cvmfs
+# repo_name: your-repo.example.org
 
 # ── CAS backend ───────────────────────────────────────────────────────────────
 cas:
   type: localfs
   root: /srv/cvmfs/cas
-  # type: s3
-  # bucket: cvmfs-cas-primary
-  # region: us-east-1
+  # type: s3                 # bucket/credentials: install.sh --s3-conf-from (INSTALL.md step 2)
+  # server_conf: /etc/cvmfs-prepub/your-repo.example.org.s3.server.conf
 
 pipeline:
-  workers: 0            # 0 = runtime.NumCPU()
-  compression: zlib
-  upload_concurrency: 16
+  # Keep these matched to MemoryMax in the unit file: peak RSS scales with
+  # workers x largest-file.
+  workers: 2            # unset/0 keeps the built-in default (4)
+  upload_concurrency: 4
 
-repositories:
-  - name: your-repo.example.org   # replace with your CVMFS repository name
-    gc:
-      enabled: false
+# ── Stratum 1 pre-warming ─────────────────────────────────────────────────────
+# Off by default. true makes it available; each build still asks for it.
+# Set with install.sh --prewarm / --no-prewarm. Also needs the broker flags of
+# INSTALL.md section 7 on ExecStart.
+# prewarm: false
+CFGEOF
+    sed -i "s|^spool_root: .*|spool_root: ${SPOOL_DIR}|" "$1"
+}
+
+# write_receiver_template_to -- render the CURRENT receiver config template to
+# path $1 (install writes it when absent; update only diffs against it).
+write_receiver_template_to() {
+    cat > "$1" <<'EOF'
+# /etc/cvmfs-prepub/receiver.yaml  — generated by install.sh
+# Edit before starting the receiver service.
+# Discovery/broker settings (--discovery-url, --discovery-verify-key,
+# --broker-auth) have no config keys: add them to the unit's ExecStart.
+
+control_addr: ":9100"        # plain-HTTP /metrics listener
+# node_id: stratum1-a        # default: hostname
+repos:
+  - your-repo.example.org
+receiver_stratum0_url: http://stratum0.example.org:8080   # cvmfs-prepub base URL
+# broker_ca_cert: /etc/cvmfs-prepub/tls/ca.crt
+
+cas:
+  root: /srv/cvmfs/stratum1/cas
 EOF
-            chown "root:${SERVICE_USER}" "$cfg"
+}
+
+install_config_template() {
+    header "Configuration"
+
+    # Publisher config
+    if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
+        local cfg="${CONFIG_DIR}/config.yaml"
+        if [ -f "$cfg" ]; then
+            skip "${cfg} — already exists (not overwritten)"
+        elif $DRY_RUN; then
+            dry "Write config template → ${cfg}"
+            FRESH_PUB=true
+        else
+            write_config_template_to "$cfg"
+            FRESH_PUB=true
+            chown "root:${ACCESS_GROUP}" "$cfg"
             chmod 0640 "$cfg"
             ok "Config template written: ${cfg}"
         fi
@@ -515,21 +715,11 @@ EOF
             skip "${rcfg} — already exists (not overwritten)"
         elif $DRY_RUN; then
             dry "Write receiver config template → ${rcfg}"
+            FRESH_RCV=true
         else
-            cat > "$rcfg" <<'EOF'
-# /etc/cvmfs-prepub/receiver.yaml  — generated by install.sh
-# Edit before starting the receiver service.
-
-server:
-  listen: ":9100"
-  tls_cert: /etc/cvmfs-prepub/tls/server.crt
-  tls_key:  /etc/cvmfs-prepub/tls/server.key
-
-cas:
-  type: localfs
-  root: /srv/cvmfs/stratum1/cas
-EOF
-            chown "root:${SERVICE_USER}" "$rcfg"
+            FRESH_RCV=true
+            write_receiver_template_to "$rcfg"
+            chown "root:${ACCESS_GROUP}" "$rcfg"
             chmod 0640 "$rcfg"
             ok "Receiver config template written: ${rcfg}"
         fi
@@ -542,31 +732,449 @@ EOF
     elif $DRY_RUN; then
         dry "Write secrets env skeleton → ${env_file}"
     else
-        cat > "$env_file" <<'EOF'
-# /etc/cvmfs-prepub/env — sourced by systemd EnvironmentFile=
-# Mode 0600; owned by root or cvmfs-prepub.
-# NEVER commit this file to version control.
-
-# Gateway secret (gateway publish mode only)
-# CVMFS_GATEWAY_SECRET=
-
-# API bearer token (clients authenticate with Authorization: Bearer <token>)
-# PREPUB_API_TOKEN=
-
-# S3 credentials (S3 CAS backend only)
-# AWS_ACCESS_KEY_ID=
-# AWS_SECRET_ACCESS_KEY=
-
-# Override gateway key_id at runtime (optional; value in config.yaml takes precedence)
-# CVMFS_GATEWAY_KEY_ID=
-EOF
-        chown "root:${SERVICE_USER}" "$env_file"
+        write_env_skeleton_to "$env_file"
+        chown "root:${ACCESS_GROUP}" "$env_file"
         chmod 0600 "$env_file"
         ok "Secrets env skeleton written: ${env_file}"
     fi
 }
 
+# set_s3_conf -- write prepub's own S3 config: the file cas.server_conf names.
+#
+# One file is both the server.conf prepub's S3 store reads (its
+# CVMFS_UPSTREAM_STORAGE names the file itself) and the S3 config prepub hands
+# to the direct-S3 ingest (--s3-config), so both upload paths use the same
+# credentials and tuning and nothing depends on a file at a default path. The
+# CVMFS_S3_* lines are copied from the source (--s3-conf-from, else the source
+# recorded in the file) on every install/update; tuning keys after the marker
+# are kept. It holds the S3 secret: root:${ACCESS_GROUP} 0640, written through a
+# mktemp file (0600) so it is never readable by others.
+S3_TUNING_MARK="# -- prepub tuning: install.sh keeps the lines below on update --"
+S3_SOURCE_TAG="# source: "
+# Only these may be tuned below the marker: everything else (endpoint, bucket,
+# credentials, ACL, the upstream line) comes from the source, so a stale or
+# planted line there can neither outlive a key rotation nor redirect uploads.
+S3_TUNING_KEYS="CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS CVMFS_S3_TIMEOUT CVMFS_S3_MAX_RETRIES CVMFS_S3_PEEK_BEFORE_PUT"
+set_s3_conf() {
+    local cfg="${CONFIG_DIR}/config.yaml" dst repo src="$S3_CONF_FROM"
+    if [[ "$MODE" != "publisher" && "$MODE" != "all" ]]; then
+        [ -n "$src" ] && warn "--s3-conf-from only applies to the publisher — ignored"
+        return 0
+    fi
+    if [ "$(read_yaml_key "$cfg" cas type "")" != "s3" ]; then
+        [ -n "$src" ] && err "S3 config not written: --s3-conf-from needs cas.type: s3 in ${cfg}"
+        return 0
+    fi
+    dst=$(read_yaml_key "$cfg" cas server_conf "")
+    repo=$(read_yaml_key "$cfg" "" repo_name "")
+    if [ -z "$src" ]; then
+        # Without the option: the source recorded by an earlier run, else the
+        # repository's S3 config at its conventional place; nothing when
+        # neither exists (the operator has not set this up).
+        # A symlink was put there on purpose: leave it to --s3-conf-from.
+        [ -n "$dst" ] && [ -f "$dst" ] && [ ! -L "$dst" ] || return 0
+        src=$(sed -n "s|^${S3_SOURCE_TAG}||p" "$dst" | head -1 | tr -d '\r')
+        if [ -z "$src" ]; then
+            # The S3 config the copied server.conf names (...@<file>), when it
+            # is on this host, else the conventional place.
+            local named c
+            named=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_UPSTREAM_STORAGE=.*@//p' "$dst" | tail -1 | tr -d "\"'\r")
+            for c in "$named" ${repo:+"${CVMFS_ETC}/keys/${repo}.s3.conf"}; do
+                if [ -n "$c" ] && [ -r "$c" ] && [ "$(realpath -m -- "$c")" != "$(realpath -m -- "$dst")" ]; then
+                    src="$c"
+                    break
+                fi
+            done
+            [ -n "$src" ] || return 0
+        fi
+    fi
+    [ -n "$repo" ] || { err "S3 config not written: repo_name is not set in ${cfg}"; return 0; }
+    [ -n "$dst" ] || { err "S3 config not written: set cas.server_conf in ${cfg} (e.g. ${CONFIG_DIR}/${repo}.s3.server.conf)"; return 0; }
+    # Lexically canonical and directly under CONFIG_DIR: no "..", no "//".
+    if [ "$(realpath -ms -- "$dst")" != "$dst" ]; then
+        err "S3 config not written: cas.server_conf (${dst}) is not a canonical absolute path"; return 0
+    fi
+    case "$dst" in
+        "${CONFIG_DIR}"/*) ;;
+        *) err "S3 config not written: cas.server_conf (${dst}) is outside ${CONFIG_DIR}"; return 0 ;;
+    esac
+    src=$(realpath -m -- "$src")
+    if [ "$src" = "$(realpath -m -- "$dst")" ]; then
+        err "S3 config not written: the source is cas.server_conf itself — name the repository's S3 config"; return 0
+    fi
+    if [ ! -r "$src" ] || ! grep -qE '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_HOST=' "$src"; then
+        err "S3 config not written: ${src} is not readable or has no CVMFS_S3_HOST"; return 0
+    fi
+    if grep -qF -- "$S3_TUNING_MARK" "$src"; then
+        err "S3 config not written: ${src} is a prepub S3 config, not the repository's"; return 0
+    fi
+
+    # The alias (the object key prefix in the bucket) and temp dir come from the
+    # CVMFS_UPSTREAM_STORAGE already there, above the marker: the S3 server.conf
+    # copied from the gateway host, or a file written here before. Never guessed —
+    # a wrong alias publishes catalogs whose objects no client finds.
+    local alias="" tmpdir="/var/spool/cvmfs/${repo}/tmp" up="" f1 f2 f3
+    if [ -f "$dst" ]; then
+        up=$(awk -v m="$S3_TUNING_MARK" '{ sub(/\r$/, "") } $0 == m { exit } { print }' "$dst" \
+             | sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_UPSTREAM_STORAGE=//p' | tail -1 | tr -d "\"'")
+    fi
+    if [ -n "$up" ]; then
+        IFS=, read -r f1 f2 f3 <<<"$up"
+        [ -n "$f3" ] && tmpdir="$f2"
+        up="${up##*,}"
+        [[ "$up" == *@* ]] && alias="${up%%@*}"
+    fi
+    local owner=""
+    if [ -f "$dst" ]; then
+        owner=$(awk -v m="$S3_TUNING_MARK" '{ sub(/\r$/, "") } $0 == m { exit } { print }' "$dst" \
+                | sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_USER=["'"'"']?([A-Za-z0-9._-]+).*/\2/p' | tail -1)
+    fi
+    if [ -z "$alias" ]; then
+        err "S3 config not written: no S3 alias in ${dst} — copy the repository's S3 server.conf (CVMFS_UPSTREAM_STORAGE=S3,...,<alias>@...) there first"
+        return 0
+    fi
+
+    # Tuning kept from a file written here before (allowed keys and comments
+    # only); the default otherwise.
+    local tuning="CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=64" dropped=""
+    if [ -f "$dst" ] && [ ! -L "$dst" ] && tr -d '\r' < "$dst" | grep -qxF -- "$S3_TUNING_MARK"; then
+        local kept="" line key
+        while IFS= read -r line; do
+            line="${line%$'\r'}"
+            key=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z0-9_]+)=.*/\2/p' <<<"$line")
+            if [ -z "$key" ] || [[ " ${S3_TUNING_KEYS} " == *" ${key} "* ]]; then
+                kept+="${line}"$'\n'
+            else
+                dropped+=" ${key}"
+            fi
+        done < <(awk -v m="$S3_TUNING_MARK" '{ sub(/\r$/, "") } found { print } $0 == m { found = 1 }' "$dst")
+        tuning="${kept%$'\n'}"
+    fi
+    [ -n "$dropped" ] && warn "dropped from the tuning block of ${dst} (not tunable here):${dropped}"
+
+    if $DRY_RUN; then
+        dry "Write ${dst} from ${src} (alias ${alias})"
+        return 0
+    fi
+    # A file not written here (a copied server.conf) is kept once, for reference,
+    # with the same protection as the new one in case it held a secret.
+    if [ -f "$dst" ] && [ ! -L "$dst" ] && ! grep -qF -- "$S3_TUNING_MARK" "$dst" && [ ! -e "${dst}.orig" ]; then
+        run "Keep the previous ${dst} as ${dst}.orig" install -o root -g "$ACCESS_GROUP" -m 0640 "$dst" "${dst}.orig"
+    fi
+    local tmp
+    tmp=$(mktemp "${dst}.XXXXXX") || { err "cannot create a temporary file next to ${dst}"; return 0; }
+    if {
+        echo "# cvmfs-prepub S3 settings for ${repo}, written by install.sh. prepub's S3 store"
+        echo "# reads it (CVMFS_UPSTREAM_STORAGE names this file) and the direct-S3 ingest gets"
+        echo "# it as --s3-config. The CVMFS_S3_* lines are copied from the source on every"
+        echo "# install/update; below the tuning marker only these are kept: ${S3_TUNING_KEYS}."
+        echo "${S3_SOURCE_TAG}${src}"
+        echo "CVMFS_UPSTREAM_STORAGE=S3,${tmpdir},${alias}@${dst}"
+        # The repository owner, kept for repo_service_user (prepub ignores it).
+        [ -z "$owner" ] || echo "CVMFS_USER=${owner}"
+        grep -E '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_' "$src" \
+            | grep -vE '^[[:space:]]*(export[[:space:]]+)?CVMFS_S3_REPO_ALIAS=' | tr -d '\r'
+        # The direct-S3 ingest writes objects under this prefix; without it, under
+        # the repository name, which the bucket does not serve when they differ.
+        echo "CVMFS_S3_REPO_ALIAS=${alias}"
+        echo "$S3_TUNING_MARK"
+        [ -z "$tuning" ] || printf '%s\n' "$tuning"
+    } > "$tmp" && chown "root:${ACCESS_GROUP}" "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$dst"; then
+        ok "S3 config ${dst} written from ${src} (root:${ACCESS_GROUP} 0640)"
+    else
+        rm -f "$tmp"
+        err "could not write ${dst}"
+        return 0
+    fi
+
+    local rconf="${CVMFS_ETC}/repositories.d/${repo}/server.conf"
+    if [ -f "$rconf" ] && grep -q '^[[:space:]]*CVMFS_INGEST_DIRECT_S3_CONFIG=' "$rconf"; then
+        warn "${rconf} sets CVMFS_INGEST_DIRECT_S3_CONFIG; prepub passes --s3-config, which overrides it — remove the line"
+    fi
+    if [ "$ACTION" = "install" ] && svc_active "$SVC_PUB"; then
+        warn "${SVC_PUB} is running: restart it to apply (systemctl restart ${SVC_PUB})"
+    fi
+}
+
+# repo_service_user -- the repository owner named in /etc/cvmfs (CVMFS_USER of
+# the repository's own server.conf, else of the S3 server.conf copied from the
+# gateway host to cas.server_conf), so a publisher runs as the account that may
+# publish without --user. Empty when neither names one.
+repo_service_user() {
+    local cfg="${CONFIG_DIR}/config.yaml" repo f u
+    repo=$(config_repo)
+    [ -n "$repo" ] || return 0
+    for f in "${CVMFS_ETC}/repositories.d/${repo}/server.conf" "$(read_yaml_key "$cfg" cas server_conf "")"; do
+        [ -n "$f" ] && [ -f "$f" ] || continue
+        u=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CVMFS_USER=["'"'"']?([A-Za-z0-9._-]+).*/\2/p' "$f" | tail -1)
+        [ -n "$u" ] || continue
+        # A service with an HTTP API never runs as root, and a name from a
+        # gateway-host copy may not exist here: fall back to the default.
+        if ! id -u "$u" &>/dev/null; then
+            warn "CVMFS_USER ${u} (${f}) has no account on this host — not used as the service user" >&2
+        elif [ "$(id -u "$u")" = 0 ]; then
+            warn "CVMFS_USER ${u} (${f}) is root — not used as the service user" >&2
+        else
+            echo "$u"
+        fi
+        return 0
+    done
+}
+
+# config_repo -- repo_name from config.yaml when it is a valid repository name
+# (it ends up in paths and commands run as root), else empty.
+config_repo() {
+    local repo
+    repo=$(read_yaml_key "${CONFIG_DIR}/config.yaml" "" repo_name "")
+    [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && echo "$repo"
+    return 0
+}
+
+# connect_gw -- register this host as a gateway publisher of repo_name, once:
+# `cvmfs_server connect-gw` with the gateway, Stratum 0 and owner from the
+# configuration, mountless (-P) unless --mounted. Runs only for the ingest path
+# in gateway mode; a repository already registered here is left as it is. The
+# gateway key (/etc/cvmfs/keys/<repo>.gw) is a secret and is never fetched:
+# copy it from the old publisher or the gateway first. The repository's .pub
+# and .crt come from the gateway (-K).
+connect_gw() {
+    [[ "$MODE" == "publisher" || "$MODE" == "all" ]] || return 0
+    local cfg="${CONFIG_DIR}/config.yaml" repo gw s0 rconf key up
+    [ -f "$cfg" ] || return 0
+    [ "$(read_yaml_key "$cfg" "" ingest_publish "")" = "true" ] || return 0
+    [ "$(read_yaml_key "$cfg" "" publish_mode gateway)" = "gateway" ] || return 0
+    repo=$(config_repo)
+    [ -n "$repo" ] || { warn "Gateway registration skipped: repo_name in ${cfg} is not set or not a repository name"; return 0; }
+    rconf="${CVMFS_ETC}/repositories.d/${repo}/server.conf"
+    if [ -f "$rconf" ]; then
+        up=$(sed -nE 's/^[[:space:]]*CVMFS_UPSTREAM_STORAGE=//p' "$rconf" | tail -1 | tr -d "\"'")
+        case "$up" in
+            gw,*) skip "${repo} already registered on this host (${up##*,})" ;;
+            *)    warn "${repo} is set up on this host but not as a gateway publisher (${up:-no upstream}) — not changed" ;;
+        esac
+        return 0
+    fi
+    gw=$(read_yaml_key "$cfg" gateway url ""); gw="${gw%/}"; gw="${gw%/api/v1}"
+    s0=$(read_yaml_key "$cfg" "" stratum0_url ""); s0="${s0%/}"
+    if [ -z "$gw" ] || [ -z "$s0" ]; then
+        err "Gateway registration of ${repo} skipped: gateway.url and stratum0_url must be set in ${cfg}"
+        return 0
+    fi
+    key="${CVMFS_ETC}/keys/${repo}.gw"
+    if [ ! -f "$key" ]; then
+        warn "Gateway registration of ${repo} skipped: ${key} is missing — copy the gateway key"
+        warn "  (plain_text <key_id> <secret>, root:${SERVICE_GROUP} 0640) from the old publisher, then re-run update"
+        return 0
+    fi
+    local args=(connect-gw -K -u "${gw}/api/v1" -w "${s0}/${repo}" -o "$SERVICE_USER" "$repo")
+    $GW_MOUNTED || args=(connect-gw -P "${args[@]:1}")
+    command -v cvmfs_server &>/dev/null || { err "Gateway registration of ${repo}: cvmfs_server is not installed"; return 0; }
+    if $DRY_RUN; then
+        dry "cvmfs_server ${args[*]}"
+        return 0
+    fi
+    local out
+    if out=$(cvmfs_server "${args[@]}" </dev/null 2>&1); then
+        ok "Registered ${repo} with ${gw} ($($GW_MOUNTED && echo mounted || echo mountless), owner ${SERVICE_USER})"
+        $GW_MOUNTED || info "Mountless: the gateway must create parent directories (CVMFS_GW_MKDIR_PARENTS=true in its server.conf for ${repo})"
+    else
+        err "cvmfs_server ${args[*]} failed:"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/       /' >&2
+        # mkfs writes the repository's server.conf early, so a later failure
+        # leaves a half registration that the next run would take as done.
+        [ -f "$rconf" ] && warn "  partly registered: remove it (cvmfs_server rmfs -f ${repo}), fix the cause, re-run update"
+    fi
+}
+
+# selinux_restore -- reset the SELinux labels of everything this installation
+# uses. Files copied or moved from elsewhere (a home directory, /tmp, another
+# host) keep a label systemd may not read: "Failed to load environment files:
+# Permission denied" with an AVC denial for init_t.
+selinux_restore() {
+    command -v selinuxenabled &>/dev/null && selinuxenabled || return 0
+    command -v restorecon &>/dev/null || return 0
+    local repo p paths=() top=()
+    repo=$(config_repo)
+    for p in "$CONFIG_DIR" "${BINARY_DIR}/cvmfs-prepub" "${BINARY_DIR}/cvmfs-prepub-receiver" \
+             "${UNIT_DIR}/${SVC_PUB}.service" "${UNIT_DIR}/${SVC_PUB}.service.d" \
+             "${UNIT_DIR}/${SVC_RCV}.service" "${UNIT_DIR}/${SVC_RCV}.service.d" \
+             "${CVMFS_ETC}/keys" ${repo:+"${CVMFS_ETC}/repositories.d/${repo}"}; do
+        [ -e "$p" ] && paths+=("$p")
+    done
+    # The spool only at its top: its job files inherit the label, and walking
+    # them would lengthen every update's downtime.
+    for p in "$SPOOL_DIR" "${SPOOL_DIR}/tmp"; do [ -e "$p" ] && top+=("$p"); done
+    if $DRY_RUN; then
+        dry "restorecon -R ${paths[*]}; restorecon ${top[*]}"
+        return 0
+    fi
+    local out
+    if out=$( { [ ${#paths[@]} -eq 0 ] || restorecon -R "${paths[@]}"; } 2>&1 &&
+              { [ ${#top[@]} -eq 0 ] || restorecon "${top[@]}"; } 2>&1 ); then
+        ok "SELinux labels restored ($(( ${#paths[@]} + ${#top[@]} )) paths)"
+    else
+        warn "restorecon reported a problem (labels may be unchanged): $(printf '%s' "$out" | tail -2)"
+    fi
+}
+
+# set_prewarm -- write prewarm: true|false into the publisher's config.yaml when
+# --prewarm or --no-prewarm was given. Pre-warming is opt-in: without either the
+# key is left untouched (absent means off).
+set_prewarm() {
+    [ -n "$PREWARM" ] || return 0
+    if [[ "$MODE" != "publisher" && "$MODE" != "all" ]]; then
+        warn "--prewarm/--no-prewarm only apply to the publisher — ignored"
+        return 0
+    fi
+    local cfg="${CONFIG_DIR}/config.yaml"
+    if $DRY_RUN; then
+        dry "Set prewarm: ${PREWARM} in ${cfg}"
+        return 0
+    fi
+    [ -f "$cfg" ] || { err "${cfg} not found — prewarm not set"; return 0; }
+    # One top-level key only (yaml.v3 refuses a duplicate): replace the live
+    # line, else the template's commented one, else append.
+    if grep -qE '^prewarm:' "$cfg"; then
+        sed -i -E "s|^prewarm:.*|prewarm: ${PREWARM}|" "$cfg"
+    elif grep -qE '^# *prewarm:' "$cfg"; then
+        sed -i -E "0,/^# *prewarm:.*/s//prewarm: ${PREWARM}/" "$cfg"
+    else
+        printf '\nprewarm: %s\n' "$PREWARM" >> "$cfg"
+    fi
+    ok "prewarm: ${PREWARM} in ${cfg}"
+    # install only starts a stopped unit; update restarts a running one itself.
+    if [ "$ACTION" = "install" ] && svc_active "$SVC_PUB"; then
+        warn "${SVC_PUB} is running: restart it to apply (systemctl restart ${SVC_PUB})"
+    fi
+}
+
+# write_env_skeleton_to FILE -- secrets env skeleton with the variables of the
+# roles being installed (both roles share the file in --mode all).
+write_env_skeleton_to() {
+    local f="$1"
+    cat > "$f" <<'EOF'
+# /etc/cvmfs-prepub/env — sourced by systemd EnvironmentFile=
+# Mode 0600, owner root, group cvmfs-prepub: only root can read it; systemd
+# loads it as root before starting the service as its own user.
+# NEVER commit this file to version control.
+EOF
+    if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
+        cat >> "$f" <<'EOF'
+
+# ── Publisher (cvmfs-prepub) ──────────────────────────────────────────────────
+# Gateway secret (gateway publish mode only)
+# CVMFS_GATEWAY_SECRET=
+
+# Shared secret for the publish API. Used as a bearer token, or as the HMAC
+# key for signed requests, depending on server.auth_mode:
+#   bearer — the token travels on every request
+#   both   — either is accepted (default; use while publishers migrate)
+#   hmac   — signed requests only, so the token stops travelling
+# After switching to hmac, ROTATE this value once: until then it was on the wire.
+# PREPUB_API_TOKEN=
+
+# Gateway key id (gateway publish mode only; default cvmfs-prepub)
+# CVMFS_GATEWAY_KEY_ID=
+EOF
+    fi
+    if [[ "$MODE" == "receiver" || "$MODE" == "all" ]]; then
+        cat >> "$f" <<'EOF'
+
+# ── Receiver (cvmfs-prepub-receiver) ──────────────────────────────────────────
+# Per-node broker enrollment key (hex); required only with --broker-auth.
+# Generate it ON THE PUBLISHER, which holds the master secret, for this node's
+# node_id (receiver.yaml; default: the hostname):
+#   PREPUB_HMAC_SECRET=<master> cvmfs-prepub node-key <node_id>
+# The receiver never needs the master secret itself.
+# S1_NODE_KEY=
+EOF
+    fi
+}
+
 # install_units -- write systemd unit files.
+# write_units_to -- render the CURRENT unit templates into directory $1 as
+# <name>.service. Single source of truth shared by install (writes them into
+# place) and update (renders to a temp dir to diff against what is installed),
+# so the two can never drift.
+write_units_to() {
+    local dir="$1"
+    # Another primary group than the access group: add it explicitly.
+    local groups="Group=${SERVICE_GROUP}"
+    [[ "$SERVICE_GROUP" != "$ACCESS_GROUP" ]] &&
+        groups+=$'\n'"SupplementaryGroups=${ACCESS_GROUP}"
+
+    if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
+        cat > "${dir}/${SVC_PUB}.service" <<EOF
+[Unit]
+Description=CVMFS Pre-Publisher Service
+After=network.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+${groups}
+ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/config.yaml
+Restart=on-failure
+RestartSec=5s
+# Keep temporaries off /tmp (small, and RAM-backed when PrivateTmp is on).
+# Set BEFORE EnvironmentFile so an operator can still override TMPDIR there;
+# systemd applies these in unit order and the last assignment wins. The service
+# also sets it itself at startup, which covers child processes we exec.
+Environment=TMPDIR=${SPOOL_DIR}/tmp
+EnvironmentFile=${CONFIG_DIR}/env
+# Memory containment. Peak RSS scales with --pipeline-workers x largest-file,
+# because each compress worker holds a whole file plus its compressed chunks.
+# Without a cap the KERNEL picks the OOM victim, and on a host shared with
+# cvmfs_gateway that victim may be the gateway rather than this service.
+# MemoryHigh throttles and reclaims first; MemoryMax is the hard stop.
+# Tune both to the host (these suit an 8 GB node shared with the gateway).
+# IMPORTANT: this cap only holds with a matching pipeline.workers in
+# config.yaml — the generated template sets 2. At the built-in default of 4 the
+# observed peak was 6.7 GB, i.e. above MemoryMax, which turns an occasional
+# kernel OOM into a systemd SIGKILL on every large publish.
+MemoryHigh=2G
+MemoryMax=3G
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+# "-": the CAS directory is optional (a node serving only the ingest path has
+# none); a missing listed path would stop the unit at step NAMESPACE.
+ReadWritePaths=${SPOOL_DIR} -${CAS_PUB}
+# /var/cache/cvmfs-prepub, owned by the service user: the published-catalog
+# cache defaults to it (CACHE_DIRECTORY/catalogs), local disk rather than the
+# spool, which may be a network filesystem.
+CacheDirectory=cvmfs-prepub
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+
+    if [[ "$MODE" == "receiver" || "$MODE" == "all" ]]; then
+        cat > "${dir}/${SVC_RCV}.service" <<EOF
+[Unit]
+Description=CVMFS Pre-Publisher Stratum-1 Receiver
+After=network.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+${groups}
+ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/receiver.yaml --mode receiver
+Restart=on-failure
+RestartSec=5s
+EnvironmentFile=${CONFIG_DIR}/env
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+ReadWritePaths=${CAS_RCV}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+}
+
 install_units() {
     header "Systemd Units"
 
@@ -575,69 +1183,23 @@ install_units() {
         return
     fi
 
-    # Publisher unit
-    if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
-        local pub_unit; pub_unit="$(unit_file "$SVC_PUB")"
-        if $DRY_RUN; then
-            dry "Write unit ${pub_unit}"
-        else
-            cat > "$pub_unit" <<EOF
-[Unit]
-Description=CVMFS Pre-Publisher Service
-After=network.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_USER}
-ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/config.yaml
-Restart=on-failure
-RestartSec=5s
-EnvironmentFile=${CONFIG_DIR}/env
-NoNewPrivileges=true
-ProtectSystem=full
-PrivateTmp=true
-ReadWritePaths=${SPOOL_DIR} ${DEFAULT_CAS_PUB}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            NEED_DAEMON_RELOAD=true
-            ok "Unit written: ${pub_unit}"
-        fi
+    if $DRY_RUN; then
+        [[ "$MODE" == "publisher" || "$MODE" == "all" ]] && dry "Write unit $(unit_file "$SVC_PUB")"
+        [[ "$MODE" == "receiver"  || "$MODE" == "all" ]] && dry "Write unit $(unit_file "$SVC_RCV")"
+        maybe_daemon_reload
+        return
     fi
 
-    # Receiver unit
-    if [[ "$MODE" == "receiver" || "$MODE" == "all" ]]; then
-        local rcv_unit; rcv_unit="$(unit_file "$SVC_RCV")"
-        if $DRY_RUN; then
-            dry "Write unit ${rcv_unit}"
-        else
-            cat > "$rcv_unit" <<EOF
-[Unit]
-Description=CVMFS Pre-Publisher Stratum-1 Receiver
-After=network.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_USER}
-ExecStart=${BINARY_DIR}/cvmfs-prepub --config ${CONFIG_DIR}/receiver.yaml --mode receiver
-Restart=on-failure
-RestartSec=5s
-EnvironmentFile=${CONFIG_DIR}/env
-NoNewPrivileges=true
-ProtectSystem=full
-PrivateTmp=true
-ReadWritePaths=${DEFAULT_CAS_RCV}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            NEED_DAEMON_RELOAD=true
-            ok "Unit written: ${rcv_unit}"
-        fi
-    fi
+    local tmp; tmp="$(mktemp -d)"
+    write_units_to "$tmp"
+    for name in "$SVC_PUB" "$SVC_RCV"; do
+        local src="${tmp}/${name}.service"
+        [ -f "$src" ] || continue
+        install -m 644 "$src" "$(unit_file "$name")"
+        NEED_DAEMON_RELOAD=true
+        ok "Unit written: $(unit_file "$name")"
+    done
+    rm -rf "$tmp"
 
     maybe_daemon_reload
 }
@@ -655,17 +1217,29 @@ enable_start_services() {
 
     header "Service Activation"
 
-    local units=()
-    [[ "$MODE" == "publisher" || "$MODE" == "all" ]] && units+=("${SVC_PUB}.service")
-    [[ "$MODE" == "receiver"  || "$MODE" == "all" ]] && units+=("${SVC_RCV}.service")
+    local names=()
+    [[ "$MODE" == "publisher" || "$MODE" == "all" ]] && names+=("$SVC_PUB")
+    [[ "$MODE" == "receiver"  || "$MODE" == "all" ]] && names+=("$SVC_RCV")
 
-    for unit in "${units[@]}"; do
+    for name in "${names[@]}"; do
+        local unit="${name}.service"
+        local fresh=$FRESH_PUB cfg="${CONFIG_DIR}/config.yaml"
+        if [[ "$name" == "$SVC_RCV" ]]; then
+            fresh=$FRESH_RCV cfg="${CONFIG_DIR}/receiver.yaml"
+        fi
         run "Enable ${unit}" systemctl enable "$unit"
+        # A fresh template is not a working config: starting it only fails.
+        if $fresh; then
+            skip "Start ${unit} — not started: ${cfg} is a new template"
+            info "Configure ${cfg} and ${CONFIG_DIR}/env, then:  systemctl start ${unit}"
+            continue
+        fi
         run "Start ${unit}"  systemctl start  "$unit"
         if ! $DRY_RUN; then
             sleep 1
             if systemctl is-active --quiet "$unit" 2>/dev/null; then
                 ok "${unit} is running"
+                STARTED+=("$name")
             else
                 err "${unit} failed to start — check: journalctl -u ${unit} -n 30"
             fi
@@ -673,10 +1247,15 @@ enable_start_services() {
     done
 }
 
-# install_health_check -- verify the service responds on the health endpoint.
+# install_health_check -- probe each service this run started: the publisher's
+# health endpoint (server.listen) and the receiver's /metrics (control_addr).
 install_health_check() {
     if $SKIP_SERVICE || $DRY_RUN; then
         skip "Health check — skipped"
+        return
+    fi
+    if [ ${#STARTED[@]} -eq 0 ]; then
+        skip "Health check — no service was started"
         return
     fi
     header "Health Check"
@@ -685,14 +1264,277 @@ install_health_check() {
         return
     fi
     sleep 2   # give the service a moment to start
-    local resp rc=0
-    resp=$(curl -sf --max-time 5 http://localhost:8080/api/v1/health 2>/dev/null) || rc=$?
-    if [[ $rc -eq 0 ]]; then
-        ok "Health endpoint responded: $resp"
+    local name url waited up
+    for name in "${STARTED[@]}"; do
+        if [[ "$name" == "$SVC_RCV" ]]; then
+            # The receiver binds /metrics only after discovery succeeds, which
+            # can take up to ~60 s: keep probing, and only warn if still down.
+            url="$(rcv_metrics_url)"
+            up=false
+            info "${name}: waiting up to 60 s for ${url} (bound after discovery)"
+            for waited in $(seq 0 5 60); do
+                if curl -sf --max-time 5 -o /dev/null "$url" 2>/dev/null; then
+                    up=true
+                    break
+                fi
+                if [ "$waited" -lt 60 ]; then sleep 5; fi
+            done
+            if $up; then
+                ok "${name}: ${url} responded"
+            else
+                warn "${name}: ${url} not reachable after 60 s — discovery may still be retrying."
+                warn "Check:  journalctl -u ${name} -n 30   and   curl ${url}"
+            fi
+            continue
+        fi
+        url="$(pub_health_url)"
+        if curl -sf --max-time 5 -o /dev/null "$url" 2>/dev/null; then
+            ok "${name}: ${url} responded"
+        else
+            warn "${name}: ${url} not reachable yet — the service may still be starting."
+            warn "Verify manually:  curl ${url}"
+            ERRS=$((ERRS + 1))
+        fi
+    done
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# UPDATE
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Replace the binaries (and, if they changed, the systemd units) on a host that
+# is ALREADY installed, without touching operator state:
+#
+#   preserved: config.yaml, env (secrets), receiver.yaml, TLS material,
+#              spool, CAS, the service account, and the enabled/disabled +
+#              active/inactive state of every unit
+#   replaced:  cvmfs-prepub and unit files whose content differs
+#              (the previous unit is backed up first)
+#
+# The service is stopped for the binary swap and restarted only if it was
+# running before — an update must never silently start a service the operator
+# had deliberately stopped, nor leave a running publisher down.
+
+# update_prereq_check -- refuse to "update" a host that was never installed,
+# rather than half-installing one.
+update_prereq_check() {
+    header "Prerequisites"
+    local missing=0
+
+    for bin in cvmfs-prepub; do
+        local path="${BIN_DIR}/${bin}"
+        if [ -f "$path" ] && [ -x "$path" ]; then
+            ok "New binary found: $path"
+        else
+            err "Binary not found or not executable: $path"
+            info "Build it first:  make build"
+            missing=$((missing + 1))
+        fi
+    done
+
+    if [ ! -d "$CONFIG_DIR" ]; then
+        err "${CONFIG_DIR} does not exist — this host is not installed"
+        info "Run a full install first:  sudo ${PROG} install --mode ${MODE}"
+        missing=$((missing + 1))
     else
-        warn "Health endpoint not yet reachable on :8080 — the service may still be starting."
-        warn "Verify manually:  curl http://localhost:8080/api/v1/health"
-        ERRS=$((ERRS + 1))
+        ok "Existing installation found: ${CONFIG_DIR}"
+    fi
+
+    [ "$missing" -gt 0 ] && die "Prerequisites not met — nothing was changed."
+    return 0
+}
+
+# binary_version -- best-effort version string for before/after reporting.
+binary_version() {
+    local path="$1"
+    local v=""
+    [ -x "$path" ] || { echo "(absent)"; return; }
+    # Builds older than the --version flag exit with a usage error.
+    v="$(timeout 5 "$path" --version 2>/dev/null | head -1)" || v=""
+    echo "${v:-(unknown)}"
+}
+
+# update_units -- refresh unit files only when their content actually changed,
+# backing up the existing one first. Operators do edit units (ExecStart flags,
+# resource limits); silently overwriting that is how an update loses a
+# production tuning nobody remembers making.
+update_units() {
+    header "Systemd Units"
+    if ! has_systemd; then
+        skip "systemctl not available — skipping unit refresh"
+        return
+    fi
+
+    local tmp; tmp="$(mktemp -d)"
+    # write_units_to writes the CURRENT templates into $1 (same content
+    # install_units would install).
+    write_units_to "$tmp"
+
+    local names=()
+    [[ "$MODE" == "publisher" || "$MODE" == "all" ]] && names+=("$SVC_PUB")
+    [[ "$MODE" == "receiver"  || "$MODE" == "all" ]] && names+=("$SVC_RCV")
+
+    for name in "${names[@]}"; do
+        local new="${tmp}/${name}.service"
+        local cur; cur="$(unit_file "$name")"
+        [ -f "$new" ] || continue
+
+        if [ ! -f "$cur" ]; then
+            # Adding a role is an explicit choice, not a side effect of update.
+            if $MODE_SET; then
+                run "Install missing unit ${cur}" install -m 644 "$new" "$cur"
+                NEED_DAEMON_RELOAD=true
+            else
+                skip "${cur} — not installed (pass --mode to add it)"
+            fi
+        elif cmp -s "$new" "$cur"; then
+            skip "${cur} — unchanged"
+        else
+            local bak="${cur}.bak-$(date +%Y%m%d%H%M%S)"
+            warn "${cur} differs from the shipped template (local edits?)"
+            run "Back up existing unit → ${bak}" cp -p "$cur" "$bak"
+            run "Update unit ${cur}"             install -m 644 "$new" "$cur"
+            NEED_DAEMON_RELOAD=true
+        fi
+    done
+
+    rm -rf "$tmp"
+}
+
+# update_config_report -- never rewrite config; just point out keys the shipped
+# templates have that the live configs lack, so a new release's settings are
+# not silently missed. Only the roles being updated are checked.
+update_config_report() {
+    header "Configuration (preserved)"
+
+    local f
+    for f in "${CONFIG_DIR}/config.yaml" "${CONFIG_DIR}/env" "${CONFIG_DIR}/receiver.yaml"; do
+        if [ "$f" = "${CONFIG_DIR}/config.yaml" ] && [ -n "$PREWARM" ]; then
+            [ -f "$f" ] && ok "config.yaml — preserved; only prewarm is set below"
+        else
+            [ -f "$f" ] && ok "$(basename "$f") — preserved, not modified"
+        fi
+    done
+    if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
+        report_new_keys "${CONFIG_DIR}/config.yaml" write_config_template_to
+    fi
+    if [[ "$MODE" == "receiver" || "$MODE" == "all" ]]; then
+        report_new_keys "${CONFIG_DIR}/receiver.yaml" write_receiver_template_to
+    fi
+}
+
+# report_new_keys CFG WRITER -- warn about top-level keys in the template that
+# WRITER renders which CFG does not set. Top-level keys only: enough to flag a
+# new config section without pretending to be a YAML parser.
+report_new_keys() {
+    local cfg="$1" writer="$2"
+    [ -f "$cfg" ] || { warn "${cfg} is missing"; return; }
+
+    local tmp; tmp="$(mktemp -d)"
+    "$writer" "${tmp}/template.yaml" 2>/dev/null || { rm -rf "$tmp"; return; }
+    local newkeys; newkeys="$(grep -oE '^[a-z0-9_]+:' "${tmp}/template.yaml" 2>/dev/null | sort -u)"
+    local curkeys; curkeys="$(grep -oE '^[a-z0-9_]+:' "$cfg"                  2>/dev/null | sort -u)"
+    local added;   added="$(comm -23 <(echo "$newkeys") <(echo "$curkeys"))"
+    rm -rf "$tmp"
+
+    if [ -n "$added" ]; then
+        warn "This release ships config keys your ${cfg} does not set:"
+        while read -r k; do [ -n "$k" ] && warn "    ${k}"; done <<<"$added"
+        info "They are optional (flag defaults apply); see REFERENCE.md §3."
+    else
+        ok "$(basename "$cfg"): no new top-level config keys in this release"
+    fi
+}
+
+# do_update -- orchestrate the update flow.
+do_update() {
+    if $DRY_RUN; then
+        printf "\n${BOLD}cvmfs-prepub update  [DRY RUN]  mode=%s${RESET}\n" "$MODE"
+        printf "${DIM}No changes will be made.  config.yaml is not modified (only the prewarm key, with --prewarm/--no-prewarm).${RESET}\n"
+    else
+        printf "\n${BOLD}cvmfs-prepub update  mode=%s${RESET}\n" "$MODE"
+        info "Configuration, spool and CAS are preserved; prepub's S3 config is refreshed from its source."
+        confirm "Update cvmfs-prepub binaries on this host?" || { printf "Aborted.\n"; exit 0; }
+    fi
+
+    update_prereq_check
+
+    header "Current Version"
+    info "installed: $(binary_version "${BINARY_DIR}/cvmfs-prepub")"
+    info "new:       $(binary_version "${BIN_DIR}/cvmfs-prepub")"
+
+    # Record what is running/enabled so the same state can be restored.
+    local units=()
+    [[ "$MODE" == "publisher" || "$MODE" == "all" ]] && units+=("$SVC_PUB")
+    [[ "$MODE" == "receiver"  || "$MODE" == "all" ]] && units+=("$SVC_RCV")
+
+    local was_active=()
+    for name in "${units[@]}"; do
+        if svc_active "$name"; then
+            was_active+=("$name")
+            info "${name}: running — will be restarted after the update"
+        else
+            info "${name}: not running — will be left stopped"
+        fi
+    done
+
+    # Stop before swapping binaries: a publisher mid-job would otherwise keep
+    # the old binary mapped while the new one is already on disk, and an
+    # in-flight publish could span two versions.
+    if [ ${#was_active[@]} -gt 0 ]; then
+        header "Stopping Services"
+        for name in "${was_active[@]}"; do
+            run "Stop ${name}" systemctl stop "${name}.service"
+        done
+    fi
+
+    install_account     # idempotent; a --user account joins the access group
+    install_dirs        # idempotent; restores a missing directory
+    install_binaries    # the actual update
+    remove_old_prepubctl
+    update_units
+    update_config_report
+    set_prewarm
+    set_s3_conf
+    connect_gw
+    selinux_restore
+    maybe_daemon_reload
+
+    if [ ${#was_active[@]} -gt 0 ]; then
+        header "Restarting Services"
+        for name in "${was_active[@]}"; do
+            run "Start ${name}" systemctl start "${name}.service"
+        done
+        if ! $DRY_RUN; then
+            sleep 1
+            for name in "${was_active[@]}"; do
+                if svc_active "$name"; then
+                    ok "${name} is running"
+                else
+                    err "${name} failed to start after the update"
+                    info "Inspect:  journalctl -u ${name} -n 50 --no-pager"
+                fi
+            done
+        fi
+    fi
+
+    header "Next Steps"
+    if $DRY_RUN; then
+        info "Re-run without --dry-run to apply the above changes."
+    else
+        if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
+            info "Verify health:   curl $(pub_health_url)"
+            info "Check the log:   journalctl -u ${SVC_PUB} -n 30 --no-pager"
+        fi
+        if [[ "$MODE" == "receiver" || "$MODE" == "all" ]]; then
+            info "Verify metrics:  curl $(rcv_metrics_url)"
+            info "Check the log:   journalctl -u ${SVC_RCV} -n 30 --no-pager"
+        fi
+        if [ -n "$PREWARM" ]; then
+            info "config.yaml: only prewarm was set (${PREWARM})."
+        else
+            info "config.yaml was not modified."
+        fi
     fi
 }
 
@@ -728,7 +1570,7 @@ do_install() {
         else
             warn ""
             warn "Use --purge-legacy to remove them automatically, or run:"
-            warn "  sudo $PROG uninstall    (after cvmfs-prepub is confirmed working)"
+            warn "  sudo $PROG --purge-legacy    (re-run the install; removes only the legacy artifacts)"
             if ! $DRY_RUN && ! $YES; then
                 if confirm "Remove legacy spool artifacts now and continue installing?"; then
                     remove_legacy
@@ -745,7 +1587,11 @@ do_install() {
     install_dirs
     install_binaries
     install_config_template
+    set_prewarm
+    set_s3_conf
+    connect_gw
     install_units
+    selinux_restore
     enable_start_services
     install_health_check
 
@@ -754,14 +1600,29 @@ do_install() {
     if $DRY_RUN; then
         info "Re-run without --dry-run to apply the above changes."
     else
-        info "1. Edit /etc/cvmfs-prepub/config.yaml — set gateway URL, key_id, stratum0_url, and repos."
-        info "2. Set secrets in /etc/cvmfs-prepub/env (mode 0600): CVMFS_GATEWAY_SECRET."
-        info "3. Restart the service:  systemctl restart ${SVC_PUB}"
-        info "4. Verify health:        curl http://localhost:8080/api/v1/health"
-        info "5. Run the smoke test from INSTALL.md §8."
-        info "6. In bits-console ui-config.yaml set:"
-        info "     publish_pipeline: .gitlab/cvmfs-prepub-publish.yml"
-        info "     # prepub_url: https://<this-host>:8080"
+        if [[ "$MODE" == "publisher" || "$MODE" == "all" ]]; then
+            info "Publisher:"
+            info "1. Edit ${CONFIG_DIR}/config.yaml — set gateway URL, stratum0_url and cas."
+            info "2. Set secrets in ${CONFIG_DIR}/env (mode 0600): PREPUB_API_TOKEN, CVMFS_GATEWAY_SECRET, CVMFS_GATEWAY_KEY_ID."
+            info "3. Start (or restart) the service:  systemctl restart ${SVC_PUB}"
+            info "4. Verify health:        curl $(pub_health_url)"
+            info "5. Run the smoke test from INSTALL.md §6 (Verify the installation)."
+            info "6. In bits-console ui-config.yaml set:"
+            info "     publish_pipeline: .gitlab/cvmfs-prepub-publish.yml"
+            info "     # prepub_url: http://<this-host>:$(pub_listen | sed 's/.*://')"
+        fi
+        if [[ "$MODE" == "receiver" || "$MODE" == "all" ]]; then
+            info "Receiver:"
+            info "1. Edit ${CONFIG_DIR}/receiver.yaml — set repos, receiver_stratum0_url (the publisher's URL), node_id and cas.root."
+            info "2. For broker auth: add --broker-auth, --discovery-url and --discovery-verify-key to"
+            info "   ExecStart in a drop-in (systemctl edit ${SVC_RCV}; an empty ExecStart= line"
+            info "   first, then the full new one), and set S1_NODE_KEY in"
+            info "   ${CONFIG_DIR}/env — generate it on the publisher:"
+            info "     PREPUB_HMAC_SECRET=<master> cvmfs-prepub node-key <node_id>"
+            info "3. Start (or restart) the receiver:  systemctl restart ${SVC_RCV}"
+            info "4. Verify metrics:       curl $(rcv_metrics_url)"
+            info "5. Check the log:        journalctl -u ${SVC_RCV} -n 30 --no-pager"
+        fi
     fi
 }
 
@@ -769,22 +1630,55 @@ do_install() {
 # UNINSTALL
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Resolve CAS paths from installed config before config dir might be removed.
+# ── service identity and paths (resolved once, used by every action) ─────────
+# CAS and spool come from the installed config when there is one, so install,
+# update and uninstall act on the directories the service really uses.
 CAS_PUB="$(read_cas_root "${CONFIG_DIR}/config.yaml"   "${DEFAULT_CAS_PUB}")"
 CAS_RCV="$(read_cas_root "${CONFIG_DIR}/receiver.yaml" "${DEFAULT_CAS_RCV}")"
+
+# read_spool_root CFG — spool_root from a config file; empty when unset.
+read_spool_root() {
+    [ -f "$1" ] || return 0
+    sed -n 's/^spool_root:[[:space:]]*//p' "$1" | head -1 | yaml_scalar
+}
+
+if [ -z "$SERVICE_USER" ]; then
+    # Keep the user an installed unit runs as (drop-ins included): update must
+    # not hand the spool back to the default account behind the service's back.
+    _unit="$SVC_PUB"; [[ "$MODE" == "receiver" ]] && _unit="$SVC_RCV"
+    has_systemd && SERVICE_USER="$(systemctl show -p User --value "${_unit}.service" 2>/dev/null || true)"
+    # Else the repository owner /etc/cvmfs names: the account that may publish.
+    if [ -z "$SERVICE_USER" ] && [[ "$MODE" != "receiver" && "$ACTION" != uninstall ]]; then
+        SERVICE_USER="$(repo_service_user)"
+        [ -z "$SERVICE_USER" ] || info "Service user ${SERVICE_USER}: the repository owner (CVMFS_USER)"
+    fi
+    SERVICE_USER="${SERVICE_USER:-$DEFAULT_USER}"
+fi
+# Files are owned by the user's primary group (its own, for a new account).
+SERVICE_GROUP="$(id -gn "$SERVICE_USER" 2>/dev/null || echo "$SERVICE_USER")"
+
+_cfg_spool="$(read_spool_root "${CONFIG_DIR}/config.yaml")"
+if [[ -n "$SPOOL_DIR" && -n "$_cfg_spool" && "$ACTION" != uninstall ]] &&
+   [[ "$(readlink -m "$SPOOL_DIR")" != "$(readlink -m "$_cfg_spool")" ]]; then
+    # config.yaml is never rewritten, so the unit and the service would disagree.
+    die "--spool-dir ${SPOOL_DIR} differs from spool_root ${_cfg_spool} in ${CONFIG_DIR}/config.yaml — change it there first."
+fi
+SPOOL_DIR="${SPOOL_DIR:-${_cfg_spool:-$DEFAULT_SPOOL_DIR}}"
+[[ "$SPOOL_DIR" == /* ]] || die "Spool directory must be an absolute path: ${SPOOL_DIR}"
+# systemd follows symlinks (in any path component) while building the unit's
+# mount namespace and SELinux may refuse that (226/NAMESPACE): name the real
+# directory. -m: also when parts of it do not exist yet.
+_real="$(readlink -m "$SPOOL_DIR")"
+if [[ "$_real" != "$SPOOL_DIR" ]]; then
+    info "Spool ${SPOOL_DIR} resolves through a symlink — using ${_real}"
+    SPOOL_DIR="$_real"
+fi
 
 do_publisher_uninstall() {
     header "Services (publisher)"
     stop_disable "$SVC_PUB"
     remove_unit  "$SVC_PUB"
     maybe_daemon_reload
-
-    header "Binaries"
-    remove_file "${BINARY_DIR}/cvmfs-prepub" "cvmfs-prepub"
-    remove_file "${BINARY_DIR}/prepubctl"    "prepubctl"
-
-    header "Configuration"
-    remove_dir "$CONFIG_DIR" "config directory ${CONFIG_DIR}"
 
     header "Spool (job state + WAL journal)"
     if $KEEP_SPOOL; then
@@ -794,10 +1688,10 @@ do_publisher_uninstall() {
     fi
 
     header "Publisher CAS"
-    if $KEEP_CAS; then
-        skip "Publisher CAS ${CAS_PUB} — preserved (--keep-cas)"
-    else
+    if $PURGE_CAS; then
         remove_dir "$CAS_PUB" "publisher CAS ${CAS_PUB}" true
+    else
+        skip "Publisher CAS ${CAS_PUB} — preserved (delete with --purge-cas)"
     fi
 }
 
@@ -807,23 +1701,45 @@ do_receiver_uninstall() {
     remove_unit  "$SVC_RCV"
     maybe_daemon_reload
 
-    # In "receiver" mode the publisher was never set up on this host.
-    # In "all" mode binaries and config were already removed by do_publisher_uninstall;
-    # the helpers are idempotent (they skip if already gone).
-    if [[ "$MODE" == "receiver" ]]; then
-        header "Binaries"
-        remove_file "${BINARY_DIR}/cvmfs-prepub" "cvmfs-prepub"
-        remove_file "${BINARY_DIR}/prepubctl"    "prepubctl"
+    header "Receiver CAS"
+    if $PURGE_CAS; then
+        remove_dir "$CAS_RCV" "receiver CAS ${CAS_RCV}" true
+    else
+        skip "Receiver CAS ${CAS_RCV} — preserved (delete with --purge-cas)"
+    fi
+}
 
-        header "Configuration"
-        remove_dir "$CONFIG_DIR" "config directory ${CONFIG_DIR}"
+# other_role_svc -- the unit of the role NOT being removed (none for "all").
+other_role_svc() {
+    case "$MODE" in
+        publisher) echo "$SVC_RCV" ;;
+        receiver)  echo "$SVC_PUB" ;;
+    esac
+}
+
+# do_shared_uninstall -- the binary and config dir are shared by both roles:
+# remove them only when no other role's unit remains, else only this role's
+# config file.
+do_shared_uninstall() {
+    local other; other="$(other_role_svc)"
+    header "Binaries"
+    remove_old_prepubctl
+    if $KEEP_SHARED; then
+        skip "cvmfs-prepub — kept (${other}.service still uses it)"
+    else
+        remove_file "${BINARY_DIR}/cvmfs-prepub" "cvmfs-prepub"
     fi
 
-    header "Receiver CAS"
-    if $KEEP_CAS; then
-        skip "Receiver CAS ${CAS_RCV} — preserved (--keep-cas)"
+    header "Configuration"
+    if $KEEP_SHARED; then
+        if [[ "$MODE" == "publisher" ]]; then
+            remove_file "${CONFIG_DIR}/config.yaml"
+        else
+            remove_file "${CONFIG_DIR}/receiver.yaml"
+        fi
+        skip "Rest of ${CONFIG_DIR} (env, tls) — kept (${other}.service still uses it)"
     else
-        remove_dir "$CAS_RCV" "receiver CAS ${CAS_RCV}" true
+        remove_dir "$CONFIG_DIR" "config directory ${CONFIG_DIR}"
     fi
 }
 
@@ -831,6 +1747,14 @@ do_account_uninstall() {
     header "System Account"
     if $KEEP_USER; then
         skip "Account '${SERVICE_USER}' — preserved (--keep-user)"
+        return
+    fi
+    if $KEEP_SHARED; then
+        skip "Account '${SERVICE_USER}' — kept ($(other_role_svc).service is still installed)"
+        return
+    fi
+    if [[ "$SERVICE_USER" != "$DEFAULT_USER" ]]; then
+        skip "Account '${SERVICE_USER}' — not created by ${PROG}, preserved"
         return
     fi
     if id "$SERVICE_USER" &>/dev/null 2>&1; then
@@ -841,39 +1765,53 @@ do_account_uninstall() {
 }
 
 do_uninstall() {
+    # The other role's unit still installed: keep the files both roles share.
+    local other; other="$(other_role_svc)"
+    if [ -n "$other" ] && unit_exists "$other"; then
+        KEEP_SHARED=true
+    fi
+
     # Build a removal manifest for the confirmation prompt.
     local manifest=() warn_items=()
     case "$MODE" in
         publisher|all)
-            manifest+=("Binaries: ${BINARY_DIR}/{cvmfs-prepub,prepubctl}")
             manifest+=("Systemd unit: $(unit_file "${SVC_PUB}")")
-            manifest+=("Config: ${CONFIG_DIR}/")
             if ! $KEEP_SPOOL; then
                 warn_items+=("Spool + WAL journal: ${SPOOL_DIR}/  [ALL JOB HISTORY]")
             else
                 manifest+=("Spool ${SPOOL_DIR}/ — PRESERVED (--keep-spool)")
             fi
-            if ! $KEEP_CAS; then
-                warn_items+=("Publisher CAS: ${CAS_PUB}/  [ALL CAS OBJECTS]")
+            if $PURGE_CAS; then
+                warn_items+=("Publisher CAS: ${CAS_PUB}/  [ALL CAS OBJECTS] (--purge-cas)")
             else
-                manifest+=("Publisher CAS ${CAS_PUB}/ — PRESERVED (--keep-cas)")
+                manifest+=("Publisher CAS ${CAS_PUB}/ — PRESERVED (delete with --purge-cas)")
             fi
             ;;&
         receiver|all)
-            [[ "$MODE" == "receiver" ]] && \
-                manifest+=("Binaries: ${BINARY_DIR}/{cvmfs-prepub,prepubctl}")
             manifest+=("Systemd unit: $(unit_file "${SVC_RCV}")")
-            [[ "$MODE" == "receiver" ]] && \
-                manifest+=("Config: ${CONFIG_DIR}/")
-            if ! $KEEP_CAS; then
-                warn_items+=("Receiver CAS: ${CAS_RCV}/  [ALL CACHED OBJECTS]")
+            if $PURGE_CAS; then
+                warn_items+=("Receiver CAS: ${CAS_RCV}/  [ALL CACHED OBJECTS] (--purge-cas)")
             else
-                manifest+=("Receiver CAS ${CAS_RCV}/ — PRESERVED (--keep-cas)")
+                manifest+=("Receiver CAS ${CAS_RCV}/ — PRESERVED (delete with --purge-cas)")
             fi
             ;;
     esac
-    if ! $KEEP_USER; then
-        manifest+=("System account: ${SERVICE_USER}")
+    if $KEEP_SHARED; then
+        if [[ "$MODE" == "publisher" ]]; then
+            manifest+=("Config: ${CONFIG_DIR}/config.yaml")
+        else
+            manifest+=("Config: ${CONFIG_DIR}/receiver.yaml")
+        fi
+        manifest+=("Binary, rest of ${CONFIG_DIR}/ and account — KEPT (${other}.service remains)")
+    else
+        manifest+=("Binary: ${BINARY_DIR}/cvmfs-prepub")
+        manifest+=("Config: ${CONFIG_DIR}/")
+        if ! $KEEP_USER && [[ "$SERVICE_USER" == "$DEFAULT_USER" ]]; then
+            manifest+=("System account: ${SERVICE_USER}")
+        fi
+    fi
+    if [ -e "$OLD_PREPUBCTL" ] || [ -L "$OLD_PREPUBCTL" ]; then
+        manifest+=("Obsolete binary: ${OLD_PREPUBCTL}")
     fi
 
     if legacy_present; then
@@ -895,7 +1833,7 @@ do_uninstall() {
                 for item in "${warn_items[@]}"; do
                     printf "  ${RED}• %s${RESET}\n" "$item"
                 done
-                printf "\n  Use --keep-spool / --keep-cas to preserve these.\n"
+                printf "\n  Use --keep-spool to keep the spool; drop --purge-cas to keep the CAS.\n"
             fi
             printf "\n  Run with --dry-run to preview each command first.\n\n"
             read -r -p "Type 'yes' to continue, anything else to abort: " _confirm
@@ -904,10 +1842,12 @@ do_uninstall() {
     fi
 
     case "$MODE" in
-        publisher) do_publisher_uninstall; do_account_uninstall ;;
-        receiver)  do_receiver_uninstall;  do_account_uninstall ;;
-        all)       do_publisher_uninstall; do_receiver_uninstall; do_account_uninstall ;;
+        publisher) do_publisher_uninstall ;;
+        receiver)  do_receiver_uninstall ;;
+        all)       do_publisher_uninstall; do_receiver_uninstall ;;
     esac
+    do_shared_uninstall
+    do_account_uninstall
 
     # Also clean up any legacy spool artifacts found during uninstall
     if legacy_present; then
@@ -943,6 +1883,7 @@ print_summary() {
 
 case "$ACTION" in
     install)   do_install   ;;
+    update)    do_update    ;;
     uninstall) do_uninstall ;;
 esac
 

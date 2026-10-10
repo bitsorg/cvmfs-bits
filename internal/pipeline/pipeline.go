@@ -8,6 +8,7 @@ package pipeline
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/hex"
@@ -56,6 +57,11 @@ type Config struct {
 	CAS cas.Backend
 	// SpoolDir is the temporary directory for catalog.db and upload.log.
 	SpoolDir string
+	// MaxEntrySize caps the size of any single file in the tar; 0 uses
+	// unpack.MaxFileSize. The service sets it to the maximum tar size. It is
+	// only honoured above unpack.MaxFileSize where files stream (see
+	// EntryLimit).
+	MaxEntrySize int64
 	// Obs provides logging, tracing, and metrics.
 	Obs *observe.Provider
 	// PreloadExe is the repo-relative path to the application binary whose
@@ -67,6 +73,27 @@ type Config struct {
 	// run.  Only paths present in the submitted tar produce CAS hashes in the
 	// preload file.  Ignored when PreloadExe is empty.
 	PreloadPaths []string
+}
+
+// EntryLimit is the per-file size limit this configuration can process. Only
+// when large files are both spilled to disk and compressed by streaming (a
+// SpoolDir and a fixed chunk grid) may it exceed unpack.MaxFileSize; the other
+// paths read a file whole into memory, so they keep the 1 GiB cap.
+func (c Config) EntryLimit() int64 {
+	cc := compress.Config{SpillDir: c.SpoolDir, ChunkMin: c.ChunkMin, ChunkAvg: c.ChunkAvg, ChunkMax: c.ChunkMax}
+	if cc.Streaming() && c.MaxEntrySize > 0 {
+		return c.MaxEntrySize
+	}
+	return inMemoryLimit(c.MaxEntrySize)
+}
+
+// inMemoryLimit is the per-file limit for a path that holds files in memory:
+// n (0 = default), but never above unpack.MaxFileSize.
+func inMemoryLimit(n int64) int64 {
+	if n <= 0 || n > unpack.MaxFileSize {
+		return unpack.MaxFileSize
+	}
+	return n
 }
 
 // Result is returned after a successful pipeline run.
@@ -128,6 +155,33 @@ func Run(ctx context.Context, tarPath string, cfg Config) (*Result, error) {
 type PrefetchResult struct {
 	SortedEntries []unpack.FileEntry
 	DirtabContent []byte
+	// SpillDir holds the on-disk content of large entries. The sorted entry
+	// list keeps only metadata plus small inline files, so a package no longer
+	// has to fit in memory to be published. Call Cleanup when done.
+	SpillDir string
+}
+
+// Cleanup removes the spill directory. Safe to call more than once, and on a
+// PrefetchResult that never spilled.
+func (p *PrefetchResult) Cleanup() {
+	if p == nil || p.SpillDir == "" {
+		return
+	}
+	_ = os.RemoveAll(p.SpillDir)
+	p.SpillDir = ""
+}
+
+// newSpillDir creates a unique spill directory under root. An empty root
+// disables spilling (everything stays in memory, the pre-existing behaviour).
+func newSpillDir(root string) (string, error) {
+	if root == "" {
+		return "", nil
+	}
+	dir, err := os.MkdirTemp(root, "unpack-spill-")
+	if err != nil {
+		return "", fmt.Errorf("creating spill dir under %q: %w", root, err)
+	}
+	return dir, nil
 }
 
 // Prefetch performs Phase 0 only (collect + validate + sort) from a tar file.
@@ -139,22 +193,60 @@ type PrefetchResult struct {
 // tar from scratch.  A non-nil *PrefetchResult is always valid and ready to
 // pass to RunFromPrefetch.
 func Prefetch(ctx context.Context, tarPath string, obs *observe.Provider) (*PrefetchResult, error) {
+	return PrefetchWithSpill(ctx, tarPath, "", obs)
+}
+
+// PrefetchWithSpill is Prefetch with a spill root: entries larger than
+// unpack.DefaultInlineMaxSize are written under spillRoot instead of being held
+// in memory. An empty spillRoot keeps everything in memory.
+func PrefetchWithSpill(ctx context.Context, tarPath, spillRoot string, obs *observe.Provider) (*PrefetchResult, error) {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening tar for prefetch %q: %w", tarPath, err)
 	}
 	defer f.Close()
-	return PrefetchFromReader(ctx, f, obs)
+	return prefetchFromReader(ctx, f, spillRoot, 0, obs)
 }
 
 // PrefetchFromReader performs Phase 0 from an io.Reader.
 // It is the same collect+validate+sort logic used by RunFromReader, extracted
 // so it can run before the concurrency slot is acquired.
 func PrefetchFromReader(ctx context.Context, r io.Reader, obs *observe.Provider) (*PrefetchResult, error) {
+	return prefetchFromReader(ctx, r, "", 0, obs)
+}
+
+// PrefetchFromReaderWithSpill is PrefetchFromReader with a spill root, for
+// callers that already hold an open handle on the tar (preserving a stable
+// inode reference across a concurrent rename) and still want large entries
+// written to disk rather than held in memory. maxEntrySize is the per-file
+// limit (0 = unpack.MaxFileSize; pass Config.EntryLimit); without a spill
+// root it is capped at unpack.MaxFileSize, as entries then stay in memory.
+func PrefetchFromReaderWithSpill(ctx context.Context, r io.Reader, spillRoot string, maxEntrySize int64, obs *observe.Provider) (*PrefetchResult, error) {
+	return prefetchFromReader(ctx, r, spillRoot, maxEntrySize, obs)
+}
+
+func prefetchFromReader(ctx context.Context, r io.Reader, spillRoot string, maxEntrySize int64, obs *observe.Provider) (*PrefetchResult, error) {
+	spillDir, serr := newSpillDir(spillRoot)
+	if serr != nil {
+		return nil, serr
+	}
+	if spillDir == "" {
+		maxEntrySize = inMemoryLimit(maxEntrySize)
+	}
+	// Any error path below must not leave spilled content behind: the caller
+	// gets no PrefetchResult and therefore no handle to Cleanup with.
+	ok := false
+	defer func() {
+		if !ok && spillDir != "" {
+			_ = os.RemoveAll(spillDir)
+		}
+	}()
+
 	collectChan := make(chan unpack.FileEntry, 256)
 	collectErrCh := make(chan error, 1)
 	go func() {
-		collectErrCh <- unpack.Extract(ctx, r, collectChan)
+		collectErrCh <- unpack.ExtractWithOptions(ctx, r, collectChan,
+			unpack.Options{SpillDir: spillDir, MaxEntrySize: maxEntrySize})
 		close(collectChan)
 	}()
 
@@ -166,12 +258,16 @@ func PrefetchFromReader(ctx context.Context, r io.Reader, obs *observe.Provider)
 			for range collectChan { //nolint:revive
 			}
 			<-collectErrCh
-			return nil, fmt.Errorf("duplicate path %q in tar — each path must appear exactly once", entry.Path)
+			return nil, fmt.Errorf("%w: duplicate path %q in tar — each path must appear exactly once", unpack.ErrInvalidArchive, entry.Path)
 		}
 		seenPaths[entry.Path] = struct{}{}
-		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && len(entry.Data) > 0 {
-			capturedDirtab = make([]byte, len(entry.Data))
-			copy(capturedDirtab, entry.Data)
+		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && entry.Size > 0 {
+			b, derr := entry.Bytes()
+			if derr != nil {
+				return nil, fmt.Errorf("reading .cvmfsdirtab: %w", derr)
+			}
+			capturedDirtab = make([]byte, len(b))
+			copy(capturedDirtab, b)
 		}
 		sortedEntries = append(sortedEntries, entry)
 	}
@@ -188,9 +284,11 @@ func PrefetchFromReader(ctx context.Context, r io.Reader, obs *observe.Provider)
 			"entries", len(sortedEntries))
 	}
 
+	ok = true
 	return &PrefetchResult{
 		SortedEntries: sortedEntries,
 		DirtabContent: capturedDirtab,
+		SpillDir:      spillDir,
 	}, nil
 }
 
@@ -247,10 +345,24 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 	// Duplicate-path detection and .cvmfsdirtab capture move here from the
 	// fan-out goroutine so the collect phase remains the single owner of the
 	// raw entry slice.
+	// Files up to unpack.MaxFileSize stay in memory as they always have; a
+	// larger one (allowed by EntryLimit only when it streams) is spilled
+	// under SpoolDir, so a higher limit never means a larger allocation.
+	spillDir, serr := newSpillDir(cfg.SpoolDir)
+	if serr != nil {
+		return nil, serr
+	}
+	if spillDir != "" {
+		defer os.RemoveAll(spillDir)
+	}
 	collectChan := make(chan unpack.FileEntry, 256)
 	collectErrCh := make(chan error, 1)
 	go func() {
-		collectErrCh <- unpack.Extract(ctx, r, collectChan)
+		collectErrCh <- unpack.ExtractWithOptions(ctx, r, collectChan, unpack.Options{
+			MaxEntrySize:  cfg.EntryLimit(),
+			SpillDir:      spillDir,
+			InlineMaxSize: unpack.MaxFileSize,
+		})
 		close(collectChan)
 	}()
 
@@ -263,15 +375,19 @@ func RunFromReader(ctx context.Context, r io.Reader, cfg Config) (*Result, error
 			for range collectChan { //nolint:revive
 			}
 			<-collectErrCh
-			err := fmt.Errorf("duplicate path %q in tar — each path must appear exactly once", entry.Path)
+			err := fmt.Errorf("%w: duplicate path %q in tar — each path must appear exactly once", unpack.ErrInvalidArchive, entry.Path)
 			span.RecordError(err)
 			return nil, err
 		}
 		seenPaths[entry.Path] = struct{}{}
 
-		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && len(entry.Data) > 0 {
-			capturedDirtab = make([]byte, len(entry.Data))
-			copy(capturedDirtab, entry.Data)
+		if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && entry.Size > 0 {
+			b, derr := entry.Bytes()
+			if derr != nil {
+				return nil, fmt.Errorf("reading .cvmfsdirtab: %w", derr)
+			}
+			capturedDirtab = make([]byte, len(b))
+			copy(capturedDirtab, b)
 		}
 
 		sortedEntries = append(sortedEntries, entry)
@@ -306,7 +422,7 @@ type ArchiveSource struct {
 // peeking at the first two magic bytes (0x1f 0x8b), and streams all
 // FileEntry values produced by unpack.Extract to out.
 // The file is closed before streamArchive returns.
-func streamArchive(ctx context.Context, path string, out chan<- unpack.FileEntry) error {
+func streamArchive(ctx context.Context, path string, maxEntrySize int64, out chan<- unpack.FileEntry) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening archive %q: %w", path, err)
@@ -326,7 +442,7 @@ func streamArchive(ctx context.Context, path string, out chan<- unpack.FileEntry
 		defer gr.Close()
 		r = gr
 	}
-	return unpack.Extract(ctx, r, out)
+	return unpack.ExtractWithOptions(ctx, r, out, unpack.Options{MaxEntrySize: maxEntrySize})
 }
 
 // RunFromArchiveList processes a list of (possibly compressed) archives through
@@ -394,7 +510,8 @@ func RunFromArchiveList(ctx context.Context, archives []ArchiveSource, cfg Confi
 		extractErrCh := make(chan error, 1)
 		archPath := arch.Path
 		go func() {
-			extractErrCh <- streamArchive(ctx, archPath, entryCh)
+			// No spill here: entries stay in memory, so the 1 GiB cap holds.
+			extractErrCh <- streamArchive(ctx, archPath, inMemoryLimit(cfg.MaxEntrySize), entryCh)
 			close(entryCh)
 		}()
 
@@ -406,14 +523,18 @@ func RunFromArchiveList(ctx context.Context, archives []ArchiveSource, cfg Confi
 				for range entryCh { //nolint:revive
 				}
 				dupErr = fmt.Errorf(
-					"duplicate path %q in archive %q — each path must appear exactly once across all archives",
-					entry.Path, archPath)
+					"%w: duplicate path %q in archive %q — each path must appear exactly once across all archives",
+					unpack.ErrInvalidArchive, entry.Path, archPath)
 				break
 			}
 			seenPaths[entry.Path] = struct{}{}
-			if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && len(entry.Data) > 0 {
-				capturedDirtab = make([]byte, len(entry.Data))
-				copy(capturedDirtab, entry.Data)
+			if filepath.Base(entry.Path) == ".cvmfsdirtab" && entry.Mode.IsRegular() && entry.Size > 0 {
+				b, derr := entry.Bytes()
+				if derr != nil {
+					return nil, fmt.Errorf("reading .cvmfsdirtab: %w", derr)
+				}
+				capturedDirtab = make([]byte, len(b))
+				copy(capturedDirtab, b)
 			}
 			archEntries = append(archEntries, entry)
 		}
@@ -451,6 +572,19 @@ func runFromSortedEntries(
 	_, span := cfg.Obs.Tracer.Start(ctx, "pipeline.stages")
 	defer span.End()
 
+	// Compressed chunks are spilled here while they wait to be uploaded. Each
+	// file is removed as soon as its object reaches CAS; this directory only
+	// catches the remainder if a job dies mid-flight.
+	chunkSpillDir, cserr := newSpillDir(cfg.SpoolDir)
+	if cserr != nil {
+		return nil, cserr
+	}
+	defer func() {
+		if chunkSpillDir != "" {
+			_ = os.RemoveAll(chunkSpillDir)
+		}
+	}()
+
 	// Channels for pipeline stages.
 	compressChan := make(chan unpack.FileEntry, 64)
 	catalogChan := make(chan unpack.FileEntry, 64)
@@ -460,7 +594,7 @@ func runFromSortedEntries(
 
 	// Stage 1: Fan-out — feed sorted entries to both compress and catalog.
 	//
-	// Fix #14: if the compress send succeeds but the catalog send is blocked
+	// If the compress send succeeds but the catalog send is blocked
 	// at context cancellation, we return an error so the two stages cannot
 	// silently diverge.
 	eg.Go(func() error {
@@ -485,6 +619,9 @@ func runFromSortedEntries(
 	eg.Go(func() error {
 		defer close(compressOut)
 		return compress.Run(egCtx, compressChan, compressOut, compress.Config{
+			// Chunks are written here and removed as soon as they reach CAS,
+			// so neither the file nor its compressed form is ever resident.
+			SpillDir:      chunkSpillDir,
 			Workers:       cfg.Workers,
 			ChunkSize:     cfg.ChunkSize,
 			ChunkMin:      cfg.ChunkMin,
@@ -539,7 +676,7 @@ func runFromSortedEntries(
 	uploadLogPath := filepath.Join(cfg.SpoolDir, "upload.log")
 	uploadLog := upload.OpenUploadLog(uploadLogPath)
 
-	// Fix H2: store only the hash strings we need for catalog patching, not the
+	// Store only the hash strings we need for catalog patching, not the
 	// full compress.Result (which holds the compressed byte slices that are
 	// already in CAS and should be GC'd after upload).
 	type chunkMeta struct {
@@ -575,7 +712,7 @@ func runFromSortedEntries(
 	// concurrent workers never attempt to upload the same object.
 	// compressedData and compressedSize refer to the object bytes to upload;
 	// they may be nil/0 for objects that are already confirmed dedup hits.
-	processHash := func(workerCtx context.Context, hash string, compressedData []byte, compressedSize int64) error {
+	processHash := func(workerCtx context.Context, hash string, open func() (io.ReadCloser, error), compressedSize int64) error {
 		isDup, err := checkExists(workerCtx, hash)
 		if err != nil {
 			return fmt.Errorf("dedup check %s: %w", hash, err)
@@ -597,8 +734,10 @@ func runFromSortedEntries(
 			return nil
 		}
 
-		// New object: upload to CAS.
-		if err := upload.PutWithRetry(workerCtx, cfg.CAS, hash, compressedData, compressedSize); err != nil {
+		// New object: upload to CAS. When the compressor streamed the chunk to
+		// disk, open re-reads it per attempt so the compressed bytes are never
+		// held in memory; otherwise it reads from the in-memory slice.
+		if err := upload.PutStreamWithRetry(workerCtx, cfg.CAS, hash, open, compressedSize); err != nil {
 			return fmt.Errorf("cas put %s: %w", hash, err)
 		}
 		if err := uploadLog.Record(hash); err != nil {
@@ -621,7 +760,7 @@ func runFromSortedEntries(
 		// derived from egCtx so any pipeline stage failure cancels all workers.
 		inner, innerCtx := errgroup.WithContext(egCtx)
 
-		// Fix #P1 (upload stage): capture sem.Acquire failure without returning early.
+		// Upload stage: capture sem.Acquire failure without returning early.
 		// If we returned on Acquire error, in-flight inner.Go workers would still be
 		// running when we return, and they access shared state (result, resultMu,
 		// uploadLog) after the outer eg proceeds past eg.Wait() — a data race.
@@ -669,7 +808,8 @@ func runFromSortedEntries(
 			// to ObjectHashes immediately without spawning a worker.
 			type uploadTask struct {
 				hash           string
-				compressed     []byte
+				open           func() (io.ReadCloser, error)
+				path           string // spill file to remove once uploaded ("" = in memory)
 				compressedSize int64
 			}
 			var tasks []uploadTask
@@ -686,10 +826,12 @@ func runFromSortedEntries(
 						cfg.Obs.Metrics.PipelineDedupHits.Inc()
 					} else {
 						seenHashes[chunk.Hash+"P"] = true
+						ch := chunk // capture: Open() is called later, per attempt
 						tasks = append(tasks, uploadTask{
-							hash:           chunk.Hash + "P",
-							compressed:     chunk.Compressed,
-							compressedSize: chunk.CompressedSize,
+							hash:           ch.Hash + "P",
+							open:           ch.Open,
+							path:           ch.Path,
+							compressedSize: ch.CompressedSize,
 						})
 					}
 				}
@@ -701,9 +843,10 @@ func runFromSortedEntries(
 						cfg.Obs.Metrics.PipelineDedupHits.Inc()
 					} else {
 						seenHashes[hash] = true
+						data := compResult.Compressed
 						tasks = append(tasks, uploadTask{
 							hash:           hash,
-							compressed:     compResult.Compressed,
+							open:           func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil },
 							compressedSize: compResult.CompressedSize,
 						})
 					}
@@ -721,9 +864,16 @@ func runFromSortedEntries(
 				}
 				inner.Go(func() error {
 					defer uploadSem.Release(1)
-					if err := processHash(innerCtx, task.hash, task.compressed, task.compressedSize); err != nil {
+					if err := processHash(innerCtx, task.hash, task.open, task.compressedSize); err != nil {
 						uspan.RecordError(err)
 						return err
+					}
+					// The compressed chunk is in CAS (or was a dedup hit); drop
+					// its spill file now rather than at job end, so a large
+					// package does not accumulate its whole compressed form on
+					// disk while it uploads.
+					if task.path != "" {
+						_ = os.Remove(task.path)
 					}
 					return nil
 				})
@@ -763,7 +913,7 @@ func runFromSortedEntries(
 	result.DirtabContent = capturedDirtab
 
 	// Patch catalog entries with hashes and chunks from compress results.
-	// Fix C2: hex decode errors are now propagated rather than silently ignored.
+	// Hex decode errors are propagated rather than silently ignored.
 	rawEntries := builder.Entries()
 	result.CatalogEntries = make([]cvmfscatalog.Entry, len(rawEntries))
 	for i, e := range rawEntries {
@@ -780,19 +930,24 @@ func runFromSortedEntries(
 			continue
 		}
 
-		hashBytes, err := hex.DecodeString(fm.bulkHash)
-		if err != nil {
-			return nil, fmt.Errorf("decoding hash for %s: %w", e.FullPath, err)
-		}
-		result.CatalogEntries[i].Hash = hashBytes
 		result.CatalogEntries[i].HashAlgo = cvmfscatalog.HashSha1
 		result.CatalogEntries[i].CompAlgo = cvmfscatalog.CompZlib
 
-		// For chunked files: populate chunk records.
+		// Whole-file objects: the catalog hash is the CAS key.
+		if len(fm.chunks) == 0 {
+			hashBytes, err := hex.DecodeString(fm.bulkHash)
+			if err != nil {
+				return nil, fmt.Errorf("decoding hash for %s: %w", e.FullPath, err)
+			}
+			result.CatalogEntries[i].Hash = hashBytes
+		}
+
+		// Chunked files: the content lives in the chunks only and the bulk
+		// hash stays NULL, as CVMFS writes it without legacy bulk chunks.
 		if len(fm.chunks) > 0 {
 			chunks := make([]cvmfscatalog.ChunkRecord, len(fm.chunks))
 			for j, ch := range fm.chunks {
-				// Fix C2: propagate decode error instead of silently using nil bytes.
+				// Propagate decode error instead of silently using nil bytes.
 				chBytes, decErr := hex.DecodeString(ch.hash)
 				if decErr != nil {
 					return nil, fmt.Errorf("decoding chunk hash for %s at offset %d: %w",
@@ -843,11 +998,16 @@ func runFromSortedEntries(
 				continue
 			}
 			if len(fm.chunks) > 0 {
-				// Chunked file: the actual CAS objects are the chunk hashes.
+				// Chunked file: the actual CAS objects are the chunk hashes,
+				// stored under the 'P' (kSuffixPartial) suffix — the same key
+				// the uploader used at the SubmitPayload site above. Emitting
+				// the bare hash here named an object that does not exist, so
+				// every entry in the generated .cvmfspreload file was a 404.
 				for _, ch := range fm.chunks {
-					if _, ok := hashSeen[ch.hash]; !ok {
-						hashSeen[ch.hash] = struct{}{}
-						preloadHashes = append(preloadHashes, ch.hash)
+					key := ch.hash + "P"
+					if _, ok := hashSeen[key]; !ok {
+						hashSeen[key] = struct{}{}
+						preloadHashes = append(preloadHashes, key)
 					}
 				}
 			} else if fm.bulkHash != "" {

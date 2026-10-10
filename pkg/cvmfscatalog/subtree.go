@@ -19,20 +19,23 @@ package cvmfscatalog
 // publish are silently removed.  This matches cvmfs_server ingest semantics
 // and is correct for complete-version software publishing.
 //
-// Both subtree paths (LeasePath != "") and root-level publishes (LeasePath == "")
-// use BuildSubtree.  The gateway (cvmfs_receiver) grafts the resulting catalog
-// into the existing repository at LeasePath during the commit step, so this
-// function never needs to download or modify the existing repository catalog.
+// The orchestrator calls BuildSubtree only for subtree publishes
+// (LeasePath != ""); root-level publishes commit without a catalog of their
+// own.  The gateway (cvmfs_receiver) grafts the resulting catalog into the
+// existing repository at LeasePath during the commit step, so this function
+// never needs to download or modify the existing repository catalog.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"cvmfs.io/prepub/pkg/cvmfsdirtab"
 	"cvmfs.io/prepub/pkg/cvmfshash"
@@ -65,6 +68,16 @@ type SubtreeConfig struct {
 	// panics if new_catalog->root_prefix() != nested_root_ps, so the correct
 	// path-valued root_prefix must be present.
 	DirectGraft bool
+	// DirsOnly marks a subtree that only creates intermediate DIRECTORIES
+	// (the mkdir-p path): its entries are merged into the existing catalog by
+	// DiffRec, so LeasePath does NOT become a nested catalog root.
+	//
+	// BuildSubtree therefore must not add a .cvmfscatalog marker for it —
+	// check reports a marker in a directory that is not a nested root as
+	// "found abandoned nested catalog marker at /test/.cvmfscatalog"
+	// (swissknife_check.cc:394). Content publishes leave this false: their
+	// lease path IS grafted as a nested catalog and needs the marker.
+	DirsOnly bool
 }
 
 // SubtreeResult holds the catalog hashes produced by BuildSubtree.
@@ -81,6 +94,13 @@ type SubtreeResult struct {
 	// Each hash is plain hex without the 'C' suffix.  The caller must append
 	// "C" when uploading these objects to the CAS or the gateway.
 	AllCatalogHashes []string
+	// NeedsMarkerObject is true when BuildSubtree synthesized at least one
+	// .cvmfscatalog marker entry (a nested catalog root that had none).  The
+	// caller MUST then make the empty-file object from NestedMarkerObject()
+	// available in the object store, exactly like any other content object,
+	// or clients (and `cvmfs_swissknife check -c`) will find the marker entry
+	// pointing at a missing object.
+	NeedsMarkerObject bool
 }
 
 // BuildSubtree builds the new subtree catalog for LeasePath and all split
@@ -218,11 +238,70 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		}
 	}
 
+	// ── Ensure the nested-catalog root directory entry is present and named ───
+	// A tar may contain only files with no "." root entry (bits modulefiles
+	// packages are a single bare file).  Without an explicit root dir the
+	// nested-catalog root is created nameless, so its mount-point in the parent
+	// catalog is unreachable and the directory appears empty.  Synthesize the
+	// root dir entry when missing — mirroring the coarse-publish
+	// buildset.expand() behaviour, which already handles this case correctly.
+	if prefix != "" {
+		hasRoot := false
+		for i := range entries {
+			if entries[i].FullPath == prefix {
+				entries[i].IsNestedRoot = true
+				hasRoot = true
+				break
+			}
+		}
+		if !hasRoot {
+			entries = append(entries, Entry{
+				FullPath:     prefix,
+				Name:         path.Base(prefix),
+				Mode:         fs.ModeDir | 0o755,
+				Mtime:        time.Now().Unix(),
+				LinkCount:    2,
+				IsNestedRoot: true,
+			})
+		}
+	}
+
 	// ── Plan catalog split points ─────────────────────────────────────────────
 	// Inspect the entry list for .cvmfscatalog marker files and dirtab glob
 	// rules.  Every matching directory within the lease boundary becomes a
 	// nested-catalog split point, rooted in its own fresh SQLite database.
 	splitPaths := planSplits(entries, targetAbsPath, dt)
+
+	// ── Ensure every nested-catalog root carries its marker file ─────────────
+	// check requires a .cvmfscatalog inside each nested catalog root
+	// (swissknife_check.cc:643-649). Two roots can lack one:
+	//   * the subtree root itself — it becomes a nested catalog when the
+	//     gateway grafts it at the lease path, and tars rarely contain the
+	//     marker at their top level ("nested catalog without marker at
+	//     /test/smoke.0", 28 occurrences in one `make test` run);
+	//   * a dirtab-driven split, where nothing in the tar marks the directory.
+	// Split points triggered BY a marker already have one, so check first.
+	// Adding the marker here (after planSplits) cannot create new splits: a
+	// marker at the subtree root is not "under" the lease path (isUnderLease
+	// requires a strict prefix), and the dirtab paths are already split points.
+	markerMtime := time.Now().Unix()
+	needsMarkerObject := false
+	if prefix != "" && !cfg.DirsOnly && !hasMarkerIn(entries, prefix) {
+		entries = append(entries, nestedMarkerEntry(prefix, markerMtime))
+		needsMarkerObject = true
+	}
+	for _, sp := range splitPaths {
+		if !hasMarkerIn(entries, sp) {
+			entries = append(entries, nestedMarkerEntry(sp, markerMtime))
+			needsMarkerObject = true
+		}
+	}
+
+	// ── Normalise directory link counts ───────────────────────────────────────
+	// Runs after paths are absolute, the synthetic root entry exists and the
+	// markers are in place, so a single rule covers every producer (tar
+	// entries, synthesized roots, mkdir-p parents). See normalizeDirLinkCounts.
+	dirLinkCounts := normalizeDirLinkCounts(entries)
 
 	// Create a fresh child catalog for each split point.
 	//
@@ -247,6 +326,17 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			return nil, fmt.Errorf("creating new catalog for %q: %w", sp, createErr)
 		}
 		newCats[sp] = &newCatNode{cat: newCat, path: sp}
+
+		// Create()'s placeholder root row is replaced below by the real
+		// directory entry (see splitRootEntries). When the entry list has no
+		// entry for this split point, fall back to fixing the one field the
+		// placeholder cannot guess.
+		if lc, ok := dirLinkCounts[sp]; ok {
+			if lcErr := newCat.SetRootLinkCount(lc); lcErr != nil {
+				closeAllSplits()
+				return nil, fmt.Errorf("setting root link count for %q: %w", sp, lcErr)
+			}
+		}
 	}
 
 	// ── Route entries to the correct catalog ──────────────────────────────────
@@ -269,6 +359,13 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 	leafCat := chain[len(chain)-1].cat // = leaseCat (single chain element)
 	batchMap := make(map[*Catalog][]Entry, len(newCats)+1)
 	var leaseCatRootEntry *Entry // tar's "." entry for the lease root catalog, if present
+	// Real directory entries for split points, to replace the placeholder root
+	// row Create() put in each child catalog (see the routing loop below).
+	type splitRootEntry struct {
+		cat   *Catalog
+		entry Entry
+	}
+	var splitRootEntries []splitRootEntry
 	for _, entry := range entries {
 		owner := findOwner(splitPaths, entry.FullPath)
 		var targetCat *Catalog
@@ -306,6 +403,21 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			continue
 		}
 
+		// A split point's own directory entry is routed to its PARENT catalog
+		// (findOwner returns a strict prefix), where it is the mountpoint /
+		// "transition point". The CHILD catalog needs the very same entry as
+		// its root: check calls CompareEntries(transition_point, root_entry,
+		// compare_names=true) and requires them to be identical apart from the
+		// nested-catalog flags (swissknife_check.cc:831). Create()'s
+		// placeholder differs in name, size, mode, mtime and hash, which
+		// surfaced as "transition point and root entry differ
+		// (/test/smoke.0/nested)" once the catalogs became walkable.
+		if child, isSplitRoot := newCats[entry.FullPath]; isSplitRoot {
+			e := entry
+			e.IsNestedRoot = true
+			splitRootEntries = append(splitRootEntries, splitRootEntry{cat: child.cat, entry: e})
+		}
+
 		batchMap[targetCat] = append(batchMap[targetCat], entry)
 	}
 	// Flush remaining batches (all entries except the lease-root "." entry).
@@ -321,8 +433,15 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 			return nil, fmt.Errorf("upserting lease root entry %q: %w", leaseCatRootEntry.FullPath, upsertErr)
 		}
 	}
+	// Same for every split point: give the child catalog the real directory
+	// entry as its root, so it matches the transition point in the parent.
+	for _, sr := range splitRootEntries {
+		if upsertErr := sr.cat.Upsert(sr.entry); upsertErr != nil {
+			return nil, fmt.Errorf("upserting split root entry %q: %w", sr.entry.FullPath, upsertErr)
+		}
+	}
 
-	result := &SubtreeResult{}
+	result := &SubtreeResult{NeedsMarkerObject: needsMarkerObject}
 
 	// ── Finalise split catalogs deepest-first ─────────────────────────────────
 	// Sort split paths by descending length so the deepest nested catalogs are
@@ -345,8 +464,7 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		// node.cat is now closed by Finalize; no further Close needed for this node.
 
 		casFile := filepath.Join(cfg.TempDir, cvmfshash.ObjectPath(hash)+"C")
-		fi, statErr := os.Stat(casFile)
-		if statErr != nil {
+		if _, statErr := os.Stat(casFile); statErr != nil {
 			closeAllSplits()
 			return nil, fmt.Errorf("stat split catalog %s: %w", hash, statErr)
 		}
@@ -360,24 +478,28 @@ func BuildSubtree(ctx context.Context, cfg SubtreeConfig, entries []Entry) (*Sub
 		} else {
 			parentCat = leafCat
 		}
-		if addErr := parentCat.AddNestedMount(sp, hash, fi.Size()); addErr != nil {
+		// nested_catalogs.size is the UNCOMPRESSED database size — CVMFS
+		// decompresses the child object before comparing (see
+		// Catalog.UncompressedSize); passing the compressed object size made
+		// every nested catalog unloadable for cvmfs_swissknife check.
+		if addErr := parentCat.AddNestedMount(sp, hash, node.cat.UncompressedSize()); addErr != nil {
 			closeAllSplits()
 			return nil, fmt.Errorf("adding nested mount %q to parent catalog: %w", sp, addErr)
 		}
 
 		// Propagate child statistics into parent delta.
-		parentCat.delta.SubtreeRegular  += delta.SelfRegular  + delta.SubtreeRegular
-		parentCat.delta.SubtreeSymlink  += delta.SelfSymlink  + delta.SubtreeSymlink
-		parentCat.delta.SubtreeDir      += delta.SelfDir      + delta.SubtreeDir
-		parentCat.delta.SubtreeNested   += delta.SelfNested   + delta.SubtreeNested
-		parentCat.delta.SubtreeXattr    += delta.SelfXattr    + delta.SubtreeXattr
+		parentCat.delta.SubtreeRegular += delta.SelfRegular + delta.SubtreeRegular
+		parentCat.delta.SubtreeSymlink += delta.SelfSymlink + delta.SubtreeSymlink
+		parentCat.delta.SubtreeDir += delta.SelfDir + delta.SubtreeDir
+		parentCat.delta.SubtreeNested += delta.SelfNested + delta.SubtreeNested
+		parentCat.delta.SubtreeXattr += delta.SelfXattr + delta.SubtreeXattr
 		parentCat.delta.SubtreeExternal += delta.SelfExternal + delta.SubtreeExternal
-		parentCat.delta.SubtreeSpecial  += delta.SelfSpecial  + delta.SubtreeSpecial
+		parentCat.delta.SubtreeSpecial += delta.SelfSpecial + delta.SubtreeSpecial
 		// Chunked-file and size counters (task #12).
-		parentCat.delta.SubtreeChunked          += delta.SelfChunked          + delta.SubtreeChunked
-		parentCat.delta.SubtreeChunks           += delta.SelfChunks           + delta.SubtreeChunks
-		parentCat.delta.SubtreeFileSize         += delta.SelfFileSize         + delta.SubtreeFileSize
-		parentCat.delta.SubtreeChunkedSize      += delta.SelfChunkedSize      + delta.SubtreeChunkedSize
+		parentCat.delta.SubtreeChunked += delta.SelfChunked + delta.SubtreeChunked
+		parentCat.delta.SubtreeChunks += delta.SelfChunks + delta.SubtreeChunks
+		parentCat.delta.SubtreeFileSize += delta.SelfFileSize + delta.SubtreeFileSize
+		parentCat.delta.SubtreeChunkedSize += delta.SelfChunkedSize + delta.SubtreeChunkedSize
 		parentCat.delta.SubtreeExternalFileSize += delta.SelfExternalFileSize + delta.SubtreeExternalFileSize
 	}
 

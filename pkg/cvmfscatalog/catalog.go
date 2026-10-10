@@ -47,40 +47,56 @@ type Catalog struct {
 	dbPath     string
 	rootPrefix string
 	delta      Statistics // accumulated changes to flush in Finalize
+	// uncompressedSize is the size of the SQLite database as written by
+	// Finalize, before zlib compression.  Set by Finalize; read via
+	// UncompressedSize.
+	uncompressedSize int64
 	// closeOnce ensures that Close() is safe to call from multiple goroutines
 	// simultaneously — only the first call actually closes the underlying DB.
 	closeOnce sync.Once
 }
+
+// UncompressedSize returns the size in bytes of the finalized SQLite database
+// BEFORE compression, or 0 when Finalize has not run.
+//
+// This is the value CVMFS expects in a parent catalog's nested_catalogs.size
+// column: cvmfs_swissknife check downloads the child object, decompresses it,
+// and compares GetFileSize(decompressed) against that column
+// (swissknife_check.cc:726-741) — recording the COMPRESSED object size there
+// makes every nested catalog fail to load with "catalog file size mismatch",
+// which in turn makes the checker's walked statistics fall short of the root
+// catalog's aggregated counters ("statistics counter mismatch").
+func (c *Catalog) UncompressedSize() int64 { return c.uncompressedSize }
 
 // Statistics holds all counter columns from the statistics table.
 // Fields mirror the (counter TEXT PRIMARY KEY, value INTEGER) rows that
 // cvmfs_receiver reads via SqlGetCounter.
 type Statistics struct {
 	// Type counts (matching cvmfs/catalog_counters.h self_* / subtree_*)
-	SelfRegular     int64
-	SelfSymlink     int64
-	SelfDir         int64
-	SelfNested      int64
-	SelfSpecial     int64
-	SelfExternal    int64
-	SelfXattr       int64
+	SelfRegular  int64
+	SelfSymlink  int64
+	SelfDir      int64
+	SelfNested   int64
+	SelfSpecial  int64
+	SelfExternal int64
+	SelfXattr    int64
 	// Chunked-file counters (task #12)
-	SelfChunked    int64 // files that use the chunked-upload path
-	SelfChunks     int64 // total number of chunk records across all chunked files
+	SelfChunked int64 // files that use the chunked-upload path
+	SelfChunks  int64 // total number of chunk records across all chunked files
 	// Size counters (bytes, uncompressed)
 	SelfFileSize         int64 // sum of non-chunked regular file sizes
 	SelfChunkedSize      int64 // sum of chunked file sizes
 	SelfExternalFileSize int64 // sum of external file sizes
 
-	SubtreeRegular  int64
-	SubtreeSymlink  int64
-	SubtreeDir      int64
-	SubtreeNested   int64
-	SubtreeSpecial  int64
-	SubtreeExternal int64
-	SubtreeXattr    int64
-	SubtreeChunked    int64
-	SubtreeChunks     int64
+	SubtreeRegular          int64
+	SubtreeSymlink          int64
+	SubtreeDir              int64
+	SubtreeNested           int64
+	SubtreeSpecial          int64
+	SubtreeExternal         int64
+	SubtreeXattr            int64
+	SubtreeChunked          int64
+	SubtreeChunks           int64
 	SubtreeFileSize         int64
 	SubtreeChunkedSize      int64
 	SubtreeExternalFileSize int64
@@ -253,8 +269,6 @@ CREATE TABLE IF NOT EXISTS properties (
 		UID:          0,
 		GID:          0,
 		LinkCount:    1,
-		HashAlgo:     HashSha256,
-		CompAlgo:     CompZlib,
 		IsNestedRoot: isNestedRoot,
 	}
 
@@ -383,11 +397,60 @@ type entryTrackInfo struct {
 	chunkCount int   // number of chunk records (0 for non-chunked files)
 }
 
+// fileContent returns where a regular file's content lives: its whole-file
+// hash, or its chunks ordered by offset when the entry is chunked.  found is
+// false when the path is absent or is not a regular file with content.
+func (c *Catalog) fileContent(absPath string) (hashHex string, algo HashAlgo, chunks []ChunkRecord, size int64, found bool, err error) {
+	p1, p2 := MD5Path(absPath)
+	var hashBlob []byte
+	var flags int
+	var mode int64
+	scanErr := c.db.QueryRow(
+		"SELECT hash, flags, mode, size FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+	).Scan(&hashBlob, &flags, &mode, &size)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return "", 0, nil, 0, false, nil
+	}
+	if scanErr != nil {
+		return "", 0, nil, 0, false, fmt.Errorf("looking up %q: %w", absPath, scanErr)
+	}
+	if mode&0o170000 != 0o100000 {
+		return "", 0, nil, 0, false, nil
+	}
+	algo = HashAlgoFromFlags(flags)
+	if flags&FlagFileChunk == 0 {
+		if len(hashBlob) == 0 {
+			return "", 0, nil, 0, false, nil
+		}
+		return hex.EncodeToString(hashBlob), algo, nil, size, true, nil
+	}
+	rows, qErr := c.db.Query(
+		"SELECT offset, size, hash FROM chunks WHERE md5path_1 = ? AND md5path_2 = ? ORDER BY offset", p1, p2)
+	if qErr != nil {
+		return "", 0, nil, 0, false, fmt.Errorf("listing chunks of %q: %w", absPath, qErr)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ch ChunkRecord
+		if err := rows.Scan(&ch.Offset, &ch.Size, &ch.Hash); err != nil {
+			return "", 0, nil, 0, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
+		}
+		chunks = append(chunks, ch)
+	}
+	if err := rows.Err(); err != nil {
+		return "", 0, nil, 0, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
+	}
+	if len(chunks) == 0 {
+		return "", 0, nil, 0, false, nil
+	}
+	return "", algo, chunks, size, true, nil
+}
+
 // trackAdd increments the appropriate self-counters for a newly inserted entry.
 //
 // Type dispatch order (checked before falling to the default):
 //  1. FlagDir   → directory
-//  2. FlagLink  → symlink
+//  2. FlagLink  → symlink (CVMFS sets FlagFile too, so this precedes the file bits)
 //  3. FlagFileSpecial → device / named pipe / socket
 //  4. FlagFileExternal → external (catalogued without stored content)
 //  5. FlagFileChunk → chunked regular file
@@ -402,12 +465,23 @@ func (c *Catalog) trackAdd(info entryTrackInfo) {
 		c.delta.SelfSymlink++
 	case info.flags&FlagFileSpecial != 0:
 		c.delta.SelfSpecial++
+	// NB: file_size covers EVERY regular file. cvmfs_swissknife check adds
+	// entries[i].size() to self.file_size in its `else if (IsRegular())`
+	// branch (swissknife_check.cc:532-534), and then adds the external and
+	// chunked sizes to their own counters in SEPARATE `if` blocks (:566-582).
+	// The counters are cumulative, not mutually exclusive: a chunked file
+	// contributes to file_size AND chunked_file_size. Treating them as
+	// exclusive under-reported file_size by the whole chunked/external volume
+	// ("catalog statistics mismatch: subtree_file_size (expected 1300866854 /
+	// in catalog: 696887078)").
 	case info.flags&FlagFileExternal != 0:
 		c.delta.SelfRegular++
+		c.delta.SelfFileSize += info.size
 		c.delta.SelfExternal++
 		c.delta.SelfExternalFileSize += info.size
 	case info.flags&FlagFileChunk != 0:
 		c.delta.SelfRegular++
+		c.delta.SelfFileSize += info.size
 		c.delta.SelfChunked++
 		c.delta.SelfChunks += int64(info.chunkCount)
 		c.delta.SelfChunkedSize += info.size
@@ -429,12 +503,16 @@ func (c *Catalog) trackRemove(info entryTrackInfo) {
 		c.delta.SelfSymlink--
 	case info.flags&FlagFileSpecial != 0:
 		c.delta.SelfSpecial--
+	// Mirrors trackAdd exactly — including file_size for external and chunked
+	// files, which are regular files and therefore counted there too.
 	case info.flags&FlagFileExternal != 0:
 		c.delta.SelfRegular--
+		c.delta.SelfFileSize -= info.size
 		c.delta.SelfExternal--
 		c.delta.SelfExternalFileSize -= info.size
 	case info.flags&FlagFileChunk != 0:
 		c.delta.SelfRegular--
+		c.delta.SelfFileSize -= info.size
 		c.delta.SelfChunked--
 		c.delta.SelfChunks -= int64(info.chunkCount)
 		c.delta.SelfChunkedSize -= info.size
@@ -880,9 +958,43 @@ func (c *Catalog) AddNestedMount(mountPath, hashHex string, size int64) error {
 	return nil
 }
 
+// SetRootLinkCount fixes the link count of THIS catalog's own root directory
+// entry (the one Create inserted at rootPrefix).
+//
+// A nested catalog's root entry exists twice: as the mountpoint entry in the
+// parent catalog — which BuildSubtree routes from the tar entry list, so
+// normalizeDirLinkCounts already gave it the right value — and as the root
+// entry inside the child catalog itself, which Create synthesizes with
+// LinkCount 1 because it cannot know how many subdirectories will be routed
+// into it. cvmfs_swissknife check inspects the CHILD copy when it walks that
+// catalog (this_directory is the catalog's root entry), so the synthetic 1
+// surfaced as "wrong linkcount for /test/smoke.0/nested; expected 3, got 1".
+//
+// The high 32 bits of the hardlinks column (the hardlink group) are preserved;
+// only the low 32 bits (the count) are replaced.
+func (c *Catalog) SetRootLinkCount(linkCount uint32) error {
+	rootPath := c.rootPrefix // "" for a repo-root catalog
+	p1, p2 := MD5Path(rootPath)
+
+	var current int64
+	if err := c.db.QueryRow(
+		"SELECT hardlinks FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?",
+		p1, p2).Scan(&current); err != nil {
+		return fmt.Errorf("reading root entry of %q: %w", rootPath, err)
+	}
+	updated := (current &^ 0xFFFFFFFF) | int64(linkCount)
+	if _, err := c.db.Exec(
+		"UPDATE catalog SET hardlinks = ? WHERE md5path_1 = ? AND md5path_2 = ?",
+		updated, p1, p2); err != nil {
+		return fmt.Errorf("updating root link count of %q: %w", rootPath, err)
+	}
+	return nil
+}
+
 // FindNestedMount checks whether absPath is a nested catalog mount point in
-// this catalog.  If found, it returns the compressed catalog hash (hex) and
-// compressed size stored in the nested_catalogs table.
+// this catalog.  If found, it returns the catalog hash (hex, naming the
+// compressed object) and the UNCOMPRESSED database size stored in the
+// nested_catalogs table (see UncompressedSize).
 // Returns found=false (no error) when no row exists for absPath.
 //
 // nested_catalogs uses the CVMFS native schema: path TEXT PRIMARY KEY, sha1 TEXT.
@@ -1010,6 +1122,10 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 	if err != nil {
 		return "", Statistics{}, fmt.Errorf("reading database: %w", err)
 	}
+	// Remember the UNCOMPRESSED database size: that — not the size of the
+	// compressed object — is what a parent catalog's nested_catalogs.size must
+	// hold (see UncompressedSize).
+	c.uncompressedSize = int64(len(raw))
 
 	// Compress with zlib.
 	//
@@ -1060,30 +1176,6 @@ func (c *Catalog) Finalize(destDir string) (hashHex string, delta Statistics, er
 	_ = os.Remove(c.dbPath) //nolint:errcheck
 
 	return hash, savedDelta, nil
-}
-
-// LookupFileHash returns the content hash and hash algorithm of a regular file
-// stored at absPath in this catalog.  The hash algorithm is extracted from the
-// entry's flags column.  Returns ("", 0, false, nil) when no entry exists for
-// the path or when the stored entry has no content hash (e.g. directories or
-// symlinks that were written without a hash).
-func (c *Catalog) LookupFileHash(absPath string) (hashHex string, algo HashAlgo, found bool, err error) {
-	p1, p2 := MD5Path(absPath)
-	var hashBlob []byte
-	var flags int
-	scanErr := c.db.QueryRow(
-		"SELECT hash, flags FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-	).Scan(&hashBlob, &flags)
-	if errors.Is(scanErr, sql.ErrNoRows) {
-		return "", 0, false, nil
-	}
-	if scanErr != nil {
-		return "", 0, false, fmt.Errorf("looking up %q: %w", absPath, scanErr)
-	}
-	if len(hashBlob) == 0 {
-		return "", 0, false, nil
-	}
-	return hex.EncodeToString(hashBlob), HashAlgoFromFlags(flags), true, nil
 }
 
 // SchemaVersion returns the schema version.

@@ -73,10 +73,20 @@ publish_mode: gateway
 gateway:
   url: http://gw.example.com:4929
 log_level: debug
+promote_workers: 32
 `)
 	fc, err := loadFileConfig(path)
 	if err != nil {
 		t.Fatalf("loadFileConfig: %v", err)
+	}
+	// The key must be exercised through YAML, not just through a Go literal:
+	// loadFileConfig does a plain Unmarshal with no KnownFields, so a typo in
+	// the struct tag makes the operator's setting a silent no-op.
+	//
+	// NEGATIVE CONTROL: change the tag to `yaml:"promote_workerz"` and this
+	// fails with "PromoteWorkers = 0; want 32".
+	if fc.PromoteWorkers != 32 {
+		t.Errorf("PromoteWorkers = %d; want 32", fc.PromoteWorkers)
 	}
 	if fc.SpoolRoot != "/custom/spool" {
 		t.Errorf("SpoolRoot = %q; want /custom/spool", fc.SpoolRoot)
@@ -119,20 +129,6 @@ func TestLoadFileConfig_EmptyFile(t *testing.T) {
 	}
 }
 
-func TestLoadFileConfig_WarmQuorum(t *testing.T) {
-	path := writeYAML(t, `
-distribution:
-  warm_quorum: 0.75
-`)
-	fc, err := loadFileConfig(path)
-	if err != nil {
-		t.Fatalf("loadFileConfig: %v", err)
-	}
-	if fc.Distribution.WarmQuorum != 0.75 {
-		t.Errorf("WarmQuorum = %v; want 0.75", fc.Distribution.WarmQuorum)
-	}
-}
-
 // ── applyFileConfig ───────────────────────────────────────────────────────────
 
 // applyTestVars holds default-valued flag variables for an applyFileConfig call.
@@ -140,19 +136,35 @@ type applyTestVars struct {
 	mode, logLevel                                          string
 	devMode                                                 bool
 	spoolRoot, stagingRoot, listen, publishMode, gatewayURL string
-	cvmfsMount, casType, casRoot                            string
+	cvmfsMount, casType, casRoot, casServerConf             string
 	stratum0URL, repoName                                   string
 	jobTimeout                                              time.Duration
 	minConcurrentJobs, maxConcurrentJobs                    int
-	warmQuorum                                              float64
 	brokerCACert                                            string
-	controlAddr, dataAddr, dataHost, tlsCert, tlsKey        string
-	sessionTTL                                              time.Duration
-	diskHeadroom                                            float64
+	controlAddr                                             string
 	nodeID, repos, recvStratum0URL                          string
 	provenanceEnabled                                       bool
 	rekorServer, rekorSigningKey, oidcIssuers               string
+	allowedPublishPrefixes                                  string
 	gatewayDirectGraft                                      bool
+	gatewayAllowPlaintext                                   bool
+	authMode                                                string
+	debugListen                                             string
+	signatureSkew                                           time.Duration
+	ingestPublish                                           bool
+	ingestPublishOwner                                      string
+	replaceOnConflict                                       bool
+	measurementsDir                                         string
+	ingestSwissknife, ingestConfigPrefix, ingestEnv         string
+	chunkMin, chunkAvg, chunkMax                            int64
+	pipelineWorkers, pipelineUploadConc, prefetchLimit      int
+	promoteWorkers                                          int
+	prefetch                                                bool
+	maxTarSizeGiB, spoolMinFreeGiB                          int
+	retryWindow                                             time.Duration
+	preWarm                                                 bool
+	catalogCacheDir                                         string
+	catalogCacheMiB                                         int
 }
 
 func defaultApplyVars() *applyTestVars {
@@ -161,9 +173,8 @@ func defaultApplyVars() *applyTestVars {
 		spoolRoot: "/default/spool", listen: ":8080", publishMode: "gateway",
 		gatewayURL: "https://localhost:4929", cvmfsMount: "/cvmfs",
 		casType: "localfs", casRoot: "/var/lib/cas",
-		jobTimeout: 0, warmQuorum: 1.0,
-		controlAddr: ":9100", dataAddr: ":9101",
-		sessionTTL: time.Hour, diskHeadroom: 1.2,
+		jobTimeout:  0,
+		controlAddr: ":9100",
 	}
 }
 
@@ -171,15 +182,27 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 	applyFileConfig(fc, explicit,
 		&v.mode, &v.logLevel, &v.devMode,
 		&v.spoolRoot, &v.stagingRoot, &v.listen, &v.publishMode, &v.gatewayURL, &v.cvmfsMount, &v.casType, &v.casRoot,
+		&v.casServerConf,
 		&v.stratum0URL, &v.repoName,
 		&v.jobTimeout, &v.minConcurrentJobs, &v.maxConcurrentJobs,
-		&v.warmQuorum,
 		&v.brokerCACert,
-		&v.controlAddr, &v.dataAddr, &v.dataHost, &v.tlsCert, &v.tlsKey,
-		&v.sessionTTL, &v.diskHeadroom,
+		&v.controlAddr,
 		&v.nodeID, &v.repos, &v.recvStratum0URL,
 		&v.provenanceEnabled, &v.rekorServer, &v.rekorSigningKey, &v.oidcIssuers,
-		&v.gatewayDirectGraft,
+		&v.allowedPublishPrefixes,
+		&v.gatewayDirectGraft, &v.gatewayAllowPlaintext,
+		&v.authMode,
+		&v.debugListen,
+		&v.signatureSkew,
+		&v.ingestPublish, &v.ingestPublishOwner,
+		&v.replaceOnConflict, &v.measurementsDir,
+		&v.ingestSwissknife, &v.ingestConfigPrefix, &v.ingestEnv,
+		&v.chunkMin, &v.chunkAvg, &v.chunkMax,
+		&v.pipelineWorkers, &v.pipelineUploadConc, &v.prefetchLimit, &v.promoteWorkers, &v.prefetch,
+		&v.maxTarSizeGiB, &v.spoolMinFreeGiB,
+		&v.retryWindow,
+		&v.preWarm,
+		&v.catalogCacheDir, &v.catalogCacheMiB,
 	)
 }
 
@@ -210,13 +233,161 @@ func TestApplyFileConfig_CLIOverridesConfig(t *testing.T) {
 	}
 }
 
-func TestApplyFileConfig_WarmQuorum(t *testing.T) {
+// TestApplyFileConfig_PipelineWorkers guards the memory lever: peak RSS scales
+// with the compress worker count (each worker holds a whole file plus its
+// compressed chunks), so a constrained host must be able to lower it from the
+// config file, and an explicit flag must still win.
+func TestApplyFileConfig_PipelineWorkers(t *testing.T) {
 	fc := &fileConfig{}
-	fc.Distribution.WarmQuorum = 0.5
+	fc.Pipeline.Workers = 1
+	fc.Pipeline.UploadConcurrency = 2
+
+	v := defaultApplyVars()
+	v.pipelineWorkers, v.pipelineUploadConc = 4, 4
+	v.apply(fc, map[string]bool{})
+	if v.pipelineWorkers != 1 {
+		t.Errorf("pipeline.workers = %d; want 1 from config", v.pipelineWorkers)
+	}
+	if v.pipelineUploadConc != 2 {
+		t.Errorf("pipeline.upload_concurrency = %d; want 2 from config", v.pipelineUploadConc)
+	}
+
+	// An explicitly-set flag must not be overridden by the file.
+	v = defaultApplyVars()
+	v.pipelineWorkers = 8
+	v.apply(fc, map[string]bool{"pipeline-workers": true})
+	if v.pipelineWorkers != 8 {
+		t.Errorf("explicit --pipeline-workers was overridden: %d", v.pipelineWorkers)
+	}
+}
+
+func TestApplyFileConfig_ReplaceOnConflict(t *testing.T) {
+	on := true
+	fc := &fileConfig{ReplaceOnConflict: &on}
 	v := defaultApplyVars()
 	v.apply(fc, map[string]bool{})
+	if !v.replaceOnConflict {
+		t.Error("replace_on_conflict: true in config was not applied")
+	}
+	// An explicit CLI flag wins over the config file, both directions.
+	v2 := defaultApplyVars()
+	v2.apply(fc, map[string]bool{"replace-on-conflict": true})
+	if v2.replaceOnConflict {
+		t.Error("explicit --replace-on-conflict=false was overridden by config")
+	}
+}
 
-	if v.warmQuorum != 0.5 {
-		t.Errorf("warmQuorum = %v; want 0.5 (copied from config)", v.warmQuorum)
+// An explicit `false` in YAML must turn off a default-true flag; an absent key
+// must leave the default alone.
+func TestApplyFileConfig_ExplicitFalseBool(t *testing.T) {
+	fc, err := loadFileConfig(writeYAML(t, "gateway:\n  direct_graft: false\n"))
+	if err != nil {
+		t.Fatalf("loadFileConfig: %v", err)
+	}
+	v := defaultApplyVars()
+	v.gatewayDirectGraft = true
+	v.apply(fc, map[string]bool{})
+	if v.gatewayDirectGraft {
+		t.Error("direct_graft: false in config was not applied")
+	}
+
+	empty, err := loadFileConfig(writeYAML(t, "spool_root: /x\n"))
+	if err != nil {
+		t.Fatalf("loadFileConfig: %v", err)
+	}
+	v2 := defaultApplyVars()
+	v2.gatewayDirectGraft = true
+	v2.apply(empty, map[string]bool{})
+	if !v2.gatewayDirectGraft {
+		t.Error("absent direct_graft key must keep the default (true)")
+	}
+}
+
+// The config file supplies the promote concurrency only when the flag was not
+// given; an explicit --promote-workers wins. Same rule as every other int.
+func TestApplyFileConfig_PromoteWorkers(t *testing.T) {
+	fc := &fileConfig{PromoteWorkers: 32}
+	v := defaultApplyVars()
+	v.promoteWorkers = 16
+	v.apply(fc, map[string]bool{})
+	if v.promoteWorkers != 32 {
+		t.Errorf("promoteWorkers = %d; want 32 from config", v.promoteWorkers)
+	}
+
+	v2 := defaultApplyVars()
+	v2.promoteWorkers = 64
+	v2.apply(fc, map[string]bool{"promote-workers": true})
+	if v2.promoteWorkers != 64 {
+		t.Errorf("promoteWorkers = %d; explicit flag must win", v2.promoteWorkers)
+	}
+}
+
+func TestEnvInt(t *testing.T) {
+	const k = "PREPUB_TEST_ENVINT_XYZ"
+	os.Unsetenv(k)
+	if got := envInt(k, 7); got != 7 { // unset -> builtin
+		t.Fatalf("unset: want 7, got %d", got)
+	}
+	os.Setenv(k, "  32 ")
+	defer os.Unsetenv(k)
+	if got := envInt(k, 7); got != 32 { // valid, trimmed -> parsed
+		t.Fatalf("valid: want 32, got %d", got)
+	}
+	for _, bad := range []string{"notanumber", "", "  "} { // garbage/empty -> builtin
+		os.Setenv(k, bad)
+		if got := envInt(k, 7); got != 7 {
+			t.Fatalf("bad %q: want builtin 7, got %d", bad, got)
+		}
+	}
+}
+
+// prewarm: true in config.yaml makes pre-warming available, like --prewarm;
+// an explicit --prewarm=false on the command line wins.
+func TestApplyFileConfig_PreWarm(t *testing.T) {
+	yes := true
+	v := defaultApplyVars()
+	v.apply(&fileConfig{PreWarm: &yes}, map[string]bool{})
+	if !v.preWarm {
+		t.Error("prewarm: true in the config did not enable pre-warming")
+	}
+	v = defaultApplyVars()
+	v.apply(&fileConfig{PreWarm: &yes}, map[string]bool{"prewarm": true})
+	if v.preWarm {
+		t.Error("an explicit --prewarm=false must win over the config")
+	}
+}
+
+// The catalog cache settings come from config.yaml unless given on the
+// command line.
+func TestApplyFileConfig_CatalogCache(t *testing.T) {
+	v := defaultApplyVars()
+	v.catalogCacheMiB = 1024
+	v.apply(&fileConfig{CatalogCacheDir: "/var/cache/x", CatalogCacheMiB: 64}, map[string]bool{})
+	if v.catalogCacheDir != "/var/cache/x" || v.catalogCacheMiB != 64 {
+		t.Errorf("dir=%q mib=%d, want the config's", v.catalogCacheDir, v.catalogCacheMiB)
+	}
+	v = defaultApplyVars()
+	v.catalogCacheDir = "off"
+	v.apply(&fileConfig{CatalogCacheDir: "/var/cache/x"}, map[string]bool{"catalog-cache-dir": true})
+	if v.catalogCacheDir != "off" {
+		t.Errorf("dir=%q, want the command line's", v.catalogCacheDir)
+	}
+}
+
+// The S3 config path is handed unquoted to cvmfs_server, whose ingest re-splits
+// its command line through a shell.
+func TestSafeShellPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/etc/cvmfs-prepub/bits.cern.ch.s3.server.conf": true,
+		"/etc/cvmfs/keys/a_b@c+d-e.conf":                true,
+		"relative/s3.conf":                              false,
+		"/etc/with space.conf":                          false,
+		"/etc/x;rm -rf /":                               false,
+		"/etc/$(id).conf":                               false,
+		"":                                              false,
+	} {
+		if got := safeShellPath(p); got != want {
+			t.Errorf("safeShellPath(%q) = %v, want %v", p, got, want)
+		}
 	}
 }
