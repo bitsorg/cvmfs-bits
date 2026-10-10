@@ -219,6 +219,9 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 	published := s.router.PathPrefix("/api/v1/published").Subrouter()
 	published.Use(s.requireAuth)
 	published.HandleFunc("", s.publishedHandler).Methods("POST")
+	// The metadata files bits keeps in published trees (.meta.json,
+	// .bits-view.json), read in one batch: a merged view is rebuilt from them.
+	published.HandleFunc("/files", s.publishedFilesHandler).Methods("POST")
 
 	// Coarse publish finalize: publish a whole build's accumulated
 	// packages in one commit. Authenticated.
@@ -427,6 +430,109 @@ func (s *Server) publishedHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp.Hash = hash
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// Limits of POST /api/v1/published/files: paths per request (a producer
+// batches), the size of one file and of all the files of one answer.
+const (
+	maxPublishedFiles     = 512
+	maxPublishedFileBytes = 16 << 20
+	maxPublishedFilesSum  = 64 << 20
+	publishedFileWorkers  = 8
+)
+
+// publishedFileNames are the files POST /api/v1/published/files reads: the
+// metadata bits writes into what it publishes. Not a general file server.
+var publishedFileNames = map[string]bool{".meta.json": true, ".bits-view.json": true}
+
+// readPublishedFilesFn is a test seam; production reads the published
+// catalogs on stratum0.
+var readPublishedFilesFn = cvmfscatalog.ReadPublishedFiles
+
+// publishedFilesHandler handles POST /api/v1/published/files
+// {"repo","paths":[...]}: the content of each path, all read from the same
+// published revision, as {"files": {"<path>": <its JSON> | null}}. null means
+// not published; a file that is not valid JSON is null and listed in
+// "invalid". Only .meta.json and .bits-view.json can be read.
+func (s *Server) publishedFilesHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := s.obs.Tracer.Start(r.Context(), "api.published.files")
+	defer span.End()
+	w.Header().Set("Content-Type", "application/json")
+
+	var req struct {
+		Repo  string   `json:"repo"`
+		Paths []string `json:"paths"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Repo == "" || broker.ValidateRepo(req.Repo) != nil || len(req.Paths) == 0 {
+		http.Error(w, `{"error":"a valid repo and at least one path are required"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.Paths) > maxPublishedFiles {
+		http.Error(w, fmt.Sprintf(`{"error":"at most %d paths per request"}`, maxPublishedFiles),
+			http.StatusRequestEntityTooLarge)
+		return
+	}
+	paths := make([]string, 0, len(req.Paths))
+	seen := make(map[string]bool, len(req.Paths))
+	for _, p := range req.Paths {
+		// Canonical paths only: the read looks the path up as given.
+		if p == "" || p != path.Clean(p) || validateSubPath(p) != nil || !publishedFileNames[path.Base(p)] {
+			http.Error(w, `{"error":"each path must be a canonical repository-relative .meta.json or .bits-view.json"}`,
+				http.StatusBadRequest)
+			return
+		}
+		if !s.publishAuthorized(req.Repo, p) {
+			http.Error(w, `{"error":"forbidden: a path is outside this deployment's authorized CVMFS namespace"}`,
+				http.StatusForbidden)
+			return
+		}
+		if !seen[p] {
+			seen[p] = true
+			paths = append(paths, p)
+		}
+	}
+	if s.orch.Stratum0URL == "" {
+		http.Error(w, `{"error":"no stratum0 configured"}`, http.StatusNotImplemented)
+		return
+	}
+	data, oversized, err := readPublishedFilesFn(ctx, nil, s.orch.Stratum0URL, req.Repo,
+		paths, cvmfscatalog.ReadLimits{Workers: publishedFileWorkers,
+			MaxFileBytes: maxPublishedFileBytes, MaxTotalBytes: maxPublishedFilesSum})
+	if errors.Is(err, cvmfscatalog.ErrTooLarge) {
+		http.Error(w, fmt.Sprintf(`{"error":"the files exceed %d bytes: ask for fewer paths"}`,
+			maxPublishedFilesSum), http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err != nil {
+		s.obs.Logger.Warn("published/files: read failed", "repo", req.Repo, "error", err)
+		http.Error(w, `{"error":"cannot read the published repository"}`, http.StatusBadGateway)
+		return
+	}
+	resp := struct {
+		Files   map[string]json.RawMessage `json:"files"`
+		Invalid []string                   `json:"invalid,omitempty"`
+	}{Files: make(map[string]json.RawMessage, len(paths))}
+	big := make(map[string]bool, len(oversized))
+	for _, p := range oversized {
+		big[p] = true
+	}
+	for _, p := range paths {
+		b, ok := data[p]
+		switch {
+		case big[p] || (ok && !json.Valid(b)):
+			resp.Files[p] = json.RawMessage("null")
+			resp.Invalid = append(resp.Invalid, p)
+		case !ok:
+			resp.Files[p] = json.RawMessage("null")
+		default:
+			resp.Files[p] = json.RawMessage(b)
+		}
 	}
 	json.NewEncoder(w).Encode(resp)
 }

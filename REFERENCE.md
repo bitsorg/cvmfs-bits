@@ -691,6 +691,7 @@ differ from the signature).
 | `GET /api/v1/jobs/{id}/log` | yes | always | Job record and transition history |
 | `POST /api/v1/reserve` | yes | always | Fail-fast namespace check |
 | `POST /api/v1/published` | yes | always (`501` without `stratum0_url`) | Is a path already published, and by which build |
+| `POST /api/v1/published/files` | yes | always (`501` without `stratum0_url`) | Read published `.meta.json` / `.bits-view.json` files in one batch |
 | `GET /api/v1/builds/{id}` | yes | always | Coarse build status |
 | `POST /api/v1/builds/{id}/seal` | yes | always | Declare a build's job count |
 | `POST /api/v1/builds/{id}/finalize` | yes | always | Publish a build's accumulated packages now |
@@ -931,6 +932,28 @@ such file).
 | `403` | Outside `allowed_publish_prefixes` |
 | `501` | `stratum0_url` not configured |
 | `502` | The published catalogs or `.meta.json` could not be read |
+
+### POST /api/v1/published/files
+
+Reads the metadata files bits keeps in what it publishes, so that a producer can
+rebuild a tree from what is already there (a release's merged view from its
+members' `.bits-view.json`). Body `{"repo":"<repo>","paths":["<path>",...]}`,
+each a canonical repository-relative path ending in `/.meta.json` or
+`/.bits-view.json`; no other file can be read. All paths are read from the same
+published revision, and sizes are checked from the catalog before any download. Answers
+`200 {"files":{"<path>":<content>|null},"invalid":["<path>"]}`: a file's JSON
+as it is published, `null` when it is not published, and `null` plus an entry
+in `invalid` when it is not valid JSON or larger than 16 MiB. A repeated path
+is answered once.
+
+| Status | When |
+|---|---|
+| `200` | Answer as above |
+| `400` | Invalid JSON, missing or invalid `repo`, no paths, or a path that is not canonical, is invalid or names another file |
+| `403` | A path outside `allowed_publish_prefixes` (nothing is read) |
+| `413` | More than 512 paths, or more than 64 MiB of files: ask in smaller batches |
+| `501` | `stratum0_url` not configured |
+| `502` | The published catalogs or a file could not be read |
 
 ### Builds
 

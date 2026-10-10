@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // HasEntry reports whether a catalog entry (of any kind) exists at absPath in
@@ -143,15 +144,128 @@ func ReadPublishedFile(ctx context.Context, client *http.Client, stratum0URL, re
 	if abs == "" {
 		return nil, false, nil
 	}
+	root, err := publishedRoot(ctx, client, stratum0URL, repo)
+	if err != nil || root == "" {
+		return nil, false, err
+	}
+	return readFileAt(ctx, client, stratum0URL, repo, root, abs, nil)
+}
+
+// ReadLimits bound ReadPublishedFiles: reads at a time, the size of one file
+// (a larger one is reported, not read) and of all files read (beyond it the
+// call fails with ErrTooLarge). Zero sizes mean no limit.
+type ReadLimits struct {
+	Workers       int
+	MaxFileBytes  int64
+	MaxTotalBytes int64
+}
+
+// ErrTooLarge: the files asked for together exceed ReadLimits.MaxTotalBytes.
+var ErrTooLarge = errors.New("the files exceed the size limit")
+
+// errFileTooLarge: one file exceeds ReadLimits.MaxFileBytes (not read).
+var errFileTooLarge = errors.New("file exceeds the size limit")
+
+// ReadPublishedFiles reads several files as ReadPublishedFile does, all from
+// the same published revision (the manifest is read once). Sizes are checked
+// against lim from the catalog, before anything is downloaded. It returns the
+// files that were found, keyed by the relPaths given, and the paths of those
+// over MaxFileBytes; the first error stops the reads and is returned.
+func ReadPublishedFiles(ctx context.Context, client *http.Client, stratum0URL, repo string,
+	relPaths []string, lim ReadLimits) (files map[string][]byte, oversized []string, err error) {
+	files = make(map[string][]byte, len(relPaths))
+	root, err := publishedRoot(ctx, client, stratum0URL, repo)
+	if err != nil || root == "" {
+		return files, nil, err
+	}
+	// Opened once up front, so that the workers find it in the catalog cache
+	// instead of all downloading it at the same time.
+	if _, release, openErr := openPublishedCatalog(ctx, client, stratum0URL, repo, root); openErr == nil {
+		release()
+	}
+	workers := lim.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		mu       sync.Mutex
+		total    int64
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	admit := func(size int64) error {
+		if lim.MaxFileBytes > 0 && size > lim.MaxFileBytes {
+			return errFileTooLarge
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if lim.MaxTotalBytes > 0 && total+size > lim.MaxTotalBytes {
+			return ErrTooLarge
+		}
+		total += size
+		return nil
+	}
+	todo := make(chan string)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range todo {
+				abs := normalizeLeasePathForNested(p)
+				if abs == "" {
+					continue
+				}
+				data, found, rerr := readFileAt(ctx, client, stratum0URL, repo, root, abs, admit)
+				mu.Lock()
+				switch {
+				case errors.Is(rerr, errFileTooLarge):
+					oversized = append(oversized, p)
+				case rerr != nil:
+					if firstErr == nil {
+						firstErr = fmt.Errorf("%s: %w", p, rerr)
+						cancel()
+					}
+				case found:
+					files[p] = data
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+feed:
+	for _, p := range relPaths {
+		select {
+		case todo <- p:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(todo)
+	wg.Wait()
+	if firstErr == nil && ctx.Err() != nil {
+		firstErr = ctx.Err()
+	}
+	return files, oversized, firstErr
+}
+
+// publishedRoot is the root catalog hash of the published revision, without
+// its suffix; empty when the repository has never been published.
+func publishedRoot(ctx context.Context, client *http.Client, stratum0URL, repo string) (string, error) {
 	rootSuffixed, err := FetchManifestRootHash(ctx, client, stratum0URL, repo)
 	if err != nil {
-		return nil, false, fmt.Errorf("fetching manifest root hash: %w", err)
+		return "", fmt.Errorf("fetching manifest root hash: %w", err)
 	}
-	if rootSuffixed == "" {
-		return nil, false, nil
-	}
-	curHash := strings.TrimSuffix(rootSuffixed, "C")
+	return strings.TrimSuffix(rootSuffixed, "C"), nil
+}
 
+// readFileAt reads the file at abs in the revision whose root catalog is
+// rootHash; see ReadPublishedFile. A non-nil admit is given the file's size
+// before it is downloaded, and its error is returned instead of reading it.
+func readFileAt(ctx context.Context, client *http.Client, stratum0URL, repo, rootHash, abs string,
+	admit func(size int64) error) (data []byte, found bool, err error) {
+	curHash := rootHash
 	for depth := 0; depth < 64; depth++ {
 		cat, release, openErr := openPublishedCatalog(ctx, client, stratum0URL, repo, curHash)
 		if openErr != nil {
@@ -174,10 +288,15 @@ func ReadPublishedFile(ctx context.Context, client *http.Client, stratum0URL, re
 			release()
 			return nil, false, nil
 		}
-		hashHex, algo, chunks, ok, lkErr := cat.fileContent(abs)
+		hashHex, algo, chunks, size, ok, lkErr := cat.fileContent(abs)
 		release()
 		if lkErr != nil || !ok {
 			return nil, false, lkErr
+		}
+		if admit != nil {
+			if err := admit(size); err != nil {
+				return nil, true, err
+			}
 		}
 		if len(chunks) == 0 {
 			obj, objErr := DownloadObject(ctx, client, stratum0URL, repo, hashHex, algo)

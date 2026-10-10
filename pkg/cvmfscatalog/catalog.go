@@ -400,50 +400,50 @@ type entryTrackInfo struct {
 // fileContent returns where a regular file's content lives: its whole-file
 // hash, or its chunks ordered by offset when the entry is chunked.  found is
 // false when the path is absent or is not a regular file with content.
-func (c *Catalog) fileContent(absPath string) (hashHex string, algo HashAlgo, chunks []ChunkRecord, found bool, err error) {
+func (c *Catalog) fileContent(absPath string) (hashHex string, algo HashAlgo, chunks []ChunkRecord, size int64, found bool, err error) {
 	p1, p2 := MD5Path(absPath)
 	var hashBlob []byte
 	var flags int
 	var mode int64
 	scanErr := c.db.QueryRow(
-		"SELECT hash, flags, mode FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
-	).Scan(&hashBlob, &flags, &mode)
+		"SELECT hash, flags, mode, size FROM catalog WHERE md5path_1 = ? AND md5path_2 = ?", p1, p2,
+	).Scan(&hashBlob, &flags, &mode, &size)
 	if errors.Is(scanErr, sql.ErrNoRows) {
-		return "", 0, nil, false, nil
+		return "", 0, nil, 0, false, nil
 	}
 	if scanErr != nil {
-		return "", 0, nil, false, fmt.Errorf("looking up %q: %w", absPath, scanErr)
+		return "", 0, nil, 0, false, fmt.Errorf("looking up %q: %w", absPath, scanErr)
 	}
 	if mode&0o170000 != 0o100000 {
-		return "", 0, nil, false, nil
+		return "", 0, nil, 0, false, nil
 	}
 	algo = HashAlgoFromFlags(flags)
 	if flags&FlagFileChunk == 0 {
 		if len(hashBlob) == 0 {
-			return "", 0, nil, false, nil
+			return "", 0, nil, 0, false, nil
 		}
-		return hex.EncodeToString(hashBlob), algo, nil, true, nil
+		return hex.EncodeToString(hashBlob), algo, nil, size, true, nil
 	}
 	rows, qErr := c.db.Query(
 		"SELECT offset, size, hash FROM chunks WHERE md5path_1 = ? AND md5path_2 = ? ORDER BY offset", p1, p2)
 	if qErr != nil {
-		return "", 0, nil, false, fmt.Errorf("listing chunks of %q: %w", absPath, qErr)
+		return "", 0, nil, 0, false, fmt.Errorf("listing chunks of %q: %w", absPath, qErr)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var ch ChunkRecord
 		if err := rows.Scan(&ch.Offset, &ch.Size, &ch.Hash); err != nil {
-			return "", 0, nil, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
+			return "", 0, nil, 0, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
 		}
 		chunks = append(chunks, ch)
 	}
 	if err := rows.Err(); err != nil {
-		return "", 0, nil, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
+		return "", 0, nil, 0, false, fmt.Errorf("reading chunks of %q: %w", absPath, err)
 	}
 	if len(chunks) == 0 {
-		return "", 0, nil, false, nil
+		return "", 0, nil, 0, false, nil
 	}
-	return "", algo, chunks, true, nil
+	return "", algo, chunks, size, true, nil
 }
 
 // trackAdd increments the appropriate self-counters for a newly inserted entry.
