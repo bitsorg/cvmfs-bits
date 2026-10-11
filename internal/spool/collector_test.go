@@ -4,6 +4,7 @@
 package spool
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -53,10 +54,15 @@ cvmfs_prepub_spool_jobs_waiting_retry 1
 		"cvmfs_prepub_spool_jobs", "cvmfs_prepub_spool_jobs_waiting_retry"); err != nil {
 		t.Error(err)
 	}
-	// Host and filesystem gauges are present (values are the test machine's).
+	// Host and filesystem gauges are present (values are the test machine's);
+	// memory comes from /proc/meminfo, so only on Linux.
+	wantGauges := 3
+	if runtime.GOOS != "linux" {
+		wantGauges = 2
+	}
 	n, err := testutil.GatherAndCount(reg, "cvmfs_prepub_spool_fs_size_bytes",
 		"cvmfs_prepub_host_cpus", "cvmfs_prepub_host_memory_total_bytes")
-	if err != nil || n != 3 {
+	if err != nil || n != wantGauges {
 		t.Errorf("host gauges: %d, %v", n, err)
 	}
 }
