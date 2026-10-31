@@ -845,7 +845,7 @@ publisher operator has to set and check.
 | `PREPUB_COARSE` | `true` | every job carries `build_id` (the CI pipeline id) and accumulates; one finalize commits the build. Needs `finalize_ready: true` ([section 4.5](#45-coarse-publish-and-the-finalize)) |
 | `PREPUB_WAIT` | `false` | the CI job uploads, seals the build and exits; the publisher finalizes on its own, so a green pipeline does not yet mean "published" |
 | `PREPUB_SIGN` | `true` | requests are signed (`X-Bits-Auth`); works with `auth_mode` `both` or `hmac` |
-| `PREPUB_PUBLISH_PATH` | `prepub` | `ingest` and `staged` require the node to offer that path ([section 4](#4-publish-backends-and-paths)) |
+| `PREPUB_PUBLISH_PATH` | `ingest` | the node must offer it (`ingest_publish: true`); `staged`, too, must be offered, and `prepub` (retired) is used only when named ([section 4](#4-publish-backends-and-paths)) |
 | `PREPUB_PREWARM` | off | `true` sends `prewarm=true`; needs `PREPUB_OBJECT_LIST=true` (ingest with direct-S3) and a publisher with pre-warming enabled ([section 7](#7-stratum-1-pre-warming)) |
 
 ### 8.3 Verify
