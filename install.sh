@@ -1122,6 +1122,10 @@ RestartSec=5s
 # also sets it itself at startup, which covers child processes we exec.
 Environment=TMPDIR=${SPOOL_DIR}/tmp
 EnvironmentFile=${CONFIG_DIR}/env
+# cvmfs_swissknife keeps each catalog it loads open: with ~1000 nested catalogs
+# under one directory the default soft limit (1024) runs out, and the next
+# download fails as "failed to resolve host address".
+LimitNOFILE=65536:524288
 # Memory containment. Peak RSS scales with --pipeline-workers x largest-file,
 # because each compress worker holds a whole file plus its compressed chunks.
 # Without a cap the KERNEL picks the OOM victim, and on a host shared with
