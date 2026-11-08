@@ -15,12 +15,12 @@ import (
 	"testing"
 )
 
-type tarEntry struct {
+type batchTestEntry struct {
 	hdr  tar.Header
 	body string
 }
 
-func writeTestTar(t *testing.T, entries []tarEntry) string {
+func writeTestTar(t *testing.T, entries []batchTestEntry) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "payload.tar")
 	f, err := os.Create(p)
@@ -50,9 +50,9 @@ func writeTestTar(t *testing.T, entries []tarEntry) string {
 	return p
 }
 
-func readTestTar(t *testing.T, data []byte) map[string]tarEntry {
+func readTestTar(t *testing.T, data []byte) map[string]batchTestEntry {
 	t.Helper()
-	got := map[string]tarEntry{}
+	got := map[string]batchTestEntry{}
 	tr := tar.NewReader(bytes.NewReader(data))
 	for {
 		h, err := tr.Next()
@@ -69,26 +69,26 @@ func readTestTar(t *testing.T, data []byte) map[string]tarEntry {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got[h.Name] = tarEntry{hdr: *h, body: string(b)}
+		got[h.Name] = batchTestEntry{hdr: *h, body: string(b)}
 	}
 }
 
-func dir(name string) tarEntry {
-	return tarEntry{hdr: tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0o755}}
+func batchDir(name string) batchTestEntry {
+	return batchTestEntry{hdr: tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0o755}}
 }
-func file(name, body string) tarEntry {
-	return tarEntry{hdr: tar.Header{Name: name, Typeflag: tar.TypeReg}, body: body}
+func batchFile(name, body string) batchTestEntry {
+	return batchTestEntry{hdr: tar.Header{Name: name, Typeflag: tar.TypeReg}, body: body}
 }
 
 // Each member lands under its path with a marker at its root; file contents,
 // symlink targets and hard links (renamed with their member) survive.
 func TestWriteBatchTar_TwoMembers(t *testing.T) {
 	long := "./" + strings.Repeat("d", 90) + "/" + strings.Repeat("f", 120) // PAX in the batch
-	a := writeTestTar(t, []tarEntry{dir("./"), dir("./bin/"), file("./bin/tool", "A"),
+	a := writeTestTar(t, []batchTestEntry{batchDir("./"), batchDir("./bin/"), batchFile("./bin/tool", "A"),
 		{hdr: tar.Header{Name: "./bin/alias", Typeflag: tar.TypeSymlink, Linkname: "tool"}},
 		{hdr: tar.Header{Name: "./bin/copy", Typeflag: tar.TypeLink, Linkname: "./bin/tool"}},
-		file(long, "L")})
-	b := writeTestTar(t, []tarEntry{dir("./"), file("lib/x.so", "B")})
+		batchFile(long, "L")})
+	b := writeTestTar(t, []batchTestEntry{batchDir("./"), batchFile("lib/x.so", "B")})
 
 	var out bytes.Buffer
 	err := WriteBatchTar(&out, []BatchMember{{a, "Packages/A/1-1"}, {b, "Modules/modulefiles/B"}})
@@ -125,9 +125,9 @@ func TestWriteBatchTar_TwoMembers(t *testing.T) {
 // A member that already has a marker at its root gets no second one, and a
 // global header, which would apply to the members after it, is dropped.
 func TestWriteBatchTar_OwnMarkerAndGlobalHeader(t *testing.T) {
-	a := writeTestTar(t, []tarEntry{
+	a := writeTestTar(t, []batchTestEntry{
 		{hdr: tar.Header{Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": "x"}}},
-		file("./.cvmfscatalog", ""), file("./f", "x")})
+		batchFile("./.cvmfscatalog", ""), batchFile("./f", "x")})
 	var out bytes.Buffer
 	if err := WriteBatchTar(&out, []BatchMember{{a, "P/a"}}); err != nil {
 		t.Fatal(err)
@@ -146,8 +146,8 @@ func TestWriteBatchTar_OwnMarkerAndGlobalHeader(t *testing.T) {
 // A refusal comes before anything is written, so the caller can fall back
 // with nothing half-sent.
 func TestWriteBatchTar_RefusesBeforeWriting(t *testing.T) {
-	good := writeTestTar(t, []tarEntry{file("./f", "x")})
-	bad := writeTestTar(t, []tarEntry{file("../escape", "x")})
+	good := writeTestTar(t, []batchTestEntry{batchFile("./f", "x")})
+	bad := writeTestTar(t, []batchTestEntry{batchFile("../escape", "x")})
 	var out bytes.Buffer
 	if err := WriteBatchTar(&out, []BatchMember{{good, "P/a"}, {bad, "P/b"}}); err == nil || out.Len() != 0 {
 		t.Errorf("err=%v, %d bytes written; want an error and nothing written", err, out.Len())
@@ -157,11 +157,11 @@ func TestWriteBatchTar_RefusesBeforeWriting(t *testing.T) {
 // Anything that would put an entry outside its member's directory is refused,
 // so the caller publishes that package alone instead.
 func TestWriteBatchTar_Refuses(t *testing.T) {
-	ok := writeTestTar(t, []tarEntry{file("./f", "x")})
+	ok := writeTestTar(t, []batchTestEntry{batchFile("./f", "x")})
 	cases := map[string][]BatchMember{
-		"dotdot entry":   {{writeTestTar(t, []tarEntry{file("../escape", "x")}), "P/a"}},
-		"absolute entry": {{writeTestTar(t, []tarEntry{file("/etc/passwd", "x")}), "P/a"}},
-		"hard link out":  {{writeTestTar(t, []tarEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "../../x"}}}), "P/a"}},
+		"dotdot entry":   {{writeTestTar(t, []batchTestEntry{batchFile("../escape", "x")}), "P/a"}},
+		"absolute entry": {{writeTestTar(t, []batchTestEntry{batchFile("/etc/passwd", "x")}), "P/a"}},
+		"hard link out":  {{writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "../../x"}}}), "P/a"}},
 		"no members":     nil,
 		"empty path":     {{ok, ""}},
 		"absolute path":  {{ok, "/P/a"}},
@@ -169,8 +169,8 @@ func TestWriteBatchTar_Refuses(t *testing.T) {
 		"same path":      {{ok, "P/a"}, {ok, "P/a"}},
 		"nested members": {{ok, "P/a"}, {ok, "P/a/sub"}},
 		"missing tar":    {{filepath.Join(t.TempDir(), "none.tar"), "P/a"}},
-		"file as root":   {{writeTestTar(t, []tarEntry{file(".", "x")}), "P/a"}},
-		"hard link root": {{writeTestTar(t, []tarEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "."}}}), "P/a"}},
+		"file as root":   {{writeTestTar(t, []batchTestEntry{batchFile(".", "x")}), "P/a"}},
+		"hard link root": {{writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "."}}}), "P/a"}},
 		"sparse":         {{gnuSparseTar(t), "P/a"}},
 		"not a tar":      {{writeRaw(t, "this is not a tar archive, just some text that is long enough"), "P/a"}},
 	}
@@ -221,7 +221,7 @@ func gnuSparseTar(t *testing.T) string {
 // path in front: the batch must switch format rather than fail.
 func TestWriteBatchTar_UstarNameGrows(t *testing.T) {
 	name := strings.Repeat("d", 150) + "/" + strings.Repeat("f", 90)
-	a := writeTestTar(t, []tarEntry{{hdr: tar.Header{Name: name, Typeflag: tar.TypeReg, Format: tar.FormatUSTAR}}})
+	a := writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: name, Typeflag: tar.TypeReg, Format: tar.FormatUSTAR}}})
 	var out bytes.Buffer
 	if err := WriteBatchTar(&out, []BatchMember{{a, "Packages/A/1-1"}}); err != nil {
 		t.Fatal(err)
