@@ -147,6 +147,10 @@ type Orchestrator struct {
 	Measurements *measure.Writer
 	// measAcc holds the in-flight measurement per job id (map[string]*measAccum).
 	measAcc sync.Map
+
+	// IngestBatch publishes several ingest packages per commit (Max < 2: off).
+	IngestBatch IngestBatchConfig
+	batches     ingestBatches
 	// ReplaceOnConflict authorises the orchestrator to REPLACE what another
 	// build published at a job's path, for jobs that ask (job.Replace): when
 	// the published hash differs, delete the existing subtree (the backend's
@@ -1881,6 +1885,21 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		// node can now serve both paths at once, and two backends committing to
 		// one repository concurrently is the stale-root-hash race the lock
 		// exists to prevent.
+		//
+		// Several ingest packages in one commit: the batch takes the lock and the slot.
+		if !commitLockHeld && o.batchable(j) {
+			switch out := o.joinBatch(ctx, j, logger); out.kind {
+			case batchSkip:
+				j.CommittingAt = time.Now()
+				if err := o.transition(ctx, j, job.StateCommitting); err != nil {
+					span.RecordError(err)
+					return o.abortJob(ctx, j, err)
+				}
+				return o.finishAlreadyPublished(ctx, j, span)
+			case batchPublished:
+				return o.finishBatched(ctx, j, span, logger, out)
+			}
+		}
 		if !commitLockHeld {
 			unlockCommit, lockErr := o.acquireCommitLock(ctx, j)
 			if lockErr != nil {
@@ -2500,7 +2519,7 @@ func (o *Orchestrator) preCommitChecks(ctx context.Context, j *job.Job, req *lea
 		}
 	}
 	// The exact entry a second nested catalog would collide with.
-	if _, ingest := o.leaseFor(j).(*lease.IngestBackend); ingest && j.Path != "" {
+	if _, ingest := o.leaseFor(j).(batchCommitter); ingest && j.Path != "" { // the ingest backend
 		marker := strings.TrimSuffix(j.Path, "/") + "/.cvmfscatalog"
 		if exists, exErr := pathExistsFn(ctx, nil, o.Stratum0URL, j.Repo, marker); exErr == nil {
 			req.BaseExists = exists

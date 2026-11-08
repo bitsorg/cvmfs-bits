@@ -41,6 +41,7 @@ type measAccum struct {
 	lockWaited  bool
 	precheck    time.Duration
 	prechecked  bool
+	batch       batchOutcome // kind batchPublished: published in a batch
 }
 
 // measBegin starts recording for a job. Safe when measurements are disabled.
@@ -111,6 +112,19 @@ func (o *Orchestrator) measConflict(j *job.Job, replaced bool) {
 	}
 }
 
+// measBatch records the batch a job was published in: its id and size, and the
+// batch's backend time and object count beside the job's own tar size.
+func (o *Orchestrator) measBatch(j *job.Job, out batchOutcome) {
+	if a := o.measFor(j); a != nil {
+		a.mu.Lock()
+		a.batch = out
+		a.stats = out.stats
+		own := out.own
+		a.stats.TarBytes = &own
+		a.mu.Unlock()
+	}
+}
+
 // measSweep records anything Run left behind. Deferred once at the top of
 // Run: if a terminal path already recorded, the accumulator is gone and this
 // does nothing.
@@ -177,6 +191,11 @@ func (o *Orchestrator) measFinish(j *job.Job, outcome string, cause error) {
 		TotalS:      now.Sub(start).Seconds(),
 		Conflicted:  a.conflicted,
 		Replaced:    a.replaced,
+	}
+	if a.batch.kind == batchPublished {
+		rec.BatchID, rec.BatchSize = a.batch.id, a.batch.size
+		n := a.batch.bytes
+		rec.BatchBytes = &n
 	}
 	if !a.started.IsZero() {
 		rec.QueuedS = measure.Secs(a.started.Sub(start))
