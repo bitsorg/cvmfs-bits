@@ -40,6 +40,7 @@ import (
 	"cvmfs.io/prepub/pkg/cvmfscatalog"
 	"cvmfs.io/prepub/pkg/cvmfshash"
 	"cvmfs.io/prepub/pkg/observe"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // MaxRecoveries is the maximum number of times a single job may be
@@ -2142,15 +2143,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 			span.RecordError(preErr)
 			return o.abortJob(ctx, j, preErr)
 		}
-		j.PublishedAt = time.Now()
-		if err := o.transition(ctx, j, job.StatePublished); err != nil {
-			span.RecordError(err)
-			return err
-		}
-		o.webhookPublished(j)
-		o.Obs.Metrics.JobsCompleted.Inc()
-		o.measFinish(j, "already_published", nil)
-		return nil
+		return o.finishAlreadyPublished(ctx, j, span)
 	}
 
 	logger.Info("committing")
@@ -2291,48 +2284,7 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	}
 
 	// ── Provenance (non-fatal) ────────────────────────────────────────────────
-	if o.Provenance != nil && j.Provenance != nil {
-		var catalogHash string
-		var objectHashes []string
-		if subtreeResult != nil {
-			catalogHash = subtreeResult.CatalogHash // subtree root catalog hash (plain hex)
-			objectHashes = append(objectHashes, subtreeResult.AllCatalogHashes...)
-		}
-		if pipelineResult != nil {
-			objectHashes = append(pipelineResult.ObjectHashes, objectHashes...)
-		}
-		rec := &provenance.Record{
-			JobID:        j.ID,
-			Repo:         j.Repo,
-			Path:         j.Path,
-			CatalogHash:  catalogHash,
-			ObjectHashes: objectHashes,
-			GitRepo:      j.Provenance.GitRepo,
-			GitSHA:       j.Provenance.GitSHA,
-			GitRef:       j.Provenance.GitRef,
-			Actor:        j.Provenance.Actor,
-			PipelineID:   j.Provenance.PipelineID,
-			BuildSystem:  j.Provenance.BuildSystem,
-			OIDCIssuer:   j.Provenance.OIDCIssuer,
-			OIDCSubject:  j.Provenance.OIDCSubject,
-			Verified:     j.Provenance.Verified,
-		}
-		if submitErr := o.Provenance.Submit(ctx, rec); submitErr != nil {
-			logger.Warn("provenance: Rekor submission failed (continuing)", "error", submitErr)
-		} else if rec.Submitted() {
-			j.Provenance.RekorServer = rec.RekorServer
-			j.Provenance.RekorUUID = rec.RekorUUID
-			j.Provenance.RekorLogIndex = rec.RekorLogIndex
-			j.Provenance.RekorIntegratedTime = rec.RekorIntegratedTime
-			j.Provenance.RekorSET = rec.RekorSET
-			if err := o.Spool.WriteProvenanceRecord(j, rec.SignedPayload); err != nil {
-				logger.Warn("provenance: writing signed record failed (continuing)", "job_id", j.ID, "error", err)
-			}
-			if err := o.Spool.WriteManifest(j); err != nil {
-				logger.Warn("best-effort manifest write failed (rekor receipt)", "job_id", j.ID, "error", err)
-			}
-		}
-	}
+	o.submitProvenance(ctx, j, subtreeResult, pipelineResult, logger)
 
 	// ── Webhook (async, non-fatal) ────────────────────────────────────────────
 	o.webhookPublished(j)
@@ -2346,6 +2298,68 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 		"bytes_compressed", j.NBytesCompressed,
 	)
 	return nil
+}
+
+// finishAlreadyPublished ends a job whose content the repository already has.
+func (o *Orchestrator) finishAlreadyPublished(ctx context.Context, j *job.Job, span trace.Span) error {
+	j.PublishedAt = time.Now()
+	if err := o.transition(ctx, j, job.StatePublished); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	o.webhookPublished(j)
+	o.Obs.Metrics.JobsCompleted.Inc()
+	o.measFinish(j, "already_published", nil)
+	return nil
+}
+
+// submitProvenance records a published job in Rekor when the node and the job
+// ask for it; failures are logged, never the job's.
+func (o *Orchestrator) submitProvenance(ctx context.Context, j *job.Job,
+	subtreeResult *cvmfscatalog.SubtreeResult, pipelineResult *pipeline.Result, logger *slog.Logger) {
+	if o.Provenance == nil || j.Provenance == nil {
+		return
+	}
+	var catalogHash string
+	var objectHashes []string
+	if subtreeResult != nil {
+		catalogHash = subtreeResult.CatalogHash // subtree root catalog hash (plain hex)
+		objectHashes = append(objectHashes, subtreeResult.AllCatalogHashes...)
+	}
+	if pipelineResult != nil {
+		objectHashes = append(pipelineResult.ObjectHashes, objectHashes...)
+	}
+	rec := &provenance.Record{
+		JobID:        j.ID,
+		Repo:         j.Repo,
+		Path:         j.Path,
+		CatalogHash:  catalogHash,
+		ObjectHashes: objectHashes,
+		GitRepo:      j.Provenance.GitRepo,
+		GitSHA:       j.Provenance.GitSHA,
+		GitRef:       j.Provenance.GitRef,
+		Actor:        j.Provenance.Actor,
+		PipelineID:   j.Provenance.PipelineID,
+		BuildSystem:  j.Provenance.BuildSystem,
+		OIDCIssuer:   j.Provenance.OIDCIssuer,
+		OIDCSubject:  j.Provenance.OIDCSubject,
+		Verified:     j.Provenance.Verified,
+	}
+	if submitErr := o.Provenance.Submit(ctx, rec); submitErr != nil {
+		logger.Warn("provenance: Rekor submission failed (continuing)", "error", submitErr)
+	} else if rec.Submitted() {
+		j.Provenance.RekorServer = rec.RekorServer
+		j.Provenance.RekorUUID = rec.RekorUUID
+		j.Provenance.RekorLogIndex = rec.RekorLogIndex
+		j.Provenance.RekorIntegratedTime = rec.RekorIntegratedTime
+		j.Provenance.RekorSET = rec.RekorSET
+		if err := o.Spool.WriteProvenanceRecord(j, rec.SignedPayload); err != nil {
+			logger.Warn("provenance: writing signed record failed (continuing)", "job_id", j.ID, "error", err)
+		}
+		if err := o.Spool.WriteManifest(j); err != nil {
+			logger.Warn("best-effort manifest write failed (rekor receipt)", "job_id", j.ID, "error", err)
+		}
+	}
 }
 
 // PrepareRecovery decides the fate of a job found in a non-terminal state at
