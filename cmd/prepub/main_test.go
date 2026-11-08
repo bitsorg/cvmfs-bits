@@ -165,6 +165,8 @@ type applyTestVars struct {
 	preWarm                                                 bool
 	catalogCacheDir                                         string
 	catalogCacheMiB                                         int
+	ingestBatchMax, ingestBatchMaxMiB                       int
+	ingestBatchLinger                                       time.Duration
 }
 
 func defaultApplyVars() *applyTestVars {
@@ -203,6 +205,7 @@ func (v *applyTestVars) apply(fc *fileConfig, explicit map[string]bool) {
 		&v.retryWindow,
 		&v.preWarm,
 		&v.catalogCacheDir, &v.catalogCacheMiB,
+		&v.ingestBatchMax, &v.ingestBatchMaxMiB, &v.ingestBatchLinger,
 	)
 }
 
@@ -389,5 +392,20 @@ func TestSafeShellPath(t *testing.T) {
 		if got := safeShellPath(p); got != want {
 			t.Errorf("safeShellPath(%q) = %v, want %v", p, got, want)
 		}
+	}
+}
+
+func TestApplyFileConfig_IngestBatch(t *testing.T) {
+	v := defaultApplyVars()
+	v.apply(&fileConfig{IngestBatchMax: 20, IngestBatchMaxMiB: 512,
+		IngestBatchLinger: yamlDuration{Duration: 2 * time.Second}}, map[string]bool{})
+	if v.ingestBatchMax != 20 || v.ingestBatchMaxMiB != 512 || v.ingestBatchLinger != 2*time.Second {
+		t.Errorf("max=%d mib=%d linger=%s, want the config's", v.ingestBatchMax, v.ingestBatchMaxMiB, v.ingestBatchLinger)
+	}
+	v = defaultApplyVars()
+	v.ingestBatchMax = 5
+	v.apply(&fileConfig{IngestBatchMax: 20}, map[string]bool{"ingest-batch-max": true})
+	if v.ingestBatchMax != 5 {
+		t.Errorf("max=%d, want the flag's 5 over the config", v.ingestBatchMax)
 	}
 }

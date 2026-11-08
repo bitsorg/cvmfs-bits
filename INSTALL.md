@@ -485,6 +485,16 @@ the gateway must: set `CVMFS_GW_MKDIR_PARENTS=true` in the gateway's
 `/etc/cvmfs/repositories.d/<repo>/server.conf`. Without it the first publish
 into a new area fails with "failed to graft nested catalog".
 
+The `ingest-batch` path is the same ingest with several packages per commit,
+offered next to `ingest` (which is unchanged) and chosen per job
+(`publish_path=ingest-batch`):
+
+```yaml
+ingest_batch_max: 20        # at most 20 packages per commit; below 2: no ingest-batch path
+ingest_batch_max_mib: 4096  # optional: at most 4 GiB of tars per commit
+ingest_batch_linger: 0s     # optional: wait this long for more packages
+```
+
 ### 4.4 The staged path
 
 Offered in gateway mode with `cas.type: s3` (the objects are promoted by

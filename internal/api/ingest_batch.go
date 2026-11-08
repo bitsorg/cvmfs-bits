@@ -20,8 +20,8 @@ import (
 	"cvmfs.io/prepub/internal/lease"
 )
 
-// IngestBatchConfig publishes several ingest packages in one commit: at most
-// Max packages and MaxBytes of tars (0: no limit); Max 0 or 1 is off. A leader
+// IngestBatchConfig is the ingest-batch path's: at most Max packages per commit
+// and MaxBytes of tars (0: no limit); Max below 2 offers no such path. A leader
 // waits Linger for company before it commits.
 type IngestBatchConfig struct {
 	Max      int
@@ -91,10 +91,11 @@ func (b *ingestBatches) queue(repo string) *batchQueue {
 	return q
 }
 
-// batchable reports whether j may share an ingest commit with others.
+// batchable reports whether j may share an ingest commit with others: it asked
+// for the ingest-batch path, which the plain ingest path never does.
 func (o *Orchestrator) batchable(j *job.Job) bool {
 	p := strings.Trim(j.Path, "/")
-	if o.IngestBatch.Max < 2 || p == "" || path.Clean(p) != p || j.Replace || j.TagName != "" ||
+	if j.PublishPath != IngestBatchPublishPath || o.IngestBatch.Max < 2 || p == "" || path.Clean(p) != p || j.Replace || j.TagName != "" ||
 		j.StagingPrefix != "" || j.TarPath == "" {
 		return false
 	}
@@ -199,7 +200,8 @@ func (o *Orchestrator) leadBatch(ctx context.Context, leader *batchMember, logge
 	for _, w := range q.waiting {
 		fits := len(members) < o.IngestBatch.Max &&
 			(o.IngestBatch.MaxBytes <= 0 || total+w.bytes <= o.IngestBatch.MaxBytes) &&
-			w.j.DirectS3 == j.DirectS3 && w.j.ObjectList == j.ObjectList && !overlapsAny(w, members)
+			w.j.DirectS3 == j.DirectS3 && w.j.ObjectList == j.ObjectList &&
+			o.preWarmFor(w.j) == o.preWarmFor(j) && !overlapsAny(w, members)
 		if fits {
 			members = append(members, w)
 			total += w.bytes

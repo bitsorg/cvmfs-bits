@@ -102,6 +102,12 @@ type fileConfig struct {
 	CatalogCacheDir string `yaml:"catalog_cache_dir"`
 	CatalogCacheMiB int    `yaml:"catalog_cache_mib"`
 
+	// Several ingest packages per commit (--ingest-batch-max; below 2 is off),
+	// at most this many MiB of tars, after waiting this long for company.
+	IngestBatchMax    int          `yaml:"ingest_batch_max"`
+	IngestBatchMaxMiB int          `yaml:"ingest_batch_max_mib"`
+	IngestBatchLinger yamlDuration `yaml:"ingest_batch_linger"`
+
 	// Coarse-publish finalize: one cvmfs_swissknife ingestsql
 	// invocation commits a whole build. Without IngestConfigPrefix the finalize
 	// is DISABLED, and since a sealed build finalizes server-side, that failure
@@ -309,6 +315,7 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	retryWindow *time.Duration,
 	preWarm *bool,
 	catalogCacheDir *string, catalogCacheMiB *int,
+	ingestBatchMax, ingestBatchMaxMiB *int, ingestBatchLinger *time.Duration,
 ) {
 	has := func(name string) bool { return explicit[name] }
 	str := func(flag string, dst *string, val string) {
@@ -414,6 +421,9 @@ func applyFileConfig(fc *fileConfig, explicit map[string]bool,
 	str("measurements-dir", measurementsDir, fc.MeasurementsDir)
 	str("catalog-cache-dir", catalogCacheDir, fc.CatalogCacheDir)
 	i("catalog-cache-mib", catalogCacheMiB, fc.CatalogCacheMiB)
+	i("ingest-batch-max", ingestBatchMax, fc.IngestBatchMax)
+	i("ingest-batch-max-mib", ingestBatchMaxMiB, fc.IngestBatchMaxMiB)
+	dur("ingest-batch-linger", ingestBatchLinger, fc.IngestBatchLinger)
 	str("ingest-swissknife", ingestSwissknife, fc.IngestSwissknife)
 	str("ingest-config-prefix", ingestConfigPrefix, fc.IngestConfigPrefix)
 	if !has("ingest-env") && len(fc.IngestEnv) > 0 {

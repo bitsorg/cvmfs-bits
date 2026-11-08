@@ -64,10 +64,12 @@ offers are listed in the startup log and in `publish_paths` of
 | `prepub` (default; also the empty name) with `publish_mode: gateway` | always in gateway mode | Pipeline before the lease: chunk, compress, dedup (`CAS.Exists` per object), write objects to the CAS, build the subtree catalog(s); then lease, upload catalog(s), commit | The only path that can pre-warm Stratum 1s before the commit and the only path that accumulates coarse builds |
 | `prepub` with `publish_mode: local` | always in local mode | `cvmfs_server transaction <repo>`, extract the tar under `<cvmfs_mount>/<repo>/<path>`, `cvmfs_server publish <repo>` | No gateway, no CAS, no pipeline; runs on the Stratum 0 with the repository mounted |
 | `ingest` | `--ingest-publish` | `cvmfs_server ingest -t <tar> -b <path> [-c] [-u <owner>] [--direct-s3 [--s3-config <file>] [--object-list]] <repo>`; the gateway does chunking, dedup and catalogs | Needs `cvmfs_server` on `PATH` and a gateway registration per repository (`cvmfs_server connect-gw`, mountless or mounted; `install.sh` does it); one gateway transaction per package; with `direct_s3`, `object_list` and `prewarm`, pre-warms right after the commit |
+| `ingest-batch` | `--ingest-publish` and `--ingest-batch-max` of 2 or more | As `ingest`, but packages waiting to commit to one repository share one `cvmfs_server ingest -t - -b <their common directory>`: their tars as one stream, each package under its path with a `.cvmfscatalog` marker (no `-c`) | Opt-in per job; `ingest` itself never batches. A package that is already published, needs a replace, publishes into an existing directory or is in a batch that failed publishes alone, as on `ingest`. Records carry `batch_id`, `batch_size`, `batch_bytes` |
 | `staged` | gateway mode with `cas.type: s3` | A producer has already written the objects under an S3 `staging_prefix` and built the catalog (`catalog_hash`); cvmfs-prepub promotes the objects into the store with server-side copies and grafts the catalog | No tar payload; needs a gateway with the graft endpoint; always grafts |
 
 The commit granularity follows from the path: `ingest`, `staged` and the
-`local` backend commit each package as it arrives; the gateway-mode `prepub`
+`local` backend commit each package as it arrives, `ingest-batch` the packages
+waiting at the time; the gateway-mode `prepub`
 path commits each package too, unless the job is part of a coarse build (see
 [Coarse builds](#coarse-builds)). How to set each path up is in
 [INSTALL.md](INSTALL.md#4-publish-backends-and-paths).
@@ -403,6 +405,9 @@ Gateway credentials are environment variables only:
 |---|---|---|---|---|
 | `ingest_publish` | `--ingest-publish` | | `false` | Offer the `ingest` path. Startup fails if `cvmfs_server` is unusable |
 | `ingest_publish_owner` | `--ingest-publish-owner` | | tar ownership | Owner passed as `cvmfs_server ingest -u` |
+| `ingest_batch_max` | `--ingest-batch-max` | | `0` (no `ingest-batch` path) | Offer `ingest-batch` (with `ingest_publish`): at most this many packages per commit |
+| `ingest_batch_max_mib` | `--ingest-batch-max-mib` | | `0` (no limit) | Largest total of package tars in one `ingest-batch` commit; a larger package goes alone |
+| `ingest_batch_linger` | `--ingest-batch-linger` | | `0s` | How long an `ingest-batch` commit waits for more packages before it starts |
 | `ingest_config_prefix` | `--ingest-config-prefix` | | empty (finalize off) | `ingestsql -C` gateway-client config directory. Required for coarse finalize |
 | `ingest_swissknife` | `--ingest-swissknife` | | `cvmfs_swissknife` | Path of `cvmfs_swissknife` for the finalize |
 | `ingest_env` | `--ingest-env` | | empty | Extra environment for the finalize, e.g. `LD_LIBRARY_PATH=/opt/cvmfs/lib` |
@@ -751,22 +756,22 @@ parts in total).
 | `path` | string | Repository-relative target, e.g. `sw/pkg/1.0`. Empty means the repository root. Must not start with `/`, contain `..` that escapes the repository, or start with a `cvmfs/` component |
 | `tar` | file | The tar. Required except for finalize and staged jobs; refused on staged jobs |
 | `tar_sha256` | hex | SHA-256 of the tar; verified if present; required on signed uploads |
-| `publish_path` | string | `prepub` (default), `ingest` or `staged`; must be offered by the node |
+| `publish_path` | string | `prepub` (default), `ingest`, `ingest-batch` or `staged`; must be offered by the node |
 | `build_id` | string | CI run identity: groups measurements and, on the default path, makes the job a coarse-build member |
 | `coarse` | bool | Override the coarse decision; `true` requires `build_id` and the default path. In local mode `coarse=true` is treated as `false`, but without `build_id` it is still refused with `400` |
 | `build_expect` | integer >= 0 | Number of jobs in this build; cvmfs-prepub finalizes when that many are terminal |
 | `finalize` | `true` | Finalize job for `build_id`: carries no payload (a sent tar is dropped) |
-| `prewarm` | bool | Ask to pre-warm Stratum 1s for this job (default off); effective only on a node started with `--prewarm`, otherwise ignored with a log line. `true` only on the default path, or on `ingest` with `direct_s3` and `object_list` |
+| `prewarm` | bool | Ask to pre-warm Stratum 1s for this job (default off); effective only on a node started with `--prewarm`, otherwise ignored with a log line. `true` only on the default path, or on `ingest` / `ingest-batch` with `direct_s3` and `object_list` |
 | `identity_path` | string | Repository-relative path, at or under `path`, whose presence means this content is already published. Checked just before the commit: if present the job ends `published` without committing |
 | `identity_hash` | string | Expected `package.hash` in `<identity_path>/.meta.json`; a different hash fails the job instead of skipping, unless `replace` |
-| `replace` | bool | Replace content another build published here: when `<identity_path>/.meta.json` has a hash that differs from `identity_hash`, the subtree at `path` is deleted, then this job commits (one revision without it). A path without a readable hash is never replaced. Requires `identity_path` equal to `path`, an `identity_hash`, a path other than the root, the `ingest` or `staged` path, and `replace_on_conflict` on the node; otherwise `400`. The same hash still skips |
+| `replace` | bool | Replace content another build published here: when `<identity_path>/.meta.json` has a hash that differs from `identity_hash`, the subtree at `path` is deleted, then this job commits (one revision without it). A path without a readable hash is never replaced. Requires `identity_path` equal to `path`, an `identity_hash`, a path other than the root, the `ingest`, `ingest-batch` or `staged` path, and `replace_on_conflict` on the node; otherwise `400`. The same hash still skips |
 | `tag_name` | string | Named snapshot tag for the commit; up to 255 characters of `A-Z a-z 0-9 . _ -` |
 | `tag_description` | string | Tag description |
 | `webhook_url` | URL | Absolute `http://` or `https://` URL with a host; called when the job is published or fails ([Webhooks](#webhooks)) |
 | `preload_exe` | string | Repository-relative executable; with `preload_paths`, the pipeline writes a `.<name>.cvmfspreload` list next to it |
 | `preload_paths` | JSON array of strings | Repository-relative paths the executable opens at startup |
-| `direct_s3` | bool | `ingest` path only: pass `--direct-s3` to `cvmfs_server ingest`, with `--s3-config` naming prepub's own S3 config when `cas.type` is `s3` |
-| `object_list` | bool | `ingest` path only, requires `direct_s3`: collect the S3 object list |
+| `direct_s3` | bool | `ingest` and `ingest-batch` paths only: pass `--direct-s3` to `cvmfs_server ingest`, with `--s3-config` naming prepub's own S3 config when `cas.type` is `s3` |
+| `object_list` | bool | `ingest` and `ingest-batch` paths only, requires `direct_s3`: collect the S3 object list |
 | `staging_prefix` | string | `staged` path only: S3 prefix holding the prepared objects; slash-separated segments of `[A-Za-z0-9._-]`, at most 128 bytes, last segment not `data` |
 | `catalog_hash` | string | `staged` path only: the subtree catalog to graft, 40 lowercase hex characters followed by `C` |
 
@@ -1122,8 +1127,8 @@ Announces are sent only when pre-warming applies (`--prewarm` on the node and
 the job's `prewarm` field) and the transaction manifest was stored, which needs
 `--pull-object-base-url` (otherwise there is nothing to fetch), for two kinds
 of job: on the gateway-mode `prepub` path
-before the commit, and on `ingest` with `direct_s3` and `object_list` right
-after the commit, listing the data objects the publisher reported as stored.
+before the commit, and on `ingest` / `ingest-batch` with `direct_s3` and `object_list` right
+after the commit (for a batch, once for all its packages), listing the data objects the publisher reported as stored.
 Receivers fetch the objects from the publisher's CAS, so on the ingest path
 the CAS must be the repository's S3 storage (`--cas-type s3`).
 The `published` message is sent after every commit that reports a new root

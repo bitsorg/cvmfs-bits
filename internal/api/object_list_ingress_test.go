@@ -51,6 +51,13 @@ func TestSubmitJob_ObjectListIngress(t *testing.T) {
 			wantCode: http.StatusBadRequest, wantMsg: "object_list is only supported",
 		},
 		{
+			name: "accepted on ingest-batch, like ingest",
+			fields: map[string]string{
+				"publish_path": "ingest-batch", "direct_s3": "true", "object_list": "true",
+			},
+			wantCode: http.StatusAccepted, wantSet: true,
+		},
+		{
 			name: "refused without direct_s3",
 			fields: map[string]string{
 				"publish_path": "ingest", "object_list": "true",
@@ -84,7 +91,7 @@ func TestSubmitJob_ObjectListIngress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, sp, orch := newTestServer(t)
 			orch.Lease = &noopBackend{}
-			orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}}
+			orch.PublishPaths = map[string]lease.Backend{"ingest": &altBackend{}, "ingest-batch": &altBackend{}}
 
 			f := map[string]string{
 				"repo": "software.cern.ch",

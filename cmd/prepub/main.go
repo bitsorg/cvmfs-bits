@@ -181,6 +181,9 @@ func main() {
 	signatureSkew := flag.Duration("signature-skew", httpsig.DefaultSkew, "How far a signed request's timestamp may lag the server clock before it is refused. The replay cache retains nonces for twice this, so the two move together; widening it without the cache would let a nonce be forgotten while a signature bearing it is still valid. Future-dated requests get a fixed 15s of tolerance regardless [publisher]")
 	ingestPublish := flag.Bool("ingest-publish", false, "Offer the 'ingest' publish path: a job may ask for its tar to be handed to `cvmfs_server ingest` so the gateway does the chunking, dedup and catalogs. Requires cvmfs_server on PATH and a gateway registration (cvmfs_server connect-gw, mountless or mounted; install.sh does it) for each repository [publisher]")
 	catalogCacheDir := flag.String("catalog-cache-dir", "", "Directory keeping the published catalogs that existence and hash checks download, by hash (a catalog never changes under its hash). Default: systemd's cache directory ($CACHE_DIRECTORY/catalogs), else <spool>/catalog-cache; prefer local disk over a network spool. 'off' disables [publisher]")
+	ingestBatchMax := flag.Int("ingest-batch-max", 0, "Offer the 'ingest-batch' publish path (with --ingest-publish): a job that names it may share one cvmfs_server ingest with up to this many packages waiting to commit to its repository. The 'ingest' path is unchanged. Below 2 offers no such path [publisher]")
+	ingestBatchMaxMiB := flag.Int("ingest-batch-max-mib", 0, "Largest total of package tars in one ingest-batch commit, in MiB; a larger package goes alone. 0 is no limit [publisher]")
+	ingestBatchLinger := flag.Duration("ingest-batch-linger", 0, "How long an ingest-batch commit waits for more packages. 0 commits at once; under load batches fill while the previous commit runs [publisher]")
 	catalogCacheMiB := flag.Int("catalog-cache-mib", 1024, "Size limit of --catalog-cache-dir in MiB; the least recently used catalogs are removed beyond it [publisher]")
 	measurementsDir := flag.String("measurements-dir", "", "Directory for per-publish measurement records: one JSON line per publish, grouped into <build-id>.ndjson, served by GET /api/v1/measurements/{build}. These are the exact numbers behind a comparison table — a histogram cannot report a maximum, and a 15 s scrape cannot see a 0.5 s publish. Default <spool>/measurements; set to 'off' to disable [publisher]")
 	replaceOnConflict := flag.Bool("replace-on-conflict", false, "Allow a job that asks for it (replace=true) to REPLACE what another build published at its own path: when the published .meta.json hash differs from the job's, delete the existing subtree in its own transaction, then commit. Destroys the published subtree at that path (prior revisions keep their objects until GC); jobs that do not ask are never replaced [publisher]")
@@ -351,6 +354,7 @@ func main() {
 			retryWindow,
 			preWarm,
 			catalogCacheDir, catalogCacheMiB,
+			ingestBatchMax, ingestBatchMaxMiB, ingestBatchLinger,
 		)
 	}
 
@@ -398,6 +402,8 @@ func main() {
 			*pipelineWorkers, *pipelineUploadConc, *pipelineCompressLevel, *prefetchLimit, *promoteWorkers, *prefetch,
 			*chunkMin, *chunkAvg, *chunkMax,
 			*preWarm,
+			api.IngestBatchConfig{Max: *ingestBatchMax, MaxBytes: int64(*ingestBatchMaxMiB) << 20,
+				Linger: *ingestBatchLinger},
 			*brokerCACert,
 			*embeddedBrokerWSAddr, *controlPlaneURL, *pullObjectBaseURL, *embeddedBrokerTLSCert, *embeddedBrokerTLSKey, *embeddedBrokerAuth, *enrollTLSAddr, *enrollURL, *discoverySigningKey)
 	case "receiver":
@@ -464,6 +470,7 @@ func runPublisher(
 	prefetch bool,
 	chunkMin, chunkAvg, chunkMax int64,
 	preWarm bool,
+	ingestBatch api.IngestBatchConfig,
 	brokerCACert string,
 	embeddedBrokerWSAddr, controlPlaneURL, pullObjectBaseURL string,
 	embeddedBrokerTLSCert, embeddedBrokerTLSKey string,
@@ -648,9 +655,9 @@ func runPublisher(
 	// ── Optional publish paths ────────────────────────────────────────────────
 	//
 	// --publish-mode selects the DEFAULT backend; a deployment can additionally
-	// offer alternative paths that a job may name. Today there is one: "ingest",
-	// which hands the tar to `cvmfs_server ingest` so the gateway does the
-	// chunking, dedup and catalogs.
+	// offer alternative paths that a job may name: "ingest", which hands the tar
+	// to `cvmfs_server ingest` so the gateway does the chunking, dedup and
+	// catalogs, and "ingest-batch", the same with several packages per commit.
 	//
 	// The registry is keyed by path name now and becomes (repo, path) when one
 	// instance serves several repositories.
@@ -659,6 +666,9 @@ func runPublisher(
 	// replace_on_conflict: deleting a published subtree is repository-level
 	// work, not a property of how the content arrived.
 	var ib *lease.IngestBackend
+	if !ingestPublish && ingestBatch.Max >= 2 {
+		obs.Logger.Warn("--ingest-batch-max is set without --ingest-publish: no ingest-batch path is offered")
+	}
 	if ingestPublish {
 		ib = lease.NewIngestBackend(lease.IngestOptions{
 			CVMFSMount: cvmfsMount,
@@ -675,9 +685,15 @@ func runPublisher(
 			obs.Logger.Error("--ingest-publish requested but the ingest backend is unusable", "error", err)
 			os.Exit(1)
 		}
-		publishPaths["ingest"] = ib
+		publishPaths[api.IngestPublishPath] = ib
 		obs.Logger.Info("publish path available: ingest (cvmfs_server ingest — gateway does chunking/dedup/catalogs)",
 			"cvmfs_mount", cvmfsMount, "owner", ingestPublishOwner, "direct_s3_config", s3ConfigPath)
+		if ingestBatch.Max >= 2 {
+			// The same backend: one repository slot for both ingest paths.
+			publishPaths[api.IngestBatchPublishPath] = ib
+			obs.Logger.Info("publish path available: ingest-batch (several ingest packages per commit)",
+				"max", ingestBatch.Max, "max_bytes", ingestBatch.MaxBytes, "linger", ingestBatch.Linger)
+		}
 
 		if publishMode == "local" {
 			// Supported, and the natural way to exercise both paths against one
@@ -983,6 +999,7 @@ func runPublisher(
 		IngestEnv:          splitCSV(ingestEnv),
 		JobTimeout:         jobTimeout,
 		RetryWindow:        retryWindow,
+		IngestBatch:        ingestBatch,
 		BrokerConfig:       publishBrokerCfg,
 		Pipeline: pipeline.Config{
 			Workers:       pipelineWorkers,

@@ -436,6 +436,16 @@ func (o *Orchestrator) waitForManifestPropagation(ctx context.Context, repo, pat
 // DefaultPublishPath is the publish path used when a job does not name one.
 const DefaultPublishPath = "prepub"
 
+// IngestPublishPath hands each package's tar to `cvmfs_server ingest` alone;
+// IngestBatchPublishPath is the same, several packages per commit (opt-in per job).
+const (
+	IngestPublishPath      = "ingest"
+	IngestBatchPublishPath = "ingest-batch"
+)
+
+// isIngestPath reports whether a publish path runs `cvmfs_server ingest`.
+func isIngestPath(p string) bool { return p == IngestPublishPath || p == IngestBatchPublishPath }
+
 // StagedPublishPath is the path a job names when its content was prepared by a
 // producer and only needs grafting (see lease.StagedBackend). Named here rather
 // than written as a literal in the handler and the wiring, because those two

@@ -1425,10 +1425,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// hand back a 202 for a request whose central instruction was dropped —
 	// the same reasoning applied to prewarm and build_id below, and the same
 	// silent-success failure this flag was added to remove.
-	if directS3 && publishPath != "ingest" {
+	if directS3 && !isIngestPath(publishPath) {
 		os.RemoveAll(jobDir)
 		http.Error(w, fmt.Sprintf(
-			`{"error":"direct_s3 is only supported on the \"ingest\" publish path (got %q)"}`,
+			`{"error":"direct_s3 is only supported on the \"ingest\" and \"ingest-batch\" publish paths (got %q)"}`,
 			jsonEscape(publishPath)), http.StatusBadRequest)
 		return
 	}
@@ -1437,10 +1437,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// --direct-s3. Accepting it here would hand back a 202 for a request that
 	// either drops its instruction or fails at commit. Refuse both mismatches
 	// separately so the message names the one that is actually wrong.
-	if objectList && publishPath != "ingest" {
+	if objectList && !isIngestPath(publishPath) {
 		os.RemoveAll(jobDir)
 		http.Error(w, fmt.Sprintf(
-			`{"error":"object_list is only supported on the \"ingest\" publish path (got \"%s\")"}`,
+			`{"error":"object_list is only supported on the \"ingest\" and \"ingest-batch\" publish paths (got \"%s\")"}`,
 			jsonEscape(publishPath)), http.StatusBadRequest)
 		return
 	}
@@ -1512,9 +1512,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		// publisher stored: only ingest with direct_s3 and object_list has it,
 		// and it warms right after the commit. Accepting the request and
 		// ignoring it would be worse than saying so.
-		if preWarm != nil && *preWarm && !(publishPath == "ingest" && directS3 && objectList) {
+		if preWarm != nil && *preWarm && !(isIngestPath(publishPath) && directS3 && objectList) {
 			os.RemoveAll(jobDir)
-			http.Error(w, fmt.Sprintf(`{"error":"publish path %q cannot pre-warm Stratum 1 caches; use ingest with direct_s3 and object_list, or the %q path"}`,
+			http.Error(w, fmt.Sprintf(`{"error":"publish path %q cannot pre-warm Stratum 1 caches; use ingest or ingest-batch with direct_s3 and object_list, or the %q path"}`,
 				jsonEscape(publishPath), DefaultPublishPath), http.StatusBadRequest)
 			return
 		}

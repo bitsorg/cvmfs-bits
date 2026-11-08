@@ -61,18 +61,23 @@ func (b *batchFake) seen() ([]string, []string) {
 // returns the backend and the records, after every job has finished.
 func runBatched(t *testing.T, cfg IngestBatchConfig, fail bool, extra map[string]map[string]string,
 	paths ...string) (*batchFake, []measure.Record) {
+	return runOnPath(t, IngestBatchPublishPath, cfg, fail, extra, paths...)
+}
+
+func runOnPath(t *testing.T, publishPath string, cfg IngestBatchConfig, fail bool,
+	extra map[string]map[string]string, paths ...string) (*batchFake, []measure.Record) {
 	t.Helper()
 	srv, _, orch := newTestServer(t)
 	w := withMeasurements(t, orch)
 	be := &batchFake{fail: fail}
-	orch.PublishPaths = map[string]lease.Backend{"ingest": be}
+	orch.PublishPaths = map[string]lease.Backend{IngestPublishPath: be, IngestBatchPublishPath: be}
 	orch.IngestBatch = cfg
 	if extra != nil {
 		orch.Stratum0URL = "http://stratum0.test"
 	}
 	for _, p := range paths {
 		fields := map[string]string{"repo": "software.cern.ch", "path": p,
-			"publish_path": "ingest", "build_id": "b1"}
+			"publish_path": publishPath, "build_id": "b1"}
 		for k, v := range extra[p] {
 			fields[k] = v
 		}
@@ -182,6 +187,20 @@ func TestIngestBatch_OverlappingPathWaits(t *testing.T) {
 	for _, r := range recs {
 		if r.Outcome != "published" {
 			t.Errorf("%s: %s", r.Path, r.Outcome)
+		}
+	}
+}
+
+// The plain ingest path never batches, whatever the node's settings.
+func TestIngestBatch_PlainIngestIsUnchanged(t *testing.T) {
+	be, recs := runOnPath(t, IngestPublishPath, IngestBatchConfig{Max: 3, Linger: 500 * time.Millisecond},
+		false, nil, pkgs+"A/1-1", pkgs+"B/1-1")
+	if singles, batches := be.seen(); len(batches) != 0 || len(singles) != 2 {
+		t.Fatalf("singles %v, batches %v; want both alone", singles, batches)
+	}
+	for _, r := range recs {
+		if r.PublishPath != IngestPublishPath || r.BatchID != "" {
+			t.Errorf("record %+v", r)
 		}
 	}
 }
