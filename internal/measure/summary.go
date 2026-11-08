@@ -37,8 +37,11 @@ type Summary struct {
 	// clock. Not the sum of the per-job times -- jobs overlap.
 	WindowS float64 `json:"window_s"`
 
-	// Backend is the per-publish tool duration distribution.
-	// Serialised sum vs WindowS is what shows whether the path is serialised.
+	// Batches counts commits shared by several packages (distinct batch ids).
+	Batches int `json:"batches,omitempty"`
+
+	// Backend is the per-commit tool duration distribution (a batch counted
+	// once). Serialised sum vs WindowS is what shows whether the path is serialised.
 	Backend Stats `json:"backend_s"`
 	// Total is submission-to-terminal per job.
 	Total Stats `json:"total_s"`
@@ -115,6 +118,9 @@ func Summarise(recs []Record) Summary {
 	// minimum needs no heuristic and is right when a long job starts first --
 	// the GEANT4 shape.
 	var earliestStart time.Time
+	// A batch's members share its backend time and object count: take each
+	// once, from the first member that has it.
+	batches, batchBackend, batchObjects := map[string]bool{}, map[string]bool{}, map[string]bool{}
 
 	for _, r := range recs {
 		s.Jobs++
@@ -145,8 +151,13 @@ func Summarise(recs []Record) Summary {
 		if r.Timestamp.After(s.Last) {
 			s.Last = r.Timestamp
 		}
-		if r.BackendS != nil {
+		if r.BatchID != "" && !batches[r.BatchID] {
+			batches[r.BatchID] = true
+			s.Batches++
+		}
+		if r.BackendS != nil && (r.BatchID == "" || !batchBackend[r.BatchID]) {
 			backend = append(backend, *r.BackendS)
+			batchBackend[r.BatchID] = true
 		}
 		total = append(total, r.TotalS)
 		if r.LockWaitS != nil {
@@ -155,12 +166,14 @@ func Summarise(recs []Record) Summary {
 		if r.TarBytes != nil {
 			s.TarBytes += *r.TarBytes
 		}
-		if r.Objects != nil {
+		switch {
+		case r.Objects != nil && (r.BatchID == "" || !batchObjects[r.BatchID]):
 			countedObjects += *r.Objects
+			batchObjects[r.BatchID] = true
 			if !r.ObjectsExact {
 				sawInexact = true
 			}
-		} else {
+		case r.Objects == nil && r.BatchID == "":
 			sawUncounted = true
 		}
 		if !r.Timestamp.IsZero() {
@@ -170,6 +183,11 @@ func Summarise(recs []Record) Summary {
 		}
 	}
 
+	for id := range batches {
+		if !batchObjects[id] {
+			sawUncounted = true // no member of that batch counted its objects
+		}
+	}
 	s.Backend = statsOf(backend)
 	s.Total = statsOf(total)
 	s.LockWait = statsOf(lockWait)

@@ -1033,13 +1033,18 @@ commit lock, which serialises its publishes), `commit_s`, `backend_s`, `pipeline
 before `commit_s` starts), `ancestors_s` (the part of `commit_s` before the
 publish tool runs that creates the target's parent directories; the delete
 before a replace is in neither), `tar_bytes`, `objects`, `objects_exact`, `bytes_raw`, `bytes_compressed`,
-`conflicted`, `replaced`, `error` (the real cause, truncated). Times are
+`conflicted`, `replaced`, `batch_id`, `batch_size`, `batch_bytes` (a package
+published with others in one commit: an id unique to that commit, the packages
+and tar bytes in it; `backend_s`, `commit_s` and `objects` are then the
+batch's, the same on every member), `error` (the real cause, truncated). Times are
 seconds; absent values are omitted.
 
 Summary fields: `build_id`, `repo`, `publish_paths` (count per path), `jobs`,
 `published`, `failed`, `incomplete`, `conflicted`, `replaced`, `first`,
-`last`, `window_s`, `backend_s`, `total_s` and `lock_wait_s` (each `{n, sum,
-mean, median, p90, p99, max}`), `tar_bytes`, `objects`, `objects_partial`.
+`last`, `window_s`, `batches` (commits shared by several packages), `backend_s`,
+`total_s` and `lock_wait_s` (each `{n, sum, mean, median, p90, p99, max}`;
+`backend_s` and `objects` count a batch once, so `backend_s.n` is the number of
+commits), `tar_bytes`, `objects`, `objects_partial`.
 
 `404` for an unknown build, when nothing has been recorded yet (`latest`), or
 when measurements are disabled; `500` when the directory cannot be read.

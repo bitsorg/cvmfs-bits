@@ -381,3 +381,57 @@ func TestAppend_StampsHostAndEmitsDirectS3(t *testing.T) {
 		t.Errorf("direct_s3=false was not emitted: %s", blob)
 	}
 }
+
+// Members of one batch share its commit: Σbackend_s and objects count it once,
+// tar_bytes stay per package, and the batch survives a JSON round trip.
+func TestSummarise_CountsABatchOnce(t *testing.T) {
+	tar, objs, batch := int64(10), 7, int64(30)
+	member := func(job string) Record {
+		return Record{JobID: job, Outcome: "published", PublishPath: "ingest",
+			BackendS: Secs(2 * time.Second), TarBytes: &tar, Objects: &objs, ObjectsExact: true,
+			BatchID: "j1", BatchSize: 3, BatchBytes: &batch}
+	}
+	alone := Record{JobID: "j4", Outcome: "published", PublishPath: "ingest",
+		BackendS: Secs(time.Second), TarBytes: &tar, Objects: &objs, ObjectsExact: true}
+	recs := []Record{member("j1"), member("j2"), alone, member("j3")}
+
+	line, err := json.Marshal(recs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Record
+	if err := json.Unmarshal(line, &back); err != nil || back.BatchID != "j1" ||
+		back.BatchSize != 3 || back.BatchBytes == nil || *back.BatchBytes != 30 {
+		t.Errorf("round trip: %s -> %+v (%v)", line, back, err)
+	}
+
+	s := Summarise(recs)
+	if s.Backend.N != 2 || s.Backend.Sum != 3 || s.Batches != 1 {
+		t.Errorf("backend n=%d sum=%v batches=%d, want 2/3/1", s.Backend.N, s.Backend.Sum, s.Batches)
+	}
+	if s.Objects != 14 || s.ObjectsPartial || s.TarBytes != 40 || s.Jobs != 4 {
+		t.Errorf("objects=%d partial=%v tar=%d jobs=%d, want 14/false/40/4",
+			s.Objects, s.ObjectsPartial, s.TarBytes, s.Jobs)
+	}
+}
+
+// The shared numbers come from whichever member has them, and a batch where no
+// member counted objects makes the total partial.
+func TestSummarise_BatchNumbersFromAnyMember(t *testing.T) {
+	objs := 7
+	recs := []Record{
+		{JobID: "j1", Outcome: "failed", BatchID: "c1"}, // nothing measured
+		{JobID: "j2", Outcome: "published", BatchID: "c1", BackendS: Secs(2 * time.Second), Objects: &objs, ObjectsExact: true},
+		{JobID: "j3", Outcome: "published", BatchID: "c1", BackendS: Secs(2 * time.Second), Objects: &objs, ObjectsExact: true},
+	}
+	s := Summarise(recs)
+	if s.Backend.N != 1 || s.Backend.Sum != 2 || s.Objects != 7 || s.ObjectsPartial {
+		t.Errorf("backend n=%d sum=%v objects=%d partial=%v, want 1/2/7/false",
+			s.Backend.N, s.Backend.Sum, s.Objects, s.ObjectsPartial)
+	}
+	s = Summarise(append(recs, Record{JobID: "j4", Outcome: "published", BatchID: "c2",
+		BackendS: Secs(time.Second)}))
+	if s.Batches != 2 || s.Backend.N != 2 || !s.ObjectsPartial {
+		t.Errorf("batches=%d backend n=%d partial=%v, want 2/2/true", s.Batches, s.Backend.N, s.ObjectsPartial)
+	}
+}

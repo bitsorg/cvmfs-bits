@@ -90,6 +90,13 @@ type Record struct {
 	BytesRaw        *int64 `json:"bytes_raw,omitempty"`
 	BytesCompressed *int64 `json:"bytes_compressed,omitempty"`
 
+	// ── batching: several packages in one ingest commit ──
+	// BatchID names the commit (unique per commit), empty when published alone;
+	// every member then carries the batch's BackendS, CommitS and Objects.
+	BatchID    string `json:"batch_id,omitempty"`
+	BatchSize  int    `json:"batch_size,omitempty"`
+	BatchBytes *int64 `json:"batch_bytes,omitempty"`
+
 	// ── replacement (replace_on_conflict) ──
 	Conflicted bool `json:"conflicted,omitempty"`
 	Replaced   bool `json:"replaced,omitempty"`
