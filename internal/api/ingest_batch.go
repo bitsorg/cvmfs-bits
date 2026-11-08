@@ -21,8 +21,8 @@ import (
 )
 
 // IngestBatchConfig is the ingest-batch path's: at most Max packages per commit
-// and MaxBytes of tars (0: no limit); Max below 2 offers no such path. A leader
-// waits Linger for company before it commits.
+// and MaxBytes of tars (0: no limit); Max below 2 offers no such path. A new
+// leader waits up to Linger for company, less once Max packages are there.
 type IngestBatchConfig struct {
 	Max      int
 	MaxBytes int64
@@ -70,6 +70,7 @@ type batchMember struct {
 type batchQueue struct {
 	waiting []*batchMember
 	leading bool
+	arrived chan struct{} // a job joined the waiting list
 }
 
 // ingestBatches is the per-repository queue of ingest jobs ready to commit.
@@ -85,7 +86,7 @@ func (b *ingestBatches) queue(repo string) *batchQueue {
 	}
 	q := b.queues[repo]
 	if q == nil {
-		q = &batchQueue{}
+		q = &batchQueue{arrived: make(chan struct{}, 1)}
 		b.queues[repo] = q
 	}
 	return q
@@ -123,15 +124,19 @@ func (o *Orchestrator) joinBatch(ctx context.Context, j *job.Job, logger *slog.L
 		q.leading = true
 	} else {
 		q.waiting = append(q.waiting, m)
+		select {
+		case q.arrived <- struct{}{}:
+		default:
+		}
 	}
 	o.batches.mu.Unlock()
 	if lead {
-		return o.leadBatch(ctx, m, logger)
+		return o.leadBatch(ctx, m, logger, true)
 	}
 	select {
 	case out := <-m.done:
-		if out.kind == batchLead {
-			return o.leadBatch(ctx, m, logger)
+		if out.kind == batchLead { // it waited already: no linger
+			return o.leadBatch(ctx, m, logger, false)
 		}
 		return out
 	case <-ctx.Done():
@@ -153,6 +158,39 @@ func (o *Orchestrator) joinBatch(ctx context.Context, j *job.Job, logger *slog.L
 	}
 }
 
+// sameRoute reports whether two jobs may share a commit's settings.
+func (o *Orchestrator) sameRoute(a, b *job.Job) bool {
+	return a.DirectS3 == b.DirectS3 && a.ObjectList == b.ObjectList && o.preWarmFor(a) == o.preWarmFor(b)
+}
+
+// lingerFor waits up to the linger for company, ending once enough jobs that
+// could join leader's batch wait.
+func (o *Orchestrator) lingerFor(ctx context.Context, q *batchQueue, leader *job.Job) {
+	timer := time.NewTimer(o.IngestBatch.Linger)
+	defer timer.Stop()
+	for {
+		o.batches.mu.Lock()
+		n := 0
+		for _, w := range q.waiting {
+			if o.sameRoute(w.j, leader) {
+				n++
+			}
+		}
+		full := n >= o.IngestBatch.Max-1
+		o.batches.mu.Unlock()
+		if full {
+			return
+		}
+		select {
+		case <-q.arrived:
+		case <-timer.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // handOn passes the lead to the first waiting job, or ends it.
 func (o *Orchestrator) handOn(q *batchQueue) {
 	o.batches.mu.Lock()
@@ -167,18 +205,16 @@ func (o *Orchestrator) handOn(q *batchQueue) {
 }
 
 // leadBatch commits one batch, the leader first, under the repository's commit lock.
-func (o *Orchestrator) leadBatch(ctx context.Context, leader *batchMember, logger *slog.Logger) batchOutcome {
+func (o *Orchestrator) leadBatch(ctx context.Context, leader *batchMember, logger *slog.Logger,
+	linger bool) batchOutcome {
 	j := leader.j
 	o.batches.mu.Lock()
 	q := o.batches.queue(j.Repo)
 	o.batches.mu.Unlock()
 	defer o.handOn(q)
 
-	if o.IngestBatch.Linger > 0 { // before the lock: other publish paths do not wait for it
-		select {
-		case <-time.After(o.IngestBatch.Linger):
-		case <-ctx.Done():
-		}
+	if linger && o.IngestBatch.Linger > 0 { // before the lock: other publish paths do not wait for it
+		o.lingerFor(ctx, q, j)
 	}
 	unlock, err := o.acquireCommitLock(ctx, j)
 	if err != nil {
@@ -200,8 +236,7 @@ func (o *Orchestrator) leadBatch(ctx context.Context, leader *batchMember, logge
 	for _, w := range q.waiting {
 		fits := len(members) < o.IngestBatch.Max &&
 			(o.IngestBatch.MaxBytes <= 0 || total+w.bytes <= o.IngestBatch.MaxBytes) &&
-			w.j.DirectS3 == j.DirectS3 && w.j.ObjectList == j.ObjectList &&
-			o.preWarmFor(w.j) == o.preWarmFor(j) && !overlapsAny(w, members)
+			o.sameRoute(w.j, j) && !overlapsAny(w, members)
 		if fits {
 			members = append(members, w)
 			total += w.bytes

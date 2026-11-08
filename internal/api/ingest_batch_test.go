@@ -23,6 +23,7 @@ type batchFake struct {
 	singles []string
 	batches []string // "base: rel,rel"
 	fail    bool
+	slow    time.Duration // each batch commit takes this long
 }
 
 func (b *batchFake) Commit(_ context.Context, req lease.CommitRequest) error {
@@ -33,6 +34,7 @@ func (b *batchFake) Commit(_ context.Context, req lease.CommitRequest) error {
 }
 
 func (b *batchFake) CommitBatch(_ context.Context, req lease.BatchCommitRequest) error {
+	time.Sleep(b.slow)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var rels []string
@@ -66,10 +68,14 @@ func runBatched(t *testing.T, cfg IngestBatchConfig, fail bool, extra map[string
 
 func runOnPath(t *testing.T, publishPath string, cfg IngestBatchConfig, fail bool,
 	extra map[string]map[string]string, paths ...string) (*batchFake, []measure.Record) {
+	return runWith(t, &batchFake{fail: fail}, publishPath, cfg, extra, paths...)
+}
+
+func runWith(t *testing.T, be *batchFake, publishPath string, cfg IngestBatchConfig,
+	extra map[string]map[string]string, paths ...string) (*batchFake, []measure.Record) {
 	t.Helper()
 	srv, _, orch := newTestServer(t)
 	w := withMeasurements(t, orch)
-	be := &batchFake{fail: fail}
 	orch.PublishPaths = map[string]lease.Backend{IngestPublishPath: be, IngestBatchPublishPath: be}
 	orch.IngestBatch = cfg
 	if extra != nil {
@@ -202,6 +208,21 @@ func TestIngestBatch_PlainIngestIsUnchanged(t *testing.T) {
 		if r.PublishPath != IngestPublishPath || r.BatchID != "" {
 			t.Errorf("record %+v", r)
 		}
+	}
+}
+
+// A full batch does not wait out the linger, and a lead handed on to a job
+// that waited during the commit does not linger again.
+func TestIngestBatch_LingerEndsEarly(t *testing.T) {
+	start := time.Now()
+	be, recs := runWith(t, &batchFake{slow: 2 * time.Second}, IngestBatchPublishPath,
+		IngestBatchConfig{Max: 2, Linger: 20 * time.Second}, nil, pkgs+"A/1-1", pkgs+"B/1-1", pkgs+"C/1-1")
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("took %s: the linger was waited out", took)
+	}
+	singles, batches := be.seen()
+	if len(batches) != 1 || len(singles) != 1 || len(recs) != 3 {
+		t.Fatalf("singles %v, batches %v; want one batch of two, then one alone", singles, batches)
 	}
 }
 
