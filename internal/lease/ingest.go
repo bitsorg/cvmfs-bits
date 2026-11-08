@@ -378,12 +378,36 @@ func (b *IngestBackend) cvmfsServerOutputWithObjectList(
 func (b *IngestBackend) cvmfsServerListTimed(
 	ctx context.Context, onLine func(string), args ...string,
 ) (string, *timeline, bool, error) {
+	if onLine == nil { // args name the object-list pipe: never run without it
+		return "", nil, false, fmt.Errorf("object list: onLine is nil")
+	}
+	return b.cvmfsServerRun(ctx, nil, onLine, nil, args...)
+}
+
+// cvmfsServerRun runs cvmfs_server with stdin (when not nil), with onLine the
+// object-list pipe, and setup given the command before it starts.
+func (b *IngestBackend) cvmfsServerRun(ctx context.Context, stdin *os.File, onLine func(string),
+	setup func(*exec.Cmd), args ...string) (string, *timeline, bool, error) {
 	cmd := newCvmfsServerCmd(ctx, args...)
 	tl := newTimeline()
 	cmd.Stdout = tl
 	cmd.Stderr = tl
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
+	if setup != nil {
+		setup(cmd)
+	}
 
-	readToEOF, err := runWithObjectList(ctx, cmd, b.obs.Logger, onLine)
+	var (
+		readToEOF bool
+		err       error
+	)
+	if onLine != nil {
+		readToEOF, err = runWithObjectList(ctx, cmd, b.obs.Logger, onLine)
+	} else {
+		err = cmd.Run()
+	}
 
 	out := strings.TrimSpace(tl.Output())
 	if out != "" {
@@ -727,15 +751,7 @@ func (b *IngestBackend) cvmfsServerOutput(ctx context.Context, args ...string) (
 // cvmfsServerTimed runs cvmfs_server and returns its combined output, as
 // CombinedOutput did, and when each line of it arrived.
 func (b *IngestBackend) cvmfsServerTimed(ctx context.Context, args ...string) (string, *timeline, error) {
-	cmd := newCvmfsServerCmd(ctx, args...)
-	tl := newTimeline()
-	cmd.Stdout = tl
-	cmd.Stderr = tl
-	err := cmd.Run()
-	out := strings.TrimSpace(tl.Output())
-	if out != "" {
-		b.obs.Logger.Debug("cvmfs_server", "args", args, "output", truncateLog(out))
-	}
+	out, tl, _, err := b.cvmfsServerRun(ctx, nil, nil, nil, args...)
 	return out, tl, err
 }
 

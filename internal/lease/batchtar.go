@@ -30,13 +30,8 @@ const catalogMarker = ".cvmfscatalog"
 // with a catalog marker at its root unless it has one. All are checked first; after
 // a later error w holds a partial archive, so kill its reader rather than close it.
 func WriteBatchTar(w io.Writer, members []BatchMember) error {
-	if err := checkBatchMembers(members); err != nil {
+	if err := CheckBatch(members); err != nil {
 		return err
-	}
-	for _, m := range members {
-		if err := walkBatchMember(m, nil); err != nil {
-			return fmt.Errorf("batch member %q: %w", m.RelPath, err)
-		}
 	}
 	tw := tar.NewWriter(w)
 	for _, m := range members {
@@ -45,6 +40,20 @@ func WriteBatchTar(w io.Writer, members []BatchMember) error {
 		}
 	}
 	return tw.Close()
+}
+
+// CheckBatch is WriteBatchTar's check of the members and their tars, which
+// reads only the headers.
+func CheckBatch(members []BatchMember) error {
+	if err := checkBatchMembers(members); err != nil {
+		return err
+	}
+	for _, m := range members {
+		if err := walkBatchMember(m, nil); err != nil {
+			return fmt.Errorf("batch member %q: %w", m.RelPath, err)
+		}
+	}
+	return nil
 }
 
 // checkBatchMembers refuses paths that are not clean and relative, and members
