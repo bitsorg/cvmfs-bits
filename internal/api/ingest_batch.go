@@ -317,8 +317,12 @@ func (o *Orchestrator) commitBatch(ctx context.Context, ready []*batchMember,
 	req := lease.BatchCommitRequest{Base: base, DirectS3: leaderJob.DirectS3,
 		ObjectList: leaderJob.ObjectList, Stats: &lease.PublishStats{}}
 	for i, m := range ready {
-		req.Members = append(req.Members, lease.BatchMember{TarPath: m.j.TarPath,
-			RelPath: strings.TrimPrefix(strings.TrimPrefix(paths[i], base), "/")})
+		member := lease.BatchMember{TarPath: m.j.TarPath, Encoding: m.j.TarEncoding,
+			RelPath: strings.TrimPrefix(strings.TrimPrefix(paths[i], base), "/")}
+		if m.j.TarEncoding != "" { // its tar's size, for its record, once written
+			member.Limit, member.TarBytes = o.tarLimit(), &m.bytes
+		}
+		req.Members = append(req.Members, member)
 	}
 	var confirmed []string
 	if leaderJob.ObjectList && leaderJob.DirectS3 && o.preWarmFor(leaderJob) {

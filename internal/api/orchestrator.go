@@ -150,7 +150,10 @@ type Orchestrator struct {
 
 	// IngestBatch publishes several ingest packages per commit (Max < 2: off).
 	IngestBatch IngestBatchConfig
-	batches     ingestBatches
+	// TarLimit bounds a compressed payload's tar once decompressed: the size an
+	// uncompressed upload may have (max_tar_size; 0: defaultMaxTarSize).
+	TarLimit int64
+	batches  ingestBatches
 	// ReplaceOnConflict authorises the orchestrator to REPLACE what another
 	// build published at a job's path, for jobs that ask (job.Replace): when
 	// the published hash differs, delete the existing subtree (the backend's
@@ -2089,6 +2092,8 @@ func (o *Orchestrator) Run(ctx context.Context, j *job.Job, onStagingComplete fu
 	req := lease.CommitRequest{
 		Token:          token,
 		TarPath:        j.TarPath,
+		TarEncoding:    j.TarEncoding,
+		TarLimit:       o.tarLimit(),
 		CVMFSDir:       cvmfsDir,
 		TagName:        j.TagName,
 		TagDescription: j.TagDescription,
@@ -2894,4 +2899,12 @@ func (o *Orchestrator) abortLeaseDetachedErr(j *job.Job, token string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), leaseAbortTimeout)
 	defer cancel()
 	return o.leaseFor(j).Abort(ctx, token)
+}
+
+// tarLimit is the largest tar a compressed payload may decompress to.
+func (o *Orchestrator) tarLimit() int64 {
+	if o.TarLimit > 0 {
+		return o.TarLimit
+	}
+	return defaultMaxTarSize
 }

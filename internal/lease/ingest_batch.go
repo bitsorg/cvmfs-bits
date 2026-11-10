@@ -93,6 +93,7 @@ func (b *IngestBackend) CommitBatch(ctx context.Context, req BatchCommitRequest)
 	sizes := make([]int64, len(req.Members))
 	members := append([]BatchMember(nil), req.Members...)
 	for i := range members {
+		members[i].TarBytes = nil
 		if members[i].Encoding != "" {
 			members[i].TarBytes = &sizes[i]
 		} else if fi, statErr := os.Stat(members[i].TarPath); statErr == nil {
@@ -132,6 +133,11 @@ func (b *IngestBackend) CommitBatch(ctx context.Context, req BatchCommitRequest)
 		}
 		return fmt.Errorf("cvmfs_server ingest of %d packages into %q: %w (writing the batch: %v; output: %s)",
 			len(req.Members), baseArg, err, feedErr, truncateLog(out))
+	}
+	for i, m := range req.Members {
+		if m.TarBytes != nil {
+			*m.TarBytes = sizes[i]
+		}
 	}
 	if req.Stats != nil {
 		var n int64

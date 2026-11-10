@@ -82,7 +82,11 @@ type Record struct {
 
 	// ── volume ──
 	TarBytes *int64 `json:"tar_bytes,omitempty"`
-	Objects  *int   `json:"objects,omitempty"`
+	// TarEncoding and PayloadBytes: a compressed payload, and the bytes sent;
+	// TarBytes is then the tar's size once decompressed.
+	TarEncoding  string `json:"tar_encoding,omitempty"`
+	PayloadBytes *int64 `json:"payload_bytes,omitempty"`
+	Objects      *int   `json:"objects,omitempty"`
 	// ObjectsExact is emitted even when false: absence would be
 	// indistinguishable from "exact", and an inexact count is precisely what a
 	// reader must not quote as the total.

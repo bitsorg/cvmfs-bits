@@ -265,6 +265,9 @@ type Job struct {
 	// TarSize is the size of the submitted tar in bytes.
 	// Populated at submission time; used by the console tooltip.
 	TarSize int64 `json:"tar_size,omitempty"`
+	// TarEncoding is "gzip" when the spooled payload is a gzip-compressed tar
+	// (ingest paths only); TarSize is then its compressed size.
+	TarEncoding string `json:"tar_encoding,omitempty"`
 	// TarSHA256 is the hex-encoded SHA-256 digest of the tar file, recorded at
 	// submission time.  Non-empty when the caller provided a checksum (required
 	// for tar_path / JSON submissions; optional for multipart uploads).

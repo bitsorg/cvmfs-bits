@@ -218,6 +218,10 @@ func (o *Orchestrator) measFinish(j *job.Job, outcome string, cause error) {
 	if a.stats.TarBytes != nil {
 		rec.TarBytes = a.stats.TarBytes
 	}
+	if j.TarEncoding != "" {
+		n := j.TarSize
+		rec.TarEncoding, rec.PayloadBytes = j.TarEncoding, &n
+	}
 	if a.stats.Objects != nil {
 		rec.Objects = a.stats.Objects
 		rec.ObjectsExact = a.stats.ObjectsAuthoritative

@@ -245,6 +245,9 @@ func New(obs *observe.Provider, apiToken string, orch *Orchestrator, sp *spool.S
 func (s *Server) SetUploadLimits(maxTar, minFree int64) {
 	if maxTar > 0 {
 		s.maxTarSize = maxTar
+		if s.orch != nil {
+			s.orch.TarLimit = maxTar
+		}
 	}
 	s.spoolMinFree = max(minFree, 0)
 }
@@ -892,6 +895,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		identityPath              string   // optional: see job.IdentityPath
 		identityHash              string   // optional: see job.IdentityHash
 		replace                   bool     // optional: see job.Replace
+		tarEncoding               string   // optional: "gzip", see job.TarEncoding
 	)
 
 	jobID := uuid.New().String()
@@ -1264,6 +1268,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			buildExpect = n
 		}
 		publishPath = field("publish_path")
+		tarEncoding = strings.TrimSpace(field("tar_encoding"))   // optional
 		identityPath = strings.TrimSpace(field("identity_path")) // optional
 		identityHash = strings.TrimSpace(field("identity_hash")) // optional
 		// prewarm: absent means not requested; only true asks (and only a node
@@ -1418,6 +1423,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		os.RemoveAll(jobDir)
 		http.Error(w, fmt.Sprintf(`{"error":"publish path %q cannot replace published content; use ingest"}`,
 			jsonEscape(publishPath)), http.StatusBadRequest)
+		return
+	}
+	if msg := compressedPayloadRefusal(tarEncoding, publishPath, spoolTarPath); msg != "" {
+		os.RemoveAll(jobDir)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, msg), http.StatusBadRequest)
 		return
 	}
 	// direct_s3 is a property of the ingest path: it becomes --direct-s3 on
@@ -1635,6 +1645,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	j.PreloadExe = preloadExe
 	j.PreloadPaths = preloadPaths
 	j.PublishPath = publishPath
+	j.TarEncoding = tarEncoding
 	j.PreWarm = preWarm
 	if identityPath != "" {
 		j.IdentityPath = path.Clean(identityPath)
@@ -2608,6 +2619,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		// ReplaceAllowed lets a producer refuse a package another build
 		// published before uploading it, when this node cannot replace it.
 		ReplaceAllowed bool `json:"replace_allowed"`
+		// TarEncodings are the compressed payloads taken (tar_encoding), on the
+		// ingest paths only; absent on a node that takes none.
+		TarEncodings []string `json:"tar_encodings,omitempty"`
 		// ReplayCache surfaces the fail-closed counter: a non-zero
 		// rejected_full means signed requests are being refused for capacity
 		// reasons, which looks like an auth problem from the client side and
@@ -2623,9 +2637,41 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		body.PublishPaths = s.orch.PublishPathNames()
 		body.FinalizeReady = s.orch.IngestConfigPrefix != "" && s.orch.CoarseSupported()
 		body.ReplaceAllowed = s.orch.ReplaceAllowed()
+		if s.orch.HasPublishPath(IngestPublishPath) || s.orch.HasPublishPath(IngestBatchPublishPath) {
+			body.TarEncodings = []string{lease.EncodingGzip}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// compressedPayloadRefusal says why a payload sent with tar_encoding cannot be
+// taken, or "" when it can: gzip, an uploaded tar, on an ingest path, where it
+// is decompressed into the ingest's input.
+func compressedPayloadRefusal(encoding, publishPath, spooled string) string {
+	if encoding == "" {
+		return ""
+	}
+	if encoding != lease.EncodingGzip {
+		return fmt.Sprintf("tar_encoding %q is not supported (only %q)", encoding, lease.EncodingGzip)
+	}
+	if publishPath != IngestPublishPath && publishPath != IngestBatchPublishPath {
+		return fmt.Sprintf("a compressed payload is taken on the %s and %s paths only",
+			IngestPublishPath, IngestBatchPublishPath)
+	}
+	if spooled == "" {
+		return "tar_encoding needs an uploaded tar"
+	}
+	f, err := os.Open(spooled)
+	if err != nil {
+		return "the payload cannot be read"
+	}
+	defer f.Close()
+	magic := make([]byte, 2)
+	if _, err := io.ReadFull(f, magic); err != nil || magic[0] != 0x1f || magic[1] != 0x8b {
+		return "tar_encoding is gzip but the payload is not"
+	}
+	return ""
 }

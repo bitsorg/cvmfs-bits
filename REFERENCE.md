@@ -722,6 +722,7 @@ Always `200`:
   "finalize_ready": true,
   "max_tar_size": 10737418240,
   "replace_allowed": false,
+  "tar_encodings": ["gzip"],
   "replay_cache": {"entries": 12, "rejected_full": 0}
 }
 ```
@@ -734,6 +735,7 @@ Always `200`:
 | `finalize_ready` | `true` when `ingest_config_prefix` is set and the default backend is gateway mode, i.e. coarse builds can be finalized; always `false` in local mode |
 | `max_tar_size` | Largest accepted tar, bytes |
 | `replace_allowed` | `true` when jobs may send `replace` (`replace_on_conflict` and `stratum0_url` set) |
+| `tar_encodings` | Compressed payloads taken (`tar_encoding`): `["gzip"]` when an ingest path is offered, else absent |
 | `replay_cache.entries`, `replay_cache.rejected_full` | Nonces held; signed requests refused because the cache was full |
 
 The health check does not test the gateway or the CAS; those are probed once
@@ -756,6 +758,7 @@ parts in total).
 | `path` | string | Repository-relative target, e.g. `sw/pkg/1.0`. Empty means the repository root. Must not start with `/`, contain `..` that escapes the repository, or start with a `cvmfs/` component |
 | `tar` | file | The tar. Required except for finalize and staged jobs; refused on staged jobs |
 | `tar_sha256` | hex | SHA-256 of the tar; verified if present; required on signed uploads |
+| `tar_encoding` | string | `gzip`: the `tar` part is a gzip-compressed tar (`ingest` and `ingest-batch` only). It is spooled as sent, `tar_sha256` and `max_tar_size_gib` apply to the compressed bytes, and it is decompressed straight into `cvmfs_server ingest -t -`; a tar larger than `max_tar_size_gib` once decompressed, or a damaged stream, fails the job before anything is published |
 | `publish_path` | string | `prepub` (default), `ingest`, `ingest-batch` or `staged`; must be offered by the node |
 | `build_id` | string | CI run identity: groups measurements and, on the default path, makes the job a coarse-build member |
 | `coarse` | bool | Override the coarse decision; `true` requires `build_id` and the default path. In local mode `coarse=true` is treated as `false`, but without `build_id` it is still refused with `400` |
@@ -802,7 +805,7 @@ the staging directory; a refused request leaves it where it was. Body at most
 | Status | When |
 |---|---|
 | `202` | Accepted: `{"job_id":"..."}` |
-| `400` | Missing `repo`; invalid repository name ([Conventions](#conventions)); invalid `webhook_url`; malformed path, `identity_path`, tag, boolean or integer; missing `tar`; `tar_sha256` mismatch; publish path not offered; a field used on the wrong path (`direct_s3`, `object_list`, `staging_prefix`, `catalog_hash`, `prewarm`, `coarse`); `staging_prefix` without `catalog_hash` or the reverse; staged job with a tar; `finalize` or `coarse` without `build_id`; `replace` without what it requires (see `replace`); too many parts; duplicate `tar` part; broken multipart; invalid JSON; `tar_path` outside `staging_root` or missing; signed upload without `tar_sha256` |
+| `400` | Missing `repo`; invalid repository name ([Conventions](#conventions)); invalid `webhook_url`; malformed path, `identity_path`, tag, boolean or integer; missing `tar`; `tar_sha256` mismatch; publish path not offered; a field used on the wrong path (`direct_s3`, `object_list`, `staging_prefix`, `catalog_hash`, `prewarm`, `coarse`, `tar_encoding`); a `tar_encoding` other than `gzip`, or a payload that is not gzip; `staging_prefix` without `catalog_hash` or the reverse; staged job with a tar; `finalize` or `coarse` without `build_id`; `replace` without what it requires (see `replace`); too many parts; duplicate `tar` part; broken multipart; invalid JSON; `tar_path` outside `staging_root` or missing; signed upload without `tar_sha256` |
 | `401` | Authentication failed, or the signature does not match the fields or payload |
 | `403` | Target outside `allowed_publish_prefixes` (finalize jobs are exempt) |
 | `413` | Tar larger than `max_tar_size_gib` (refused from `Content-Length` before reading when possible), or a field over 1 MiB |
@@ -1037,7 +1040,9 @@ commit lock, which serialises its publishes), `commit_s`, `backend_s`, `pipeline
 `precheck_s` (the already-published check, made under the commit lock just
 before `commit_s` starts), `ancestors_s` (the part of `commit_s` before the
 publish tool runs that creates the target's parent directories; the delete
-before a replace is in neither), `tar_bytes`, `objects`, `objects_exact`, `bytes_raw`, `bytes_compressed`,
+before a replace is in neither), `tar_bytes` (of the tar, decompressed if it was sent compressed),
+`tar_encoding` and `payload_bytes` (a compressed payload, and the bytes sent), `objects`, `objects_exact`,
+`bytes_raw`, `bytes_compressed`,
 `conflicted`, `replaced`, `batch_id`, `batch_size`, `batch_bytes` (a package
 published with others in one commit: an id unique to that commit, the packages
 and tar bytes in it; `backend_s`, `commit_s` and `objects` are then the
