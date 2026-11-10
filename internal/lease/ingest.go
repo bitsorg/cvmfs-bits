@@ -6,6 +6,7 @@ package lease
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -263,7 +264,14 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 		b.obs.Logger.Warn("ingest backend: object_list ignored without direct_s3",
 			"repo", repo, "base", base)
 	}
-	args := b.commitArgs(repo, base, req.TarPath, req.DirectS3, useObjectList, req.BaseExists)
+	if req.TarEncoding != "" && req.TarEncoding != EncodingGzip {
+		return fmt.Errorf("ingest backend: payload encoding %q is not supported", req.TarEncoding)
+	}
+	tarArg := req.TarPath
+	if req.TarEncoding != "" {
+		tarArg = "-" // decompressed into its input, never onto the disk
+	}
+	args := b.commitArgs(repo, base, tarArg, req.DirectS3, useObjectList, req.BaseExists)
 
 	// direct_s3 is logged on both lines because its failure mode is silence:
 	// when it does not take effect the publish still succeeds, via the gateway,
@@ -277,7 +285,7 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 	// hands over a path, and after the publish the spool may already have
 	// moved. Stat it before the tool runs, and report nothing rather than 0
 	// if it cannot be stated.
-	if req.Stats != nil {
+	if req.Stats != nil && req.TarEncoding == "" {
 		if fi, statErr := os.Stat(req.TarPath); statErr == nil {
 			n := fi.Size()
 			req.Stats.TarBytes = &n
@@ -293,17 +301,36 @@ func (b *IngestBackend) Commit(ctx context.Context, req CommitRequest) error {
 	)
 	var confirmed []string
 	var tl *timeline
+	var onLine func(string)
 	if useObjectList {
-		out, tl, readToEOF, err = b.cvmfsServerListTimed(ctx,
-			func(line string) {
-				listed++
-				if req.ConfirmedObjects != nil {
-					if name, ok := ConfirmedObjectName(line); ok {
-						confirmed = append(confirmed, name)
-					}
+		onLine = func(line string) {
+			listed++
+			if req.ConfirmedObjects != nil {
+				if name, ok := ConfirmedObjectName(line); ok {
+					confirmed = append(confirmed, name)
 				}
+			}
+		}
+	}
+	switch {
+	case req.TarEncoding != "":
+		var tarBytes int64
+		var feedErr error
+		out, tl, readToEOF, err, feedErr = b.runFed(ctx, repo, base, "package", onLine,
+			func(w io.Writer) error {
+				n, err := writeSpooledTar(w, req.TarPath, req.TarEncoding, req.TarLimit)
+				tarBytes = n
+				return err
 			}, args...)
-	} else {
+		if feedErr != nil {
+			err = fmt.Errorf("writing the package: %w (ingest: %v)", feedErr, err)
+		}
+		if err == nil && req.Stats != nil {
+			req.Stats.TarBytes = &tarBytes
+		}
+	case useObjectList:
+		out, tl, readToEOF, err = b.cvmfsServerListTimed(ctx, onLine, args...)
+	default:
 		out, tl, err = b.cvmfsServerTimed(ctx, args...)
 	}
 	b.logTimeline(repo, base, tl, err)

@@ -89,14 +89,15 @@ func (b *IngestBackend) CommitBatch(ctx context.Context, req BatchCommitRequest)
 	// No -c: every member carries its own catalog marker, and -c would make the
 	// base one catalog for them all (baseExists=true leaves it out).
 	args := b.commitArgs(repo, baseArg, "-", req.DirectS3, useObjectList, true)
-	if req.Stats != nil {
-		var n int64
-		for _, m := range req.Members {
-			if fi, statErr := os.Stat(m.TarPath); statErr == nil {
-				n += fi.Size()
-			}
+	// A compressed member's tar size is known once it is written.
+	sizes := make([]int64, len(req.Members))
+	members := append([]BatchMember(nil), req.Members...)
+	for i := range members {
+		if members[i].Encoding != "" {
+			members[i].TarBytes = &sizes[i]
+		} else if fi, statErr := os.Stat(members[i].TarPath); statErr == nil {
+			sizes[i] = fi.Size()
 		}
-		req.Stats.TarBytes = &n
 	}
 	b.obs.Logger.Info("ingest backend: publishing a batch", "repo", repo, "base", baseArg,
 		"packages", len(req.Members), "direct_s3", req.DirectS3, "object_list", req.ObjectList)
@@ -118,7 +119,7 @@ func (b *IngestBackend) CommitBatch(ctx context.Context, req BatchCommitRequest)
 	}
 	start := time.Now()
 	out, tl, readToEOF, err, feedErr := b.runFed(ctx, repo, baseArg, "batch", onLine,
-		func(w io.Writer) error { return writeBatch(w, req.Members) }, args...)
+		func(w io.Writer) error { return writeBatch(w, members) }, args...)
 	b.logTimeline(repo, baseArg, tl, err)
 
 	if err != nil || feedErr != nil {
@@ -133,6 +134,11 @@ func (b *IngestBackend) CommitBatch(ctx context.Context, req BatchCommitRequest)
 			len(req.Members), baseArg, err, feedErr, truncateLog(out))
 	}
 	if req.Stats != nil {
+		var n int64
+		for _, s := range sizes {
+			n += s
+		}
+		req.Stats.TarBytes = &n
 		req.Stats.Backend = time.Since(start)
 		if useObjectList {
 			n := listed

@@ -117,6 +117,10 @@ type CommitRequest struct {
 
 	// TarPath is the absolute path to the spool tar file to unpack (local mode).
 	TarPath string
+	// TarEncoding is "" for a plain tar, or EncodingGzip (the ingest backend
+	// only); TarLimit then bounds the tar's decompressed size (0: no bound).
+	TarEncoding string
+	TarLimit    int64
 	// CVMFSDir is the absolute path inside the CVMFS transaction directory
 	// where the tar contents should be extracted (local mode).
 	// Typically: <cvmfsMount>/<repo>/<path>

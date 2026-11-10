@@ -566,6 +566,9 @@ func gatewayCommitBody(req CommitRequest) ([]byte, error) {
 func (c *Client) Commit(ctx context.Context, req CommitRequest) error {
 	ctx, span := c.obs.Tracer.Start(ctx, "lease.commit")
 	defer span.End()
+	if req.TarEncoding != "" { // its objects were made from the payload as a plain tar
+		return fmt.Errorf("gateway commit: a %s payload is published on the ingest paths only", req.TarEncoding)
+	}
 
 	if req.ObjectStore == nil {
 		return fmt.Errorf("ObjectStore must be set when using the gateway backend")

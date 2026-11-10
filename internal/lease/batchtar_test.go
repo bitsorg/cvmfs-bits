@@ -91,7 +91,7 @@ func TestWriteBatchTar_TwoMembers(t *testing.T) {
 	b := writeTestTar(t, []batchTestEntry{batchDir("./"), batchFile("lib/x.so", "B")})
 
 	var out bytes.Buffer
-	err := WriteBatchTar(&out, []BatchMember{{a, "Packages/A/1-1"}, {b, "Modules/modulefiles/B"}})
+	err := WriteBatchTar(&out, []BatchMember{{TarPath: a, RelPath: "Packages/A/1-1"}, {TarPath: b, RelPath: "Modules/modulefiles/B"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestWriteBatchTar_OwnMarkerAndGlobalHeader(t *testing.T) {
 		{hdr: tar.Header{Typeflag: tar.TypeXGlobalHeader, PAXRecords: map[string]string{"comment": "x"}}},
 		batchFile("./.cvmfscatalog", ""), batchFile("./f", "x")})
 	var out bytes.Buffer
-	if err := WriteBatchTar(&out, []BatchMember{{a, "P/a"}}); err != nil {
+	if err := WriteBatchTar(&out, []BatchMember{{TarPath: a, RelPath: "P/a"}}); err != nil {
 		t.Fatal(err)
 	}
 	got := readTestTar(t, out.Bytes())
@@ -149,7 +149,7 @@ func TestWriteBatchTar_RefusesBeforeWriting(t *testing.T) {
 	good := writeTestTar(t, []batchTestEntry{batchFile("./f", "x")})
 	bad := writeTestTar(t, []batchTestEntry{batchFile("../escape", "x")})
 	var out bytes.Buffer
-	if err := WriteBatchTar(&out, []BatchMember{{good, "P/a"}, {bad, "P/b"}}); err == nil || out.Len() != 0 {
+	if err := WriteBatchTar(&out, []BatchMember{{TarPath: good, RelPath: "P/a"}, {TarPath: bad, RelPath: "P/b"}}); err == nil || out.Len() != 0 {
 		t.Errorf("err=%v, %d bytes written; want an error and nothing written", err, out.Len())
 	}
 }
@@ -159,27 +159,27 @@ func TestWriteBatchTar_RefusesBeforeWriting(t *testing.T) {
 func TestWriteBatchTar_Refuses(t *testing.T) {
 	ok := writeTestTar(t, []batchTestEntry{batchFile("./f", "x")})
 	cases := map[string][]BatchMember{
-		"dotdot entry":   {{writeTestTar(t, []batchTestEntry{batchFile("../escape", "x")}), "P/a"}},
-		"absolute entry": {{writeTestTar(t, []batchTestEntry{batchFile("/etc/passwd", "x")}), "P/a"}},
-		"hard link out":  {{writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "../../x"}}}), "P/a"}},
+		"dotdot entry":   {{TarPath: writeTestTar(t, []batchTestEntry{batchFile("../escape", "x")}), RelPath: "P/a"}},
+		"absolute entry": {{TarPath: writeTestTar(t, []batchTestEntry{batchFile("/etc/passwd", "x")}), RelPath: "P/a"}},
+		"hard link out":  {{TarPath: writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "../../x"}}}), RelPath: "P/a"}},
 		"no members":     nil,
-		"empty path":     {{ok, ""}},
-		"absolute path":  {{ok, "/P/a"}},
-		"unclean path":   {{ok, "P/x/../a"}},
-		"same path":      {{ok, "P/a"}, {ok, "P/a"}},
-		"nested members": {{ok, "P/a"}, {ok, "P/a/sub"}},
-		"missing tar":    {{filepath.Join(t.TempDir(), "none.tar"), "P/a"}},
-		"file as root":   {{writeTestTar(t, []batchTestEntry{batchFile(".", "x")}), "P/a"}},
-		"hard link root": {{writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "."}}}), "P/a"}},
-		"sparse":         {{gnuSparseTar(t), "P/a"}},
-		"not a tar":      {{writeRaw(t, "this is not a tar archive, just some text that is long enough"), "P/a"}},
+		"empty path":     {{TarPath: ok, RelPath: ""}},
+		"absolute path":  {{TarPath: ok, RelPath: "/P/a"}},
+		"unclean path":   {{TarPath: ok, RelPath: "P/x/../a"}},
+		"same path":      {{TarPath: ok, RelPath: "P/a"}, {TarPath: ok, RelPath: "P/a"}},
+		"nested members": {{TarPath: ok, RelPath: "P/a"}, {TarPath: ok, RelPath: "P/a/sub"}},
+		"missing tar":    {{TarPath: filepath.Join(t.TempDir(), "none.tar"), RelPath: "P/a"}},
+		"file as root":   {{TarPath: writeTestTar(t, []batchTestEntry{batchFile(".", "x")}), RelPath: "P/a"}},
+		"hard link root": {{TarPath: writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: "l", Typeflag: tar.TypeLink, Linkname: "."}}}), RelPath: "P/a"}},
+		"sparse":         {{TarPath: gnuSparseTar(t), RelPath: "P/a"}},
+		"not a tar":      {{TarPath: writeRaw(t, "this is not a tar archive, just some text that is long enough"), RelPath: "P/a"}},
 	}
 	for name, members := range cases {
 		if err := WriteBatchTar(io.Discard, members); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	if err := WriteBatchTar(io.Discard, []BatchMember{{ok, "P/a"}, {ok, "P/ab"}}); err != nil {
+	if err := WriteBatchTar(io.Discard, []BatchMember{{TarPath: ok, RelPath: "P/a"}, {TarPath: ok, RelPath: "P/ab"}}); err != nil {
 		t.Errorf("siblings with a common name prefix refused: %v", err)
 	}
 }
@@ -223,7 +223,7 @@ func TestWriteBatchTar_UstarNameGrows(t *testing.T) {
 	name := strings.Repeat("d", 150) + "/" + strings.Repeat("f", 90)
 	a := writeTestTar(t, []batchTestEntry{{hdr: tar.Header{Name: name, Typeflag: tar.TypeReg, Format: tar.FormatUSTAR}}})
 	var out bytes.Buffer
-	if err := WriteBatchTar(&out, []BatchMember{{a, "Packages/A/1-1"}}); err != nil {
+	if err := WriteBatchTar(&out, []BatchMember{{TarPath: a, RelPath: "Packages/A/1-1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := readTestTar(t, out.Bytes())["Packages/A/1-1/"+name]; !ok {

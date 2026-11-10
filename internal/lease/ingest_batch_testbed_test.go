@@ -86,8 +86,8 @@ func published(t *testing.T, s0, repo, rel string) (string, bool) {
 }
 
 func testbedMember(t *testing.T, name string) BatchMember {
-	return BatchMember{writeTestTar(t, []batchTestEntry{batchDir("./"), batchDir("./bin/"),
-		batchFile("./bin/x", "content of "+name)}), name + "/1-1"}
+	return BatchMember{TarPath: writeTestTar(t, []batchTestEntry{batchDir("./"), batchDir("./bin/"),
+		batchFile("./bin/x", "content of "+name)}), RelPath: name + "/1-1"}
 }
 
 func TestTestbed_CommitBatch(t *testing.T) {

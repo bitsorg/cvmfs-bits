@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"strings"
 	"time"
@@ -17,9 +16,14 @@ import (
 
 // BatchMember is one package of a batched ingest: its spooled tar, and where
 // it goes relative to the batch's base directory (e.g. "Packages/X/1-1").
+// Encoding and Limit are as CommitRequest's TarEncoding and TarLimit; with
+// TarBytes set, the tar's size is stored there once it is written.
 type BatchMember struct {
-	TarPath string
-	RelPath string
+	TarPath  string
+	RelPath  string
+	Encoding string
+	Limit    int64
+	TarBytes *int64
 }
 
 // catalogMarker in a directory makes `cvmfs_swissknife ingest` give it its own
@@ -43,7 +47,8 @@ func WriteBatchTar(w io.Writer, members []BatchMember) error {
 }
 
 // CheckBatch is WriteBatchTar's check of the members and their tars, which
-// reads only the headers.
+// reads only the headers. A compressed tar is only opened: reading its headers
+// would decompress all of it, so WriteBatchTar checks its entries as it goes.
 func CheckBatch(members []BatchMember) error {
 	if err := checkBatchMembers(members); err != nil {
 		return err
@@ -79,14 +84,19 @@ func checkBatchMembers(members []BatchMember) error {
 // walkBatchMember renames a member's entries and, with tw, writes them and the
 // marker; without tw it only checks them (the file is then read by seeking).
 func walkBatchMember(m BatchMember, tw *tar.Writer) error {
-	f, err := os.Open(m.TarPath)
+	pl, err := openSpooledTar(m.TarPath, m.Encoding, m.Limit)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	var src io.Reader = f
-	if tw != nil {
-		src = bufio.NewReaderSize(f, 1<<20)
+	defer pl.Close()
+	if tw == nil && m.Encoding != "" {
+		return nil
+	}
+	var src io.Reader = pl
+	if tw != nil && m.Encoding == "" {
+		src = bufio.NewReaderSize(pl, 1<<20)
+	} else if tw == nil {
+		src = pl.f // seekable: the check skips the contents
 	}
 	tr := tar.NewReader(src)
 	marked, rootTime := false, time.Now()
@@ -133,6 +143,14 @@ func walkBatchMember(m BatchMember, tw *tar.Writer) error {
 		if _, err := io.Copy(tw, tr); err != nil {
 			return err
 		}
+	}
+	if m.Encoding != "" { // to the end of the stream, where gzip checks its CRC
+		if _, err := io.Copy(io.Discard, pl); err != nil {
+			return fmt.Errorf("reading %s: %w", m.TarPath, err)
+		}
+	}
+	if m.TarBytes != nil {
+		*m.TarBytes = pl.n
 	}
 	if marked || tw == nil {
 		return nil

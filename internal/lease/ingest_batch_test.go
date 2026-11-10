@@ -35,8 +35,8 @@ func batchBackend(t *testing.T, script string) (*IngestBackend, string, string) 
 
 func twoMembers(t *testing.T) []BatchMember {
 	return []BatchMember{
-		{writeTestTar(t, []batchTestEntry{batchDir("./"), batchFile("./bin/a", "A")}), "a/1-1"},
-		{writeTestTar(t, []batchTestEntry{batchDir("./"), batchFile("./lib/b", "B")}), "b/1-1"},
+		{TarPath: writeTestTar(t, []batchTestEntry{batchDir("./"), batchFile("./bin/a", "A")}), RelPath: "a/1-1"},
+		{TarPath: writeTestTar(t, []batchTestEntry{batchDir("./"), batchFile("./lib/b", "B")}), RelPath: "b/1-1"},
 	}
 }
 
@@ -159,7 +159,7 @@ func TestCommitBatch_IngestFailingEarlyDoesNotHang(t *testing.T) {
 	abandonedInputs.Unlock()
 	big := writeTestTar(t, []batchTestEntry{batchDir("./"), batchFile("./big", strings.Repeat("x", 4<<20))})
 	err := commitBatchWithin(t, b, BatchCommitRequest{Token: token, Base: "x",
-		Members: []BatchMember{{big, "a/1-1"}}})
+		Members: []BatchMember{{TarPath: big, RelPath: "a/1-1"}}})
 	if err == nil || !strings.Contains(err.Error(), "exit status 3") || !strings.Contains(err.Error(), "ingest refused") {
 		t.Fatalf("err = %v, want the ingest's exit status and output", err)
 	}

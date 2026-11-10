@@ -145,6 +145,10 @@ func interruptedPublishErr(repo string, ctxErr, pubErr error, markerSeen bool) e
 func (b *LocalBackend) Commit(ctx context.Context, req CommitRequest) error {
 	repo := req.Token // for local backend, token == repo name
 
+	if req.TarEncoding != "" { // it would unpack the compressed bytes as a tar
+		return fmt.Errorf("local backend: a %s payload is published on the ingest paths only", req.TarEncoding)
+	}
+
 	// Ensure the target directory exists inside the CVMFS transaction.
 	if err := os.MkdirAll(req.CVMFSDir, 0755); err != nil {
 		return fmt.Errorf("creating CVMFS target dir %q: %w", req.CVMFSDir, err)
